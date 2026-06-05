@@ -4,6 +4,19 @@ This file is the first thing every Claude Code session should read. It gives you
 
 ---
 
+## Confirmed build configuration (operator decisions 2026-06-05)
+
+| Topic | Decision |
+|-------|----------|
+| Market data (Phase 1) | **yfinance** (free) — Polygon.io deferred to Phase 2+ |
+| Infrastructure | **Docker Compose** on local machine — cloud migration deferred |
+| Broker | **IBKR only** — no Alpaca. Paper = port 7497, Live = port 7496 |
+| Team | **Solo** — clean interfaces designed for future handoff, no multi-user auth |
+
+See `Worklog.md` Session 2 for full rationale.
+
+---
+
 ## What this project is
 
 **Robust Quant Investment System (RQIS)** — a production-grade quantitative investment platform covering the full alpha-generation lifecycle:
@@ -92,7 +105,9 @@ Full directory tree with file-level detail: `PRD.md` Section 5.
 | `IBKR_HOST` | IBKR TWS/Gateway host |
 | `IBKR_PORT` | IBKR TWS/Gateway port |
 | `MLFLOW_TRACKING_URI` | MLflow tracking server URL |
-| `PAPER_TRADING` | `"true"` or `"false"` — NEVER change from `"false"` without operator confirmation |
+| `IBKR_HOST` | IBKR TWS/Gateway host (default: `127.0.0.1`) |
+| `IBKR_PORT` | `7497` = paper trading, `7496` = live trading — **never hardcode** |
+| `PAPER_TRADING` | `"true"` or `"false"` — NEVER change from `"false"` without operator `"YES"` confirmation (C9) |
 
 Reference `.env.example` for the full list.
 

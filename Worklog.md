@@ -14,6 +14,82 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-05
 
+### Session 2 — Operator Configuration Decisions
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/quant-system-prd-koDnJ`  
+**Commits this session:** (pending — configuration decisions logged before build begins)
+
+---
+
+#### What was done
+
+Operator answered four blocking pre-build clarification questions. Answers override or refine PRD defaults for all subsequent implementation work.
+
+---
+
+#### Operator decisions recorded
+
+**[DECISION] Data source: yfinance (free tier) for Phase 1**  
+Operator does not have a Polygon.io subscription. Phase 1 will use `yfinance` for daily OHLCV and fundamental data. The data ingestion module will be written against an abstract `DataClient` interface so Polygon (or any other provider) can be swapped in via config in a later phase without rewriting consuming code. This means no real-time feed in Phase 1 — daily bars only, which is appropriate given we are not executing intraday.  
+*Impact on PRD:* F1.1 "Polygon.io (primary)" deferred to Phase 2+. yfinance is Phase 1 primary.
+
+**[DECISION] Deployment: Local machine via Docker Compose**  
+All infrastructure (TimescaleDB, MinIO, Redis, Airflow, MLflow, Prometheus/Grafana) will run as Docker Compose services on a local machine. No cloud provisioning in Phase 1. Config will use environment variables throughout so a future cloud migration is a matter of changing env vars, not code. No Terraform or cloud-specific IaC in v1.  
+*Impact on PRD:* `infra/` folder will contain `docker-compose.yml` and `Dockerfile` as the primary delivery. Kubernetes / cloud configs deferred.
+
+**[DECISION] Broker: IBKR only (no Alpaca)**  
+Operator has an IBKR account. Alpaca will not be built. The execution layer will have:
+- `IBKRBroker` as the sole concrete broker implementation
+- IBKR natively supports a paper trading account (separate TWS/Gateway paper session on port 7497 vs. live on port 7496) — this is how paper vs. live will be differentiated, controlled by `IBKR_PORT` env var and the `PAPER_TRADING=true/false` flag
+- The `BaseBroker` abstract interface will still be written so a second broker can be added later without changing OMS code
+- Alpaca references in the PRD's tech stack section are superseded by this decision  
+*Impact on PRD:* F4.4 "Alpaca" broker integration dropped from v1. `execution/brokers/alpaca_broker.py` will not be created. IBKR paper port (7497) serves the paper trading phase gate (C8).
+
+**[SAFETY] IBKR paper vs. live port separation**  
+Because IBKR uses the same `ib_insync` client for both paper and live, the only difference is the port number (7497 paper / 7496 live). This is a single config value that, if changed accidentally, would route paper orders to a live account. Safeguard:  
+- `PAPER_TRADING=true` env var must be set to route to port 7497  
+- At startup, the broker client will log a clearly visible warning: `⚠ PAPER TRADING MODE — connected to port 7497` or `🔴 LIVE TRADING MODE — connected to port 7496`  
+- Switching `PAPER_TRADING` from `true` to `false` is treated as a C9 destructive action requiring `"YES"` confirmation  
+- A CI test will assert that `PAPER_TRADING=true` always maps to port 7497
+
+**[DECISION] Team structure: Solo now, designed for handoff**  
+No multi-user auth or role-based access controls in v1. However:
+- Every module gets a brief module-level docstring explaining its responsibility and key invariants
+- All public functions get type hints and one-line docstrings
+- The Worklog stays comprehensive so a new team member can read recent entries and understand current state
+- Interface boundaries between layers (data / signals / portfolio / execution / risk) are kept clean — no cross-layer imports that bypass the defined interface
+- No single-operator shortcuts that would require rewriting for a team (e.g., no hardcoded paths, no personal-machine assumptions in Docker configs)
+
+---
+
+#### What changes from PRD defaults (summary)
+
+| Topic | PRD default | Actual build target |
+|-------|-------------|---------------------|
+| Data source (Phase 1) | Polygon.io primary | yfinance primary |
+| Infrastructure | Docker Compose + K8s migration path | Docker Compose only; env-var-ready for cloud |
+| Broker | IBKR (live) + Alpaca (paper) | IBKR only; paper via port 7497 |
+| Paper trading env | Alpaca paper API | IBKR paper account (TWS port 7497) |
+| Team access controls | Single-operator for now | Clean interfaces, no multi-user auth yet |
+
+---
+
+#### Next steps (Phase 1 build begins next session)
+
+1. Create full folder skeleton with `.gitkeep` files
+2. Write `docker-compose.yml` for local stack (TimescaleDB, MinIO, Redis, Airflow, MLflow, Prometheus, Grafana)
+3. Write `.env.example` with all required variables
+4. Write `pyproject.toml` + `requirements.txt`
+5. Write TimescaleDB schema SQL for `daily_prices` and `corporate_actions` tables
+6. Write Alembic migration setup
+7. Write `data/ingestion/market/yfinance_client.py` with quality checks
+8. Write `data/normalization/point_in_time.py`
+
+---
+
+### Session 1 — Project Initialization
+
 ### Session 1 — Project Initialization
 
 **Operator:** mshane@thecanadalist.ca  
