@@ -1,0 +1,51 @@
+# ─── Core ────────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ─── Data layer ──────────────────────────────────────────────────────────────
+yfinance==0.2.37
+pandas==2.2.0
+polars==0.20.6
+numpy==1.26.4
+pyarrow==15.0.0           # parquet read/write
+
+# ─── Database ────────────────────────────────────────────────────────────────
+sqlalchemy==2.0.27
+psycopg2-binary==2.9.9
+alembic==1.13.1
+
+# ─── Object storage ──────────────────────────────────────────────────────────
+minio==7.2.3
+
+# ─── Cache ───────────────────────────────────────────────────────────────────
+redis==5.0.1
+
+# ─── Signals & statistics ────────────────────────────────────────────────────
+scipy==1.12.0
+statsmodels==0.14.1
+scikit-learn==1.4.0
+lightgbm==4.3.0
+
+# ─── Portfolio construction ──────────────────────────────────────────────────
+cvxpy==1.4.2
+PyPortfolioOpt==1.5.5
+
+# ─── NLP / sentiment ─────────────────────────────────────────────────────────
+spacy==3.7.4
+# FinBERT: pip install transformers torch (not pinned — install separately)
+
+# ─── Broker connectivity ─────────────────────────────────────────────────────
+ib-insync==0.9.86
+
+# ─── Experiment tracking ─────────────────────────────────────────────────────
+mlflow==2.10.2
+
+# ─── Observability ───────────────────────────────────────────────────────────
+structlog==24.1.0
+prometheus-client==0.20.0
+
+# ─── Reporting ───────────────────────────────────────────────────────────────
+matplotlib==3.8.2
+seaborn==0.13.2
+streamlit==1.31.1
+jinja2==3.1.3
+weasyprint==61.2          # PDF tearsheet generation

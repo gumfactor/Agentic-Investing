@@ -1,0 +1,56 @@
+# Universe definition — what securities are eligible for signal scoring and trading.
+#
+# The 'screen' skill reads this file. The universe_loader module applies these
+# filters at runtime to produce a list of eligible tickers.
+#
+# Phase 1: We use S&P 500 constituent tickers as a proxy universe,
+# fetched from Wikipedia on each pipeline run. This is free and
+# sufficient for initial development and backtesting.
+#
+# Phase 2+: Replace with Polygon.io's official constituent history
+# to get point-in-time-correct inclusion/exclusion dates (avoids
+# survivorship bias in backtests).
+
+# ─── Universe source ──────────────────────────────────────────────────────────
+source: sp500_wikipedia   # 'sp500_wikipedia' | 'csv' | 'polygon' (Phase 2)
+
+# Path to a static CSV if source == 'csv'. Column must be 'ticker'.
+# csv_path: config/universe_tickers.csv
+
+# ─── Eligibility filters ──────────────────────────────────────────────────────
+# Applied after pulling the raw constituent list.
+# All thresholds are evaluated on the most recent available data.
+
+filters:
+  # Minimum market capitalisation (USD)
+  min_market_cap_usd: 500_000_000
+
+  # Minimum average daily dollar volume over the lookback window (USD)
+  min_adv_usd: 1_000_000
+  adv_lookback_days: 30
+
+  # Exclude shares priced below this threshold (penny stock filter)
+  min_price_usd: 5.00
+
+  # Exclude common stock types other than these (if data available)
+  # 'CS' = common stock, 'ADR' = American Depositary Receipt
+  allowed_security_types:
+    - CS
+    - ADR
+
+  # Exclude securities currently in bankruptcy or halted
+  exclude_bankrupt: true
+  exclude_halted: true
+
+# ─── ESG exclusion list ───────────────────────────────────────────────────────
+# Optional. Set esg_enabled: true to activate exclusions.
+# Individual tickers can be added to esg_exclusions for hard exclusion.
+esg_enabled: false
+esg_exclusions: []
+  # - TICKER1
+  # - TICKER2
+
+# ─── Manual overrides ────────────────────────────────────────────────────────
+# Force-include or force-exclude specific tickers regardless of filters.
+force_include: []
+force_exclude: []

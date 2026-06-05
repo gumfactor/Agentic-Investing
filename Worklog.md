@@ -14,6 +14,123 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-05
 
+### Session 3 — Phase 1 Build: Full Data Foundation
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/quant-system-prd-koDnJ`  
+**Commits this session:** (see git log)
+
+---
+
+#### What was built
+
+**Infrastructure:**
+- `docker-compose.yml` — complete 9-service local stack: TimescaleDB, Redis, MinIO, MLflow, Airflow (webserver + scheduler + init), Prometheus, Loki, Grafana
+- `infra/db/init/01_create_databases.sql` — creates `airflow` and `mlflow` databases at container first boot
+- `infra/db/init/02_extensions.sql` — enables TimescaleDB, pgcrypto, pg_stat_statements
+- `infra/prometheus/prometheus.yml` — Prometheus scrape config
+- `infra/grafana/provisioning/datasources/datasources.yaml` — auto-provisions Prometheus and Loki data sources in Grafana
+
+**Python project setup:**
+- `pyproject.toml` — package discovery, pytest config, ruff linter config, mypy strict config
+- `requirements.txt` — all production dependencies pinned to specific versions
+- `requirements-dev.txt` — test/lint dependencies
+- `Makefile` — developer convenience targets: `make up/down/clean/migrate/backfill/test/lint/typecheck/fmt`
+
+**Database schema:**
+- `data/storage/schema/market.sql` — canonical SQL reference for all Phase 1 tables (daily_prices, corporate_actions, data_ingestion_log, data_quality_flags) with inline documentation
+- `data/storage/schema/fundamentals.sql` — Phase 2 placeholder with PIT correctness design notes
+- `data/storage/schema/signals.sql` — Phase 2 placeholder
+- `alembic.ini` — Alembic config with DATABASE_URL read from environment (no hardcoded credentials)
+- `infra/db/migrations/env.py` — Alembic env file
+- `infra/db/migrations/versions/001_initial_market_schema.py` — full reversible migration for all Phase 1 tables including TimescaleDB hypertable creation
+
+**Folder skeleton:**
+- All 40+ directories from PRD Section 5 created with `__init__.py` (Python packages) or `.gitkeep` (non-Python dirs)
+
+**Data ingestion layer:**
+- `data/ingestion/market/base_client.py` — abstract `BaseMarketDataClient` with `OHLCVBar` and `CorporateActionRecord` dataclasses; Decimal pricing throughout
+- `data/ingestion/market/yfinance_client.py` — full yfinance implementation: batched downloads, multi/single ticker normalisation, corporate actions fetch, CLI `backfill` entry point
+
+**Data normalisation layer:**
+- `data/normalization/quality_checks.py` — 5 check types: negative prices, HLOC violations, zero volume, price jump detection (rolling z-score), universe completeness
+- `data/normalization/corporate_actions.py` — cumulative adjustment factor computation (splits backward-walking algorithm, dividend ex-date adjustment); `apply_adjustment_factors()` for OHLCV
+- `data/normalization/point_in_time.py` — `pit_join()`, `pit_latest()`, `add_ohlcv_release_date()`; documented look-ahead bias prevention with release_date semantics
+
+**Data storage layer:**
+- `data/storage/timescale_writer.py` — `TimescaleWriter` with idempotent upserts for OHLCV, corporate actions, quality flags; ingestion log write/read; batched inserts; Decimal-safe writes
+- `data/storage/parquet_snapshots.py` — `ParquetSnapshots` for MinIO read/write; snapshot versioning; raw API response archiving for idempotent reprocessing
+
+**Configuration:**
+- `config/settings.yaml` — all tunable parameters with documented units and defaults
+- `config/universe.yaml` — universe source and eligibility filter definitions
+- `config/universe_loader.py` — `load_universe()` fetching S&P 500 from Wikipedia; CSV fallback; force include/exclude overrides
+
+**Orchestration:**
+- `airflow/dags/daily_data_pipeline.py` — full Airflow DAG with 9 tasks: fetch_universe → fetch_ohlcv → quality_checks → write_flags/write_ohlcv/save_snapshot; parallel corporate actions track; XCom-based data passing; 3× retry with exponential backoff
+
+**Tests (50+ test cases):**
+- `data/tests/test_point_in_time.py` — 14 tests covering the critical look-ahead-bias gates including release_date lag on fundamentals
+- `data/tests/test_quality_checks.py` — 15 tests across all 5 check types
+- `data/tests/test_corporate_actions.py` — 9 tests for split/dividend factor computation and application
+- `data/tests/test_yfinance_client.py` — 13 tests with mocked yfinance API
+
+---
+
+#### Key decisions recorded
+
+**[DECISION] `daily_prices` stores unadjusted prices; adjusted prices computed from `corporate_actions`**  
+Rationale: Storing unadjusted prices with a separate corporate actions table makes every adjustment auditable and reversible. If an adjustment is found to be wrong, we fix the corporate action record and recompute — we never lose the original prices. Source-provided adjusted closes are stored in `source_adj_close` for cross-validation only.
+
+**[DECISION] Decimal (not float) for all prices throughout the stack**  
+Rationale: Floating-point representation errors accumulate across adjustment factor multiplications. A 2-for-1 split applied to 252 daily closes produces measurable rounding differences in float vs. Decimal arithmetic. The schema uses `NUMERIC(18,6)`; Python code uses `Decimal`. This is a correctness requirement, not a style preference.
+
+**[DECISION] Ingestion pipeline is fully idempotent (upserts, not inserts)**  
+Rationale: Airflow tasks retry on failure. If a task succeeds but Airflow marks it failed due to a timeout, re-running it must produce the same result. All DB writes use `ON CONFLICT DO UPDATE`, so rerunning is always safe.
+
+**[DECISION] Raw API responses stored in MinIO before any transformation**  
+Rationale: If a transformation bug is discovered after the fact, we can re-run the transformation against the archived raw data without hitting the API again. This also satisfies the C7 data-version audit requirement — the raw_storage_path in `data_ingestion_log` gives a permanent record of the exact data received.
+
+**[DECISION] `pit_join()` requires explicit `release_date_col` for non-OHLCV data**  
+Rationale: Making the caller explicitly specify the release date column prevents accidentally using `date` as a proxy for release date (which is wrong for fundamentals). The function raises `KeyError` if the column doesn't exist, rather than silently falling back — fail loud is preferable to silent look-ahead bias.
+
+**[DECISION] Airflow uses XCom for inter-task data passing (not shared filesystem)**  
+Rationale: XCom is Airflow-native and works whether tasks run on the same or different workers. The data volumes in Phase 1 (daily S&P 500 bars ≈ 500 rows × 8 columns ≈ small JSON) are well within XCom size limits. For larger datasets in later phases, replace with MinIO path passing (fetch → write to MinIO → pass path via XCom).
+
+**[DECISION] Wikipedia S&P 500 fetch for Phase 1 universe (survivorship bias caveat documented)**  
+Rationale: No paid data source is available in Phase 1. Wikipedia gives current membership, which introduces survivorship bias (companies that were removed from the index are excluded from backtests). This is explicitly documented in `config/universe_loader.py` and `config/universe.yaml` as a Phase 1 limitation. Phase 2 replaces with Polygon constituent history.
+
+**[SAFETY] `make clean` requires interactive `YES` confirmation**  
+Rationale: `docker compose down -v` is irreversible — it destroys all local data. The Makefile target wraps this in a `read -p` confirmation gate, consistent with C9 in the PRD. This cannot be bypassed by piping input from another command in a normal shell session.
+
+---
+
+#### Phase 1 exit criterion progress
+
+| Criterion | Status |
+|-----------|--------|
+| Infrastructure stack runnable | ✅ docker-compose.yml complete |
+| Database schema deployed | ✅ Migration 001 ready (`make migrate`) |
+| OHLCV ingestion working | ✅ yfinance_client.py + Airflow DAG |
+| Corporate actions pipeline | ✅ fetch + normalise + write |
+| Point-in-time correctness | ✅ pit_join() with tests |
+| Quality checks operational | ✅ 5 check types with tests |
+| 5 years of data in DB | ⏳ Run `make backfill` after `make up && make migrate` |
+| Data quality green | ⏳ Requires live backfill run |
+
+---
+
+#### Next steps (remaining Phase 1 work)
+
+1. Run `make up` and `make migrate` on operator's machine to provision the stack
+2. Run `make backfill` to pull 5 years of S&P 500 OHLCV
+3. Review quality flags produced by backfill — resolve any `severity=error` flags
+4. Verify Airflow daily pipeline runs clean for one full week
+5. Snapshot the backfilled data (`ParquetSnapshots.save_snapshot()`) to pin the Phase 1 dataset version
+6. Begin Phase 2 planning: SimFin fundamental data client
+
+---
+
 ### Session 2 — Operator Configuration Decisions
 
 **Operator:** mshane@thecanadalist.ca  
