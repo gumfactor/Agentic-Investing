@@ -1,0 +1,102 @@
+# RQIS — Engineering Worklog
+
+This file is the canonical running record of all work performed on the Robust Quant Investment System.
+Every session must append a dated entry. Every significant decision, trade-off, or "why did we do it this way" must be recorded here.
+
+**Convention:**
+- Entries are newest-first within each date block.
+- Decision records are prefixed `[DECISION]`.
+- Risk / safety notes are prefixed `[SAFETY]`.
+- Blockers are prefixed `[BLOCKER]`.
+- Resolved items are prefixed `[RESOLVED]`.
+
+---
+
+## 2026-06-05
+
+### Session 1 — Project Initialization
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/quant-system-prd-koDnJ`  
+**Commits this session:** `6640e50`
+
+---
+
+#### What was done
+
+1. **Repository initialized** on branch `claude/quant-system-prd-koDnJ`.
+   - The repo was completely empty at session start — no files, no prior commits.
+
+2. **`PRD.md` authored and committed** (921 lines, commit `6640e50`).
+   - Full Product Requirements Document for the Robust Quant Investment System.
+   - Covers all seven system layers: Data, Signal Generation, Portfolio Construction, Execution, Risk & Monitoring, Backtesting, Reporting.
+   - Covers the Claude Code skill architecture (11 skills with MCP server interfaces).
+
+3. **`Worklog.md` created** (this file).
+   - Establishes the pattern for session-by-session documentation.
+
+4. **`CLAUDE.md` created** (project context file for Claude Code sessions).
+   - Gives any future Claude Code session immediate orientation to the project.
+
+---
+
+#### Key decisions recorded
+
+**[DECISION] PRD written before any code**  
+Rationale: The system touches live brokerage accounts and real capital. Writing a comprehensive PRD first ensures all safety constraints, approval gates, and architectural decisions are explicit and reviewed before a single line of executable code is written. A PRD-first approach also makes every later build decision traceable to a requirement.
+
+**[DECISION] Phase-gated milestones (5 phases over 36 weeks)**  
+Rationale: The system has hard dependencies between layers — you cannot validate signals without clean data; you cannot paper-trade without a working OMS; you cannot go live without paper-trading for 4 weeks. A linear phase gate prevents the temptation to skip steps that protect capital.
+
+**[DECISION] Nine safety/reversibility constraints codified in PRD (C1–C9)**  
+Rationale: Quantitative trading systems have historically failed catastrophically not from bad signals but from operational errors — runaway orders, corrupt data silently influencing live positions, audit trails that could not reconstruct what happened. Encoding these as named, numbered constraints (not vague guidelines) means they can be referenced by constraint ID in code reviews, incident reports, and runbooks.
+
+**[DECISION] `execute_trade` skill requires literal `"YES"` confirmation**  
+Rationale (C1 from PRD): Market orders cannot be recalled once filled. The cost of a confirmation prompt is seconds; the cost of an unintended order is potentially thousands of dollars and regulatory exposure. The confirmation gate is enforced at the code level and will be verified by a CI unit test — not just documented in a readme that could be ignored.
+
+**[DECISION] Append-only audit log (C3 from PRD)**  
+Rationale: Regulatory compliance and investor trust both require that the signal → order → fill ledger cannot be retroactively altered. A mutable audit log is legally worthless. The append-only constraint is enforced at the database level (PostgreSQL RULE) not just at the application level.
+
+**[DECISION] Paper trading phase gate of 4 weeks minimum before live capital (C8 from PRD)**  
+Rationale: Backtests can be overfitted or contain subtle look-ahead bias that only surfaces in real-time operation. Four weeks of paper trading with zero critical incidents is the minimum evidence that the live system behaves as expected. "Critical incident" is defined precisely in the PRD so this gate cannot be gamed by redefining what counts as a problem.
+
+**[DECISION] TimescaleDB as the primary time-series store**  
+Rationale: PostgreSQL-compatible (lowers cognitive overhead; team knows SQL), excellent time-series compression, supports point-in-time queries natively, mature ecosystem. Alternative was InfluxDB — rejected because its query language (Flux) adds a learning curve and its financial data ecosystem is thinner.
+
+**[DECISION] CVXPY as the optimization engine**  
+Rationale: Declarative constraint syntax maps cleanly to portfolio constraint specifications (sector limits, factor exposure bounds, position limits). Switching optimization objectives (MVO → risk parity → max Sharpe) is a matter of rewriting the objective expression, not restructuring the code. Alternative was scipy.optimize — rejected because constraint declaration is more verbose and error-prone.
+
+**[DECISION] MLflow for experiment tracking**  
+Rationale: Every backtest run must be reproducible from its run ID. MLflow logs params, metrics, and artifacts together; links strategy config hashes to results; provides a UI for comparing runs. Alternative was Weights & Biases — rejected to avoid a SaaS dependency for a financial system where data residency matters.
+
+**[DECISION] DVC for data versioning**  
+Rationale: Pinning a backtest to a specific dataset snapshot (C7 in PRD) requires a versioning tool that treats data files as first-class versioned artifacts. DVC integrates with git so a git commit hash + DVC data hash together fully specify a reproducible environment.
+
+---
+
+#### Files created this session
+
+| File | Purpose | Size |
+|------|---------|------|
+| `PRD.md` | Full Product Requirements Document | 921 lines |
+| `Worklog.md` | This file — running engineering journal | — |
+| `CLAUDE.md` | Project context for Claude Code sessions | — |
+
+---
+
+#### What was NOT done (and why)
+
+- **No code written yet.** Per the PRD and the phase-gate design, the correct sequence is: PRD → CLAUDE.md + Worklog → skeleton folder structure → data layer code. Writing application code before the project context documents are in place would mean future sessions lack orientation.
+- **No infrastructure provisioned.** Docker Compose, TimescaleDB, and MinIO setup is Phase 1 work (Weeks 1–2). Premature infrastructure means unmaintained scaffolding.
+
+---
+
+#### Next steps (Phase 1, Weeks 1–2)
+
+1. Create the full folder skeleton (all directories from `PRD.md` Section 5, with `.gitkeep` files)
+2. Write `docker-compose.yml` for TimescaleDB + MinIO + Redis + Airflow local stack
+3. Write database schema SQL for `market` tables (OHLCV, corporate actions)
+4. Write the Polygon.io OHLCV ingestion client with quality checks
+5. Write Alembic migration setup
+
+---
