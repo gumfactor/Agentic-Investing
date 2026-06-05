@@ -37,13 +37,20 @@ class TestNormaliseYfDownload:
     def _multi_ticker_raw(self, tickers: list[str]) -> pd.DataFrame:
         """Simulate yfinance output for multiple tickers (MultiIndex columns)."""
         idx = pd.to_datetime(["2024-01-02"])
+        price_cols = ["Open", "High", "Low", "Close", "Adj Close"]
         arrays = [
-            ["Open", "Open", "Close", "Close", "Volume", "Volume", "Adj Close", "Adj Close"],
-            tickers * 4,
+            [col for col in price_cols for _ in tickers] + ["Volume"] * len(tickers),
+            tickers * len(price_cols) + tickers,
         ]
         cols = pd.MultiIndex.from_arrays(arrays)
-        data = [[150.0, 200.0, 152.0, 202.0, 1_000_000, 500_000, 150.5, 201.0]]
-        return pd.DataFrame(data, index=idx, columns=cols)
+        # open, high, low, close, adj_close per ticker, then volume per ticker
+        row = [150.0, 200.0,  # Open
+               155.0, 205.0,  # High
+               149.0, 199.0,  # Low
+               152.0, 202.0,  # Close
+               150.5, 201.0,  # Adj Close
+               1_000_000, 500_000]  # Volume
+        return pd.DataFrame([row], index=idx, columns=cols)
 
     def test_single_ticker_columns(self) -> None:
         raw = self._single_ticker_raw()

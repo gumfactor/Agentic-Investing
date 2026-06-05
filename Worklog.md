@@ -14,6 +14,61 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-05
 
+### Session 4 — Phase 1 Unit Test Coverage: Fill Gaps
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/quant-system-prd-koDnJ`  
+**Commits this session:** (see git log)
+
+---
+
+#### What was done
+
+Audited Phase 1 test coverage. Three source files had zero tests; the base
+client had one untested method. Wrote four new test files to close all gaps.
+
+**Gap analysis:**
+
+| Source file | Had tests? | Action |
+|---|---|---|
+| `data/ingestion/market/base_client.py` | No | New: `test_base_client.py` |
+| `data/ingestion/market/yfinance_client.py` | Yes (from Session 3) | — |
+| `data/normalization/corporate_actions.py` | Yes | — |
+| `data/normalization/point_in_time.py` | Yes | — |
+| `data/normalization/quality_checks.py` | Yes | — |
+| `data/storage/timescale_writer.py` | **No** | New: `test_timescale_writer.py` |
+| `data/storage/parquet_snapshots.py` | **No** | New: `test_parquet_snapshots.py` |
+| `config/universe_loader.py` | **No** | New: `test_universe_loader.py` |
+
+**New test files:**
+- `data/tests/test_base_client.py` — 6 tests: `validate_date_range`, frozen dataclass, optional fields
+- `data/tests/test_timescale_writer.py` — 26 tests: upsert SQL contract (ON CONFLICT DO UPDATE), batching, missing-column validation, `_to_decimal_or_none`, `_to_int_or_none` edge cases
+- `data/tests/test_parquet_snapshots.py` — 18 tests: save/load/list round-trip, object key format, FileNotFoundError on missing snapshots, bucket auto-creation
+- `data/tests/test_universe_loader.py` — 16 tests: Wikipedia source, CSV source, force include/exclude, deduplication, error handling
+
+**Two pre-existing test bugs fixed:**
+- `test_no_false_positive_on_normal_movement` in quality checks: date arithmetic overflowed January (day > 31). Fixed with `timedelta(days=i)`.
+- `test_multi_ticker_extracts_correct_rows` in yfinance client: mock MultiIndex fixture was missing `High`/`Low` columns. Fixed by constructing a complete fixture.
+
+**Final result:** 120 tests, all passing, no live services required.
+
+---
+
+#### [DECISION] TimescaleWriter tests mock the SQLAlchemy engine, not the DB
+Rationale: Unit tests for the writer should verify SQL generation and parameter passing, not PostgreSQL behaviour. Integration tests against a real DB belong in `tests/integration/` and require `make up` — they are marked with `@pytest.mark.integration` and excluded from the default `make test` run.
+
+---
+
+#### Next steps
+
+Phase 1 exit criterion is now fully covered by tests. Remaining operational steps:
+1. Operator: `make up && make migrate && make backfill` on local machine
+2. Monitor quality flags from backfill run
+3. Pin the dataset snapshot version in MLflow
+4. Begin Phase 2: SimFin fundamental data client
+
+---
+
 ### Session 3 — Phase 1 Build: Full Data Foundation
 
 **Operator:** mshane@thecanadalist.ca  

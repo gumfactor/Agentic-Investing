@@ -124,14 +124,15 @@ class TestPriceJumpCheck:
         assert not jump_flags.empty
 
     def test_no_false_positive_on_normal_movement(self) -> None:
-        # Small random-walk, no big jumps
+        from datetime import timedelta
+        base = date(2024, 1, 2)
         rows = []
         price = 100.0
         for i in range(40):
             price *= 1.001  # steady 0.1% daily gain
             rows.append(_make_row(
                 ticker="STEADY",
-                dt=date(2024, 1, i + 1),
+                dt=base + timedelta(days=i),
                 open_=price * 0.999,
                 high=price * 1.001,
                 low=price * 0.998,
