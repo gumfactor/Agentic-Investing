@@ -6,18 +6,31 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
+
+# Load .env so that running `alembic upgrade head` directly from the shell
+# (without manually exporting DATABASE_URL) works out of the box.
+# dotenv searches the current directory and all parents, so this works
+# whether you run alembic from the repo root or any subdirectory.
+load_dotenv()
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Read DATABASE_URL from environment so credentials are never in alembic.ini.
-# alembic.ini contains the placeholder %(DATABASE_URL)s which Alembic expands.
+# Override the dummy sqlalchemy.url in alembic.ini with the real value
+# from the environment. Fail loudly if it's absent rather than producing
+# a confusing SQLAlchemy error later in the migration.
 database_url = os.environ.get("DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+if not database_url:
+    raise RuntimeError(
+        "DATABASE_URL is not set. "
+        "Copy .env.example to .env, fill in POSTGRES_PASSWORD, and ensure "
+        "DATABASE_URL matches. Then re-run: alembic upgrade head"
+    )
+config.set_main_option("sqlalchemy.url", database_url)
 
 
 def run_migrations_offline() -> None:

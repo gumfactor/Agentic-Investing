@@ -14,6 +14,54 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-05
 
+### Session 6 — Fix Alembic migration config bugs found during live stack validation
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/quant-system-prd-koDnJ`  
+**Commits this session:** (see git log)
+
+---
+
+#### What was done
+
+Operator ran `make migrate` and hit a failure. Two bugs in the Alembic config fixed.
+
+**Bug 1 — `alembic.ini`: ConfigParser interpolation error on `%(DATABASE_URL)s`**
+
+Root cause: `%(KEY)s` is Python ConfigParser interpolation syntax. It looks for
+`KEY` as a variable defined elsewhere in the same ini file — it does NOT read
+from environment variables. The key `DATABASE_URL` was never defined in
+`alembic.ini`, so ConfigParser raised `InterpolationMissingOptionError` before
+`env.py` even ran.
+
+Fix: Replaced the interpolation placeholder with a non-interpolated sentinel
+string `not-set-see-env-py`. Since `env.py` calls
+`config.set_main_option("sqlalchemy.url", ...)` at runtime, the ini value is
+never used; it just needs to not crash ConfigParser.
+
+**Bug 2 — `env.py`: `.env` never loaded, `DATABASE_URL` always `None`**
+
+Root cause: `env.py` called `os.environ.get("DATABASE_URL")` but never loaded
+`.env` first. Running `alembic upgrade head` from a shell that hasn't exported
+`DATABASE_URL` meant the variable was always `None`. `config.set_main_option`
+was silently skipped, leaving the dummy ini value in place, which then caused
+a confusing SQLAlchemy connection error.
+
+Fix:
+- Added `load_dotenv()` (from `python-dotenv`, already in `requirements.txt`)
+  before reading `os.environ`. `load_dotenv()` searches the cwd and all parent
+  directories, so it works from any working directory.
+- Changed the `if database_url:` guard to a hard `raise RuntimeError` with a
+  clear message if the URL is still absent after loading `.env`. Fail loud and
+  early rather than producing a confusing downstream error.
+
+---
+
+#### Next steps
+Re-run `make migrate` — should apply migration 001 cleanly now.
+
+---
+
 ### Session 5 — Fix docker-compose.yml bugs found during live stack validation
 
 **Operator:** mshane@thecanadalist.ca  
