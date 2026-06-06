@@ -277,6 +277,11 @@ def _backfill_cli() -> None:
     """
     import sys
     from datetime import timedelta
+    from dotenv import load_dotenv
+
+    # Load .env so DATABASE_URL and other env vars are available without
+    # the caller having to manually export them first.
+    load_dotenv()
 
     from data.normalization.quality_checks import run_quality_checks
     from data.storage.timescale_writer import TimescaleWriter

@@ -14,6 +14,60 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-05
 
+### Session 7 — Fix backfill CLI and Wikipedia universe fetch bugs
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/quant-system-prd-koDnJ`  
+**Commits this session:** (see git log)
+
+---
+
+#### What was done
+
+Operator ran `make backfill` and hit two failures. Both fixed.
+
+**Bug 1 — `_backfill_cli()` not loading `.env`**
+
+Root cause: The backfill entry point in `yfinance_client.py` called
+`TimescaleWriter()` which reads `DATABASE_URL` from `os.environ`, but
+the backfill CLI never loaded `.env` before entering that code. Running
+`make backfill` from a plain shell (without manually exporting env vars)
+meant `DATABASE_URL` was absent and the writer failed to connect.
+
+Fix: Added `load_dotenv()` at the top of `_backfill_cli()`, before any
+imports that read environment variables.
+
+**Bug 2 — Wikipedia S&P 500 fetch returning 403 (Windows / User-Agent)**
+
+Root cause: `pd.read_html(url)` uses Python's `urllib` with a default
+`Python-urllib/3.x` User-Agent. Wikipedia blocks this with a 403 on
+Windows (and increasingly on other platforms). The fetch silently returned
+an empty list, so `tickers=0` and the backfill wrote nothing.
+
+Fix: Replaced `pd.read_html(url)` with a `requests.get()` call that sends
+a Chrome-style `User-Agent` header, then passes `io.StringIO(response.text)`
+to `pd.read_html()`. The `io.StringIO` wrapper is also required by pandas 2.x,
+which treats a bare HTML string argument as a file path (causing a
+`No such file or directory` error with the raw string).
+
+Added `requests==2.31.0` explicitly to `requirements.txt` (it was always
+installed as a transitive dependency of yfinance, but we now import it
+directly).
+
+Updated `test_universe_loader.py`: the four Wikipedia tests now mock
+`config.universe_loader.requests.get` instead of `pd.read_html`,
+and a new `test_sends_browser_user_agent` test asserts the User-Agent
+header is present.
+
+**Final test count:** 121 tests, all passing.
+
+---
+
+#### Next steps
+Re-run `make backfill` — should complete successfully now.
+
+---
+
 ### Session 6 — Fix Alembic migration config bugs found during live stack validation
 
 **Operator:** mshane@thecanadalist.ca  

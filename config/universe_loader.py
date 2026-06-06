@@ -15,12 +15,14 @@ limitation in mind.
 
 from __future__ import annotations
 
+import io
 import os
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import requests
 import structlog
 import yaml
 
@@ -73,17 +75,29 @@ def load_universe(config_path: Optional[Path] = None) -> list[str]:
 def _fetch_sp500_from_wikipedia() -> list[str]:
     """Fetch current S&P 500 constituents from Wikipedia.
 
-    Uses pandas.read_html which is part of the standard pandas install.
-    Falls back to an empty list (with a loud warning) if Wikipedia is unreachable,
-    so the pipeline degrades gracefully rather than crashing.
+    Uses requests with a browser User-Agent (Wikipedia returns 403 to the
+    default Python/urllib agent) then passes the HTML to pandas.read_html.
+    Falls back to an empty list if Wikipedia is unreachable so the pipeline
+    degrades gracefully rather than crashing.
 
     PHASE 1 CAVEAT: This is current membership, not historical. Use only for
     development and rough backtesting. Replace with Polygon constituent history
     for production-quality backtests.
     """
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
     try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        # pandas 2.x requires io.StringIO for inline HTML strings;
+        # passing a raw string is treated as a file path.
+        tables = pd.read_html(io.StringIO(response.text))
         # First table on the page has the current constituents
         df = tables[0]
         tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()

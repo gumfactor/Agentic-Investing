@@ -33,34 +33,51 @@ def _write_csv(tmp_path: Path, tickers: list[str]) -> Path:
 
 # ─── _fetch_sp500_from_wikipedia ──────────────────────────────────────────────
 
+def _make_wikipedia_html(tickers: list[str]) -> str:
+    """Minimal HTML table that pd.read_html will parse as the S&P 500 list."""
+    rows = "".join(f"<tr><td>{t}</td></tr>" for t in tickers)
+    return f"<table><thead><tr><th>Symbol</th></tr></thead><tbody>{rows}</tbody></table>"
+
+
 class TestFetchSp500FromWikipedia:
-    @patch("config.universe_loader.pd.read_html")
-    def test_returns_ticker_list(self, mock_read_html: MagicMock) -> None:
-        mock_read_html.return_value = [
-            pd.DataFrame({"Symbol": ["AAPL", "MSFT", "GOOGL"]})
-        ]
+    def _mock_response(self, tickers: list[str]) -> MagicMock:
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        # production code wraps response.text in io.StringIO before passing
+        # to pd.read_html, so .text just needs to be a valid HTML string.
+        mock_resp.text = _make_wikipedia_html(tickers)
+        return mock_resp
+
+    @patch("config.universe_loader.requests.get")
+    def test_returns_ticker_list(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = self._mock_response(["AAPL", "MSFT", "GOOGL"])
         result = _fetch_sp500_from_wikipedia()
         assert result == ["AAPL", "MSFT", "GOOGL"]
 
-    @patch("config.universe_loader.pd.read_html")
-    def test_replaces_dot_with_dash_in_ticker(self, mock_read_html: MagicMock) -> None:
+    @patch("config.universe_loader.requests.get")
+    def test_sends_browser_user_agent(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = self._mock_response(["AAPL"])
+        _fetch_sp500_from_wikipedia()
+        headers = mock_get.call_args[1]["headers"]
+        assert "Mozilla" in headers["User-Agent"]
+
+    @patch("config.universe_loader.requests.get")
+    def test_replaces_dot_with_dash_in_ticker(self, mock_get: MagicMock) -> None:
         # BRK.B appears in S&P 500; yfinance expects BRK-B
-        mock_read_html.return_value = [
-            pd.DataFrame({"Symbol": ["BRK.B", "BF.B"]})
-        ]
+        mock_get.return_value = self._mock_response(["BRK.B", "BF.B"])
         result = _fetch_sp500_from_wikipedia()
         assert "BRK-B" in result
         assert "BF-B" in result
         assert "BRK.B" not in result
 
-    @patch("config.universe_loader.pd.read_html", side_effect=Exception("network error"))
-    def test_returns_empty_list_on_failure(self, mock_read_html: MagicMock) -> None:
+    @patch("config.universe_loader.requests.get", side_effect=Exception("network error"))
+    def test_returns_empty_list_on_failure(self, mock_get: MagicMock) -> None:
         result = _fetch_sp500_from_wikipedia()
         assert result == []
 
-    @patch("config.universe_loader.pd.read_html")
-    def test_returns_list_not_series(self, mock_read_html: MagicMock) -> None:
-        mock_read_html.return_value = [pd.DataFrame({"Symbol": ["AAPL"]})]
+    @patch("config.universe_loader.requests.get")
+    def test_returns_list_not_series(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = self._mock_response(["AAPL"])
         result = _fetch_sp500_from_wikipedia()
         assert isinstance(result, list)
 
