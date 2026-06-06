@@ -266,6 +266,29 @@ class TimescaleWriter:
             val = result.scalar_one_or_none()
         return val
 
+    def get_tickers_with_data(self, start: date, end: date) -> set[str]:
+        """Return tickers that have daily_prices rows within 31 days of start.
+
+        Used by the backfill CLI to skip tickers already present in the DB so
+        an interrupted backfill can be resumed without re-fetching completed work.
+        A ticker is considered 'done' if it has at least one row in the first 31
+        calendar days of [start, end] — this tolerates weekends and public holidays
+        while still catching genuine gaps for fresh tickers.
+        """
+        from datetime import timedelta
+        cutoff = start + timedelta(days=31)
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    SELECT DISTINCT ticker FROM daily_prices
+                    WHERE date >= :start AND date < :cutoff
+                    """
+                ),
+                {"start": start, "cutoff": cutoff},
+            )
+            return {row[0] for row in result}
+
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
 

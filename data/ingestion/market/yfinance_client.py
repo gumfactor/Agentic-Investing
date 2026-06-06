@@ -266,22 +266,36 @@ class YFinanceClient(BaseMarketDataClient):
 
 # ─── CLI entry point (make backfill) ─────────────────────────────────────────
 
+# Tuned for Yahoo Finance's unofficial rate limits.  Smaller batches and longer
+# delays prevent the 429s that kill a 500-ticker × 5-year run.
+_BACKFILL_BATCH_SIZE = 20        # tickers per yf.download call
+_BACKFILL_INTER_BATCH_DELAY = 3.0  # seconds between batches
+_BACKFILL_RETRY_DELAYS = (5, 10, 20)  # seconds; one entry per attempt after first
+
+
 def _backfill_cli() -> None:
     """Backfill 5 years of daily OHLCV for the configured universe.
 
     Invoked via: python -m data.ingestion.market.yfinance_client backfill
     or:          make backfill
 
+    Design for scale
+    ----------------
+    * 20-ticker batches → stays well under Yahoo's informal rate limit.
+    * Resumable: tickers already in daily_prices (near the start date) are
+      skipped, so an interrupted run continues rather than re-fetching.
+    * Incremental writes: upserts after every batch, so a crash only loses
+      the current batch (≤20 tickers).
+    * Per-batch retry: up to 3 attempts with 5 s / 10 s / 20 s back-off.
+    * Quality flags written per batch so partial results are still flagged.
+
     Imports are deferred to avoid circular dependencies when this module
     is used as a library.
     """
-    import sys
     from datetime import timedelta
     from dotenv import load_dotenv
 
-    # Load .env so DATABASE_URL and other env vars are available without
-    # the caller having to manually export them first.
-    load_dotenv()
+    load_dotenv()  # must precede any import that reads os.environ
 
     from data.normalization.quality_checks import run_quality_checks
     from data.storage.timescale_writer import TimescaleWriter
@@ -291,24 +305,121 @@ def _backfill_cli() -> None:
     start_date = end_date - timedelta(days=5 * 365)
 
     tickers = load_universe()
-    logger.info("backfill_start", tickers=len(tickers), start=str(start_date), end=str(end_date))
-
-    client = YFinanceClient()
     writer = TimescaleWriter()
 
-    ohlcv = client.fetch_ohlcv(tickers, start_date, end_date)
-    flags = run_quality_checks(ohlcv)
+    # ── Resumability ──────────────────────────────────────────────────────────
+    already_done = writer.get_tickers_with_data(start_date, end_date)
+    pending = [t for t in tickers if t not in already_done]
 
-    if not flags.empty:
-        error_count = (flags["severity"] == "error").sum()
-        logger.warning("quality_flags_detected", total=len(flags), errors=int(error_count))
+    logger.info(
+        "backfill_start",
+        total_tickers=len(tickers),
+        already_done=len(already_done),
+        pending=len(pending),
+        start=str(start_date),
+        end=str(end_date),
+    )
 
-    records_written = writer.upsert_ohlcv(ohlcv)
-    logger.info("backfill_complete", records_written=records_written)
+    if not pending:
+        logger.info("backfill_already_complete")
+        return
 
-    corp_actions = client.fetch_corporate_actions(tickers, start_date, end_date)
-    ca_written = writer.upsert_corporate_actions(corp_actions)
-    logger.info("corporate_actions_written", records_written=ca_written)
+    # ── OHLCV — batched, retried, incremental ────────────────────────────────
+    batches = [
+        pending[i : i + _BACKFILL_BATCH_SIZE]
+        for i in range(0, len(pending), _BACKFILL_BATCH_SIZE)
+    ]
+    total_ohlcv_written = 0
+    failed_tickers: list[str] = []
+
+    for batch_idx, batch in enumerate(batches):
+        batch_log = logger.bind(
+            batch=batch_idx + 1,
+            total_batches=len(batches),
+            n_tickers=len(batch),
+        )
+
+        # Retry loop — first attempt + len(_BACKFILL_RETRY_DELAYS) retries
+        batch_df: pd.DataFrame | None = None
+        all_delays = (0,) + _BACKFILL_RETRY_DELAYS
+        for attempt, pre_sleep in enumerate(all_delays):
+            if pre_sleep:
+                batch_log.warning(
+                    "backfill_batch_retry",
+                    attempt=attempt,
+                    wait_s=pre_sleep,
+                )
+                time.sleep(pre_sleep)
+            try:
+                raw = yf.download(
+                    tickers=batch,
+                    start=datetime.combine(start_date, datetime.min.time()),
+                    end=datetime.combine(end_date, datetime.min.time()) + pd.Timedelta(days=1),
+                    auto_adjust=False,
+                    actions=False,
+                    progress=False,
+                    threads=True,
+                )
+                batch_df = _normalise_yf_download(raw, batch)
+                batch_df["source"] = "yfinance"
+                break
+            except Exception as exc:
+                batch_log.error(
+                    "backfill_batch_attempt_failed",
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
+                if attempt == len(all_delays) - 1:
+                    failed_tickers.extend(batch)
+
+        if batch_df is None or batch_df.empty:
+            batch_log.warning("backfill_batch_no_data")
+        else:
+            # Quality checks per batch
+            flags = run_quality_checks(batch_df)
+            if not flags.empty:
+                error_count = int((flags["severity"] == "error").sum())
+                batch_log.warning(
+                    "quality_flags_detected", total=len(flags), errors=error_count
+                )
+                writer.write_quality_flags(flags)
+
+            # Incremental write — crash loses at most this batch
+            written = writer.upsert_ohlcv(batch_df)
+            total_ohlcv_written += written
+            batch_log.info(
+                "backfill_batch_complete",
+                rows=len(batch_df),
+                records_written=written,
+                cumulative_written=total_ohlcv_written,
+            )
+
+        if batch_idx < len(batches) - 1:
+            time.sleep(_BACKFILL_INTER_BATCH_DELAY)
+
+    logger.info(
+        "backfill_ohlcv_complete",
+        total_records_written=total_ohlcv_written,
+        failed_ticker_count=len(failed_tickers),
+    )
+    if failed_tickers:
+        logger.warning("backfill_failed_tickers", tickers=failed_tickers)
+
+    # ── Corporate actions ─────────────────────────────────────────────────────
+    # Fetched per-ticker (yf.Ticker API), so naturally granular — no batch
+    # sizing needed.  Excludes tickers that permanently failed OHLCV.
+    corp_tickers = [t for t in pending if t not in failed_tickers]
+    if corp_tickers:
+        client = YFinanceClient(
+            batch_size=_BACKFILL_BATCH_SIZE,
+            inter_batch_delay=_BACKFILL_INTER_BATCH_DELAY,
+        )
+        corp_actions = client.fetch_corporate_actions(corp_tickers, start_date, end_date)
+        if not corp_actions.empty:
+            ca_written = writer.upsert_corporate_actions(corp_actions)
+            logger.info("corporate_actions_written", records_written=ca_written)
+
+    logger.info("backfill_complete")
 
 
 if __name__ == "__main__":
