@@ -1,5 +1,3 @@
-version: "3.8"
-
 # RQIS local development stack.
 # All services are configured via environment variables from .env (see .env.example).
 # Start: make up   Stop: make down   Wipe volumes: make clean
