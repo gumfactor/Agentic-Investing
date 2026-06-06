@@ -268,9 +268,35 @@ class YFinanceClient(BaseMarketDataClient):
 
 # Tuned for Yahoo Finance's unofficial rate limits.  Smaller batches and longer
 # delays prevent the 429s that kill a 500-ticker × 5-year run.
-_BACKFILL_BATCH_SIZE = 20        # tickers per yf.download call
+_BACKFILL_BATCH_SIZE = 20          # tickers per yf.download call
 _BACKFILL_INTER_BATCH_DELAY = 3.0  # seconds between batches
 _BACKFILL_RETRY_DELAYS = (5, 10, 20)  # seconds; one entry per attempt after first
+_BACKFILL_SINGLE_TICKER_DELAY = 2.0  # seconds between per-ticker fallback retries
+
+
+def _yf_fetch(tickers: list[str], start_date: date, end_date: date) -> pd.DataFrame:
+    """Download and normalise OHLCV for the given tickers.  No retry — caller
+    handles retry/fallback logic.
+
+    Returns a long-format DataFrame with a 'source' column, or an empty
+    DataFrame with the correct columns if yfinance returns nothing.
+    yfinance may silently drop individual tickers from the result when Yahoo
+    returns an empty response for them ('Expecting value: line 1 column 1');
+    callers should check which tickers are actually present in the result.
+    """
+    raw = yf.download(
+        tickers=tickers,
+        start=datetime.combine(start_date, datetime.min.time()),
+        end=datetime.combine(end_date, datetime.min.time()) + pd.Timedelta(days=1),
+        auto_adjust=False,
+        actions=False,
+        progress=False,
+        threads=True,
+    )
+    df = _normalise_yf_download(raw, tickers)
+    if not df.empty:
+        df["source"] = "yfinance"
+    return df
 
 
 def _backfill_cli() -> None:
@@ -351,17 +377,7 @@ def _backfill_cli() -> None:
                 )
                 time.sleep(pre_sleep)
             try:
-                raw = yf.download(
-                    tickers=batch,
-                    start=datetime.combine(start_date, datetime.min.time()),
-                    end=datetime.combine(end_date, datetime.min.time()) + pd.Timedelta(days=1),
-                    auto_adjust=False,
-                    actions=False,
-                    progress=False,
-                    threads=True,
-                )
-                batch_df = _normalise_yf_download(raw, batch)
-                batch_df["source"] = "yfinance"
+                batch_df = _yf_fetch(batch, start_date, end_date)
                 break
             except Exception as exc:
                 batch_log.error(
@@ -375,6 +391,29 @@ def _backfill_cli() -> None:
         if batch_df is None or batch_df.empty:
             batch_log.warning("backfill_batch_no_data")
         else:
+            # yfinance silently drops tickers that Yahoo returns empty for
+            # ('Expecting value: line 1 column 1').  Detect them and retry
+            # individually so a single throttled ticker doesn't lose the batch.
+            returned = set(batch_df["ticker"].unique())
+            missing = [t for t in batch if t not in returned]
+            if missing:
+                batch_log.warning("backfill_tickers_missing_from_batch", missing=missing)
+                recovered: list[pd.DataFrame] = [batch_df]
+                for miss in missing:
+                    time.sleep(_BACKFILL_SINGLE_TICKER_DELAY)
+                    try:
+                        single_df = _yf_fetch([miss], start_date, end_date)
+                        if not single_df.empty:
+                            recovered.append(single_df)
+                            batch_log.info("backfill_ticker_recovered", ticker=miss)
+                        else:
+                            failed_tickers.append(miss)
+                            batch_log.warning("backfill_ticker_permanently_empty", ticker=miss)
+                    except Exception as exc:
+                        failed_tickers.append(miss)
+                        batch_log.error("backfill_ticker_failed", ticker=miss, error=str(exc))
+                batch_df = pd.concat(recovered, ignore_index=True)
+
             # Quality checks per batch
             flags = run_quality_checks(batch_df)
             if not flags.empty:
