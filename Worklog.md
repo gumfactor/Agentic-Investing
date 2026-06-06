@@ -14,6 +14,63 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-05
 
+### Session 5 — Fix docker-compose.yml bugs found during live stack validation
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/quant-system-prd-koDnJ`  
+**Commits this session:** (see git log)
+
+---
+
+#### What was done
+
+Operator ran `make up` locally and hit two real bugs in `docker-compose.yml`. Both fixed.
+
+**Bug 1 — `airflow-init` broken multiline command**
+
+Root cause: YAML `>` folding scalar folds newlines into spaces. A multiline
+`bash -c "... \n airflow users create \n --username admin \n ..."` string
+looked fine in the file but the newlines inside the bash double-quoted string
+produced parse errors when Docker executed the command.
+
+Fix: Replaced the folded string form with a YAML list form. The entire
+`bash -c` argument is now a single unambiguous quoted string:
+```yaml
+command:
+  - bash
+  - -c
+  - "airflow db migrate && airflow users create --username admin ..."
+```
+
+**Bug 2 — MLflow missing `psycopg2` and `boto3`**
+
+Root cause: `ghcr.io/mlflow/mlflow:v2.10.2` is a minimal image. It does not
+ship `psycopg2-binary` (needed for `--backend-store-uri postgresql+psycopg2://`)
+or `boto3` (needed for `--artifacts-destination s3://` against MinIO).
+MLflow starts but immediately crashes when it tries to connect to either backend.
+
+Fix: Added `infra/docker/Dockerfile.mlflow` which extends the base image and
+installs both packages. Updated docker-compose.yml `mlflow` service to use
+`build:` instead of `image:`.
+
+Note: First `make up` after this fix will build the MLflow image locally
+(~2 min). Subsequent starts use the cached layer.
+
+---
+
+#### [DECISION] Thin custom Dockerfile for MLflow rather than entrypoint hack
+Rationale: An alternative fix is `entrypoint: bash -c "pip install ... && mlflow server ..."`.
+That reinstalls packages on every container restart, adding 30–60 seconds to
+every start. A build-time install is permanent in the image layer — same result,
+no runtime cost.
+
+---
+
+#### Next steps
+Same as Session 4 — operational validation on operator's machine.
+
+---
+
 ### Session 4 — Phase 1 Unit Test Coverage: Fill Gaps
 
 **Operator:** mshane@thecanadalist.ca  

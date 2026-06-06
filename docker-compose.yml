@@ -92,7 +92,9 @@ services:
 
   # ─── Experiment tracking ─────────────────────────────────────────────────────
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.10.2
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.mlflow
     restart: unless-stopped
     command: >
       mlflow server
@@ -117,17 +119,12 @@ services:
   # ─── Pipeline orchestration ──────────────────────────────────────────────────
   airflow-init:
     <<: *airflow-common
-    command: >
-      bash -c "
-        airflow db migrate &&
-        airflow users create
-          --username admin
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email ${AIRFLOW_ADMIN_EMAIL:-admin@rqis.local}
-          --password ${AIRFLOW_ADMIN_PASSWORD}
-      "
+    # List form avoids YAML folding ambiguity. Single string inside bash -c
+    # keeps the &&-chain unambiguous regardless of YAML scalar style.
+    command:
+      - bash
+      - -c
+      - "airflow db migrate && airflow users create --username admin --firstname Admin --lastname User --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-admin@rqis.local} --password ${AIRFLOW_ADMIN_PASSWORD}"
     restart: "no"
 
   airflow-webserver:
