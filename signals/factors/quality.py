@@ -146,6 +146,9 @@ def _compute_quality_ratios(
                 row["gross_profitability"] = float(gross_profit[ticker]) / ta
 
         # Accruals = (net_income - operating_cash_flow) / total_assets
+        # This is the Hribar & Collins (2002) cash-flow-based accruals measure,
+        # NOT the Sloan (1996) balance-sheet accruals (ΔNet Operating Assets).
+        # It is negated before z-scoring: low accruals → high quality score.
         if (
             net_income is not None and ticker in net_income.index
             and op_cf is not None and ticker in op_cf.index

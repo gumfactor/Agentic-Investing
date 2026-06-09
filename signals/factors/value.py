@@ -90,9 +90,18 @@ def compute_value_scores(
         if price_snap.empty:
             continue
 
-        # Market cap requires shares_outstanding
+        # Market cap requires shares_outstanding from fundamentals.
+        # NOTE: shares_outstanding is a quarterly filing value and may lag
+        # the actual share count by up to 90 days.  This is a known
+        # approximation; a more precise source (e.g. daily share counts)
+        # would improve accuracy for companies with active buyback programs.
         shares = pit_fund.get("shares_outstanding")
         if shares is None:
+            logger.warning(
+                "value_scores_missing_shares_outstanding",
+                score_date=str(score_date),
+                msg="shares_outstanding absent from fundamentals — market-cap ratios skipped for this date",
+            )
             mcap = None
         else:
             mcap = price_snap["close"].mul(shares.reindex(price_snap.index)).dropna()
@@ -142,8 +151,10 @@ def _pit_latest_fundamentals(
     if visible.empty:
         return {}
 
+    # Sort by (release_date, period_end_date) so .last() picks the most recently
+    # filed row, with ties broken by the most recent period (deterministic).
     latest = (
-        visible.sort_values("release_date")
+        visible.sort_values(["release_date", "period_end_date"])
         .groupby(["ticker", "item_name"])
         .last()
         .reset_index()[["ticker", "item_name", "value"]]
