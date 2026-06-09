@@ -426,3 +426,231 @@ class TestICEdgeCases:
         })
         result = summarize_ic(ic_series, factor_name="f")
         assert result.iloc[0]["ic_pvalue"] < 0.05
+
+
+# ─── compute_factor_turnover ──────────────────────────────────────────────────
+
+from signals.research.ic import compute_factor_turnover, rolling_ic_summary, compute_ic_ir_weights
+
+
+class TestComputeFactorTurnover:
+    def _stable_scores(self, n_tickers: int = 20, n_dates: int = 60) -> pd.DataFrame:
+        """Scores that are identical across all dates → rank autocorr ≈ 1."""
+        dates = _business_dates(date(2022, 1, 3), n_dates)
+        tickers = [f"T{i:02d}" for i in range(n_tickers)]
+        rows = []
+        for d in dates:
+            for i, t in enumerate(tickers):
+                rows.append({"ticker": t, "date": d, "score": float(i)})
+        return pd.DataFrame(rows)
+
+    def _random_scores(self, n_tickers: int = 20, n_dates: int = 60, seed: int = 0) -> pd.DataFrame:
+        rng = np.random.default_rng(seed)
+        dates = _business_dates(date(2022, 1, 3), n_dates)
+        tickers = [f"T{i:02d}" for i in range(n_tickers)]
+        rows = []
+        for d in dates:
+            for t in tickers:
+                rows.append({"ticker": t, "date": d, "score": float(rng.standard_normal(1)[0])})
+        return pd.DataFrame(rows)
+
+    def test_output_columns(self):
+        scores = self._stable_scores()
+        result = compute_factor_turnover(scores, "score")
+        assert set(result.columns) >= {"score_date", "lag_date", "lag_calendar_days", "rank_autocorrelation", "ticker_count"}
+
+    def test_stable_scores_yield_high_autocorrelation(self):
+        """Constant rankings → autocorrelation should be 1."""
+        scores = self._stable_scores()
+        result = compute_factor_turnover(scores, "score", rebalance_days=21)
+        assert not result.empty
+        assert (result["rank_autocorrelation"] > 0.99).all()
+
+    def test_random_scores_yield_low_autocorrelation(self):
+        """i.i.d. scores → autocorrelation should be near 0."""
+        scores = self._random_scores(n_tickers=50, n_dates=120)
+        result = compute_factor_turnover(scores, "score", rebalance_days=21)
+        assert not result.empty
+        assert result["rank_autocorrelation"].mean() < 0.3
+
+    def test_ticker_count_reasonable(self):
+        scores = self._stable_scores(n_tickers=15)
+        result = compute_factor_turnover(scores, "score", rebalance_days=5)
+        assert (result["ticker_count"] == 15).all()
+
+    def test_no_rows_when_insufficient_history(self):
+        """If all dates are within rebalance_days of start, no rows produced."""
+        dates = _business_dates(date(2022, 1, 3), 5)
+        rows = [{"ticker": "A", "date": d, "score": 1.0} for d in dates]
+        scores = pd.DataFrame(rows)
+        result = compute_factor_turnover(scores, "score", rebalance_days=30)
+        assert result.empty
+
+    def test_lag_date_precedes_score_date(self):
+        scores = self._stable_scores()
+        result = compute_factor_turnover(scores, "score", rebalance_days=21)
+        assert (result["lag_date"] < result["score_date"]).all()
+
+    def test_missing_score_col_raises(self):
+        scores = self._stable_scores()
+        with pytest.raises(ValueError):
+            compute_factor_turnover(scores, "nonexistent_col")
+
+
+# ─── rolling_ic_summary ───────────────────────────────────────────────────────
+
+class TestRollingICSummary:
+    def _make_ic_series(self, n_dates: int = 100, ic_val: float = 0.05) -> pd.DataFrame:
+        dates = _business_dates(date(2020, 1, 2), n_dates)
+        return pd.DataFrame({
+            "date": dates * 2,
+            "horizon_days": [21] * n_dates + [63] * n_dates,
+            "ic": [ic_val] * n_dates + [ic_val * 0.8] * n_dates,
+            "rank_ic": [ic_val * 0.9] * n_dates + [ic_val * 0.7] * n_dates,
+            "n_obs": 200,
+        })
+
+    def test_output_columns(self):
+        ic = self._make_ic_series()
+        result = rolling_ic_summary(ic)
+        expected = {"score_date", "horizon_days", "ic_mean", "rank_ic_mean",
+                    "ic_std", "ic_ir", "hit_rate", "n_dates"}
+        assert expected <= set(result.columns)
+
+    def test_both_horizons_present(self):
+        ic = self._make_ic_series()
+        result = rolling_ic_summary(ic, trailing_dates=30)
+        assert set(result["horizon_days"].unique()) == {21, 63}
+
+    def test_window_size_capped_at_trailing_dates(self):
+        ic = self._make_ic_series(n_dates=100)
+        result = rolling_ic_summary(ic, trailing_dates=30)
+        h21 = result[result["horizon_days"] == 21]
+        # After enough dates have passed, each window is exactly trailing_dates
+        assert (h21["n_dates"] <= 30).all()
+
+    def test_constant_ic_yields_correct_mean(self):
+        ic = self._make_ic_series(ic_val=0.06)
+        result = rolling_ic_summary(ic, trailing_dates=252)
+        h21 = result[result["horizon_days"] == 21]
+        assert not h21.empty
+        assert abs(h21["ic_mean"].iloc[-1] - 0.06) < 1e-9
+
+    def test_positive_ic_yields_hit_rate_one(self):
+        ic = self._make_ic_series(ic_val=0.06)
+        result = rolling_ic_summary(ic)
+        assert (result["hit_rate"] == 1.0).all()
+
+    def test_empty_input_returns_empty(self):
+        result = rolling_ic_summary(pd.DataFrame(
+            columns=["date", "horizon_days", "ic", "rank_ic"]
+        ))
+        assert result.empty
+
+    def test_insufficient_data_excluded(self):
+        """Windows with fewer than min_dates rows should be dropped."""
+        dates = _business_dates(date(2022, 1, 3), 10)
+        ic = pd.DataFrame({
+            "date": dates,
+            "horizon_days": 21,
+            "ic": [0.05] * 10,
+            "rank_ic": [0.04] * 10,
+        })
+        result = rolling_ic_summary(ic, min_dates=30)
+        assert result.empty
+
+    def test_missing_column_raises(self):
+        ic = pd.DataFrame({"date": [date(2022, 1, 3)], "horizon_days": [21], "ic": [0.05]})
+        with pytest.raises(ValueError, match="missing columns"):
+            rolling_ic_summary(ic)
+
+
+# ─── compute_ic_ir_weights ────────────────────────────────────────────────────
+
+class TestComputeICIRWeights:
+    def _make_summary(self, ic_ir: float, horizon: int = 21) -> pd.DataFrame:
+        return pd.DataFrame({
+            "horizon_days": [horizon],
+            "ic_ir": [ic_ir],
+            "ic": [ic_ir * 0.05],
+        })
+
+    def test_weights_sum_to_one(self):
+        summaries = {
+            "momentum": self._make_summary(0.5),
+            "lowvol": self._make_summary(0.3),
+            "value": self._make_summary(0.2),
+        }
+        weights = compute_ic_ir_weights(summaries)
+        assert abs(sum(weights.values()) - 1.0) < 1e-9
+
+    def test_higher_ic_ir_gets_more_weight(self):
+        summaries = {
+            "momentum": self._make_summary(1.0),
+            "lowvol": self._make_summary(0.5),
+        }
+        weights = compute_ic_ir_weights(summaries, shrinkage=0.0)
+        assert weights["momentum"] > weights["lowvol"]
+
+    def test_negative_ic_ir_zeroed(self):
+        summaries = {
+            "good": self._make_summary(0.5),
+            "bad": self._make_summary(-0.3),
+        }
+        weights = compute_ic_ir_weights(summaries, shrinkage=0.0)
+        assert weights["bad"] == 0.0
+        assert abs(weights["good"] - 1.0) < 1e-9
+
+    def test_full_shrinkage_yields_equal_weight(self):
+        summaries = {
+            "momentum": self._make_summary(1.0),
+            "lowvol": self._make_summary(0.1),
+        }
+        weights = compute_ic_ir_weights(summaries, shrinkage=1.0)
+        assert abs(weights["momentum"] - 0.5) < 1e-9
+        assert abs(weights["lowvol"] - 0.5) < 1e-9
+
+    def test_max_weight_cap_enforced(self):
+        summaries = {
+            "dominant": self._make_summary(10.0),
+            "weak": self._make_summary(0.01),
+        }
+        weights = compute_ic_ir_weights(summaries, shrinkage=0.0, max_weight=0.6)
+        assert weights["dominant"] <= 0.6 + 1e-9
+
+    def test_all_zero_ic_ir_falls_back_to_equal_weight(self):
+        summaries = {
+            "a": self._make_summary(-1.0),
+            "b": self._make_summary(-0.5),
+        }
+        weights = compute_ic_ir_weights(summaries)
+        assert abs(weights["a"] - 0.5) < 1e-9
+        assert abs(weights["b"] - 0.5) < 1e-9
+
+    def test_empty_input_returns_empty(self):
+        result = compute_ic_ir_weights({})
+        assert result == {}
+
+    def test_invalid_shrinkage_raises(self):
+        with pytest.raises(ValueError, match="shrinkage"):
+            compute_ic_ir_weights({"a": self._make_summary(0.5)}, shrinkage=1.5)
+
+    def test_infeasible_max_weight_raises(self):
+        """max_weight * n_factors < 1.0 is infeasible and should raise."""
+        summaries = {
+            "a": self._make_summary(0.5),
+            "b": self._make_summary(0.4),
+            "c": self._make_summary(0.3),
+        }
+        with pytest.raises(ValueError, match="infeasible"):
+            compute_ic_ir_weights(summaries, max_weight=0.2)  # 0.2 * 3 = 0.6 < 1.0
+
+    def test_negative_min_ic_ir_raises(self):
+        with pytest.raises(ValueError, match="min_ic_ir"):
+            compute_ic_ir_weights({"a": self._make_summary(0.5)}, min_ic_ir=-0.1)
+
+    def test_lag_calendar_days_column_present(self):
+        scores = TestComputeFactorTurnover()._stable_scores()
+        result = compute_factor_turnover(scores, "score", rebalance_days=21)
+        assert "lag_calendar_days" in result.columns
+        assert (result["lag_calendar_days"] >= 21).all()

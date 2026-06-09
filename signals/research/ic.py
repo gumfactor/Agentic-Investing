@@ -14,8 +14,9 @@ so results are traceable to the snapshot used (C7).
 
 from __future__ import annotations
 
+import bisect
 import os
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 import numpy as np
@@ -393,6 +394,283 @@ def log_ic_to_mlflow(
     except Exception as exc:
         logger.warning("mlflow_log_failed", error=str(exc))
         return None
+
+
+# ─── Factor turnover ─────────────────────────────────────────────────────────
+
+def compute_factor_turnover(
+    scores: pd.DataFrame,
+    score_col: str,
+    rebalance_days: int = 21,
+) -> pd.DataFrame:
+    """Compute factor rank autocorrelation at a given rebalancing lag.
+
+    For each date *t* in the score series, finds the most-recent prior date
+    that is at least ``rebalance_days`` calendar days before *t*, then
+    computes the Spearman rank correlation between the two cross-sections.
+
+    High autocorrelation = low turnover = lower implied transaction costs.
+    A rank autocorrelation of 0.95 at a 21-day lag means roughly 5 % of
+    relative rankings change each month — equivalent to low portfolio
+    churn.
+
+    Args:
+        scores: Long-format DataFrame with columns ``ticker``, ``date``,
+            and ``score_col``.
+        score_col: Column name for the factor score.
+        rebalance_days: Minimum calendar-day gap between the two
+            cross-sections used for autocorrelation.  Default 21 ≈ 1 month.
+
+    Returns:
+        DataFrame with columns:
+            ``score_date``, ``lag_date``, ``rank_autocorrelation``,
+            ``ticker_count``
+
+        Dates with fewer than ``_MIN_TICKERS_PER_DATE`` tickers on
+        either leg are excluded.
+    """
+    _validate_scores(scores, score_col)
+
+    wide = (
+        scores[["ticker", "date", score_col]]
+        .pivot_table(index="date", columns="ticker", values=score_col)
+    )
+    all_dates = sorted(wide.index)
+
+    rows: list[dict] = []
+    for i, curr_date in enumerate(all_dates):
+        target_prior = curr_date - timedelta(days=rebalance_days)
+        # O(log N) search for the nearest date ≤ target_prior
+        idx = bisect.bisect_right(all_dates, target_prior) - 1
+        if idx < 0:
+            continue
+        prior_date = all_dates[idx]
+
+        curr_row = wide.loc[curr_date].dropna()
+        prior_row = wide.loc[prior_date].dropna()
+        common = curr_row.index.intersection(prior_row.index)
+        if len(common) < _MIN_TICKERS_PER_DATE:
+            continue
+
+        rho = float(curr_row[common].rank().corr(prior_row[common].rank()))
+        rows.append({
+            "score_date": curr_date,
+            "lag_date": prior_date,
+            "lag_calendar_days": (curr_date - prior_date).days,
+            "rank_autocorrelation": rho,
+            "ticker_count": len(common),
+        })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["score_date", "lag_date", "lag_calendar_days",
+                 "rank_autocorrelation", "ticker_count"]
+    )
+
+
+# ─── Rolling IC (walk-forward stability) ─────────────────────────────────────
+
+def rolling_ic_summary(
+    ic_series: pd.DataFrame,
+    trailing_dates: int = 252,
+    min_dates: int = _MIN_IC_DATES_FOR_TSTAT,
+) -> pd.DataFrame:
+    """Compute rolling IC statistics over a trailing window of dates.
+
+    For each date in *ic_series*, aggregates IC over the preceding
+    ``trailing_dates`` score dates (not calendar days).  Useful for
+    detecting IC decay, regime changes, and factor instability before
+    committing to a live portfolio.
+
+    Note on ``trailing_dates``: this is a count of IC observation rows,
+    not calendar days.  If the IC series is sparse (dates dropped due to
+    insufficient universe size), a window of 252 may span more than one
+    calendar year.  Pre-filter ``ic_series`` to a specific date range to
+    enforce a calendar-day cap.
+
+    Args:
+        ic_series: Output of :func:`compute_ic_series` — long-format
+            DataFrame with columns ``date``, ``horizon_days``, ``ic``,
+            ``rank_ic``.
+        trailing_dates: Number of preceding dates to include in each
+            rolling window.  Default 252 ≈ 1 trading year.
+        min_dates: Minimum number of dates required to compute a summary.
+            Windows shorter than this are excluded.
+
+    Returns:
+        DataFrame with columns:
+            ``score_date``, ``horizon_days``, ``ic_mean``, ``rank_ic_mean``,
+            ``ic_std``, ``ic_ir``, ``hit_rate``, ``n_dates``
+
+        One row per (date, horizon) where the trailing window is long
+        enough.  ``score_date`` is the last date in the window.
+    """
+    required = {"date", "horizon_days", "ic", "rank_ic"}
+    missing = required - set(ic_series.columns)
+    if missing:
+        raise ValueError(f"ic_series missing columns: {missing}")
+    if ic_series.empty:
+        return pd.DataFrame(
+            columns=["score_date", "horizon_days", "ic_mean", "rank_ic_mean",
+                     "ic_std", "ic_ir", "hit_rate", "n_dates"]
+        )
+
+    rows: list[dict] = []
+
+    for horizon in sorted(ic_series["horizon_days"].unique()):
+        sub = (
+            ic_series[ic_series["horizon_days"] == horizon]
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+        ics = sub["ic"].values
+        rank_ics = sub["rank_ic"].values
+        dates = sub["date"].values
+
+        for i in range(len(dates)):
+            start_idx = max(0, i - trailing_dates + 1)
+            window_ic = ics[start_idx : i + 1]
+            window_rank_ic = rank_ics[start_idx : i + 1]
+
+            n = len(window_ic)
+            if n < min_dates:
+                continue
+
+            ic_mean = float(np.nanmean(window_ic))
+            rank_ic_mean = float(np.nanmean(window_rank_ic))
+            ic_std = float(np.nanstd(window_ic, ddof=1)) if n > 1 else np.nan
+            ic_ir = ic_mean / ic_std if (ic_std and not np.isnan(ic_std) and ic_std > 0) else np.nan
+            hit_rate = float(np.mean(window_ic > 0))
+
+            rows.append({
+                "score_date": dates[i],
+                "horizon_days": int(horizon),
+                "ic_mean": ic_mean,
+                "rank_ic_mean": rank_ic_mean,
+                "ic_std": ic_std,
+                "ic_ir": ic_ir,
+                "hit_rate": hit_rate,
+                "n_dates": n,
+            })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["score_date", "horizon_days", "ic_mean", "rank_ic_mean",
+                 "ic_std", "ic_ir", "hit_rate", "n_dates"]
+    )
+
+
+# ─── IC-IR weighted blend weights ────────────────────────────────────────────
+
+def compute_ic_ir_weights(
+    ic_summaries: dict[str, pd.DataFrame],
+    horizon_days: int = 21,
+    shrinkage: float = 0.25,
+    min_ic_ir: float = 0.0,
+    max_weight: float = 0.5,
+) -> dict[str, float]:
+    """Compute IC-IR-weighted blend weights for a set of factors.
+
+    Produces weights suitable for passing to
+    :func:`~signals.scoring.scorer.combine_factor_scores` ``weights``
+    parameter.  This is the stretch-goal successor to equal-weight blending
+    and should only be used after equal-weight IC has been validated.
+
+    Design choices (following Grinold & Kahn "Active Portfolio Management"):
+    - Negative IC-IR factors receive zero weight (cannot short a signal).
+    - Weights are shrunk toward equal-weight to reduce estimation error.
+    - No single factor may exceed ``max_weight`` after normalisation.
+
+    Args:
+        ic_summaries: dict mapping factor_name → output of
+            :func:`~signals.research.ic.summarize_ic`.
+        horizon_days: Which horizon row to extract IC-IR from.
+        shrinkage: Fraction of weight pulled toward equal-weight.
+            0 = pure IC-IR weighting; 1 = equal-weight.
+        min_ic_ir: IC-IR values below this floor are treated as 0.
+        max_weight: Hard cap on any single factor's normalised weight.
+
+    Returns:
+        dict of factor_name → weight, normalised to sum to 1.
+        Returns equal-weight if no factor has positive IC-IR.
+
+    Raises:
+        ValueError: if ``shrinkage`` is outside [0, 1], ``min_ic_ir`` is
+            negative, or ``max_weight`` is infeasible for the number of factors.
+    """
+    if not (0.0 <= shrinkage <= 1.0):
+        raise ValueError(f"shrinkage must be in [0, 1], got {shrinkage}")
+    if min_ic_ir < 0.0:
+        raise ValueError(f"min_ic_ir must be >= 0 to prevent negative weights, got {min_ic_ir}")
+    if not ic_summaries:
+        return {}
+
+    n_factors = len(ic_summaries)
+    if max_weight * n_factors < 1.0 - 1e-9:
+        raise ValueError(
+            f"max_weight={max_weight} is infeasible with {n_factors} factors: "
+            f"max possible weight sum = {max_weight * n_factors:.4f} < 1.0"
+        )
+    equal_w = 1.0 / n_factors
+
+    raw_ic_ir: dict[str, float] = {}
+    for name, summary in ic_summaries.items():
+        matching = summary[summary["horizon_days"] == horizon_days]
+        if matching.empty or "ic_ir" not in matching.columns:
+            raw_ic_ir[name] = 0.0
+        else:
+            val = float(matching["ic_ir"].iloc[0])
+            raw_ic_ir[name] = max(min_ic_ir, val) if not np.isnan(val) else 0.0
+
+    total_ic_ir = sum(raw_ic_ir.values())
+    if total_ic_ir <= 0:
+        logger.warning("ic_ir_weights_all_zero_fallback_equal", factors=list(ic_summaries))
+        return {name: equal_w for name in ic_summaries}
+
+    # Pure IC-IR weights (normalised)
+    pure_weights = {name: v / total_ic_ir for name, v in raw_ic_ir.items()}
+
+    # Shrink toward equal-weight
+    shrunk = {
+        name: (1.0 - shrinkage) * pure_weights[name] + shrinkage * equal_w
+        for name in ic_summaries
+    }
+
+    # Cap at max_weight: redistribute excess to positive-weight uncapped factors.
+    # Zero-weight factors (IC-IR floored to 0) are excluded from redistribution
+    # so a negative-IC-IR factor never receives weight from a capped positive factor.
+    # Use a snapshot of pre-loop weights to avoid stale-denominator errors when
+    # multiple uncapped factors are updated in the same iteration.
+    normalised = dict(shrunk)
+    for _ in range(100):
+        over = {n: w for n, w in normalised.items() if w > max_weight + 1e-12}
+        if not over:
+            break
+        excess = sum(w - max_weight for w in over.values())
+        for n in over:
+            normalised[n] = max_weight
+        # Only redistribute to factors already carrying positive weight;
+        # include factors sitting at max_weight (w > 1e-12 covers them)
+        under = {n: w for n, w in normalised.items() if w > 1e-12 and n not in over}
+        if not under:
+            # No eligible recipients — normalise (zeros stay zero)
+            total = sum(normalised.values())
+            if total > 0:
+                normalised = {n: w / total for n, w in normalised.items()}
+            break
+        # Snapshot weights before mutation to avoid stale-denominator in loop
+        snapshot = dict(under)
+        total_snapshot = sum(snapshot.values())
+        for n, snap_w in snapshot.items():
+            normalised[n] += excess * (snap_w / total_snapshot)
+        total = sum(normalised.values())
+        normalised = {n: w / total for n, w in normalised.items()}
+
+    logger.info(
+        "ic_ir_weights_computed",
+        horizon_days=horizon_days,
+        shrinkage=shrinkage,
+        weights={n: round(v, 4) for n, v in normalised.items()},
+    )
+    return normalised
 
 
 # ─── Input validation ─────────────────────────────────────────────────────────
