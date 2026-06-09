@@ -42,8 +42,10 @@ CONCEPT_ALIASES: dict[str, list[str]] = {
         "us-gaap/Assets",
     ],
     "total_equity": [
+        # Common shareholders' equity only — excludes minority interest.
+        # StockholdersEquityIncludingNCI is intentionally excluded here because
+        # it inflates B/P and ROE denominators for companies with large NCI.
         "us-gaap/StockholdersEquity",
-        "us-gaap/StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
     ],
     "total_debt": [
         "us-gaap/LongTermDebt",
@@ -59,8 +61,11 @@ CONCEPT_ALIASES: dict[str, list[str]] = {
         "us-gaap/NetCashProvidedByUsedInOperatingActivities",
     ],
     "capex": [
+        # PaymentsToAcquirePropertyPlantAndEquipment is the actual cash payment
+        # (reported as a positive number in EDGAR).  CapitalExpendituresIncurred
+        # ButNotYetPaid is a non-cash accrual — NOT a substitute for the cash
+        # capex payment and must not be used as a fallback for FCF computation.
         "us-gaap/PaymentsToAcquirePropertyPlantAndEquipment",
-        "us-gaap/CapitalExpendituresIncurredButNotYetPaid",
     ],
 }
 

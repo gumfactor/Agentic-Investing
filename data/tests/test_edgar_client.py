@@ -127,6 +127,19 @@ class TestParseObservations:
         rows = _parse_observations(obs, "MSFT", "net_income", {"annual"})
         assert len(rows) == 1
 
+    def test_same_accession_deduped(self):
+        """A 10-K re-reporting prior-year comparatives under the same accn/filed
+        should produce only one row for that (end, filed, accn) combination."""
+        obs = [
+            {**_obs("2022-12-31", "2023-11-01", 5000000, start="2022-01-01", fp="FY", form="10-K"),
+             "accn": "0000320193-23-000001"},
+            # Same accn, same end, same filed — duplicate from comparative data
+            {**_obs("2022-12-31", "2023-11-01", 5000000, start="2022-01-01", fp="FY", form="10-K"),
+             "accn": "0000320193-23-000001"},
+        ]
+        rows = _parse_observations(obs, "AAPL", "net_income", {"annual"})
+        assert len(rows) == 1
+
 
 # ─── _extract_concept ─────────────────────────────────────────────────────────
 

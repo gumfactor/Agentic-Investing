@@ -33,6 +33,7 @@ required per SEC policy.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from datetime import date, timedelta
 from decimal import Decimal
@@ -70,6 +71,12 @@ _SOURCE_VERSION = "xbrl_companyfacts_v2"
 class EdgarClient:
     """Fetches and normalises SEC EDGAR XBRL fundamentals."""
 
+    # Class-level rate-limit state shared across all instances in a process.
+    # Protects against two concurrent EdgarClient instances together exceeding
+    # the 10 req/s SEC hard limit.
+    _rate_lock: threading.Lock = threading.Lock()
+    _last_request_time: float = 0.0
+
     def __init__(self, operator_email: Optional[str] = None) -> None:
         email = operator_email or os.environ.get("OPERATOR_EMAIL", "contact@example.com")
         self._session = requests.Session()
@@ -77,7 +84,6 @@ class EdgarClient:
             "User-Agent": f"RQIS-Fundamentals-Ingestion contact:{email}",
             "Accept-Encoding": "gzip, deflate",
         })
-        self._last_request_time: float = 0.0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -205,10 +211,14 @@ class EdgarClient:
     # ── Internal HTTP ─────────────────────────────────────────────────────────
 
     def _get_json(self, url: str) -> dict:
-        """GET JSON with rate limiting and retry logic."""
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < _INTER_REQUEST_DELAY:
-            time.sleep(_INTER_REQUEST_DELAY - elapsed)
+        """GET JSON with class-level rate limiting and retry logic."""
+        with EdgarClient._rate_lock:
+            elapsed = time.monotonic() - EdgarClient._last_request_time
+            if elapsed < _INTER_REQUEST_DELAY:
+                time.sleep(_INTER_REQUEST_DELAY - elapsed)
+            # Record time before release so no other thread can proceed
+            # until the sleep is done.
+            EdgarClient._last_request_time = time.monotonic()
 
         delays = (0,) + _RETRY_DELAYS
         last_exc: Exception | None = None
@@ -219,7 +229,6 @@ class EdgarClient:
             try:
                 resp = self._session.get(url, timeout=30)
                 resp.raise_for_status()
-                self._last_request_time = time.monotonic()
                 return resp.json()
             except requests.HTTPError as exc:
                 if exc.response is not None and exc.response.status_code in (403, 404):
@@ -270,7 +279,13 @@ def _parse_observations(
     item_name: str,
     period_types: set[str],
 ) -> list[dict]:
-    """Parse a list of EDGAR fact observations into financial_statements rows."""
+    """Parse a list of EDGAR fact observations into financial_statements rows.
+
+    Deduplicates on (end, filed, accn) — the same accession can repeat the
+    same data point for the same period (e.g. a 10-K re-reporting prior-year
+    comparatives) and would otherwise produce duplicate schema rows.
+    """
+    seen: set[tuple] = set()
     rows: list[dict] = []
 
     for obs in observations:
@@ -281,9 +296,15 @@ def _parse_observations(
         filed_str = obs.get("filed")
         end_str = obs.get("end")
         val = obs.get("val")
+        accn = obs.get("accn", "")
 
         if not filed_str or not end_str or val is None:
             continue
+
+        dedup_key = (end_str, filed_str, accn)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
 
         try:
             period_end = date.fromisoformat(end_str)
@@ -291,7 +312,6 @@ def _parse_observations(
         except ValueError:
             continue
 
-        # Determine period type from duration (start/end delta) or fp field.
         start_str = obs.get("start")
         fp = obs.get("fp", "")
 
@@ -343,24 +363,53 @@ def _classify_period(
 
 
 def _compute_derived(base_rows: list[dict], ticker: str) -> list[dict]:
-    """Compute derived items (e.g. free_cash_flow) from base item rows."""
+    """Compute derived items (e.g. free_cash_flow) from base item rows.
+
+    Groups by (period_end_date, period_type).  For each group, finds the
+    latest available value for each required base item and uses the maximum
+    of their release_dates as the derived item's release_date.  This ensures
+    PIT correctness: the derived value is only available after the latest of
+    its inputs was filed.
+
+    If the two base items (e.g. operating_cash_flow and capex) were filed in
+    separate submissions for the same period, this correctly defers the derived
+    item's visibility to the later filing date.
+    """
     derived: list[dict] = []
 
     for item_name, (formula, required) in DERIVED_ITEMS.items():
-        # Index base rows by (period_end_date, release_date, period_type)
-        base_index: dict[tuple, dict[str, Decimal]] = {}
+        # Group: (period_end_date, period_type) -> item_name -> list[(release_date, value)]
+        groups: dict[tuple, dict[str, list[tuple]]] = {}
         for row in base_rows:
-            if row["item_name"] in required:
-                key = (row["period_end_date"], row["release_date"], row["period_type"])
-                base_index.setdefault(key, {})[row["item_name"]] = row["value"]
-
-        for key, items in base_index.items():
-            if not all(r in items for r in required):
+            if row["item_name"] not in required:
                 continue
-            period_end, release_dt, period_type = key
+            key = (row["period_end_date"], row["period_type"])
+            groups.setdefault(key, {}).setdefault(row["item_name"], []).append(
+                (row["release_date"], row["value"])
+            )
+
+        for (period_end, period_type), items in groups.items():
+            if not all(r in items for r in required):
+                logger.debug(
+                    "derived_item_missing_base",
+                    ticker=ticker,
+                    item_name=item_name,
+                    period_end=str(period_end),
+                    available=list(items.keys()),
+                    required=required,
+                )
+                continue
+
+            # Take the most-recently-filed value for each required item.
+            best: dict[str, tuple] = {}  # item_name -> (release_date, value)
+            for req_item in required:
+                best[req_item] = max(items[req_item], key=lambda t: t[0])
+
+            # Derived item is visible only after the latest of its inputs was filed.
+            release_dt = max(v[0] for v in best.values())
 
             if item_name == "free_cash_flow":
-                value = items["operating_cash_flow"] - items["capex"]
+                value = best["operating_cash_flow"][1] - best["capex"][1]
             else:
                 continue  # future derived items added here
 
