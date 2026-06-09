@@ -14,6 +14,154 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-09
 
+### Session 11 — Phase 2 complete: EDGAR ingestion, IC engine, value/quality factors, composite scorer
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/phase-2`
+**Commits this session:** 10 commits (b7f4714 → 53fca21)
+
+---
+
+#### What was done
+
+**Step 1 — settings.yaml tuning**
+
+Corrected stale yfinance batch parameters: `yfinance_batch_size: 200 → 20` and `yfinance_inter_batch_delay: 1.0 → 3.0`. These now match the values validated in Session 10 that prevented the Yahoo Finance IP ban.
+
+**Step 2 — Alembic migrations 002 and 003**
+
+- `002_signal_schema.py`: Creates `factor_scores` (ticker, score_date, factor_name, strategy_id, z_score, raw_value) and `alpha_scores` (ticker, score_date, strategy_id, alpha_score, rank, universe_size) and `signal_ic_stats` (IC metrics by factor/horizon). TimescaleDB hypertables with surrogate BigInt PKs + UniqueConstraints. `signal_ic_stats` is NOT a hypertable (eval-date dimension, not a time-series append).
+- `003_fundamentals_schema.py`: Creates `sec_filings` (accession_number UNIQUE, form_type, period_end_date, filing_date) and `financial_statements` (EAV: one row per ticker × period × item × release_date). PIT index on `(ticker, item_name, period_type, release_date DESC)`. Unique key includes `release_date` to preserve restatements.
+
+[DECISION] EAV (Entity-Attribute-Value) schema for `financial_statements`: new line items can be added without schema migrations. Aggregation to wide format happens in the signal layer at query time, not in the DB schema.
+
+[DECISION] Surrogate BigInt PKs for hypertables: TimescaleDB 2.x technically allows composite PKs but surrogate PKs + UniqueConstraints are cleaner and match the rest of the schema.
+
+**Step 3 — IC validation engine**
+
+Created `signals/research/ic.py`:
+- `compute_forward_returns()`: row-shift via wide pivot, safe for uniform S&P 500 universe
+- `compute_ic_series()`: Pearson + Spearman IC per (date, horizon); skips dates with < 5 valid tickers
+- `summarize_ic()`: one-sided t-test (H1: mean_IC > 0); IC-IR = mean/std (unannualized); excludes horizons with < 30 observations (autocorrelation means small sample effective N is even smaller)
+- `multiple_testing_correction()`: BH and BHY FDR correction via `statsmodels.stats.multitest.multipletests`
+- `chronological_split()`: by unique dates, no date appears in both train and val sets
+- `log_ic_to_mlflow()`: raises ValueError if data_version empty (C7 compliance)
+
+40 unit tests in `signals/tests/test_ic.py`, all passing.
+
+[DECISION] `_MIN_IC_DATES_FOR_TSTAT = 30` (raised from 10): IC series are autocorrelated at short lags, so effective sample size < raw count. A 30-observation minimum is still lenient but prevents wildly unreliable t-stats.
+
+[DECISION] One-sided t-test (`alternative="greater"`): we are testing H1 that IC > 0, not just non-zero. This is more precise and avoids double-counting evidence.
+
+**Step 4 — Fundamentals source decision: EDGAR vs SimFin**
+
+Two independent research agents both confirmed SimFin's free tier has a 12-month data delay — unusable for live signal research. SEC EDGAR is the authoritative source: `filed` date = literal SEC submission timestamp (PIT gold standard), 10 req/s limit, free.
+
+[DECISION] SEC EDGAR Company Facts API selected as the fundamentals source. SimFin free tier disqualified by 12-month delay.
+
+**Step 5 — EDGAR fundamentals ingestion**
+
+Created:
+- `data/ingestion/fundamentals/concept_map.py`: XBRL concept alias maps for 10 items (revenue, gross_profit, operating_income, net_income, total_assets, total_equity, total_debt, shares_outstanding, operating_cash_flow, capex). Carefully excluded problematic aliases: `CapitalExpendituresIncurredButNotYetPaid` (non-cash accrual, not actual cash capex) and `StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest` (inflates equity denominator for ROE/B-P ratios).
+- `data/ingestion/fundamentals/edgar_client.py`: `EdgarClient` with `get_cik_map()`, `fetch_company_facts()`, `extract_fundamentals()`, `ingest_ticker()`, `backfill()`. Thread-safe class-level rate limiting (10 req/s). `_parse_observations()` deduplicates on `(end, filed, accn)` and stores ALL observations including restatements. `_classify_period()` duration-based (340–380 days = annual, 75–110 days = quarterly) with `fp` fallback. `_compute_derived()` groups by `(period_end_date, period_type)` and uses `max(release_dates)` of inputs for PIT safety.
+
+29 unit tests in `data/tests/test_edgar_client.py`, all passing.
+
+[DECISION] Restatements stored as new rows (different `filed` dates), not overwriting originals. `pit_latest()` picks the correct value for any `as_of_date`. Full audit trail preserved.
+
+[DECISION] Derived items (free_cash_flow) computed at ingestion time with `release_date = max(release_dates of inputs)`. This prevents look-ahead: FCF cannot be "known" before both its inputs are public.
+
+**Step 6 — Value and quality factors**
+
+Created `signals/factors/value.py`:
+- Sub-factors: earnings_yield (E/P), book_to_market (B/P), fcf_yield (FCF/P)
+- Market cap via shares × close price on score date
+- `_pit_latest_fundamentals()`: `release_date ≤ as_of_date` filter, sort by (release_date, period_end_date) ascending then `.last()` per ticker
+- Cross-sectional z-score per date; equal-weight composite `value_score`
+
+Created `signals/factors/quality.py`:
+- Sub-factors: roe (net_income / total_equity), gross_profitability (gross_profit / total_assets), accruals
+- Hribar & Collins (2002) cash-flow accruals: `(net_income - operating_cash_flow) / total_assets`
+- Accruals negated before z-scoring (low accruals = high quality = high positive score)
+- Novy-Marx (2013) gross profitability factor included
+
+22 unit tests in `signals/tests/test_value_quality.py`, all passing. Tests cover: PIT correctness (future fundamentals excluded), new filing picked up after release_date, accruals sign convention, zero market cap exclusion, zero equity exclusion.
+
+[DECISION] Hribar & Collins (2002) cash-flow accruals variant chosen over Sloan (1996) balance-sheet accruals. Cash-flow based is more robust to accounting choices and better predicts future earnings quality.
+
+**Step 7 — Composite scorer + Airflow DAG**
+
+Created `signals/scoring/scorer.py`:
+- `combine_factor_scores()`: pure function, no DB I/O
+- Vectorised factor_scores_df build (replaced iterrows with pd.concat of renamed chunk DataFrames)
+- Equal-weight: `mean(skipna=True)` auto-renormalises denominator
+- Weighted: per-row weight renormalisation — `alpha = sum(w_i * v_i for non-NaN i) / sum(w_i for non-NaN i)` — so missing-factor tickers are not penalised
+- Rank (1 = best) and universe_size computed AFTER dropna, so they cleanly span 1..universe_size
+
+Created `airflow/dags/daily_signal_pipeline.py`:
+- Schedule: `"30 21 * * 1-5"` (9:30 PM ET weekdays)
+- 4 factor tasks in parallel after load_prices: compute_momentum, compute_lowvol, compute_value, compute_quality
+- `trigger_rule="none_failed"`: pipeline halts on upstream failures (data corruption), but allows intentionally skipped tasks (future sensor-based flow control)
+- Graceful degradation: value/quality tasks push `"[]"` on success when `financial_statements` table is empty (expected until Phase 2 fundamentals backfill)
+- `convert_dates=False` on all `pd.read_json` calls to prevent timezone-aware ISO string misparse
+- Null guard on `score_date_str` XCom pull
+- Single atomic transaction for both `factor_scores` and `alpha_scores` writes (prevents inconsistent state if alpha insert fails after factor insert succeeds)
+
+14 unit tests in `signals/tests/test_scorer.py`, all passing. Review agent identified and all 5 critical/major issues fixed before commit.
+
+[DECISION] `trigger_rule="none_failed"` over `"all_done"`: `"all_done"` silently writes degraded alpha scores when a factor task fails (e.g. DB connection error). `"none_failed"` halts the pipeline on failures while still allowing intentionally skipped tasks.
+
+[DECISION] Single transaction for both table writes: avoids the partial-failure scenario where factor_scores commits but alpha_scores fails, leaving the DB in a permanently inconsistent state that ON CONFLICT DO UPDATE cannot fully repair.
+
+---
+
+#### Phase 2 progress — updated status
+
+| Deliverable | Status |
+|-------------|--------|
+| `config/settings.yaml` tuning | ✅ |
+| Migration 002: signal schema | ✅ |
+| Migration 003: fundamentals schema | ✅ |
+| `signals/research/ic.py` IC engine | ✅ 40 tests |
+| EDGAR vs SimFin decision | ✅ EDGAR selected |
+| `data/ingestion/fundamentals/edgar_client.py` | ✅ 29 tests |
+| `signals/factors/value.py` | ✅ |
+| `signals/factors/quality.py` | ✅ 22 tests (value+quality combined) |
+| `signals/scoring/scorer.py` | ✅ 14 tests |
+| `airflow/dags/daily_signal_pipeline.py` | ✅ |
+| Fundamentals backfill CLI | ⏳ not yet built |
+| IC validation run on real data | ⏳ requires fundamentals backfill first |
+
+**Total test count: 111 signals + data tests passing** (up from 75 at Phase 2 start)
+
+---
+
+#### Remaining items to complete Phase 2
+
+1. **Fundamentals backfill CLI** (`scripts/backfill_fundamentals.py`): orchestrates `EdgarClient.backfill()` for all 503 tickers, with progress tracking and resume capability. Required before IC validation can run on real data.
+
+2. **IC validation on real data**: run `compute_ic_series()` against live momentum + low-vol scores and real forward returns. Confirm IC > 0 at 1M and 3M horizons before committing to the composite.
+
+3. **`signal_research` skill** (`.claude/skills/signal_research.md`): wraps IC engine for interactive factor research sessions.
+
+4. **`score` skill** (`.claude/skills/score.md`): wraps scorer for on-demand composite score computation.
+
+5. **`screen` skill** (`.claude/skills/screen.md`): wraps alpha_scores for ticker screening.
+
+6. **Universe survivorship bias audit**: current S&P 500 universe uses today's constituents. A proper backtest should use point-in-time constituents (tickers that were in the S&P 500 on each score date).
+
+---
+
+#### Stretch goals
+
+- **Sentiment factor**: `signals/factors/sentiment.py` using earnings call transcript tone or short-interest ratios (deferred per original plan — no high-quality free source identified)
+- **Analyst revision factor**: change in consensus EPS estimates (requires IBES/Refinitiv — deferred, not free)
+- **Factor turnover analysis**: measure how stable each factor's ranks are across months (low turnover = lower transaction costs when used in portfolio construction)
+- **Walk-forward IC stability**: split IC computation by sub-period to detect factor decay or regime changes
+- **Composite weight optimisation**: instead of equal-weight blending, use IC-weighted blending (weight each factor by its trailing IC-IR)
+
+---
+
 ### Session 10 — Phase 1 live validation, Phase 2 low-vol factor, PR 1 merged
 
 **Operator:** mshane@thecanadalist.ca
