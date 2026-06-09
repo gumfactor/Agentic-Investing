@@ -12,6 +12,215 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-09
+
+### Session 10 — Phase 1 live validation, Phase 2 low-vol factor, PR 1 merged
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/quant-system-prd-koDnJ` → merged to `main` via `release/phase-1`; Phase 2 work moved to `claude/phase-2`
+**Commits this session:** see git log
+
+---
+
+#### What was done
+
+**Part 1 — yfinance hardening (operator's local commits)**
+
+Two commits pushed by operator from their local machine after independent investigation:
+
+- `Harden yfinance backfill requests` — refactored `yfinance_client.py` to use a combined `fetch_market_data()` that fetches OHLCV and corporate actions in a single `yf.download(actions=True)` call, reducing API calls and adding jitter to inter-batch delays
+- `Add resilient Airflow market data catch-up` — added `Dockerfile.airflow` with a custom Airflow image and improved the daily DAG's error handling and catch-up logic
+
+[DECISION] Operator hardened the yfinance client independently. These commits were rebased cleanly onto the session branch. The combined `fetch_market_data()` approach is now canonical — it avoids a second round of Yahoo API calls for corporate actions.
+
+**Part 2 — Yahoo Finance rate-limit diagnosis and resolution**
+
+Initial `make backfill` attempts triggered a temporary IP ban from Yahoo Finance after the old 200-ticker batch code hammered their servers. Diagnosed by hitting the raw API endpoint directly:
+
+```
+status: 403
+body: Host not in allowlist
+```
+
+[RESOLVED] IP ban cleared within ~1 hour. Subsequent runs with the redesigned backfill (20-ticker batches, 3 s delay, resumable) completed without hitting rate limits.
+
+**Part 3 — Low-volatility factor (Phase 2)**
+
+Built `signals/factors/low_vol.py`:
+- Realized volatility at 21 / 63 / 252-day windows (annualised log-return std × √252)
+- Optional rolling 252-day beta vs a market reference series (computed via rolling Cov/Var)
+- Composite `lowvol_score` = negated + re-standardised mean of vol z-scores (lower vol → higher positive score, consistent with momentum sign convention)
+- 16 unit tests in `signals/tests/test_low_vol.py`, all passing
+
+**Part 4 — Phase 1 full live validation**
+
+Operator triggered the Airflow `daily_data_pipeline` DAG manually. All 7 tasks completed successfully on both a scheduled and a manual run:
+
+```
+fetch_universe → fetch_ohlcv (28–29 s) → run_quality_checks → write_quality_flags
+                                        → write_ohlcv → save_snapshot
+                                        → write_corporate_actions
+```
+
+DB state after validation:
+- `daily_prices`: 624,948 rows, 503 tickers, latest date 2026-06-08
+- `data_quality_flags`: 4,707 rows
+- `corporate_actions`: 7,922 rows, 430 tickers
+- Zero duplicate (ticker, date) pairs
+
+**Part 5 — Completeness checks, scripts, and fire drill runbook**
+
+Added at Codex's recommendation (items #3, #4, #5):
+
+- `data/normalization/completeness_checks.py` — four checks: duplicate (ticker, date) pairs, null close prices, short ticker histories (<252 rows), coverage vs reference ticker. Same flag format as `quality_checks.py`. 32 unit tests.
+- `scripts/check_pipeline_health.py` — read-only DB health check: row counts, duplicate detection, null prices. Exits 1 on issues.
+- `scripts/verify_prices.py` — cross-checks N random tickers against fresh Yahoo download. Ran successfully: 5 tickers, 14 days, max |Δ| = 0.0000.
+- `scripts/pin_snapshot.py` — pins `daily_prices` to MinIO parquet. Snapshot created at `rqis-snapshots/snapshots/daily_prices/2026-06-08/data.parquet`.
+- `docs/runbooks/airflow_fire_drill.md` — step-by-step recovery procedure: kill scheduler mid-run, restart, verify zombie-task recovery.
+
+**Part 6 — PR 1 opened and merged**
+
+Created `release/phase-1` branch (cherry-pick of all Phase 0 + Phase 1 commits, excluding Phase 2 factors). PR #1 opened against `main`, self-reviewed, merged by operator.
+
+**Part 7 — Branch restructuring**
+
+- `release/phase-1` deleted after merge
+- `claude/phase-2` created from `release/phase-1` tip + cherry-pick of momentum + low-vol commits
+- `claude/phase-2` rebased onto merged `main`
+- `claude/quant-system-prd-koDnJ` (original development branch) — stale, pending deletion
+
+[DECISION] Phase-gated PRs adopted as workflow: one PR per phase, opened only after live validation, merged to `main`. `claude/phase-N` branches are the active development branches. This keeps `main` always in a deployable validated state.
+
+---
+
+#### Phase 1 exit criteria — final status
+
+| Criterion | Status |
+|-----------|--------|
+| Infrastructure stack runnable | ✅ |
+| Database schema deployed | ✅ |
+| OHLCV ingestion working | ✅ 624,948 rows / 503 tickers |
+| Corporate actions pipeline | ✅ 7,922 rows / 430 tickers |
+| Point-in-time correctness | ✅ |
+| Quality checks operational | ✅ 4,707 flags recorded |
+| 5 years of data in DB | ✅ |
+| Data quality green | ✅ zero duplicates, price cross-check exact match |
+| Airflow DAG running | ✅ 7/7 tasks, ×2 runs |
+| Dataset snapshot pinned | ✅ `rqis-snapshots/snapshots/daily_prices/2026-06-08/data.parquet` |
+| 194 unit tests passing | ✅ |
+| PR 1 merged to main | ✅ |
+
+---
+
+#### Phase 2 progress so far
+
+| Deliverable | Status |
+|-------------|--------|
+| `signals/factors/momentum.py` | ✅ 19 tests |
+| `signals/factors/low_vol.py` | ✅ 16 tests |
+| `signals/factors/quality.py` | ⏳ requires fundamentals ingestion |
+| `signals/factors/value.py` | ⏳ requires fundamentals ingestion |
+| `signals/scoring/scorer.py` | ⏳ defer until ≥3 factors exist |
+| Fundamentals ingestion | ⏳ next major workstream |
+
+---
+
+#### Next steps
+
+1. Delete stale `claude/quant-system-prd-koDnJ` branch
+2. Set `main` as default branch in GitHub settings
+3. Begin Phase 2 fundamentals ingestion (SimFin or yfinance `.info` for P/E, P/B, ROE, etc.)
+4. Once fundamentals are available: build quality and value factors
+5. Build `signals/scoring/scorer.py` to combine factor z-scores into a composite
+
+---
+
+## 2026-06-06
+
+### Session 9 — Backfill redesign + Phase 2 momentum signal
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/quant-system-prd-koDnJ`
+**Commits this session:** (see git log)
+
+---
+
+#### What was done
+
+**Part 1 — Backfill redesign (yfinance at scale)**
+
+`make backfill` fails at ~503 tickers × 5 years because Yahoo Finance rate-limits
+large repeated batch downloads. Two root causes were identified and fixed:
+
+1. **Batch size too large (200 → 20 tickers)**  
+   yfinance silently drops individual tickers from large batches when Yahoo
+   returns an empty body ("Expecting value: line 1 column 1 (char 0)"). These
+   are not Python exceptions — our `try/except` never catches them. The ticker
+   is simply absent from the returned DataFrame.
+
+2. **Non-resumable, all-at-once write**  
+   The old design fetched all 503 tickers, then wrote everything at the end.
+   Any interruption lost the entire run.
+
+Fixes:
+- `_backfill_cli()` in `yfinance_client.py` fully rewritten:
+  - 20-ticker batches (`_BACKFILL_BATCH_SIZE = 20`)
+  - 3 s inter-batch delay (up from 1 s)
+  - Per-batch retry: 3 attempts with 5 s / 10 s / 20 s back-off
+  - `upsert_ohlcv()` called after every batch — crash loses at most 20 tickers
+  - Quality flags written per batch
+  - Failed tickers collected and logged; excluded from corporate-actions fetch
+- `TimescaleWriter.get_tickers_with_data(start, end)` — new read helper.
+  Queries `daily_prices` for tickers with rows in the first 31 calendar days
+  of the target range. Backfill skips tickers already present, making reruns
+  cheap and safe.
+
+[DECISION] Batch size set to 20, not the original 200. Rationale: Yahoo's
+informal rate limit appears to be around 20–50 simultaneous ticker requests.
+20 is conservative and leaves headroom for retries. The extra time cost
+(~25 batches × 3 s delay ≈ 75 s overhead per full run vs 2.5 s) is trivial
+for a daily or one-time operation.
+
+**Part 2 — Rate limit diagnosis**
+
+After the large failed backfill attempt, Yahoo temporarily blocked the
+operator's residential IP. Diagnosis confirmed by hitting the raw Yahoo
+Finance API with `requests.get()`:
+
+```
+status: 403
+body: Host not in allowlist
+```
+
+[BLOCKER] Yahoo Finance rate-limited the operator's IP after the large batch
+run. Temporary — typically clears in 15–60 min. Confirmed by direct HTTP test.
+
+[RESOLVED] Once the block clears, run `make backfill` with the new code. The
+resumability check means only un-fetched tickers will be attempted.
+
+**Part 3 — Phase 2 momentum factor**
+
+Built `signals/factors/momentum.py` — the first Phase 2 deliverable.
+
+Design:
+- Four lookback windows: 1 M, 3 M, 6 M, 12 M (skipping the final month per
+  Jegadeesh–Titman to avoid short-term reversal contamination)
+- Cross-sectional z-score normalization per date (mean 0, std 1)
+- Composite score = equal-weight average of all available window z-scores
+- Point-in-time safe: requires only the `date` and `close` columns present
+  in `daily_prices`; never looks ahead
+- Full unit test suite in `signals/tests/test_momentum.py`
+
+---
+
+#### Next steps
+- Wait for Yahoo rate limit to clear, then run `make backfill`
+- After data is populated: validate momentum signals against the live DB
+- Begin `signals/factors/quality.py` (ROE, ROIC, accruals) — requires
+  fundamentals data, so deferred until fundamentals ingestion is built
+
+---
+
 ## 2026-06-05
 
 ### Session 7 — Fix backfill CLI and Wikipedia universe fetch bugs
