@@ -223,7 +223,7 @@ Design:
 
 ## 2026-06-05
 
-### Session 7 — Fix backfill CLI and Wikipedia universe fetch bugs
+### Session 8 — Fix backfill CLI and Wikipedia universe fetch bugs
 
 **Operator:** mshane@thecanadalist.ca  
 **Branch:** `claude/quant-system-prd-koDnJ`  
