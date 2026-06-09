@@ -369,3 +369,60 @@ class TestChronologicalSplit:
         train, val = chronological_split(scores, train_fraction=1.0)
         assert len(train) == len(scores)
         assert len(val) == 0
+
+    def test_fraction_zero_raises(self):
+        scores = self._make_scores(20)
+        with pytest.raises(ValueError, match="train_fraction"):
+            chronological_split(scores, train_fraction=0.0)
+
+    def test_empty_input_returns_two_empty_dataframes(self):
+        empty = pd.DataFrame(columns=["ticker", "date", "score"])
+        train, val = chronological_split(empty)
+        assert train.empty
+        assert val.empty
+
+
+# ─── Edge case: NaN scores and constant scores ────────────────────────────────
+
+class TestICEdgeCases:
+    def test_nan_scores_excluded_from_ic(self):
+        """Tickers with NaN scores on a date are excluded from that date's IC."""
+        prices = _make_prices(list("ABCDEFGHIJ"), 80)
+        scores = _make_scores(prices)
+        # Introduce NaN scores for half the tickers on all dates
+        nan_tickers = list("ABCDE")
+        mask = scores["ticker"].isin(nan_tickers)
+        scores_with_nan = scores.copy()
+        scores_with_nan.loc[mask, "score"] = np.nan
+
+        result_clean = compute_ic_series(scores, prices, score_col="score", horizons=[1])
+        result_nan = compute_ic_series(scores_with_nan, prices, score_col="score", horizons=[1])
+
+        # IC series should still be produced using the 5 non-NaN tickers
+        assert not result_nan.empty
+        # n_obs should be roughly half what the clean version produces
+        assert result_nan["n_obs"].mean() < result_clean["n_obs"].mean()
+
+    def test_constant_scores_produce_nan_ic(self):
+        """All-identical scores for a date yield NaN IC (undefined correlation)."""
+        prices = _make_prices(list("ABCDEFGHIJ"), 80)
+        scores = _make_scores(prices)
+        # Force all scores to the same value
+        scores["score"] = 1.0
+        result = compute_ic_series(scores, prices, score_col="score", horizons=[1])
+        # IC should be NaN for all dates (constant scores → undefined correlation)
+        if not result.empty:
+            assert result["ic"].isna().all()
+
+    def test_one_sided_tstat_positive_for_good_factor(self):
+        """A consistently positive IC time series should have p-value < 0.05 (one-sided)."""
+        dates = _business_dates(date(2020, 1, 2), 60)
+        ic_series = pd.DataFrame({
+            "date": dates,
+            "horizon_days": 21,
+            "ic": [0.06] * 60,
+            "rank_ic": [0.05] * 60,
+            "n_obs": 200,
+        })
+        result = summarize_ic(ic_series, factor_name="f")
+        assert result.iloc[0]["ic_pvalue"] < 0.05

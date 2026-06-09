@@ -26,8 +26,10 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_HORIZONS: list[int] = [1, 5, 10, 21, 63]
-_MIN_TICKERS_PER_DATE = 5     # discard IC obs where universe shrinks below this
-_MIN_IC_DATES_FOR_TSTAT = 10  # need this many IC obs to report a t-stat
+_MIN_TICKERS_PER_DATE = 5   # discard IC obs where universe shrinks below this
+# 30 is the practical floor for a reliable t-stat; IC time series are
+# autocorrelated, so effective sample size is lower than the raw count.
+_MIN_IC_DATES_FOR_TSTAT = 30
 
 
 # ─── Forward returns ──────────────────────────────────────────────────────────
@@ -61,6 +63,12 @@ def compute_forward_returns(
     )
     wide.columns.name = None
 
+    # shift(-h) advances by h *rows* in the wide matrix, not h calendar days.
+    # For a well-formed daily universe (e.g. S&P 500 with data on every
+    # trading day), rows correspond 1-to-1 with trading days so the result
+    # is correct.  Tickers with missing dates produce NaN forward returns
+    # (those rows are dropped later) — no bias is introduced, but the sample
+    # shrinks.  If your universe has irregular coverage, validate separately.
     frames: list[pd.DataFrame] = []
     for h in horizons:
         fwd = wide.shift(-h) / wide - 1.0
@@ -210,9 +218,17 @@ def summarize_ic(
 
         ic_mean = float(ic_vals.mean())
         ic_std = float(ic_vals.std(ddof=1))
+        # rank_ic may have a different valid count from ic; n_observations
+        # tracks IC dates only (used for the t-stat denominator).
         rank_ic_mean = float(rank_ic_vals.mean()) if len(rank_ic_vals) >= 2 else float("nan")
 
-        tstat, pvalue = stats.ttest_1samp(ic_vals.values, popmean=0.0)
+        # One-sided t-test: H0: mean_IC = 0, H1: mean_IC > 0.
+        # Factors with consistently negative IC are reversible; the researcher
+        # should re-sign those scores rather than using a two-sided test.
+        tstat, pvalue = stats.ttest_1samp(ic_vals.values, popmean=0.0, alternative="greater")
+        # IC-IR = mean / std of the IC time series (unannualized Sharpe of IC).
+        # Not scaled by sqrt(periods_per_year) — comparisons across horizons
+        # should account for the different sampling frequencies.
         ic_ir = ic_mean / ic_std if ic_std > 0 else float("nan")
 
         rows.append({
@@ -296,6 +312,10 @@ def chronological_split(
     Returns:
         ``(train, validation)`` tuple of DataFrames.
     """
+    if scores.empty:
+        return scores.copy(), scores.copy()
+    if not 0.0 < train_fraction <= 1.0:
+        raise ValueError(f"train_fraction must be in (0, 1], got {train_fraction}")
     dates = sorted(scores["date"].unique())
     n_train = max(1, int(len(dates) * train_fraction))
     train_dates = set(dates[:n_train])
