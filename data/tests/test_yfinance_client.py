@@ -189,6 +189,50 @@ class TestBackfillFetch:
         assert call_kwargs["timeout"] == 15
 
 
+class TestYFinanceClientFetchMarketData:
+    @patch("data.ingestion.market.yfinance_client.yf.download")
+    def test_returns_prices_and_actions_from_one_call(
+        self, mock_download: MagicMock
+    ) -> None:
+        mock_download.return_value = pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [105.0],
+                "Low": [99.0],
+                "Close": [102.0],
+                "Adj Close": [101.5],
+                "Volume": [1_000],
+                "Dividends": [0.25],
+                "Stock Splits": [0.0],
+            },
+            index=pd.to_datetime(["2024-01-02"]),
+        )
+        client = YFinanceClient(batch_size=20, inter_batch_delay=0)
+
+        prices, actions = client.fetch_market_data(
+            ["AAPL"], date(2024, 1, 1), date(2024, 1, 3)
+        )
+
+        assert len(prices) == 1
+        assert len(actions) == 1
+        mock_download.assert_called_once()
+        assert mock_download.call_args.kwargs["actions"] is True
+
+    @patch("data.ingestion.market.yfinance_client.yf.download")
+    def test_empty_ticker_list_makes_no_request(
+        self, mock_download: MagicMock
+    ) -> None:
+        client = YFinanceClient()
+
+        prices, actions = client.fetch_market_data(
+            [], date(2024, 1, 1), date(2024, 1, 3)
+        )
+
+        assert prices.empty
+        assert actions.empty
+        mock_download.assert_not_called()
+
+
 class TestYFinanceClientFetchOhlcv:
     @pytest.fixture
     def client(self) -> YFinanceClient:

@@ -171,6 +171,77 @@ class YFinanceClient(BaseMarketDataClient):
         self._batch_size = batch_size
         self._inter_batch_delay = inter_batch_delay
 
+    def fetch_market_data(
+        self,
+        tickers: list[str],
+        start: date,
+        end: date,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Fetch OHLCV and corporate actions from the same batched responses."""
+        self.validate_date_range(start, end)
+
+        price_frames: list[pd.DataFrame] = []
+        action_frames: list[pd.DataFrame] = []
+        batches = [
+            tickers[i : i + self._batch_size]
+            for i in range(0, len(tickers), self._batch_size)
+        ]
+
+        for batch_idx, batch in enumerate(batches):
+            try:
+                raw = yf.download(
+                    tickers=batch,
+                    start=datetime.combine(start, datetime.min.time()),
+                    end=datetime.combine(end, datetime.min.time()) + pd.Timedelta(days=1),
+                    auto_adjust=False,
+                    actions=True,
+                    progress=False,
+                    threads=True,
+                    timeout=15,
+                )
+                prices = _normalise_yf_download(raw, batch)
+                if not prices.empty:
+                    prices["source"] = "yfinance"
+                    price_frames.append(prices)
+
+                actions = _normalise_yf_actions(raw, batch)
+                if not actions.empty:
+                    action_frames.append(actions)
+            except Exception as exc:
+                logger.error(
+                    "fetch_market_data_batch_failed",
+                    batch=batch_idx + 1,
+                    total_batches=len(batches),
+                    error=str(exc),
+                )
+
+            if batch_idx < len(batches) - 1:
+                time.sleep(self._inter_batch_delay)
+
+        price_columns = [
+            "ticker",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "source_adj_close",
+            "source",
+        ]
+        action_columns = ["ticker", "ex_date", "action_type", "value", "notes", "source"]
+        prices = (
+            pd.concat(price_frames, ignore_index=True)
+            if price_frames
+            else pd.DataFrame(columns=price_columns)
+        )
+        actions = (
+            pd.concat(action_frames, ignore_index=True)
+            if action_frames
+            else pd.DataFrame(columns=action_columns)
+        )
+        return prices, actions
+
     def fetch_ohlcv(
         self,
         tickers: list[str],

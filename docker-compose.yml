@@ -3,7 +3,10 @@
 # Start: make up   Stop: make down   Wipe volumes: make clean
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.8.1
+  build:
+    context: .
+    dockerfile: infra/docker/Dockerfile.airflow
+  image: rqis-airflow:2.8.1-python3.11
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://rqis:${POSTGRES_PASSWORD}@timescaledb:5432/airflow
@@ -12,6 +15,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
     AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    PYTHONPATH: /opt/airflow/rqis
     # Pass through RQIS env vars so DAGs can access data sources
     DATABASE_URL: postgresql+psycopg2://rqis:${POSTGRES_PASSWORD}@timescaledb:5432/rqis
     REDIS_URL: redis://redis:6379/0
@@ -22,6 +26,8 @@ x-airflow-common: &airflow-common
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/rqis/data:ro
+    - ./config:/opt/airflow/rqis/config:ro
     - airflow_logs:/opt/airflow/logs
   depends_on:
     timescaledb:
