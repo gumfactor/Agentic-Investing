@@ -15,6 +15,7 @@ by data/normalization/corporate_actions.py.
 
 from __future__ import annotations
 
+import random
 import time
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -120,6 +121,43 @@ def _normalise_yf_download(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFram
     )
 
     return df[["ticker", "date", "open", "high", "low", "close", "volume", "source_adj_close"]]
+
+
+def _normalise_yf_actions(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    """Extract dividends and splits from a yfinance download response."""
+    columns = ["ticker", "ex_date", "action_type", "value", "notes", "source"]
+    if raw.empty:
+        return pd.DataFrame(columns=columns)
+
+    records: list[dict] = []
+    for ticker in tickers:
+        if isinstance(raw.columns, pd.MultiIndex):
+            try:
+                sub = raw.xs(ticker, axis=1, level=1)
+            except KeyError:
+                continue
+        else:
+            sub = raw
+
+        for field, action_type in (("Dividends", "dividend"), ("Stock Splits", "split")):
+            if field not in sub.columns:
+                continue
+            for ex_dt, value in sub[field].dropna().items():
+                decimal_value = _to_decimal(value)
+                if decimal_value is None or decimal_value == 0:
+                    continue
+                records.append(
+                    {
+                        "ticker": ticker,
+                        "ex_date": ex_dt.date() if hasattr(ex_dt, "date") else ex_dt,
+                        "action_type": action_type,
+                        "value": decimal_value,
+                        "notes": None,
+                        "source": "yfinance",
+                    }
+                )
+
+    return pd.DataFrame(records, columns=columns)
 
 
 class YFinanceClient(BaseMarketDataClient):
@@ -272,14 +310,21 @@ _BACKFILL_BATCH_SIZE = 20          # tickers per yf.download call
 _BACKFILL_INTER_BATCH_DELAY = 3.0  # seconds between batches
 _BACKFILL_RETRY_DELAYS = (5, 10, 20)  # seconds; one entry per attempt after first
 _BACKFILL_SINGLE_TICKER_DELAY = 2.0  # seconds between per-ticker fallback retries
+_BACKFILL_JITTER_MAX = 2.0  # random seconds added to avoid a fixed request cadence
+_BACKFILL_REQUEST_TIMEOUT = 15  # seconds per Yahoo request
 
 
-def _yf_fetch(tickers: list[str], start_date: date, end_date: date) -> pd.DataFrame:
-    """Download and normalise OHLCV for the given tickers.  No retry — caller
-    handles retry/fallback logic.
+def _backfill_sleep(base_seconds: float) -> None:
+    """Sleep with jitter so repeated requests do not follow a fixed cadence."""
+    time.sleep(base_seconds + random.uniform(0, _BACKFILL_JITTER_MAX))
 
-    Returns a long-format DataFrame with a 'source' column, or an empty
-    DataFrame with the correct columns if yfinance returns nothing.
+
+def _yf_fetch(
+    tickers: list[str], start_date: date, end_date: date
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download OHLCV and corporate actions together; the caller handles retries.
+
+    Combining data types avoids a second full-universe pass over Yahoo.
     yfinance may silently drop individual tickers from the result when Yahoo
     returns an empty response for them ('Expecting value: line 1 column 1');
     callers should check which tickers are actually present in the result.
@@ -289,14 +334,15 @@ def _yf_fetch(tickers: list[str], start_date: date, end_date: date) -> pd.DataFr
         start=datetime.combine(start_date, datetime.min.time()),
         end=datetime.combine(end_date, datetime.min.time()) + pd.Timedelta(days=1),
         auto_adjust=False,
-        actions=False,
+        actions=True,
         progress=False,
-        threads=True,
+        threads=False,
+        timeout=_BACKFILL_REQUEST_TIMEOUT,
     )
     df = _normalise_yf_download(raw, tickers)
     if not df.empty:
         df["source"] = "yfinance"
-    return df
+    return df, _normalise_yf_actions(raw, tickers)
 
 
 def _backfill_cli() -> None:
@@ -312,7 +358,8 @@ def _backfill_cli() -> None:
       skipped, so an interrupted run continues rather than re-fetching.
     * Incremental writes: upserts after every batch, so a crash only loses
       the current batch (≤20 tickers).
-    * Per-batch retry: up to 3 attempts with 5 s / 10 s / 20 s back-off.
+    * OHLCV and corporate actions share each response, avoiding a second pass.
+    * Per-batch retry: up to 3 attempts with jittered 5 s / 10 s / 20 s back-off.
     * Quality flags written per batch so partial results are still flagged.
 
     Imports are deferred to avoid circular dependencies when this module
@@ -356,6 +403,7 @@ def _backfill_cli() -> None:
         for i in range(0, len(pending), _BACKFILL_BATCH_SIZE)
     ]
     total_ohlcv_written = 0
+    total_actions_written = 0
     failed_tickers: list[str] = []
 
     for batch_idx, batch in enumerate(batches):
@@ -367,6 +415,7 @@ def _backfill_cli() -> None:
 
         # Retry loop — first attempt + len(_BACKFILL_RETRY_DELAYS) retries
         batch_df: pd.DataFrame | None = None
+        batch_actions = pd.DataFrame()
         all_delays = (0,) + _BACKFILL_RETRY_DELAYS
         for attempt, pre_sleep in enumerate(all_delays):
             if pre_sleep:
@@ -375,11 +424,14 @@ def _backfill_cli() -> None:
                     attempt=attempt,
                     wait_s=pre_sleep,
                 )
-                time.sleep(pre_sleep)
+                _backfill_sleep(pre_sleep)
             try:
-                batch_df = _yf_fetch(batch, start_date, end_date)
+                batch_df, batch_actions = _yf_fetch(batch, start_date, end_date)
+                if batch_df.empty:
+                    raise RuntimeError("Yahoo returned no price data")
                 break
             except Exception as exc:
+                batch_df = None
                 batch_log.error(
                     "backfill_batch_attempt_failed",
                     attempt=attempt + 1,
@@ -399,12 +451,15 @@ def _backfill_cli() -> None:
             if missing:
                 batch_log.warning("backfill_tickers_missing_from_batch", missing=missing)
                 recovered: list[pd.DataFrame] = [batch_df]
+                recovered_actions: list[pd.DataFrame] = [batch_actions]
                 for miss in missing:
-                    time.sleep(_BACKFILL_SINGLE_TICKER_DELAY)
+                    _backfill_sleep(_BACKFILL_SINGLE_TICKER_DELAY)
                     try:
-                        single_df = _yf_fetch([miss], start_date, end_date)
+                        single_df, single_actions = _yf_fetch([miss], start_date, end_date)
                         if not single_df.empty:
                             recovered.append(single_df)
+                            if not single_actions.empty:
+                                recovered_actions.append(single_actions)
                             batch_log.info("backfill_ticker_recovered", ticker=miss)
                         else:
                             failed_tickers.append(miss)
@@ -413,6 +468,7 @@ def _backfill_cli() -> None:
                         failed_tickers.append(miss)
                         batch_log.error("backfill_ticker_failed", ticker=miss, error=str(exc))
                 batch_df = pd.concat(recovered, ignore_index=True)
+                batch_actions = pd.concat(recovered_actions, ignore_index=True)
 
             # Quality checks per batch
             flags = run_quality_checks(batch_df)
@@ -426,37 +482,27 @@ def _backfill_cli() -> None:
             # Incremental write — crash loses at most this batch
             written = writer.upsert_ohlcv(batch_df)
             total_ohlcv_written += written
+            if not batch_actions.empty:
+                total_actions_written += writer.upsert_corporate_actions(batch_actions)
             batch_log.info(
                 "backfill_batch_complete",
                 rows=len(batch_df),
                 records_written=written,
+                corporate_actions_written=len(batch_actions),
                 cumulative_written=total_ohlcv_written,
             )
 
         if batch_idx < len(batches) - 1:
-            time.sleep(_BACKFILL_INTER_BATCH_DELAY)
+            _backfill_sleep(_BACKFILL_INTER_BATCH_DELAY)
 
     logger.info(
         "backfill_ohlcv_complete",
         total_records_written=total_ohlcv_written,
+        total_corporate_actions_written=total_actions_written,
         failed_ticker_count=len(failed_tickers),
     )
     if failed_tickers:
         logger.warning("backfill_failed_tickers", tickers=failed_tickers)
-
-    # ── Corporate actions ─────────────────────────────────────────────────────
-    # Fetched per-ticker (yf.Ticker API), so naturally granular — no batch
-    # sizing needed.  Excludes tickers that permanently failed OHLCV.
-    corp_tickers = [t for t in pending if t not in failed_tickers]
-    if corp_tickers:
-        client = YFinanceClient(
-            batch_size=_BACKFILL_BATCH_SIZE,
-            inter_batch_delay=_BACKFILL_INTER_BATCH_DELAY,
-        )
-        corp_actions = client.fetch_corporate_actions(corp_tickers, start_date, end_date)
-        if not corp_actions.empty:
-            ca_written = writer.upsert_corporate_actions(corp_actions)
-            logger.info("corporate_actions_written", records_written=ca_written)
 
     logger.info("backfill_complete")
 

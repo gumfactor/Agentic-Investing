@@ -13,7 +13,12 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from data.ingestion.market.yfinance_client import YFinanceClient, _normalise_yf_download
+from data.ingestion.market.yfinance_client import (
+    YFinanceClient,
+    _normalise_yf_actions,
+    _normalise_yf_download,
+    _yf_fetch,
+)
 
 
 # ─── _normalise_yf_download unit tests ───────────────────────────────────────
@@ -97,6 +102,92 @@ class TestNormaliseYfDownload:
 
 
 # ─── YFinanceClient integration-style tests (mocked) ─────────────────────────
+
+class TestNormaliseYfActions:
+    def test_single_ticker_extracts_nonzero_actions(self) -> None:
+        raw = pd.DataFrame(
+            {
+                "Dividends": [0.25, 0.0],
+                "Stock Splits": [0.0, 2.0],
+            },
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        )
+
+        result = _normalise_yf_actions(raw, ["AAPL"])
+
+        assert list(result["ticker"]) == ["AAPL", "AAPL"]
+        assert list(result["action_type"]) == ["dividend", "split"]
+        assert list(result["value"]) == [Decimal("0.25"), Decimal("2.0")]
+        assert all(isinstance(value, date) for value in result["ex_date"])
+
+    def test_multi_ticker_keeps_actions_with_their_ticker(self) -> None:
+        columns = pd.MultiIndex.from_tuples(
+            [
+                ("Dividends", "AAPL"),
+                ("Stock Splits", "AAPL"),
+                ("Dividends", "MSFT"),
+                ("Stock Splits", "MSFT"),
+            ]
+        )
+        raw = pd.DataFrame(
+            [[0.25, 0.0, 0.0, 3.0]],
+            index=pd.to_datetime(["2024-01-02"]),
+            columns=columns,
+        )
+
+        result = _normalise_yf_actions(raw, ["AAPL", "MSFT"])
+
+        assert set(zip(result["ticker"], result["action_type"])) == {
+            ("AAPL", "dividend"),
+            ("MSFT", "split"),
+        }
+
+    def test_empty_response_has_writer_compatible_columns(self) -> None:
+        result = _normalise_yf_actions(pd.DataFrame(), ["AAPL"])
+
+        assert result.empty
+        assert list(result.columns) == [
+            "ticker",
+            "ex_date",
+            "action_type",
+            "value",
+            "notes",
+            "source",
+        ]
+
+
+class TestBackfillFetch:
+    @patch("data.ingestion.market.yfinance_client.yf.download")
+    def test_combines_prices_and_actions_in_one_sequential_call(
+        self, mock_download: MagicMock
+    ) -> None:
+        mock_download.return_value = pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [105.0],
+                "Low": [99.0],
+                "Close": [102.0],
+                "Adj Close": [101.5],
+                "Volume": [1_000],
+                "Dividends": [0.25],
+                "Stock Splits": [0.0],
+            },
+            index=pd.to_datetime(["2024-01-02"]),
+        )
+
+        prices, actions = _yf_fetch(
+            ["AAPL"], date(2024, 1, 1), date(2024, 1, 3)
+        )
+
+        assert len(prices) == 1
+        assert len(actions) == 1
+        assert actions.iloc[0]["action_type"] == "dividend"
+        mock_download.assert_called_once()
+        call_kwargs = mock_download.call_args.kwargs
+        assert call_kwargs["actions"] is True
+        assert call_kwargs["threads"] is False
+        assert call_kwargs["timeout"] == 15
+
 
 class TestYFinanceClientFetchOhlcv:
     @pytest.fixture

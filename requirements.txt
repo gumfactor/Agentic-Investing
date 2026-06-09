@@ -3,7 +3,7 @@ python-dotenv==1.0.1
 requests==2.31.0
 
 # ─── Data layer ──────────────────────────────────────────────────────────────
-yfinance==0.2.37
+yfinance==1.4.1
 pandas==2.2.0
 polars==0.20.6
 numpy==1.26.4
