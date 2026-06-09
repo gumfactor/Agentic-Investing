@@ -1,0 +1,81 @@
+# RQIS application settings.
+# Sensitive values (passwords, API keys) must come from environment variables.
+# This file is safe to commit — it contains no credentials.
+
+environment: ${ENVIRONMENT:-development}
+
+data:
+  # Phase 1 source. Switch to 'polygon' in Phase 2 by updating this value
+  # and ensuring POLYGON_API_KEY is set in .env.
+  primary_market_data_source: yfinance
+
+  ingestion:
+    # Batch size for yfinance downloads (tickers per request)
+    yfinance_batch_size: 200
+    # Seconds between batches
+    yfinance_inter_batch_delay: 1.0
+    # How far back to backfill on first run (years)
+    backfill_years: 5
+
+  quality:
+    # Flag as warning if this fraction of universe is missing for a date
+    missing_fraction_warning: 0.05
+    # Flag as error if this fraction is missing
+    missing_fraction_error: 0.10
+    # Price jump z-score threshold for warning flag
+    price_jump_sigma: 3.0
+    # Rolling window for price jump detection (trading days)
+    price_jump_window: 20
+
+universe:
+  # Default universe definition file
+  config_file: config/universe.yaml
+
+signals:
+  # Minimum information coefficient (IC) for a signal to be considered valid
+  min_ic_threshold: 0.03
+  # Minimum t-statistic for IC to be considered significant
+  min_ic_tstat: 2.0
+  # Rolling window for cross-sectional z-score normalization (trading days)
+  normalization_window: 252
+
+portfolio:
+  # Target annualized portfolio volatility (decimal, not percent)
+  target_volatility: 0.10
+  # Maximum single-name position weight
+  max_position_weight: 0.05
+  # Maximum sector weight
+  max_sector_weight: 0.25
+  # Minimum days between rebalances
+  min_holding_days: 5
+  # Rebalance only if signal drift exceeds this fraction of IC half-life
+  rebalance_threshold: 0.5
+
+risk:
+  # Hard breach thresholds (circuit breaker fires at these levels)
+  hard_drawdown_threshold: -0.10        # -10% from peak
+  hard_var_1d_threshold: 0.025          # 2.5% of AUM
+  hard_beta_threshold: 1.5
+  hard_concentration_threshold: 0.05    # 5% single name
+
+  # Warning thresholds (alert fires, no circuit breaker)
+  warn_drawdown_threshold: -0.05
+  warn_var_1d_threshold: 0.015
+  warn_beta_threshold: 1.3
+  warn_concentration_threshold: 0.04
+
+  # Risk model
+  covariance_lookback_days: 252
+  covariance_min_days: 126
+
+execution:
+  # IBKR paper vs. live is controlled entirely by IBKR_PORT env var (7497 vs. 7496)
+  # and the PAPER_TRADING env var. See C1 and C9 in PRD.md.
+  default_algo: twap
+  twap_duration_minutes: 30
+  vwap_participation_rate: 0.10         # 10% of historical volume
+
+reporting:
+  # Daily tearsheet delivery time (local time)
+  tearsheet_delivery_time: "07:00"
+  benchmark_ticker: SPY

@@ -1,0 +1,8 @@
+FROM apache/airflow:2.8.1-python3.11
+
+RUN pip install --no-cache-dir \
+    lxml \
+    minio==7.2.3 \
+    python-dotenv==1.0.1 \
+    structlog==24.1.0 \
+    yfinance==1.4.1

@@ -1,0 +1,13 @@
+-- ─── Fundamentals schema (Phase 2) ──────────────────────────────────────────
+-- Placeholder. Phase 2 will add:
+--   financial_statements  : income / balance sheet / cash flow, quarterly
+--   earnings_estimates    : consensus EPS/revenue estimates and revisions
+--   sec_filings           : metadata index for 10-K, 10-Q, 8-K filings
+--
+-- Point-in-time correctness for fundamentals requires storing:
+--   period_end_date  : last day of the fiscal period being reported
+--   release_date     : when the data became publicly available (filing date,
+--                      not period_end_date). Typically 30–90 days after period end.
+--
+-- The pit_join() utility in data/normalization/point_in_time.py enforces
+-- that only records with release_date <= as_of_date are visible.

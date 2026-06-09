@@ -1,0 +1,10 @@
+-- ─── Signal schema (Phase 2) ─────────────────────────────────────────────────
+-- Placeholder. Phase 2 will add:
+--   factor_scores    : individual factor z-scores per (ticker, date)
+--   alpha_scores     : composite signal score per (ticker, date)
+--   signal_ic_stats  : IC, IC-IR, decay metrics per factor per validation run
+--
+-- All score tables will include:
+--   score_date    : the date for which the score was computed
+--   computed_at   : when the score was generated (for audit trail)
+--   strategy_id   : links to the strategy config version
