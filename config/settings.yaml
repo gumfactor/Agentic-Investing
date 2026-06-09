@@ -11,9 +11,9 @@ data:
 
   ingestion:
     # Batch size for yfinance downloads (tickers per request)
-    yfinance_batch_size: 200
+    yfinance_batch_size: 20
     # Seconds between batches
-    yfinance_inter_batch_delay: 1.0
+    yfinance_inter_batch_delay: 3.0
     # How far back to backfill on first run (years)
     backfill_years: 5
 
