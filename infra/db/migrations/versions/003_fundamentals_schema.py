@@ -26,8 +26,7 @@ depends_on = None
 def upgrade() -> None:
     # ── sec_filings ──────────────────────────────────────────────────────────
     # Metadata index for EDGAR filings (10-K, 10-Q, 8-K).
-    # Stores the filing date (= release_date for financial data in that filing)
-    # and a pointer to the raw filing in object storage.
+    # filing_date is the release_date for all financial data in that filing.
     op.create_table(
         "sec_filings",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
@@ -63,12 +62,11 @@ def upgrade() -> None:
     )
 
     # ── financial_statements ─────────────────────────────────────────────────
-    # Normalised fundamental line items from income statement, balance sheet,
-    # and cash flow statement. One row per (ticker, period_end_date, item_name).
-    #
-    # Storing as EAV (entity-attribute-value) rather than wide columns lets us
-    # add new line items without schema migrations. The signal layer aggregates
-    # into wide form at query time via pivot.
+    # Normalised fundamental line items (EAV model).
+    # One row per (ticker, period_end_date, release_date, period_type,
+    # item_name, source). release_date is included in the unique key so that
+    # restated filings (same period, updated value, later release_date) are
+    # stored as new rows rather than silently overwriting original values.
     #
     # item_name examples: 'revenue', 'net_income', 'total_assets',
     #   'total_debt', 'equity', 'free_cash_flow', 'operating_income'
@@ -85,6 +83,8 @@ def upgrade() -> None:
         sa.Column("value", sa.Numeric(24, 6), nullable=True),
         sa.Column("source", sa.String(50), nullable=False),
         sa.Column("source_version", sa.String(50), nullable=True),
+        # Nullable FK back to sec_filings; populated when data comes from EDGAR.
+        sa.Column("filing_id", sa.BigInteger(), nullable=True),
         sa.Column(
             "ingested_at",
             sa.TIMESTAMP(timezone=True),
@@ -92,13 +92,21 @@ def upgrade() -> None:
             server_default=sa.text("NOW()"),
         ),
         sa.PrimaryKeyConstraint("id"),
+        # release_date is in the unique key so restated values are new rows,
+        # preserving audit history rather than silently overwriting originals.
         sa.UniqueConstraint(
-            "ticker", "period_end_date", "period_type", "item_name", "source",
+            "ticker", "period_end_date", "release_date", "period_type", "item_name", "source",
             name="uq_financial_statements_key",
         ),
         sa.CheckConstraint(
             "period_type IN ('annual', 'quarterly', 'ttm')",
             name="ck_financial_statements_period_type",
+        ),
+        sa.ForeignKeyConstraint(
+            ["filing_id"],
+            ["sec_filings.id"],
+            name="fk_financial_statements_filing",
+            ondelete="SET NULL",
         ),
     )
     op.create_index(
@@ -111,12 +119,12 @@ def upgrade() -> None:
         "financial_statements",
         [sa.text("release_date DESC")],
     )
-    # Partial index: quickly find the most recently released value per item
-    # as of any given as_of_date (supports pit_join).
+    # PIT index: equality on ticker + item_name + period_type, then range scan
+    # on release_date. Column order places equality predicates before the range.
     op.create_index(
         "ix_financial_statements_pit",
         "financial_statements",
-        ["ticker", "item_name", sa.text("release_date DESC"), "period_type"],
+        ["ticker", "item_name", "period_type", sa.text("release_date DESC")],
     )
 
 

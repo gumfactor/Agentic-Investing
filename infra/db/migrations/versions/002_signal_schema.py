@@ -21,8 +21,14 @@ def upgrade() -> None:
     # One row per (ticker, score_date, factor_name, strategy_id).
     # z_score is the cross-sectional z-score; raw_value is the un-normalized
     # underlying metric (e.g. 12-month return, realized vol).
+    #
+    # TimescaleDB note: unique constraints on hypertables must include the
+    # partition column (score_date). The UniqueConstraint below satisfies this
+    # requirement (TimescaleDB 2.x enforces it per-chunk, which is correct
+    # because each score_date lands in exactly one chunk).
     op.create_table(
         "factor_scores",
+        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("ticker", sa.String(20), nullable=False),
         sa.Column("score_date", sa.Date(), nullable=False),
         sa.Column("factor_name", sa.String(100), nullable=False),
@@ -35,7 +41,11 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("NOW()"),
         ),
-        sa.PrimaryKeyConstraint("ticker", "score_date", "factor_name", "strategy_id"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "ticker", "score_date", "factor_name", "strategy_id",
+            name="uq_factor_scores_key",
+        ),
     )
     op.create_index(
         "ix_factor_scores_date_factor",
@@ -57,6 +67,7 @@ def upgrade() -> None:
     # rank is 1-based within the universe on that date (1 = highest score).
     op.create_table(
         "alpha_scores",
+        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("ticker", sa.String(20), nullable=False),
         sa.Column("score_date", sa.Date(), nullable=False),
         sa.Column("strategy_id", sa.String(100), nullable=False),
@@ -69,7 +80,11 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("NOW()"),
         ),
-        sa.PrimaryKeyConstraint("ticker", "score_date", "strategy_id"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "ticker", "score_date", "strategy_id",
+            name="uq_alpha_scores_key",
+        ),
     )
     op.create_index(
         "ix_alpha_scores_date_strategy",
@@ -89,7 +104,7 @@ def upgrade() -> None:
     # ── signal_ic_stats ──────────────────────────────────────────────────────
     # IC metrics per (factor, horizon, eval_date, strategy).
     # eval_date = last date of the evaluation window used to compute the stats.
-    # Used by the signal_research skill and logged to MLflow.
+    # Not a hypertable — this is a sparse stats table, not a time-series.
     op.create_table(
         "signal_ic_stats",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
@@ -97,11 +112,11 @@ def upgrade() -> None:
         sa.Column("strategy_id", sa.String(100), nullable=False),
         sa.Column("eval_date", sa.Date(), nullable=False),
         sa.Column("horizon_days", sa.Integer(), nullable=False),
-        sa.Column("ic", sa.Numeric(10, 6), nullable=True),
-        sa.Column("rank_ic", sa.Numeric(10, 6), nullable=True),
-        sa.Column("ic_tstat", sa.Numeric(10, 6), nullable=True),
-        sa.Column("ic_ir", sa.Numeric(10, 6), nullable=True),
-        sa.Column("ic_pvalue", sa.Numeric(10, 6), nullable=True),
+        sa.Column("ic", sa.Numeric(12, 6), nullable=True),
+        sa.Column("rank_ic", sa.Numeric(12, 6), nullable=True),
+        sa.Column("ic_tstat", sa.Numeric(12, 6), nullable=True),
+        sa.Column("ic_ir", sa.Numeric(12, 6), nullable=True),
+        sa.Column("ic_pvalue", sa.Numeric(12, 6), nullable=True),
         sa.Column("n_observations", sa.Integer(), nullable=True),
         sa.Column("mlflow_run_id", sa.String(100), nullable=True),
         sa.Column(
@@ -125,5 +140,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("signal_ic_stats")
-    op.drop_table("alpha_scores")
-    op.drop_table("factor_scores")
+    # CASCADE required for TimescaleDB hypertables to drop internal chunk tables.
+    op.execute("DROP TABLE IF EXISTS alpha_scores CASCADE")
+    op.execute("DROP TABLE IF EXISTS factor_scores CASCADE")
