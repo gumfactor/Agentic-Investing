@@ -36,14 +36,16 @@ It is built to eventually trade real capital. Every decision you make must treat
 
 | Phase | Name | Status | Target completion |
 |-------|------|--------|-------------------|
-| 0 | PRD + Project Setup | **In progress** | Week 1 |
-| 1 | Data Foundation | Not started | Week 6 |
-| 2 | Signal Library | Not started | Week 12 |
+| 0 | PRD + Project Setup | **Complete** | Week 1 |
+| 1 | Data Foundation | **Complete** | Week 6 |
+| 2 | Signal Library | **In progress** | Week 12 |
 | 3 | Backtesting Engine | Not started | Week 18 |
 | 4 | Portfolio + Paper Trading | Not started | Week 26 |
 | 5 | Reporting + Live Trading | Not started | Week 36 |
 
-**What this means for you:** We are currently in Phase 0. No live broker connections exist. No real capital is at risk. You may freely create files, run tests, and modify non-live-trading code. The safety constraints in Section 11 of the PRD still apply as design rules even before live trading begins.
+**Active branch:** `claude/phase-2`
+
+**What this means for you:** We are in Phase 2. Phase 1 data is live — 624,948 rows, 503 tickers, 5 years of daily OHLCV in TimescaleDB. The Airflow daily pipeline is running. No broker connections exist yet. No real capital is at risk. You may freely create files, run tests, and modify all non-execution code. Safety constraints C1–C9 still apply as design rules.
 
 ---
 
@@ -99,14 +101,10 @@ Full directory tree with file-level detail: `PRD.md` Section 5.
 | `MINIO_ENDPOINT` | Object storage endpoint |
 | `MINIO_ACCESS_KEY` | Object storage access key |
 | `MINIO_SECRET_KEY` | Object storage secret key |
-| `POLYGON_API_KEY` | Polygon.io market data API key |
-| `ALPACA_API_KEY` | Alpaca trading API key |
-| `ALPACA_SECRET_KEY` | Alpaca trading secret key |
-| `IBKR_HOST` | IBKR TWS/Gateway host |
-| `IBKR_PORT` | IBKR TWS/Gateway port |
-| `MLFLOW_TRACKING_URI` | MLflow tracking server URL |
+| `POLYGON_API_KEY` | Polygon.io market data API key (Phase 2+) |
 | `IBKR_HOST` | IBKR TWS/Gateway host (default: `127.0.0.1`) |
 | `IBKR_PORT` | `7497` = paper trading, `7496` = live trading — **never hardcode** |
+| `MLFLOW_TRACKING_URI` | MLflow tracking server URL |
 | `PAPER_TRADING` | `"true"` or `"false"` — NEVER change from `"false"` without operator `"YES"` confirmation (C9) |
 
 Reference `.env.example` for the full list.
@@ -198,4 +196,4 @@ If you made a significant architectural or implementation decision, record it in
 | `CLAUDE.md` | This file — project orientation for Claude Code |
 | `docs/architecture.md` | (to be created) System diagram and data flows |
 | `docs/data_dictionary.md` | (to be created) Every table, column, unit, source |
-| `docs/runbooks/` | (to be created) Operational procedures |
+| `docs/runbooks/` | Operational procedures (e.g. `airflow_fire_drill.md`) |
