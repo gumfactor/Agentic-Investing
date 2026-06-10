@@ -14,6 +14,81 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-10
 
+### Session 15 — Phase 3: Codex architectural fixes (#1, #3, #4, #7)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/phase-3`
+**Commits this session:** cfc9cd3
+
+---
+
+#### What was done
+
+Addressed all four remaining Codex architectural findings. 218 tests pass.
+
+**Finding #3 — Unadjusted prices (`backtesting/loader.py`, new)**
+
+Created `load_from_snapshot(data_version, config, snapshots)` — the standard entry point for production backtests. It loads `daily_prices` and `corporate_actions` snapshots from MinIO, calls `compute_adjustment_factors()` then `apply_adjustment_factors()`, and replaces `close` with `adj_close` (converted to float) before constructing `DataHandler`. Split events no longer produce fictitious P&L. The `corporate_actions` snapshot is optional — missing → adj_factors default to 1.0 with a warning.
+
+**Finding #4 — Config enforcement (`backtesting/engine/event_loop.py`)**
+
+- `min_holding_days`: `_PortfolioState` now carries an `entry_dates: dict[str, date]` field. `apply_fills()` records the first buy date for each new position and clears it on full liquidation. In the rebalance block, a `date_index` dict (O(1) lookup) counts trading days held per ticker. SELL orders for positions held fewer than `min_holding_days` trading days are filtered before execution.
+- `max_position_weight`: `_select_equal_weight()` now accepts `max_position_weight` and sets each weight to `min(1/N, max_position_weight)`. When the cap binds, residual capital stays in cash — no forced renormalisation that could inadvertently concentrate a constrained portfolio.
+
+[DECISION] Cash residual when max_position_weight binds: redistributing to other positions would violate the spirit of a position-size limit (the excess would just be spread among other positions you may also want to limit). Holding cash is more conservative and more correct.
+
+[DECISION] entry_dates cleared on full liquidation only: if a position is partially reduced and later rebuilt, the original entry date is no longer meaningful (the trader has re-entered). Clearing on full exit and resetting on re-entry gives the most conservative lock behaviour.
+
+**Finding #1 — Dataset bundle (`backtesting/dataset_manifest.py`, new)**
+
+`DatasetManifest` dataclass captures: snapshot date per data type, MinIO object paths, row counts, date ranges, schema fingerprints (sha256[:16] of column names), git commit hash. `build_manifest()` creates one from loaded DataFrames; `save_manifest()` / `load_manifest()` persist to `rqis-snapshots/manifests/{version}/manifest.json`. The manifest path replaces the prices-only snapshot path as the C7 `data_version`.
+
+**Finding #7 — Historical alpha backfill (`scripts/backfill_momentum_scores.py`, new)**
+
+Script loads a price snapshot, calls `compute_momentum_scores()` once on the full history (PIT-safe — only trailing windows enter each date's score), batches through `combine_factor_scores()`, and upserts to `factor_scores` and `alpha_scores` via the new `TimescaleWriter` methods. `--dry-run` prints a row-count summary without touching the DB.
+
+**Supporting change (`data/storage/timescale_writer.py`)**
+
+Added `upsert_factor_scores()` and `upsert_alpha_scores()` — idempotent upserts using the composite PKs defined in migration 002 (`ON CONFLICT (ticker, score_date, factor_name, strategy_id)` and `ON CONFLICT (ticker, score_date, strategy_id)` respectively).
+
+**New tests (9)**
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_select_equal_weight_cap_applies` | 1/3 > 0.25 → each weight = 0.25, sum = 0.75 |
+| `test_select_equal_weight_cap_no_effect_below_threshold` | 1/5 ≤ 0.25 → unchanged |
+| `test_min_holding_days_prevents_early_sell` | AAPL not sold within 5 trading days of open |
+| `test_engine_max_position_weight_via_config` | All positions ≤ 0.25 throughout simulation |
+| `test_loader_adjust_prices_no_actions` | No actions → adj_close = unadjusted close |
+| `test_loader_adjust_prices_split` | 2-for-1 split → pre-split close halved |
+| `test_build_manifest_row_counts` | Row counts, date ranges, git_commit populated |
+| `test_build_manifest_schema_hashes_differ_by_columns` | Hash differs when columns differ |
+
+---
+
+#### Pending items (all Codex findings now addressed)
+
+| Finding | Status |
+|---------|--------|
+| #1 Dataset bundle | ✅ DatasetManifest implemented |
+| #2 Look-ahead bias | ✅ Fixed in Session 14 |
+| #3 Unadjusted prices | ✅ loader.py adjusts prices |
+| #4 Config enforcement | ✅ min_holding_days + max_position_weight live |
+| #5 Cash negative | ✅ Fixed in Session 14 |
+| #6 Non-deterministic ordering | ✅ Fixed in Session 14 |
+| #7 Historical alpha backfill | ✅ backfill_momentum_scores.py ready |
+
+---
+
+#### Next steps
+
+1. **Pin a backtest dataset bundle**: run `pin_snapshot.py` for daily_prices + corporate_actions + alpha_scores + benchmark → call `build_manifest()` → store manifest path as MLflow data_version.
+2. **Historical backfill**: run `python -m scripts.backfill_momentum_scores --snapshot-date ... --start 2020-01-02 --end 2024-12-31 --dry-run` to verify, then live run.
+3. **End-to-end live validation**: `load_from_snapshot()` → `BacktestEngine.run()` → `BacktestLogger.log_run()` for `v1_base_momentum.yaml` on 2020–2024.
+4. **Phase 3 PR**: open against `main` after live validation passes.
+
+---
+
 ### Session 14 — Phase 3: Codex bug-fix commit
 
 **Operator:** mshane@thecanadalist.ca
