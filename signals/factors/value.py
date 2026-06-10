@@ -5,11 +5,12 @@ the denominator.  Prices come from daily_prices; fundamentals from
 financial_statements via pit_latest().
 
 Point-in-time correctness
---------------------------
-Fundamental values are forward-joined to price dates using pit_latest():
-for each score_date, the most recently *filed* quarterly value is used
-(filing date <= score_date).  This prevents look-ahead bias from using
-earnings that hadn't been reported yet on a given date.
+-------------------------
+Flow items use the latest four distinct quarterly observations known on the
+score date, with the latest annual observation as a fallback. Balance-sheet
+items and shares are selected at or before the flow period end. This prevents
+mixing one quarter of earnings with a full market capitalisation or pairing
+fundamentals from incompatible fiscal periods.
 
 Survivorship bias note
 ----------------------
@@ -26,6 +27,7 @@ All three factors are defined so that HIGHER score = BETTER:
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Optional
 
 import numpy as np
@@ -36,6 +38,7 @@ logger = structlog.get_logger(__name__)
 
 _REQUIRED_FUND_COLS = {"ticker", "period_end_date", "release_date", "period_type", "item_name", "value"}
 _REQUIRED_PRICE_COLS = {"ticker", "date", "close"}
+_MAX_FUNDAMENTAL_AGE_DAYS = 550
 
 
 def compute_value_scores(
@@ -75,10 +78,8 @@ def compute_value_scores(
     rows: list[dict] = []
 
     for score_date in score_dates:
-        # Point-in-time fundamentals: most recently filed value per (ticker, item)
-        # with release_date <= score_date.
-        pit_fund = _pit_latest_fundamentals(fundamentals, score_date)
-        if not pit_fund:
+        visible = _pit_visible_fundamentals(fundamentals, score_date)
+        if visible.empty:
             continue
 
         # Prices on score_date
@@ -95,18 +96,7 @@ def compute_value_scores(
         # the actual share count by up to 90 days.  This is a known
         # approximation; a more precise source (e.g. daily share counts)
         # would improve accuracy for companies with active buyback programs.
-        shares = pit_fund.get("shares_outstanding")
-        if shares is None:
-            logger.warning(
-                "value_scores_missing_shares_outstanding",
-                score_date=str(score_date),
-                msg="shares_outstanding absent from fundamentals — market-cap ratios skipped for this date",
-            )
-            mcap = None
-        else:
-            mcap = price_snap["close"].mul(shares.reindex(price_snap.index)).dropna()
-
-        date_rows = _compute_ratios(pit_fund, mcap, score_date)
+        date_rows = _compute_ratios(visible, price_snap["close"], score_date)
         if len(date_rows) < min_tickers:
             continue
         rows.extend(date_rows)
@@ -138,73 +128,159 @@ def compute_value_scores(
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _pit_latest_fundamentals(
+def _pit_visible_fundamentals(
     fundamentals: pd.DataFrame,
     as_of_date,
-) -> dict[str, pd.Series]:
-    """Return a dict of item_name → (ticker-indexed) Series, PIT-filtered.
-
-    Uses only rows where release_date <= as_of_date, then takes the
-    most-recently-filed observation per (ticker, item_name).
-    """
+) -> pd.DataFrame:
+    """Return PIT-visible rows, keeping the latest filing for each period."""
     visible = fundamentals[fundamentals["release_date"] <= as_of_date]
+    period_cutoff = as_of_date - timedelta(days=_MAX_FUNDAMENTAL_AGE_DAYS)
+    visible = visible[visible["period_end_date"] >= period_cutoff]
     if visible.empty:
-        return {}
-
-    # Sort by (release_date, period_end_date) so .last() picks the most recently
-    # filed row, with ties broken by the most recent period (deterministic).
-    latest = (
-        visible.sort_values(["release_date", "period_end_date"])
-        .groupby(["ticker", "item_name"])
-        .last()
-        .reset_index()[["ticker", "item_name", "value"]]
+        return visible.copy()
+    return (
+        visible.sort_values("release_date")
+        .drop_duplicates(
+            subset=["ticker", "item_name", "period_type", "period_end_date"],
+            keep="last",
+        )
+        .copy()
     )
 
-    result: dict[str, pd.Series] = {}
-    for item, group in latest.groupby("item_name"):
-        series = group.set_index("ticker")["value"].astype(float)
-        series.name = item
-        result[item] = series
 
-    return result
+def _pit_flow_values(visible: pd.DataFrame, item_name: str) -> pd.DataFrame:
+    """Return TTM flow values and their fiscal period end per ticker."""
+    item_rows = visible[visible["item_name"] == item_name]
+    rows: list[dict] = []
+    for ticker, ticker_rows in item_rows.groupby("ticker"):
+        quarters = (
+            ticker_rows[ticker_rows["period_type"] == "quarterly"]
+            .sort_values("period_end_date")
+            .tail(4)
+        )
+        if len(quarters) == 4:
+            rows.append({
+                "ticker": ticker,
+                "value": float(quarters["value"].astype(float).sum()),
+                "period_end_date": quarters["period_end_date"].max(),
+            })
+            continue
+
+        annual = (
+            ticker_rows[ticker_rows["period_type"] == "annual"]
+            .sort_values("period_end_date")
+            .tail(1)
+        )
+        if not annual.empty:
+            row = annual.iloc[0]
+            rows.append({
+                "ticker": ticker,
+                "value": float(row["value"]),
+                "period_end_date": row["period_end_date"],
+            })
+    if not rows:
+        return pd.DataFrame(columns=["value", "period_end_date"])
+    return pd.DataFrame(rows).set_index("ticker")
+
+
+def _pit_stock_values(
+    visible: pd.DataFrame,
+    item_name: str,
+    anchors: pd.Series,
+) -> pd.Series:
+    """Return latest stock values at or before each ticker's anchor period."""
+    if anchors.empty:
+        return pd.Series(dtype=float, name=item_name)
+
+    item_rows = visible[visible["item_name"] == item_name].copy()
+    if item_rows.empty:
+        return pd.Series(dtype=float, name=item_name)
+
+    item_rows["period_priority"] = (
+        item_rows["period_type"] == "quarterly"
+    ).astype(int)
+    item_rows = (
+        item_rows.sort_values(
+            ["ticker", "period_end_date", "period_priority", "release_date"]
+        )
+        .drop_duplicates(["ticker", "period_end_date"], keep="last")
+        [["ticker", "period_end_date", "value"]]
+    )
+    item_rows["period_end_date"] = pd.to_datetime(item_rows["period_end_date"])
+    item_rows = item_rows.sort_values(["period_end_date", "ticker"])
+    anchor_frame = (
+        anchors.rename("anchor_period_end")
+        .rename_axis("ticker")
+        .reset_index()
+    )
+    anchor_frame["anchor_period_end"] = pd.to_datetime(
+        anchor_frame["anchor_period_end"]
+    )
+    anchor_frame = anchor_frame.sort_values(["anchor_period_end", "ticker"])
+    matched = pd.merge_asof(
+        anchor_frame,
+        item_rows,
+        left_on="anchor_period_end",
+        right_on="period_end_date",
+        by="ticker",
+        direction="backward",
+    ).dropna(subset=["value"])
+    return matched.set_index("ticker")["value"].astype(float).rename(item_name)
 
 
 def _compute_ratios(
-    pit_fund: dict[str, pd.Series],
-    mcap: Optional[pd.Series],
+    visible: pd.DataFrame,
+    prices: pd.Series,
     score_date,
 ) -> list[dict]:
     """Compute per-ticker ratios for a single score date."""
+    net_income = _pit_flow_values(visible, "net_income")
+    fcf = _pit_flow_values(visible, "free_cash_flow")
+    equity_rows = visible[visible["item_name"] == "total_equity"]
+    equity_anchors = (
+        equity_rows.sort_values("period_end_date")
+        .groupby("ticker")["period_end_date"]
+        .last()
+    )
+    total_equity = _pit_stock_values(
+        visible, "total_equity", equity_anchors
+    )
+    earnings_shares = _pit_stock_values(
+        visible, "shares_outstanding", net_income["period_end_date"]
+    )
+    equity_shares = _pit_stock_values(
+        visible, "shares_outstanding", equity_anchors
+    )
+    fcf_shares = _pit_stock_values(
+        visible, "shares_outstanding", fcf["period_end_date"]
+    )
+
     rows: list[dict] = []
-
-    net_income = pit_fund.get("net_income")
-    total_equity = pit_fund.get("total_equity")
-    fcf = pit_fund.get("free_cash_flow")
-
-    if mcap is None or len(mcap) == 0:
-        # Without market cap we can't compute yield-based factors
-        return rows
-
-    common_index = mcap.index
-
-    for ticker in common_index:
+    for ticker, price in prices.items():
         row: dict = {"ticker": ticker, "date": score_date}
-
-        mc = mcap.get(ticker)
-        if mc is None or mc <= 0:
+        if price is None or price <= 0:
             continue
 
-        if net_income is not None and ticker in net_income.index:
-            ni = float(net_income[ticker])
-            row["earnings_yield"] = ni / mc
+        if ticker in net_income.index:
+            shares = earnings_shares.get(ticker)
+            if shares is not None and shares > 0:
+                row["earnings_yield"] = (
+                    float(net_income.at[ticker, "value"]) / (price * shares)
+                )
 
-        if total_equity is not None and ticker in total_equity.index:
-            eq = float(total_equity[ticker])
-            row["book_to_market"] = eq / mc
+        if ticker in total_equity.index and ticker in equity_anchors.index:
+            shares = equity_shares.get(ticker)
+            if shares is not None and shares > 0:
+                row["book_to_market"] = (
+                    float(total_equity[ticker]) / (price * shares)
+                )
 
-        if fcf is not None and ticker in fcf.index:
-            cf = float(fcf[ticker])
-            row["fcf_yield"] = cf / mc
+        if ticker in fcf.index:
+            shares = fcf_shares.get(ticker)
+            if shares is not None and shares > 0:
+                row["fcf_yield"] = (
+                    float(fcf.at[ticker, "value"]) / (price * shares)
+                )
 
         if len(row) > 2:  # more than just ticker + date
             rows.append(row)

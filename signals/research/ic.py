@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 import structlog
+from statsmodels.regression.linear_model import OLS
 
 logger = structlog.get_logger(__name__)
 
@@ -223,10 +224,16 @@ def summarize_ic(
         # tracks IC dates only (used for the t-stat denominator).
         rank_ic_mean = float(rank_ic_vals.mean()) if len(rank_ic_vals) >= 2 else float("nan")
 
-        # One-sided t-test: H0: mean_IC = 0, H1: mean_IC > 0.
-        # Factors with consistently negative IC are reversible; the researcher
-        # should re-sign those scores rather than using a two-sided test.
-        tstat, pvalue = stats.ttest_1samp(ic_vals.values, popmean=0.0, alternative="greater")
+        # Overlapping h-day forward returns induce serial correlation in daily
+        # IC observations. Estimate the intercept-only mean with Newey-West
+        # covariance using h - 1 lags, then apply the one-sided H1: mean_IC > 0.
+        hac_lags = max(0, int(h) - 1)
+        model = OLS(ic_vals.values, np.ones((n_dates, 1))).fit(
+            cov_type="HAC",
+            cov_kwds={"maxlags": hac_lags},
+        )
+        tstat = float(model.tvalues[0])
+        pvalue = float(stats.norm.sf(tstat))
         # IC-IR = mean / std of the IC time series (unannualized Sharpe of IC).
         # Not scaled by sqrt(periods_per_year) — comparisons across horizons
         # should account for the different sampling frequencies.

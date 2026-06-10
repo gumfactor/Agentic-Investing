@@ -1,0 +1,286 @@
+"""Validate Phase 2 factor IC on live TimescaleDB data.
+
+The command recomputes historical factor scores from ``daily_prices``, reserves
+the final portion of trading dates as a chronological holdout, and evaluates
+21- and 63-trading-day forward returns. Results can be persisted to
+``signal_ic_stats`` for traceability.
+
+Usage:
+    python scripts/validate_signal_ic.py
+    python scripts/validate_signal_ic.py --factors momentum lowvol --persist
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+from signals.factors.low_vol import compute_lowvol_scores
+from signals.factors.momentum import compute_momentum_scores
+from signals.factors.quality import compute_quality_scores
+from signals.factors.value import compute_value_scores
+from signals.research.ic import (
+    compute_factor_turnover,
+    compute_ic_series,
+    rolling_ic_summary,
+    summarize_ic,
+)
+from signals.research.universe import audit_universe_survivorship
+
+load_dotenv()
+
+_DEFAULT_HORIZONS = [21, 63]
+_DEFAULT_STRATEGY_ID = "v1_base_momentum"
+
+
+@dataclass(frozen=True)
+class FactorSpec:
+    compute: Callable
+    score_col: str
+    needs_fundamentals: bool = False
+
+
+_FACTORS = {
+    "momentum": FactorSpec(compute_momentum_scores, "momentum_score"),
+    "lowvol": FactorSpec(compute_lowvol_scores, "lowvol_score"),
+    "value": FactorSpec(
+        compute_value_scores,
+        "value_score",
+        needs_fundamentals=True,
+    ),
+    "quality": FactorSpec(
+        compute_quality_scores,
+        "quality_score",
+        needs_fundamentals=True,
+    ),
+}
+
+
+def _holdout_start(dates: list, train_fraction: float) -> object:
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError("train_fraction must be between 0 and 1")
+    if len(dates) < 2:
+        raise ValueError("at least two trading dates are required")
+    split_index = min(int(len(dates) * train_fraction), len(dates) - 1)
+    return dates[split_index]
+
+
+def _add_gate_columns(
+    summary: pd.DataFrame,
+    min_ic: float,
+    min_tstat: float,
+) -> pd.DataFrame:
+    out = summary.copy()
+    out["passes_ic"] = out["ic"] >= min_ic
+    out["passes_tstat"] = out["ic_tstat"] >= min_tstat
+    out["passes_gate"] = out["passes_ic"] & out["passes_tstat"]
+    return out
+
+
+def _persist_summary(engine, summary: pd.DataFrame) -> int:
+    if summary.empty:
+        return 0
+
+    records = summary[
+        [
+            "factor_name",
+            "strategy_id",
+            "eval_date",
+            "horizon_days",
+            "ic",
+            "rank_ic",
+            "ic_tstat",
+            "ic_ir",
+            "ic_pvalue",
+            "n_observations",
+        ]
+    ].to_dict("records")
+
+    statement = text(
+        "INSERT INTO signal_ic_stats "
+        "(factor_name, strategy_id, eval_date, horizon_days, ic, rank_ic, "
+        "ic_tstat, ic_ir, ic_pvalue, n_observations) "
+        "VALUES (:factor_name, :strategy_id, :eval_date, :horizon_days, :ic, "
+        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations) "
+        "ON CONFLICT (factor_name, strategy_id, eval_date, horizon_days) "
+        "DO UPDATE SET ic = EXCLUDED.ic, rank_ic = EXCLUDED.rank_ic, "
+        "ic_tstat = EXCLUDED.ic_tstat, ic_ir = EXCLUDED.ic_ir, "
+        "ic_pvalue = EXCLUDED.ic_pvalue, "
+        "n_observations = EXCLUDED.n_observations, computed_at = NOW()"
+    )
+    with engine.begin() as connection:
+        connection.execute(statement, records)
+    return len(records)
+
+
+def _load_prices(engine) -> pd.DataFrame:
+    prices = pd.read_sql(
+        "SELECT ticker, date, close FROM daily_prices ORDER BY date, ticker",
+        engine,
+    )
+    prices["date"] = pd.to_datetime(prices["date"]).dt.date
+    return prices
+
+
+def _load_fundamentals(engine) -> pd.DataFrame:
+    fundamentals = pd.read_sql(
+        "SELECT ticker, period_end_date, release_date, period_type, "
+        "item_name, value FROM financial_statements "
+        "ORDER BY release_date, period_end_date",
+        engine,
+    )
+    for column in ["period_end_date", "release_date"]:
+        fundamentals[column] = pd.to_datetime(fundamentals[column]).dt.date
+    fundamentals["value"] = fundamentals["value"].astype(float)
+    return fundamentals
+
+
+def _print_summary(
+    factor_name: str,
+    summary: pd.DataFrame,
+    rolling: pd.DataFrame,
+    turnover: pd.DataFrame,
+) -> None:
+    print(f"\nFactor: {factor_name}")
+    display_cols = [
+        "horizon_days",
+        "ic",
+        "rank_ic",
+        "ic_ir",
+        "ic_tstat",
+        "ic_pvalue",
+        "n_observations",
+        "passes_gate",
+    ]
+    print(summary[display_cols].to_string(index=False))
+
+    if not rolling.empty:
+        latest = (
+            rolling.sort_values(["horizon_days", "score_date"])
+            .groupby("horizon_days")
+            .tail(1)
+        )
+        print("\nLatest rolling IC:")
+        print(
+            latest[
+                [
+                    "score_date",
+                    "horizon_days",
+                    "ic_mean",
+                    "rank_ic_mean",
+                    "ic_ir",
+                    "hit_rate",
+                    "n_dates",
+                ]
+            ].to_string(index=False)
+        )
+
+    if not turnover.empty:
+        print(
+            "\n21-day rank autocorrelation: "
+            f"{turnover['rank_autocorrelation'].mean():.4f}"
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--factors",
+        nargs="+",
+        choices=sorted(_FACTORS),
+        default=["momentum", "lowvol", "value", "quality"],
+    )
+    parser.add_argument("--horizons", nargs="+", type=int, default=_DEFAULT_HORIZONS)
+    parser.add_argument("--train-fraction", type=float, default=0.70)
+    parser.add_argument("--strategy-id", default=_DEFAULT_STRATEGY_ID)
+    parser.add_argument("--min-ic", type=float, default=0.03)
+    parser.add_argument("--min-tstat", type=float, default=2.0)
+    parser.add_argument("--persist", action="store_true")
+    args = parser.parse_args()
+
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("ERROR: DATABASE_URL is not set.", file=sys.stderr)
+        return 1
+
+    engine = create_engine(database_url)
+    prices = _load_prices(engine)
+    dates = sorted(prices["date"].unique())
+    holdout_start = _holdout_start(dates, args.train_fraction)
+    audit = audit_universe_survivorship(prices)
+    fundamentals = None
+
+    print(
+        f"Live prices: {len(prices):,} rows, {prices['ticker'].nunique()} tickers, "
+        f"{len(dates)} dates ({dates[0]} to {dates[-1]})"
+    )
+    print(
+        f"Holdout: {holdout_start} onward "
+        f"(final {(1.0 - args.train_fraction):.0%} of trading dates)"
+    )
+    print(audit["warning"])
+
+    summaries: list[pd.DataFrame] = []
+    for factor_name in args.factors:
+        spec = _FACTORS[factor_name]
+        if spec.needs_fundamentals:
+            if fundamentals is None:
+                fundamentals = _load_fundamentals(engine)
+            holdout_dates = [date for date in dates if date >= holdout_start]
+            scores = spec.compute(
+                fundamentals,
+                prices,
+                score_dates=holdout_dates,
+            )
+        else:
+            scores = spec.compute(prices)
+        holdout_scores = scores[scores["date"] >= holdout_start].copy()
+
+        ic_series = compute_ic_series(
+            holdout_scores,
+            prices,
+            score_col=spec.score_col,
+            horizons=args.horizons,
+        )
+        summary = summarize_ic(
+            ic_series,
+            factor_name=factor_name,
+            strategy_id=args.strategy_id,
+        )
+        summary = _add_gate_columns(summary, args.min_ic, args.min_tstat)
+        rolling = rolling_ic_summary(ic_series, trailing_dates=252, min_dates=30)
+        turnover = compute_factor_turnover(
+            holdout_scores,
+            score_col=spec.score_col,
+            rebalance_days=21,
+        )
+        _print_summary(factor_name, summary, rolling, turnover)
+        summaries.append(summary)
+
+    combined = pd.concat(summaries, ignore_index=True)
+    expected_tests = len(args.factors) * len(args.horizons)
+    passed_tests = int(combined["passes_gate"].sum())
+
+    if args.persist:
+        persisted = _persist_summary(engine, combined)
+        print(f"\nPersisted {persisted} rows to signal_ic_stats.")
+
+    print(
+        f"\nGate result: {passed_tests}/{expected_tests} factor-horizon tests pass "
+        f"(IC >= {args.min_ic:.2%}, t-stat >= {args.min_tstat:.2f})."
+    )
+    return 0 if passed_tests == expected_tests else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

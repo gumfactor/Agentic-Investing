@@ -37,6 +37,7 @@ def _make_fundamentals(
     release_date: date,
     period_end: date,
     items: dict,  # item_name → {ticker: value}
+    period_type: str = "annual",
 ) -> pd.DataFrame:
     """Build synthetic financial_statements rows."""
     rows = []
@@ -47,7 +48,7 @@ def _make_fundamentals(
                     "ticker": ticker,
                     "period_end_date": period_end,
                     "release_date": release_date,
-                    "period_type": "quarterly",
+                    "period_type": period_type,
                     "item_name": item_name,
                     "value": Decimal(str(value)),
                 })
@@ -169,6 +170,61 @@ class TestComputeValueScores:
                 expected_composite.round(6),
                 check_names=False,
             )
+
+    def test_earnings_yield_uses_four_quarter_ttm(self):
+        tickers = TICKERS
+        prices = _make_prices(tickers, [date(2023, 3, 1)])
+        frames = []
+        for quarter, value in [
+            (date(2022, 3, 31), 1.0),
+            (date(2022, 6, 30), 2.0),
+            (date(2022, 9, 30), 3.0),
+            (date(2022, 12, 31), 4.0),
+        ]:
+            frames.append(
+                _make_fundamentals(
+                    tickers,
+                    release_date=quarter + timedelta(days=30),
+                    period_end=quarter,
+                    items={
+                        "net_income": {t: value * (i + 1) for i, t in enumerate(tickers)},
+                        "shares_outstanding": {t: 1.0 for t in tickers},
+                    },
+                    period_type="quarterly",
+                )
+            )
+        result = compute_value_scores(
+            pd.concat(frames, ignore_index=True),
+            prices,
+            score_dates=[date(2023, 3, 1)],
+        )
+        assert not result.empty
+        assert result["earnings_yield"].notna().all()
+
+    def test_stock_value_does_not_come_after_flow_period(self):
+        tickers = TICKERS
+        flow = _make_fundamentals(
+            tickers,
+            date(2023, 2, 1),
+            date(2022, 12, 31),
+            {
+                "net_income": {t: i + 1 for i, t in enumerate(tickers)},
+                "shares_outstanding": {t: 1.0 for t in tickers},
+            },
+        )
+        future_shares = _make_fundamentals(
+            tickers,
+            date(2023, 2, 15),
+            date(2023, 3, 31),
+            {"shares_outstanding": {t: 1000.0 for t in tickers}},
+        )
+        prices = _make_prices(tickers, [date(2023, 3, 1)])
+        result = compute_value_scores(
+            pd.concat([flow, future_shares], ignore_index=True),
+            prices,
+            score_dates=[date(2023, 3, 1)],
+        )
+        assert not result.empty
 
     def test_pit_new_filing_picked_up_after_release_date(self):
         """Score before a new filing uses the old value; score after uses the new."""

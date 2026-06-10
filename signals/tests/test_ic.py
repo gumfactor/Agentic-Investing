@@ -260,6 +260,28 @@ class TestSummarizeIC:
         result = summarize_ic(ic_series, factor_name="f")
         assert result.iloc[0]["ic_tstat"] > 0
 
+    def test_overlapping_horizon_uses_hac_inference(self):
+        """Serially correlated IC should get a smaller HAC t-stat than naive."""
+        rng = np.random.default_rng(42)
+        innovations = rng.normal(0.0, 0.02, 120)
+        values = np.empty(120)
+        values[0] = 0.04 + innovations[0]
+        for i in range(1, len(values)):
+            values[i] = 0.04 + 0.9 * (values[i - 1] - 0.04) + innovations[i]
+        dates = _business_dates(date(2020, 1, 2), len(values))
+        ic_series = pd.DataFrame({
+            "date": dates,
+            "horizon_days": 21,
+            "ic": values,
+            "rank_ic": values,
+            "n_obs": 200,
+        })
+
+        result = summarize_ic(ic_series, factor_name="f")
+        naive_tstat = values.mean() / (values.std(ddof=1) / np.sqrt(len(values)))
+
+        assert result.iloc[0]["ic_tstat"] < naive_tstat
+
     def test_empty_input_returns_empty(self):
         result = summarize_ic(pd.DataFrame(columns=["date", "horizon_days", "ic", "rank_ic", "n_obs"]), "f")
         assert result.empty
