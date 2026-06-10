@@ -34,9 +34,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
+
 import structlog
+
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass  # dotenv not installed; DATABASE_URL must be set in environment directly
@@ -73,11 +76,13 @@ def _write_rows(engine, rows: list[dict]) -> int:
 
     upsert_sql = text(
         "INSERT INTO financial_statements "
-        "(ticker, period_end_date, release_date, period_type, item_name, value, source) "
+        "(ticker, period_end_date, release_date, period_type, item_name, value, "
+        "source, source_version) "
         "VALUES (:ticker, :period_end_date, :release_date, :period_type, "
-        ":item_name, :value, :source) "
+        ":item_name, :value, :source, :source_version) "
         "ON CONFLICT (ticker, period_end_date, release_date, period_type, item_name, source) "
-        "DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()"
+        "DO UPDATE SET value = EXCLUDED.value, "
+        "source_version = EXCLUDED.source_version, ingested_at = NOW()"
     )
 
     with engine.begin() as conn:
@@ -190,14 +195,14 @@ def main() -> int:
                 failed += 1
 
     except KeyboardInterrupt:
-        print("\n\nInterrupted. Progress is saved — re-run without --force to continue.")
+        print("\n\nInterrupted. Progress is saved; re-run without --force to continue.")
 
     _print_progress(min(i + 1, total), total, succeeded, failed, skipped)
     print()  # newline after progress line
 
     elapsed = time.monotonic() - start_time
     print(
-        f"\n{'─' * 50}\n"
+        f"\n{'-' * 50}\n"
         f"Backfill complete in {elapsed:.0f}s\n"
         f"  Succeeded : {succeeded}\n"
         f"  Skipped   : {skipped + skipped_upfront}\n"

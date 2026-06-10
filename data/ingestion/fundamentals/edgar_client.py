@@ -54,9 +54,8 @@ from data.ingestion.fundamentals.concept_map import (
 
 logger = structlog.get_logger(__name__)
 
-_BASE_URL = "https://data.sec.gov"
-_TICKER_MAP_URL = f"{_BASE_URL}/files/company_tickers.json"
-_COMPANY_FACTS_URL = f"{_BASE_URL}/api/xbrl/companyfacts/CIK{{cik}}.json"
+_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
 # 8 req/s to stay safely under the 10 req/s SEC hard limit.
 _INTER_REQUEST_DELAY = 0.13
@@ -77,11 +76,18 @@ class EdgarClient:
     _rate_lock: threading.Lock = threading.Lock()
     _last_request_time: float = 0.0
 
-    def __init__(self, operator_email: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        operator_email: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> None:
         email = operator_email or os.environ.get("OPERATOR_EMAIL", "contact@example.com")
+        resolved_user_agent = (
+            user_agent or f"RQIS-Fundamentals-Ingestion contact:{email}"
+        )
         self._session = requests.Session()
         self._session.headers.update({
-            "User-Agent": f"RQIS-Fundamentals-Ingestion contact:{email}",
+            "User-Agent": resolved_user_agent,
             "Accept-Encoding": "gzip, deflate",
         })
 

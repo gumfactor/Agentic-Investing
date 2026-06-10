@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from data.ingestion.fundamentals.concept_map import CONCEPT_ALIASES
 from data.ingestion.fundamentals.edgar_client import (
     EdgarClient,
     _classify_period,
@@ -15,8 +16,7 @@ from data.ingestion.fundamentals.edgar_client import (
     _extract_concept,
     _parse_observations,
 )
-from data.ingestion.fundamentals.concept_map import CONCEPT_ALIASES
-
+from scripts.backfill_fundamentals import _write_rows
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -243,6 +243,19 @@ class TestComputeDerived:
 
 # ─── EdgarClient (with mocked HTTP) ──────────────────────────────────────────
 
+class TestEdgarClientHeaders:
+    def test_custom_user_agent_override(self):
+        client = EdgarClient(user_agent="MyApp admin@example.com")
+        assert client._session.headers["User-Agent"] == "MyApp admin@example.com"
+
+    def test_operator_email_builds_default_user_agent(self):
+        client = EdgarClient(operator_email="admin@example.com")
+        assert (
+            client._session.headers["User-Agent"]
+            == "RQIS-Fundamentals-Ingestion contact:admin@example.com"
+        )
+
+
 class TestEdgarClientGetCikMap:
     def test_maps_ticker_to_zero_padded_cik(self):
         mock_response = {
@@ -250,8 +263,11 @@ class TestEdgarClientGetCikMap:
             "1": {"ticker": "MSFT", "cik_str": 789019, "title": "Microsoft"},
         }
         client = EdgarClient()
-        with patch.object(client, "_get_json", return_value=mock_response):
+        with patch.object(client, "_get_json", return_value=mock_response) as get_json:
             result = client.get_cik_map()
+        get_json.assert_called_once_with(
+            "https://www.sec.gov/files/company_tickers.json"
+        )
         assert result["AAPL"] == "0000320193"
         assert result["MSFT"] == "0000789019"
 
@@ -338,3 +354,28 @@ class TestEdgarClientBackfill:
             results = client.backfill(["AAPL"], cik_map=cik_map)
         assert "AAPL" in results
         assert len(results["AAPL"]) > 0
+
+
+class TestBackfillWriter:
+    def test_upsert_persists_source_version_and_uses_schema_timestamp(self):
+        engine = MagicMock()
+        connection = engine.begin.return_value.__enter__.return_value
+        rows = [{
+            "ticker": "AAPL",
+            "period_end_date": date(2023, 3, 31),
+            "release_date": date(2023, 5, 5),
+            "period_type": "quarterly",
+            "item_name": "net_income",
+            "value": Decimal("1000"),
+            "source": "sec_edgar",
+            "source_version": "xbrl_companyfacts_v2",
+        }]
+
+        assert _write_rows(engine, rows) == 1
+
+        statement, parameters = connection.execute.call_args.args
+        sql = str(statement)
+        assert "source_version" in sql
+        assert "ingested_at = NOW()" in sql
+        assert "updated_at" not in sql
+        assert parameters == rows
