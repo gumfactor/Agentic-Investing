@@ -3,6 +3,14 @@
 Revision ID: 002
 Revises: 001
 Create Date: 2026-06-09
+
+TimescaleDB constraint
+----------------------
+TimescaleDB requires every unique index (including the PRIMARY KEY) on a
+hypertable to include the partition column.  factor_scores and alpha_scores
+therefore use a composite PRIMARY KEY that includes score_date rather than a
+surrogate id column.  signal_ic_stats is NOT a hypertable so it keeps a
+surrogate id PK.
 """
 
 from __future__ import annotations
@@ -18,17 +26,9 @@ depends_on = None
 
 def upgrade() -> None:
     # ── factor_scores ────────────────────────────────────────────────────────
-    # One row per (ticker, score_date, factor_name, strategy_id).
-    # z_score is the cross-sectional z-score; raw_value is the un-normalized
-    # underlying metric (e.g. 12-month return, realized vol).
-    #
-    # TimescaleDB note: unique constraints on hypertables must include the
-    # partition column (score_date). The UniqueConstraint below satisfies this
-    # requirement (TimescaleDB 2.x enforces it per-chunk, which is correct
-    # because each score_date lands in exactly one chunk).
+    # Composite PK includes score_date (required by TimescaleDB hypertable).
     op.create_table(
         "factor_scores",
-        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("ticker", sa.String(20), nullable=False),
         sa.Column("score_date", sa.Date(), nullable=False),
         sa.Column("factor_name", sa.String(100), nullable=False),
@@ -41,10 +41,9 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("NOW()"),
         ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
+        sa.PrimaryKeyConstraint(
             "ticker", "score_date", "factor_name", "strategy_id",
-            name="uq_factor_scores_key",
+            name="pk_factor_scores",
         ),
     )
     op.create_index(
@@ -63,11 +62,9 @@ def upgrade() -> None:
     )
 
     # ── alpha_scores ─────────────────────────────────────────────────────────
-    # Composite signal score for each (ticker, date, strategy).
-    # rank is 1-based within the universe on that date (1 = highest score).
+    # Composite PK includes score_date (required by TimescaleDB hypertable).
     op.create_table(
         "alpha_scores",
-        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("ticker", sa.String(20), nullable=False),
         sa.Column("score_date", sa.Date(), nullable=False),
         sa.Column("strategy_id", sa.String(100), nullable=False),
@@ -80,10 +77,9 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("NOW()"),
         ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
+        sa.PrimaryKeyConstraint(
             "ticker", "score_date", "strategy_id",
-            name="uq_alpha_scores_key",
+            name="pk_alpha_scores",
         ),
     )
     op.create_index(
@@ -102,9 +98,8 @@ def upgrade() -> None:
     )
 
     # ── signal_ic_stats ──────────────────────────────────────────────────────
-    # IC metrics per (factor, horizon, eval_date, strategy).
-    # eval_date = last date of the evaluation window used to compute the stats.
-    # Not a hypertable — this is a sparse stats table, not a time-series.
+    # Not a hypertable — sparse stats table, not a time-series append.
+    # Surrogate id PK is fine here.
     op.create_table(
         "signal_ic_stats",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
@@ -128,7 +123,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
             "factor_name", "strategy_id", "eval_date", "horizon_days",
-            name="uq_ic_stats_factor_strategy_date_horizon",
+            name="uq_ic_stats_key",
         ),
     )
     op.create_index(
