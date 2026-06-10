@@ -8,6 +8,27 @@ the final portion of trading dates as a chronological holdout, and evaluates
 Usage:
     python scripts/validate_signal_ic.py
     python scripts/validate_signal_ic.py --factors momentum lowvol --persist
+
+FROZEN HOLDOUT WARNING
+----------------------
+The Phase 2 holdout boundary (final 30% of dates as of 2026-06-09) was
+evaluated and its results recorded in the Worklog and PRD on 2026-06-10.
+That boundary is now **frozen**.
+
+Do NOT use this script to iteratively improve a factor and retest on the same
+holdout.  Every such rerun leaks information — the researcher knows the boundary
+date, which creates implicit look-ahead bias even without touching holdout data
+directly.
+
+For any new pre-specified factor or methodology change introduced AFTER
+2026-06-10, use one of:
+  - A later out-of-sample window (extend the dataset, reserve the newest dates)
+  - A fully walk-forward design that never back-calculates using the known split
+  - A separate held-out segment explicitly set aside before development begins
+
+The existing momentum result is valid because it was evaluated before the
+holdout results were used to guide any implementation decision.  Subsequent
+factors must follow the same discipline.
 """
 
 from __future__ import annotations

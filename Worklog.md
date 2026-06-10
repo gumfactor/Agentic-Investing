@@ -21,6 +21,11 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 - Added `scripts/validate_signal_ic.py` with a frozen 70/30 chronological
   split, 21/63-day IC, rolling IC, turnover, survivorship audit, configurable
   gates, and `signal_ic_stats` persistence.
+- Added frozen-holdout contamination warning to `validate_signal_ic.py`
+  docstring: the Phase 2 holdout boundary is now sealed; iterating a factor
+  implementation and retesting on the same split constitutes look-ahead bias
+  even without directly viewing holdout data. New factors must use a later OOS
+  window or a fully walk-forward design.
 - Audited low-vol sign convention independently. The implementation correctly
   gives lower-volatility stocks higher scores; its negative held-out IC is an
   empirical rejection for this sample, not a sign bug.
