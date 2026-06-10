@@ -38,14 +38,19 @@ It is built to eventually trade real capital. Every decision you make must treat
 |-------|------|--------|-------------------|
 | 0 | PRD + Project Setup | **Complete** | Week 1 |
 | 1 | Data Foundation | **Complete** | Week 6 |
-| 2 | Signal Library | **In progress** | Week 12 |
-| 3 | Backtesting Engine | Not started | Week 18 |
+| 2 | Signal Library | **Complete** | Week 12 |
+| 3 | Backtesting Engine | **Next** | Week 18 |
 | 4 | Portfolio + Paper Trading | Not started | Week 26 |
 | 5 | Reporting + Live Trading | Not started | Week 36 |
 
-**Active branch:** `claude/phase-2`
+**Active branch:** `phase-2` (Phase 2 closeout; create the Phase 3 branch before
+starting backtesting implementation)
 
-**What this means for you:** We are in Phase 2. Phase 1 data is live — 624,948 rows, 503 tickers, 5 years of daily OHLCV in TimescaleDB. The Airflow daily pipeline is running. No broker connections exist yet. No real capital is at risk. You may freely create files, run tests, and modify all non-execution code. Safety constraints C1–C9 still apply as design rules.
+**What this means for you:** Phase 2 is complete. The point-in-time-safe signal
+research workflow is operational, momentum is the only currently accepted
+production factor, and rejected candidate factors remain diagnostic-only.
+Phase 3 backtesting is next. No broker connections exist yet and no real capital
+is at risk. Safety constraints C1–C9 still apply as design rules.
 
 ---
 

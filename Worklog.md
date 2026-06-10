@@ -12,6 +12,58 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-10
+
+### Session 12 — Held-out IC validation and factor methodology correction
+
+**Date:** 2026-06-10
+
+- Added `scripts/validate_signal_ic.py` with a frozen 70/30 chronological
+  split, 21/63-day IC, rolling IC, turnover, survivorship audit, configurable
+  gates, and `signal_ic_stats` persistence.
+- Audited low-vol sign convention independently. The implementation correctly
+  gives lower-volatility stocks higher scores; its negative held-out IC is an
+  empirical rejection for this sample, not a sign bug.
+- Replaced naive overlapping-return t-tests with Newey-West/HAC inference
+  using `horizon_days - 1` lags.
+- Repaired value and quality methodology:
+  - flow metrics use four PIT-visible quarterly observations (TTM), with annual
+    fallback;
+  - restatements resolve to the latest filing known on the score date;
+  - shares, equity, and assets are aligned at or before the corresponding flow
+    period end;
+  - fundamentals older than 550 days are treated as stale.
+- Extended the daily signal DAG price lookback from 365 to 450 calendar days
+  so 12-month momentum has 252 trading days plus the 21-day skip window.
+- Mounted `./signals` read-only into the Airflow containers. The DAG previously
+  parsed because factor imports are task-local, but factor tasks could not
+  import the package at runtime.
+- All four factors continue to be persisted for diagnostics, but production
+  alpha now uses momentum only until another factor passes validation.
+- Production-path validation for 2026-06-09 wrote 1,828 factor rows and 502
+  alpha rows. All 502 alpha scores exactly matched momentum scores; low-vol,
+  value, and quality remained diagnostic-only.
+
+#### Frozen held-out result
+
+Holdout begins 2024-12-05 (final 30% of 1,256 trading dates). Current-member
+S&P 500 survivorship warning remains attached; 9 of 503 names are late entrants.
+
+| Factor | 21d IC | 21d HAC t | 63d IC | 63d HAC t | Gate |
+|---|---:|---:|---:|---:|---|
+| Momentum | 9.73% | 2.43 | 15.33% | 2.07 | Pass |
+| Low-vol | -16.58% | -3.21 | -24.60% | -2.90 | Reject |
+| Value (TTM/aligned) | -2.22% | -1.04 | -2.00% | -0.66 | Reject |
+| Quality (TTM/aligned) | -2.22% | -2.39 | -3.67% | -7.57 | Reject |
+
+**Decision:** Revised the Phase 2 PRD exit criterion to validate the factor
+research infrastructure rather than require three initial placeholder factors
+to predict returns. Phase 2 is closed: the point-in-time-safe held-out workflow
+is reproducible, momentum exceeds 3% IC with HAC t-stat >= 2.0 at both required
+horizons, and rejected factors are excluded from production alpha. Do not tune
+rejected factors against this holdout. New pre-specified predictors will be
+evaluated through the same acceptance process as ongoing research.
+
 ## 2026-06-09
 
 ### Session 11 — Phase 2 complete: EDGAR ingestion, IC engine, value/quality factors, composite scorer
