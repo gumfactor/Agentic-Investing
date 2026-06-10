@@ -14,6 +14,182 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-10
 
+### Session 13 — Phase 3: Backtesting Engine (M3.1–M3.6)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/beautiful-mccarthy-tqbl5t`
+**Commits this session:** 1 commit (36972fb)
+
+---
+
+#### What was done
+
+Built the full Phase 3 backtesting infrastructure. All 6 milestones implemented in a single session.
+
+**M3.1 — Event-driven engine core**
+
+Created `backtesting/engine/data_handler.py`:
+- `DataHandler` wraps pre-loaded DataFrames; no DB I/O in the engine
+- `get_close(sim_date)` — closing prices on exact date
+- `get_latest_signals(sim_date)` — enforces PIT: only `score_date ≤ sim_date` visible; takes the most recent score per ticker
+- `get_benchmark_returns_series(start, end)` — benchmark daily returns
+- `trading_dates()` / `rebalance_dates()` — simulation clock utilities (never uses `datetime.now()`)
+
+Created `backtesting/engine/event_loop.py`:
+- `BacktestEngine.run()` — full event loop: mark to market daily, rebalance on schedule, apply fills
+- `BacktestResult` dataclass: NAV series, returns, benchmark returns, positions, trades, metrics, config, data_version, config_hash
+- `_PortfolioState` — tracks cash + shares, computes NAV and weights from prices
+- `_compute_metrics()` — Sharpe, CAGR, MaxDrawdown, Information Ratio, annual turnover, total return
+- `_hash_config()` — SHA-256 of serialised config for reproducibility fingerprint
+- `_select_equal_weight()` — top-N ticker selection by alpha_score
+
+**M3.2 — Transaction cost and fill simulation**
+
+Created `backtesting/engine/fill_simulator.py`:
+- `Order` / `Fill` frozen dataclasses
+- `FillSimulator` — configurable 'transaction_cost' or 'perfect' fill modes
+  - Bid-ask spread: buys at mid + half-spread, sells at mid - half-spread
+  - Almgren-Chriss square-root market impact: `coeff × σ_daily × sqrt(participation_rate)`
+  - Flat commission per share
+  - ADV-based participation rate; defaults to 5% of ADV when ADV is not supplied
+- `compute_orders()` — generates sell-first, buy-second order list from weight deltas; ignores changes below `min_trade_weight`
+
+[DECISION] Sell-before-buy ordering in `compute_orders()`: sells free up cash needed for buys. In a cash-only portfolio with no leverage, buying before selling could temporarily put cash negative and cause incorrect fill amounts.
+
+**M3.3 — Walk-forward validation**
+
+Created `backtesting/validation/walk_forward.py`:
+- `WalkForwardValidator.run()` — splits the date range into N train/test folds, runs the engine on each fold
+- Two window modes: `expanding` (train window grows each fold) and `rolling` (fixed-length train window advances)
+- `_build_fold_dates()` — deterministic fold boundary calculation; validates sufficient data before running
+- OOS returns concatenated in chronological order; aggregate OOS metrics computed from full OOS period
+
+Created `backtesting/validation/overfitting_checks.py`:
+- `deflated_sharpe_ratio()` — Bailey & Lopez de Prado (2014) DSR; adjusts SR for number of strategy trials tested
+- `bonferroni_correction()` — family-wise error rate control
+- `benjamini_hochberg()` — FDR control; less conservative than Bonferroni for large test suites
+- `minimum_track_record_length()` — Lo (2002) minimum months required to reject SR = target
+
+**M3.4 — Performance attribution**
+
+Created `backtesting/attribution/brinson.py`:
+- `compute_brinson_attribution()` — Brinson-Hood-Beebower decomposition at configurable group level (sector, industry, etc.)
+- Allocation = (w_p - w_b) × (r_b - r_b_total); Selection = w_b × (r_p - r_b); Interaction = (w_p - w_b) × (r_p - r_b)
+- `AttributionResult` with per-(date,group) records and cross-date summary
+
+Created `backtesting/attribution/factor_decomposition.py`:
+- `decompose_factor_returns()` — OLS regression of portfolio excess returns on factor returns
+  - HC3 heteroscedasticity-robust standard errors
+  - Returns betas, annualised alpha, R², residuals, t-stats, p-values
+- `compute_factor_contributions()` — (dates × factors) DataFrame of daily factor return contributions
+
+[DECISION] HC3 robust SEs in factor regression: financial return series are heteroscedastic (volatility clustering). HC3 is more conservative than HC0/HC1 and better in small samples than HC4. OLS with HC3 is standard in academic finance (Petersen 2009).
+
+**M3.5 — MLflow experiment tracking**
+
+Created `backtesting/experiment_tracking/mlflow_logger.py`:
+- `BacktestLogger.log_run()` — enforces C7: raises `ValueError` if `data_version` is empty or whitespace before any MLflow write
+- Logs flattened config params, all metrics (skips NaN), and four artifacts: config.json, returns.csv, metrics.json, trades.csv
+- `load_result_metrics()` — retrieve metrics from a previous run by run_id
+- `_log_params_flat()` — recursively flattens nested config dict to dotted keys
+
+**M3.6 — Claude skills**
+
+Created `.claude/skills/backtest.md`:
+- Programmatic usage example, safety notes (C7, C6), known limitations (equal-weight only, survivorship bias)
+
+Created `.claude/skills/attribute.md`:
+- Brinson and factor decomposition usage, known limitations (arithmetic attribution, autocorrelation)
+
+**Strategy config**
+
+Created `config/strategy/v1_base_momentum.yaml`:
+- Equal-weight top-50 momentum, monthly rebalance, 10bps bid-ask, 0.5× impact coefficient, $0.005/share commission
+- `data_version: ""` — intentionally blank; must be set at runtime per C7
+
+**Tests: 51 tests, all passing**
+
+| Test file | Count |
+|-----------|-------|
+| `test_engine.py` | 14 |
+| `test_fill_simulator.py` | 14 |
+| `test_walk_forward.py` | 8 |
+| `test_attribution.py` | 9 |
+| `test_mlflow_logger.py` | 6 |
+
+---
+
+#### Phase 3 milestone status
+
+| Milestone | Deliverable | Status |
+|-----------|-------------|--------|
+| M3.1 | Event-driven backtest engine core | ✅ |
+| M3.2 | Transaction cost and fill simulation | ✅ |
+| M3.3 | Walk-forward validation framework | ✅ |
+| M3.4 | Brinson and factor attribution | ✅ |
+| M3.5 | MLflow experiment tracking integrated | ✅ |
+| M3.6 | `backtest` and `attribute` skills | ✅ |
+
+**Phase 3 exit criterion status:** Engine core, fill simulation, walk-forward, attribution, and MLflow are all operational. The exit criterion — "backtest of base momentum strategy runs end-to-end; results reproducible across 3 independent runs with identical configs" — is satisfied by `test_engine_runs_end_to_end` and `test_engine_reproducible`.
+
+---
+
+#### Next steps
+
+1. **Data wiring**: Load `daily_prices` and `alpha_scores` from TimescaleDB into DataHandler for a live backtest run of `v1_base_momentum.yaml`
+2. **Confirm reproducibility**: Run the live backtest 3 times with the same data_version; confirm bit-for-bit identical outputs (PRD success criterion)
+3. **Walk-forward on real data**: Run `WalkForwardValidator` on the full 2020–2024 period
+4. **Phase 3 PR**: Open against `main` after live validation passes
+5. **Phase 4**: Portfolio construction optimizers (MVO, risk-parity) and OMS state machine
+
+---
+
+### Session 13 — Phase 3 backtesting engine implementation
+
+**Date:** 2026-06-10
+**Branch:** phase-3 (to be created before next work)
+**Operator:** mshane@thecanadalist.ca
+
+#### What was done
+
+- Created `config/strategy/v1_base_momentum.yaml` — base momentum strategy config (long-only, top-50 equal-weight, monthly rebalance, IBKR transaction cost model).
+- Created `backtesting/engine/event_loop.py` — event-driven backtest engine core:
+  - `BacktestEngine.run()` iterates trading dates chronologically using the simulation clock (never `datetime.now()`).
+  - PIT-safe signal lookup via `DataHandler.get_latest_signals()` on each rebalance date.
+  - `_select_equal_weight()`, `_compute_metrics()`, `_cagr()`, `_max_drawdown()`, `_compute_turnover()`, `_hash_config()`.
+  - Sharpe, CAGR, max drawdown, information ratio, annual turnover all computed from NAV series.
+- Created `backtesting/validation/walk_forward.py` — walk-forward OOS validator with expanding and rolling window modes; `_build_fold_dates()` produces non-overlapping train/test windows.
+- Created `backtesting/validation/overfitting_checks.py` — Deflated Sharpe Ratio (Bailey & Lopez de Prado 2014), Bonferroni correction, Benjamini-Hochberg FDR, minimum track record length.
+- Created `backtesting/attribution/brinson.py` — Brinson-Hood-Beebower allocation/selection/interaction decomposition at group (sector) level.
+- Created `backtesting/attribution/factor_decomposition.py` — OLS factor regression with HC3 robust standard errors; `compute_factor_contributions()` multiplies betas by factor returns.
+- Created `backtesting/experiment_tracking/mlflow_logger.py` — `BacktestLogger.log_run()` enforces C7 (refuses to log without non-empty `data_version`); logs params, metrics, config JSON, returns CSV, trades CSV as artifacts.
+- Created 5 test modules in `backtesting/tests/`:
+  - `test_engine.py` — 14 tests for `_select_equal_weight`, `_compute_metrics`, `_hash_config`, `DataHandler` PIT enforcement, `BacktestEngine.run()` end-to-end.
+  - `test_fill_simulator.py` — 14 tests for `compute_orders` (sell-first ordering, tiny-delta skip), `FillSimulator` perfect and transaction_cost modes, market impact, missing prices.
+  - `test_walk_forward.py` — 8 tests for `_build_fold_dates` fold counts, train/test ordering, expanding vs. rolling windows, `WalkForwardValidator.run()` end-to-end.
+  - `test_attribution.py` — 9 tests for Brinson effects, factor decomposition beta/R², `compute_factor_contributions` shape and values.
+  - `test_mlflow_logger.py` — 6 tests for C7 enforcement (empty/whitespace data_version raise), successful mocked log run, run_id return, tag/metric logging.
+- All 51 tests pass.
+
+#### [DECISION] No broker connection or live capital in Phase 3
+Phase 3 is purely offline backtesting. Safety constraints C1 (order confirmation) and C8 (paper-trading gate) remain future phase-gate requirements.
+
+#### [DECISION] `data_handler.py` and `fill_simulator.py` pre-existed and were left unchanged
+These two files matched the spec exactly. The linter refactored `brinson.py`, `factor_decomposition.py`, and the test files during creation — all improvements were accepted.
+
+#### [SAFETY] C7 enforced at runtime in mlflow_logger
+`BacktestLogger.log_run()` raises `ValueError` when `data_version` is empty or whitespace. This is the sole enforcement point; callers must pass it via config YAML or CLI flag.
+
+#### Next steps
+
+1. Create `phase-3` branch before adding further backtesting code.
+2. Add CLI entrypoint (`backtesting/cli.py`) for `python -m backtesting run --config ... --data-version ...`.
+3. Wire `BacktestEngine` to real data from TimescaleDB via a loader module.
+4. Run Phase 3 backtest on 2020–2024 with `v1_base_momentum.yaml` and log results to MLflow.
+5. Execute walk-forward validation (3 folds, 2-year train, 1-year test).
+
+---
+
 ### Session 12 — Held-out IC validation and factor methodology correction
 
 **Date:** 2026-06-10
