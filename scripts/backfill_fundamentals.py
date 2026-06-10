@@ -197,7 +197,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n\nInterrupted. Progress is saved; re-run without --force to continue.")
 
-    _print_progress(min(i + 1, total), total, succeeded, failed, skipped)
+    _print_progress(min((i + 1) if "i" in locals() else 0, total), total, succeeded, failed, skipped)
     print()  # newline after progress line
 
     elapsed = time.monotonic() - start_time

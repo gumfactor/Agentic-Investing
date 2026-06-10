@@ -140,15 +140,19 @@ def _compute_value(**context: Any) -> None:
             text(
                 "SELECT ticker, period_end_date, release_date, period_type, "
                 "item_name, value::float AS value "
-                "FROM financial_statements"
+                "FROM financial_statements "
+                "WHERE release_date <= :as_of "
+                "AND period_end_date >= :cutoff "
+                "AND item_name IN ('net_income', 'total_equity', 'free_cash_flow', 'shares_outstanding')"
             ),
             conn,
+            params={"as_of": score_date, "cutoff": score_date - timedelta(days=550)},
         )
     fund["period_end_date"] = pd.to_datetime(fund["period_end_date"]).dt.date
     fund["release_date"] = pd.to_datetime(fund["release_date"]).dt.date
 
     prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
-    prices = pd.read_json(prices_json, orient="records")
+    prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
     scores = compute_value_scores(fund, prices, score_dates=[score_date])
@@ -181,15 +185,19 @@ def _compute_quality(**context: Any) -> None:
             text(
                 "SELECT ticker, period_end_date, release_date, period_type, "
                 "item_name, value::float AS value "
-                "FROM financial_statements"
+                "FROM financial_statements "
+                "WHERE release_date <= :as_of "
+                "AND period_end_date >= :cutoff "
+                "AND item_name IN ('net_income', 'total_equity', 'total_assets', 'gross_profit', 'operating_cash_flow')"
             ),
             conn,
+            params={"as_of": score_date, "cutoff": score_date - timedelta(days=550)},
         )
     fund["period_end_date"] = pd.to_datetime(fund["period_end_date"]).dt.date
     fund["release_date"] = pd.to_datetime(fund["release_date"]).dt.date
 
     prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
-    prices = pd.read_json(prices_json, orient="records")
+    prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
     scores = compute_quality_scores(fund, prices, score_dates=[score_date])

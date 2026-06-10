@@ -14,8 +14,8 @@ Each factor DataFrame passed to combine_factor_scores must be long-format:
     ticker, date, {composite_col}, [sub-factor columns...]
 
 The composite_col is the column used for the final alpha blend (e.g.
-'momentum_score', 'lowvol_score').  Sub-factor columns are written to
-factor_scores for diagnostics but not used in the alpha blend.
+'momentum_score', 'lowvol_score'). The current implementation persists only
+this composite score per factor into factor_scores (as `z_score`).
 
 Equal-weight blending
 ---------------------
