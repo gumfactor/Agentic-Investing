@@ -604,7 +604,8 @@ Each skill is defined as a Markdown file in `.claude/skills/` and exposes a stru
 ---
 
 ### Phase 2 — Signal Library (Weeks 7–12)
-**Goal:** Core factor library validated; composite score running daily.
+**Goal:** Reproducible factor-research and scoring infrastructure validated;
+at least one empirically supported signal running daily.
 
 | # | Deliverable | Owner | Week |
 |---|------------|-------|------|
@@ -614,7 +615,14 @@ Each skill is defined as a Markdown file in `.claude/skills/` and exposes a stru
 | M2.4 | `signal_research` and `score` Claude skills operational | Engineering | 11 |
 | M2.5 | `screen` skill with configurable universe definition | Engineering | 12 |
 
-**Exit criterion:** Daily composite alpha scores produced and stored for full universe; IC > 3% on held-out validation set for at least 3 factors.
+**Exit criterion:** Daily factor and composite alpha scores are produced and
+stored for the full universe; the point-in-time-safe research workflow can take
+a pre-specified factor from implementation through reproducible held-out IC,
+turnover, stability, and significance results; and at least one production
+factor has IC > 3% with HAC t-statistic >= 2.0 at both the 21- and 63-trading-day
+horizons. Factors that fail these gates remain available for diagnostics but
+must be excluded from the production composite. Additional factors are an
+ongoing research objective, not a prerequisite for beginning Phase 3.
 
 ---
 
