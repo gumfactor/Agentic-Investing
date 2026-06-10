@@ -14,6 +14,61 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-10
 
+### Session 14 — Phase 3: Codex bug-fix commit
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/phase-3`
+**Commits this session:** 7a98021
+
+---
+
+#### What was done
+
+Applied and committed three blocking fixes identified by Codex review of the Phase 3 engine.
+
+**Fix 1 — Look-ahead bias (Codex finding #2)**
+
+`DataHandler.get_latest_signals()` previously used `score_date <= sim_date`, allowing signals computed from day-t's closing prices to be traded at the same close. This is look-ahead bias: the signal cannot exist before the close prints. Changed to strict `score_date < sim_date`. Updated docstring to explain the 1-day execution lag invariant.
+
+**Fix 2 — Non-deterministic order generation (Codex finding #6)**
+
+`compute_orders()` in `fill_simulator.py` iterated over `set(target_weights) | set(current_weights)`. Python set iteration order is hash-randomised across processes, so three separate process runs could produce different order sequences and therefore different fills. Changed to `sorted(set(...) | set(...))` for stable alphabetical ordering.
+
+**Fix 3 — Cash can go negative (Codex finding #5)**
+
+Initial full deployment allocated 100% of NAV to buys, then transaction costs (spread + impact + commission) consumed cash that no longer existed. Replaced single-pass rebalance in `event_loop.py` with a two-pass approach: execute all sells first to free cash, then scale buy notional to `portfolio.cash * 0.995 / nav` so costs cannot push cash below zero. The 0.5% haircut absorbs worst-case spread + impact on a normal-sized initial deployment.
+
+**New regression tests (3)**
+
+- `test_data_handler_no_same_day_execution` — asserts that `score_date == sim_date` returns empty signals
+- `test_engine_cash_never_negative` — runs full deployment with `transaction_cost` fill model; asserts `all(NAV >= 0)`
+- `test_compute_orders_deterministic` — reverses dict insertion order; asserts ticker sequence is identical
+
+**Test results:** 210 tests pass across `backtesting/` and `signals/` (up from 51 backtesting-only at end of Session 13).
+
+---
+
+#### Pending architectural items (from Codex review — not yet addressed)
+
+| Finding | Description | Priority |
+|---------|-------------|----------|
+| #1 | Data-version provenance: MinIO snapshot covers prices only, not alpha scores or corporate actions | High |
+| #3 | Unadjusted prices: splits produce fictitious P&L; need to apply `corporate_actions.py` factors in loader | High |
+| #4 | Config fields unimplemented: `min_holding_days`, `max_position_weight`, `min_market_cap_usd`, etc. are in YAML but ignored by engine | Medium |
+| #7 | Historical alpha unavailable: Airflow DAG started 2026-06-09; 2020–2024 backtest requires signal backfill script | High |
+
+---
+
+#### Next steps
+
+1. **Address finding #3 (adjusted prices)**: Apply `corporate_actions.py` adjustment factors in the backtest loader before constructing `DataHandler`. Write one test with a synthetic split through the complete engine.
+2. **Address finding #7 (historical backfill)**: Write `scripts/backfill_momentum_scores.py` to regenerate momentum alpha scores for 2020–2024 from a pinned price snapshot.
+3. **Address finding #1 (dataset bundle)**: Define a versioned input manifest that covers prices + alpha scores + corporate actions + benchmark + universe + strategy git commit.
+4. **Address finding #4 (config enforcement)**: Implement `min_holding_days` hold-timer in the rebalance loop; add `max_position_weight` cap in `_select_equal_weight`.
+5. **Phase 3 PR**: Open against `main` once the adjusted-price loader and historical backfill are in place and live validation passes.
+
+---
+
 ### Session 13 — Phase 3: Backtesting Engine (M3.1–M3.6)
 
 **Operator:** mshane@thecanadalist.ca
