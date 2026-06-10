@@ -58,9 +58,7 @@ def audit_universe_survivorship(prices: pd.DataFrame) -> dict:
     provides a consistent label for IC output.
 
     Args:
-        prices: Long-format DataFrame with columns ``ticker``, ``date``,
-            ``close``.
-
+        prices: Long-format DataFrame with columns ``ticker`` and ``date``.
     Returns:
         dict with keys:
           - ``total_tickers`` (int)

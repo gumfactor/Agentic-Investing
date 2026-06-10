@@ -280,8 +280,7 @@ def multiple_testing_correction(
 
     Returns:
         Input DataFrame with two additional columns:
-            ``corrected_pvalue`` — BH/BHY-adjusted p-value (the effective
-            threshold, not a transformed p-value).
+            ``corrected_pvalue`` — BH/BHY-adjusted p-value (q-value).
             ``significant`` — bool, True if the test survives correction.
     """
     if "ic_pvalue" not in summaries.columns:
