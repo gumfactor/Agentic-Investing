@@ -316,3 +316,201 @@ def test_engine_no_dates_raises():
     engine = BacktestEngine()
     with pytest.raises(ValueError, match="No trading dates"):
         engine.run(config, handler, fill_sim)
+
+
+# ------------------------------------------------------------------
+# _select_equal_weight — max_position_weight
+# ------------------------------------------------------------------
+
+def test_select_equal_weight_cap_applies():
+    """Weight = min(1/N, max_position_weight); residual stays in cash."""
+    signals = pd.DataFrame({
+        "ticker": ["A", "B", "C"],
+        "score_date": [date(2023, 1, 2)] * 3,
+        "alpha_score": [3.0, 2.0, 1.0],
+    })
+    # 1/3 ≈ 0.333 > 0.25 → cap at 0.25 per position
+    weights = _select_equal_weight(signals, n_long=3, max_position_weight=0.25)
+    assert set(weights.keys()) == {"A", "B", "C"}
+    assert all(abs(w - 0.25) < 1e-9 for w in weights.values())
+    assert abs(sum(weights.values()) - 0.75) < 1e-9  # 0.25 cash in reserve
+
+
+def test_select_equal_weight_cap_no_effect_below_threshold():
+    """Cap has no effect when 1/N <= max_position_weight."""
+    signals = pd.DataFrame({
+        "ticker": ["A", "B", "C", "D", "E"],
+        "score_date": [date(2023, 1, 2)] * 5,
+        "alpha_score": [5.0, 4.0, 3.0, 2.0, 1.0],
+    })
+    # 1/5 = 0.20 <= 0.25 → unchanged
+    weights = _select_equal_weight(signals, n_long=5, max_position_weight=0.25)
+    assert all(abs(w - 0.20) < 1e-9 for w in weights.values())
+
+
+# ------------------------------------------------------------------
+# min_holding_days enforcement
+# ------------------------------------------------------------------
+
+def _make_daily_config(start: str = "2023-01-02", end: str = "2023-03-31") -> dict:
+    cfg = _make_config(start, end)
+    cfg["portfolio"]["rebalance_frequency"] = "daily"
+    cfg["portfolio"]["min_holding_days"] = 5   # 5 trading days lock
+    return cfg
+
+
+def test_min_holding_days_prevents_early_sell():
+    """A position opened today must NOT be sold within min_holding_days."""
+    tickers = ["AAPL", "GOOG", "MSFT"]
+    prices = _make_prices(60, tickers)
+    # Signal on day 0 selects AAPL; signal on day 1 selects GOOG only.
+    # With min_holding_days=5, AAPL should NOT be sold on day 1.
+    signal_day0 = date(2022, 12, 28)
+    signal_day1 = date(2023, 1, 3)   # one trading day after 2023-01-02
+    signals = pd.DataFrame([
+        {"ticker": "AAPL", "score_date": signal_day0, "alpha_score": 10.0},
+        {"ticker": "GOOG", "score_date": signal_day0, "alpha_score": 1.0},
+        # On day 1, GOOG becomes the top-1 signal
+        {"ticker": "GOOG", "score_date": signal_day1, "alpha_score": 10.0},
+        {"ticker": "AAPL", "score_date": signal_day1, "alpha_score": 1.0},
+    ])
+    benchmark = _make_benchmark(60)
+    handler = DataHandler(prices, signals, benchmark)
+
+    config = _make_daily_config("2023-01-02", "2023-01-20")
+    config["portfolio"]["n_long"] = 1
+
+    fill_sim = FillSimulator(fill_model="perfect")
+    result = BacktestEngine().run(config, handler, fill_sim)
+
+    # If min_holding_days is respected, AAPL should NOT appear as a SELL trade
+    # within the first 5 trading days after the first rebalance.
+    if not result.trades.empty:
+        aapl_sells = result.trades[
+            (result.trades["ticker"] == "AAPL") &
+            (result.trades["direction"] == "SELL")
+        ]
+        if not aapl_sells.empty:
+            first_sell_date = aapl_sells["date"].min()
+            # AAPL was bought on 2023-01-02; must not be sold before 5 trading days have passed.
+            assert first_sell_date > date(2023, 1, 6), (
+                f"AAPL sold too early ({first_sell_date}); min_holding_days=5 violated"
+            )
+
+
+def test_engine_max_position_weight_via_config():
+    """max_position_weight from config is respected: per-position weight capped."""
+    tickers = ["AAPL", "GOOG", "MSFT"]
+    prices = _make_prices(60, tickers)
+    signals = pd.DataFrame([
+        {"ticker": t, "score_date": date(2022, 12, 28), "alpha_score": float(i)}
+        for i, t in enumerate(tickers)
+    ])
+    benchmark = _make_benchmark(60)
+    handler = DataHandler(prices, signals, benchmark)
+
+    config = _make_config("2023-01-02", "2023-03-15")
+    config["portfolio"]["n_long"] = 3
+    config["portfolio"]["max_position_weight"] = 0.25   # 1/3 > 0.25 → cap binds
+
+    fill_sim = FillSimulator(fill_model="perfect")
+    result = BacktestEngine().run(config, handler, fill_sim)
+
+    # Positions DataFrame should show no ticker exceeding 0.25 + small tolerance
+    if not result.positions.empty:
+        max_weight = result.positions.max().max()
+        assert max_weight <= 0.25 + 1e-4, (
+            f"max_position_weight=0.25 violated; observed {max_weight:.4f}"
+        )
+
+
+# ------------------------------------------------------------------
+# backtesting/loader.py — Finding #3
+# ------------------------------------------------------------------
+
+def _make_loader_prices(tickers=("AAPL",)) -> pd.DataFrame:
+    rows = []
+    for i in range(30):
+        d = date(2023, 1, 2) + timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        for t in tickers:
+            rows.append({"ticker": t, "date": d, "close": 150.0, "source": "yfinance"})
+    return pd.DataFrame(rows)
+
+
+def test_loader_adjust_prices_no_actions():
+    """With no corporate actions all adj_factors = 1.0; close unchanged."""
+    from backtesting.loader import _adjust_prices
+    prices = _make_loader_prices()
+    corp = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value"])
+    result = _adjust_prices(prices, corp)
+    assert "close" in result.columns
+    assert all(abs(result["close"] - 150.0) < 1e-6)
+
+
+def test_loader_adjust_prices_split():
+    """A 2-for-1 split halves prices before ex-date."""
+    from backtesting.loader import _adjust_prices
+    prices = _make_loader_prices()
+    split_date = date(2023, 1, 10)
+    corp = pd.DataFrame([{
+        "ticker": "AAPL",
+        "ex_date": split_date,
+        "action_type": "split",
+        "value": 2.0,
+    }])
+    result = _adjust_prices(prices, corp)
+    before_split = result[result["date"] < split_date]
+    after_split = result[result["date"] >= split_date]
+    assert all(abs(before_split["close"] - 75.0) < 1e-3)
+    assert all(abs(after_split["close"] - 150.0) < 1e-3)
+
+
+# ------------------------------------------------------------------
+# backtesting/dataset_manifest.py — Finding #1
+# ------------------------------------------------------------------
+
+def test_build_manifest_row_counts():
+    """build_manifest captures correct row counts for each data type."""
+    from backtesting.dataset_manifest import build_manifest
+    prices = _make_loader_prices(["AAPL", "GOOG"])
+    alpha = pd.DataFrame({
+        "ticker": ["AAPL"], "score_date": [date(2023, 1, 2)],
+        "strategy_id": ["v1"], "alpha_score": [1.0],
+    })
+    corp = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value"])
+    bm = pd.DataFrame({"date": [date(2023, 1, 2)], "close": [400.0]})
+
+    manifest = build_manifest(
+        version="2026-06-10",
+        strategy_id="v1",
+        dataframes={
+            "daily_prices": prices,
+            "alpha_scores": alpha,
+            "corporate_actions": corp,
+            "benchmark": bm,
+        },
+        object_paths={
+            "daily_prices": "rqis-snapshots/snapshots/daily_prices/2026-06-10/data.parquet",
+        },
+        snapshot_dates={"daily_prices": date(2026, 6, 10)},
+    )
+
+    assert manifest.version == "2026-06-10"
+    assert manifest.strategy_id == "v1"
+    assert manifest.row_counts["daily_prices"] == len(prices)
+    assert manifest.row_counts["alpha_scores"] == 1
+    assert manifest.row_counts["corporate_actions"] == 0
+    assert len(manifest.git_commit) > 0
+    assert "daily_prices" in manifest.date_ranges
+
+
+def test_build_manifest_schema_hashes_differ_by_columns():
+    """Schema hashes differ when column sets differ."""
+    from backtesting.dataset_manifest import build_manifest
+    df1 = pd.DataFrame({"ticker": [], "date": [], "close": []})
+    df2 = pd.DataFrame({"ticker": [], "score_date": [], "alpha_score": []})
+    m1 = build_manifest("v1", "v1", {"a": df1}, {}, {})
+    m2 = build_manifest("v1", "v1", {"a": df2}, {}, {})
+    assert m1.schema_hashes["a"] != m2.schema_hashes["a"]

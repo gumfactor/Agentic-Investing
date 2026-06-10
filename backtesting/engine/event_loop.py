@@ -56,7 +56,8 @@ class BacktestResult:
 @dataclass
 class _PortfolioState:
     cash: float
-    positions: dict[str, float]    # ticker → shares held
+    positions: dict[str, float]          # ticker → shares held
+    entry_dates: dict[str, date] = field(default_factory=dict)  # ticker → first buy date
 
     def nav(self, close_prices: dict[str, float]) -> float:
         equity = sum(
@@ -78,13 +79,17 @@ class _PortfolioState:
     def apply_fills(self, fills: list[Fill]) -> None:
         for f in fills:
             if f.direction == "BUY":
-                self.positions[f.ticker] = self.positions.get(f.ticker, 0.0) + f.shares
+                prev_shares = self.positions.get(f.ticker, 0.0)
+                self.positions[f.ticker] = prev_shares + f.shares
                 self.cash -= f.notional + f.total_cost
+                if prev_shares < 1e-6:  # new position — record entry date
+                    self.entry_dates[f.ticker] = f.sim_date
             else:
                 self.positions[f.ticker] = self.positions.get(f.ticker, 0.0) - f.shares
                 self.cash += f.notional - f.total_cost
             if self.positions.get(f.ticker, 0.0) < 1e-6:
                 self.positions.pop(f.ticker, None)
+                self.entry_dates.pop(f.ticker, None)
 
 
 class BacktestEngine:
@@ -122,11 +127,16 @@ class BacktestEngine:
         initial_capital = float(bt_cfg["initial_capital"])
         n_long = int(port_cfg["n_long"])
         rebal_freq = port_cfg.get("rebalance_frequency", "monthly")
+        min_holding_days = int(port_cfg.get("min_holding_days", 0))
+        max_position_weight = float(port_cfg.get("max_position_weight", 1.0))
         data_version = config.get("data_version", "")
 
         trading_dates = data_handler.trading_dates(start, end)
         if not trading_dates:
             raise ValueError(f"No trading dates found between {start} and {end}")
+
+        # O(1) held-days lookup: maps each sim date to its ordinal position.
+        date_index: dict[date, int] = {d: i for i, d in enumerate(trading_dates)}
 
         rebal_dates = set(data_handler.rebalance_dates(start, end, rebal_freq))
         portfolio = _PortfolioState(cash=initial_capital, positions={})
@@ -153,9 +163,25 @@ class BacktestEngine:
             if sim_date in rebal_dates:
                 signals = data_handler.get_latest_signals(sim_date)
                 if not signals.empty:
-                    target_weights = _select_equal_weight(signals, n_long)
+                    target_weights = _select_equal_weight(
+                        signals, n_long, max_position_weight
+                    )
                     current_weights = portfolio.weights(close_prices)
                     orders = compute_orders(target_weights, current_weights)
+
+                    # Drop sell orders for positions held fewer than min_holding_days.
+                    if min_holding_days > 0:
+                        sim_idx = date_index[sim_date]
+                        locked = {
+                            t for t, entry in portfolio.entry_dates.items()
+                            if sim_idx - date_index.get(entry, 0) < min_holding_days
+                        }
+                        if locked:
+                            orders = [
+                                o for o in orders
+                                if not (o.direction == "SELL" and o.ticker in locked)
+                            ]
+
                     nav = portfolio.nav(close_prices)
 
                     # Pass 1: execute sells first to free cash.
@@ -239,8 +265,14 @@ class BacktestEngine:
 def _select_equal_weight(
     signals: pd.DataFrame,
     n_long: int,
+    max_position_weight: float = 1.0,
 ) -> dict[str, float]:
-    """Select top n_long tickers by alpha_score and assign equal weights."""
+    """Select top n_long tickers by alpha_score and assign equal weights.
+
+    Each weight = min(1/N, max_position_weight).  When the cap binds,
+    residual capital remains in cash rather than being redistributed —
+    this avoids inadvertently concentrating a constrained portfolio.
+    """
     top = (
         signals.nlargest(n_long, "alpha_score")
         if len(signals) > n_long
@@ -248,7 +280,7 @@ def _select_equal_weight(
     )
     if top.empty:
         return {}
-    weight = 1.0 / len(top)
+    weight = min(1.0 / len(top), max_position_weight)
     return dict(zip(top["ticker"], [weight] * len(top)))
 
 

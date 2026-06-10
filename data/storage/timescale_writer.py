@@ -165,6 +165,103 @@ class TimescaleWriter:
         logger.info("upsert_corporate_actions_complete", rows_written=rows_written)
         return rows_written
 
+    def upsert_factor_scores(self, df: pd.DataFrame) -> int:
+        """Upsert factor z-scores into factor_scores.
+
+        Required columns: ticker, score_date, factor_name, strategy_id, z_score.
+        Optional: raw_value.
+        Returns the number of rows written.
+        """
+        if df.empty:
+            return 0
+        required = {"ticker", "score_date", "factor_name", "strategy_id", "z_score"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"upsert_factor_scores: missing required columns {missing}")
+
+        rows_written = 0
+        for batch in _iter_batches(df, self._batch_size):
+            rows = [
+                {
+                    "ticker": row["ticker"],
+                    "score_date": row["score_date"],
+                    "factor_name": row["factor_name"],
+                    "strategy_id": row["strategy_id"],
+                    "z_score": _to_decimal_or_none(row["z_score"]),
+                    "raw_value": _to_decimal_or_none(row.get("raw_value")),
+                }
+                for _, row in batch.iterrows()
+            ]
+            with self._engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO factor_scores
+                            (ticker, score_date, factor_name, strategy_id, z_score, raw_value)
+                        VALUES
+                            (:ticker, :score_date, :factor_name, :strategy_id, :z_score, :raw_value)
+                        ON CONFLICT (ticker, score_date, factor_name, strategy_id) DO UPDATE SET
+                            z_score     = EXCLUDED.z_score,
+                            raw_value   = EXCLUDED.raw_value,
+                            computed_at = NOW()
+                        """
+                    ),
+                    rows,
+                )
+            rows_written += len(rows)
+
+        logger.info("upsert_factor_scores_complete", rows_written=rows_written)
+        return rows_written
+
+    def upsert_alpha_scores(self, df: pd.DataFrame) -> int:
+        """Upsert composite alpha scores into alpha_scores.
+
+        Required columns: ticker, score_date, strategy_id, alpha_score.
+        Optional: rank, universe_size.
+        Returns the number of rows written.
+        """
+        if df.empty:
+            return 0
+        required = {"ticker", "score_date", "strategy_id", "alpha_score"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"upsert_alpha_scores: missing required columns {missing}")
+
+        rows_written = 0
+        for batch in _iter_batches(df, self._batch_size):
+            rows = [
+                {
+                    "ticker": row["ticker"],
+                    "score_date": row["score_date"],
+                    "strategy_id": row["strategy_id"],
+                    "alpha_score": _to_decimal_or_none(row["alpha_score"]),
+                    "rank": _to_int_or_none(row.get("rank")),
+                    "universe_size": _to_int_or_none(row.get("universe_size")),
+                }
+                for _, row in batch.iterrows()
+            ]
+            with self._engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO alpha_scores
+                            (ticker, score_date, strategy_id, alpha_score, rank, universe_size)
+                        VALUES
+                            (:ticker, :score_date, :strategy_id, :alpha_score, :rank, :universe_size)
+                        ON CONFLICT (ticker, score_date, strategy_id) DO UPDATE SET
+                            alpha_score    = EXCLUDED.alpha_score,
+                            rank           = EXCLUDED.rank,
+                            universe_size  = EXCLUDED.universe_size,
+                            computed_at    = NOW()
+                        """
+                    ),
+                    rows,
+                )
+            rows_written += len(rows)
+
+        logger.info("upsert_alpha_scores_complete", rows_written=rows_written)
+        return rows_written
+
     def write_quality_flags(self, df: pd.DataFrame) -> int:
         """Write quality flags. Existing flags for the same (ticker, date, flag_type) are not updated
         — duplicate flags are silently skipped (ON CONFLICT DO NOTHING).
