@@ -41,8 +41,14 @@ from airflow.operators.python import PythonOperator
 
 _MARKET_TIMEZONE = pendulum.timezone("America/New_York")
 _DAG_START_DATE = pendulum.datetime(2026, 6, 9, 21, 30, tz=_MARKET_TIMEZONE)
-_PRICE_LOOKBACK_DAYS = 365   # days of price history to load for factor computation
+# 12-month momentum needs 252 trading days plus the 21-day skip window.
+_PRICE_LOOKBACK_DAYS = 450
 _DEFAULT_STRATEGY_ID = "v1_base_momentum"
+# All factors remain persisted for diagnostics. Only momentum currently clears
+# the frozen held-out IC and HAC significance gates for production alpha.
+_COMPOSITE_FACTOR_WEIGHTS = {
+    "momentum": 1.0,
+}
 
 _default_args: dict[str, Any] = {
     "owner": "rqis",
@@ -241,6 +247,7 @@ def _combine_scores(**context: Any) -> None:
         score_col_map=score_col_map,
         strategy_id=strategy_id,
         score_date=score_date,
+        weights=_COMPOSITE_FACTOR_WEIGHTS,
     )
 
     context["ti"].xcom_push(

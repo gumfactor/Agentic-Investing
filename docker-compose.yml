@@ -27,6 +27,7 @@ x-airflow-common: &airflow-common
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/plugins:/opt/airflow/plugins
     - ./data:/opt/airflow/rqis/data:ro
+    - ./signals:/opt/airflow/rqis/signals:ro
     - ./config:/opt/airflow/rqis/config:ro
     - airflow_logs:/opt/airflow/logs
   depends_on:
