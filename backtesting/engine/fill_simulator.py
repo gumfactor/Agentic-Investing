@@ -175,7 +175,7 @@ def compute_orders(
     Returns:
         List of Orders sorted by sell-first (to free cash before buying).
     """
-    all_tickers = set(target_weights) | set(current_weights)
+    all_tickers = sorted(set(target_weights) | set(current_weights))
     sells: list[Order] = []
     buys: list[Order] = []
     for ticker in all_tickers:

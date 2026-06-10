@@ -64,10 +64,15 @@ class DataHandler:
     def get_latest_signals(self, sim_date: date) -> pd.DataFrame:
         """Most-recent alpha_score per ticker visible on sim_date.
 
-        Enforces PIT: only scores with score_date <= sim_date are returned.
+        Enforces PIT with a 1-day execution lag: scores computed from day t's
+        closing prices are only tradeable from day t+1 onwards.  Using the same
+        close to both compute a signal and fill the resulting order is look-ahead
+        bias — the signal did not exist before the close printed.
+
+        Only scores with score_date < sim_date (strictly less than) are returned.
         Returns a DataFrame with columns ticker, score_date, alpha_score.
         """
-        mask = self._alpha_scores["score_date"] <= sim_date
+        mask = self._alpha_scores["score_date"] < sim_date
         visible = self._alpha_scores[mask]
         if visible.empty:
             return pd.DataFrame(columns=["ticker", "score_date", "alpha_score"])

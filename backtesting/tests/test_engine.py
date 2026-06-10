@@ -38,11 +38,15 @@ def _make_prices(n_days: int = 60, tickers: list[str] | None = None) -> pd.DataF
 
 
 def _make_signals(n_days: int = 60, tickers: list[str] | None = None) -> pd.DataFrame:
-    """Generate synthetic alpha scores."""
+    """Generate synthetic alpha scores.
+
+    Signals start 5 calendar days before the price series (2022-12-28) so
+    they are available on the first trading day after the 1-day execution lag.
+    """
     if tickers is None:
         tickers = ["AAPL", "GOOG", "MSFT", "AMZN", "META"]
-    start = date(2023, 1, 2)
-    dates = [start + timedelta(days=i) for i in range(0, n_days, 21)]  # monthly scores
+    signal_start = date(2022, 12, 28)  # 5 days before 2023-01-02 price start
+    dates = [signal_start + timedelta(days=i) for i in range(0, n_days, 21)]
     dates = [d for d in dates if d.weekday() < 5]
     rows = []
     for i, d in enumerate(dates):
@@ -178,13 +182,72 @@ def test_data_handler_pit_enforcement():
     benchmark = _make_benchmark(30)
     handler = DataHandler(prices, signals, benchmark)
 
-    # Signal date is 2023-02-01; querying on 2023-01-15 should return empty
+    # Earlier date: no signal yet
     early = handler.get_latest_signals(date(2023, 1, 15))
     assert early.empty
 
-    # Querying on 2023-02-01 should return the signal
-    on_date = handler.get_latest_signals(date(2023, 2, 1))
-    assert len(on_date) == 1
+    # Same day as signal: NOT tradeable (signal uses that day's close — look-ahead)
+    same_day = handler.get_latest_signals(date(2023, 2, 1))
+    assert same_day.empty
+
+    # Next day: tradeable
+    next_day = handler.get_latest_signals(date(2023, 2, 2))
+    assert len(next_day) == 1
+
+
+def test_data_handler_no_same_day_execution():
+    """Confirm that score_date == sim_date is explicitly blocked."""
+    prices = _make_prices(5, ["AAPL"])
+    signals = pd.DataFrame({
+        "ticker": ["AAPL", "AAPL"],
+        "score_date": [date(2023, 1, 3), date(2023, 1, 4)],
+        "alpha_score": [1.0, 2.0],
+    })
+    benchmark = _make_benchmark(5)
+    handler = DataHandler(prices, signals, benchmark)
+
+    # On 2023-01-04: only the 2023-01-03 score is visible, not the 2023-01-04 one
+    visible = handler.get_latest_signals(date(2023, 1, 4))
+    assert len(visible) == 1
+    assert visible.iloc[0]["score_date"] == date(2023, 1, 3)
+
+
+def test_engine_cash_never_negative():
+    """Full initial deployment with transaction costs must not push cash negative."""
+    tickers = ["AAPL", "GOOG", "MSFT"]
+    prices = _make_prices(60, tickers)
+    # Signals available before the first price date so trading starts immediately
+    signals = pd.DataFrame([
+        {"ticker": t, "score_date": date(2022, 12, 28), "alpha_score": float(i)}
+        for i, t in enumerate(tickers)
+    ])
+    benchmark = _make_benchmark(60)
+    handler = DataHandler(prices, signals, benchmark)
+
+    config = _make_config("2023-01-02", "2023-03-15")
+    fill_sim = FillSimulator(
+        bid_ask_spread_bps=20.0,
+        market_impact_coeff=0.5,
+        commission_per_share=0.01,
+        fill_model="transaction_cost",
+    )
+    result = BacktestEngine().run(config, handler, fill_sim)
+
+    assert (result.nav_series >= 0).all(), "NAV went negative — cash constraint violated"
+
+
+def test_compute_orders_deterministic():
+    """Order list must be identical regardless of dict insertion order."""
+    from backtesting.engine.fill_simulator import compute_orders
+    tickers = [f"T{i:03d}" for i in range(50)]
+    target = {t: 0.02 for t in tickers}
+    current = {t: 0.015 for t in tickers}
+    # Reverse insertion order — a set-based implementation would differ
+    target_rev = dict(reversed(list(target.items())))
+    current_rev = dict(reversed(list(current.items())))
+    orders1 = compute_orders(target, current)
+    orders2 = compute_orders(target_rev, current_rev)
+    assert [o.ticker for o in orders1] == [o.ticker for o in orders2]
 
 
 # ------------------------------------------------------------------

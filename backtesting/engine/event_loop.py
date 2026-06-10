@@ -31,7 +31,7 @@ import pandas as pd
 import structlog
 
 from backtesting.engine.data_handler import DataHandler
-from backtesting.engine.fill_simulator import Fill, FillSimulator, compute_orders
+from backtesting.engine.fill_simulator import Fill, FillSimulator, Order, compute_orders
 
 logger = structlog.get_logger(__name__)
 
@@ -156,11 +156,40 @@ class BacktestEngine:
                     target_weights = _select_equal_weight(signals, n_long)
                     current_weights = portfolio.weights(close_prices)
                     orders = compute_orders(target_weights, current_weights)
-                    fills = fill_simulator.simulate_fills(
-                        orders, close_prices, sim_date, portfolio.nav(close_prices)
+                    nav = portfolio.nav(close_prices)
+
+                    # Pass 1: execute sells first to free cash.
+                    sell_orders = [o for o in orders if o.direction == "SELL"]
+                    sell_fills = fill_simulator.simulate_fills(
+                        sell_orders, close_prices, sim_date, nav
                     )
-                    portfolio.apply_fills(fills)
-                    all_fills.extend(fills)
+                    portfolio.apply_fills(sell_fills)
+                    all_fills.extend(sell_fills)
+
+                    # Pass 2: scale buys to 99.5% of available cash so transaction
+                    # costs cannot push cash below zero on the initial full deployment.
+                    buy_orders = [o for o in orders if o.direction == "BUY"]
+                    if buy_orders and portfolio.cash > 0:
+                        total_buy_delta = sum(abs(o.delta_weight) for o in buy_orders)
+                        max_buy_weight = (portfolio.cash * 0.995) / nav
+                        scale = min(1.0, max_buy_weight / total_buy_delta) if total_buy_delta > 0 else 0.0
+                        if scale > 0:
+                            if scale < 1.0:
+                                buy_orders = [
+                                    Order(
+                                        ticker=o.ticker,
+                                        direction=o.direction,
+                                        target_weight=o.target_weight * scale,
+                                        current_weight=o.current_weight,
+                                        delta_weight=o.delta_weight * scale,
+                                    )
+                                    for o in buy_orders
+                                ]
+                            buy_fills = fill_simulator.simulate_fills(
+                                buy_orders, close_prices, sim_date, nav
+                            )
+                            portfolio.apply_fills(buy_fills)
+                            all_fills.extend(buy_fills)
 
             current_nav = portfolio.nav(close_prices)
             nav_records.append((sim_date, current_nav))
