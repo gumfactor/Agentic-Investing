@@ -360,17 +360,20 @@ def _make_daily_config(start: str = "2023-01-02", end: str = "2023-03-31") -> di
 
 
 def test_min_holding_days_prevents_early_sell():
-    """A position opened today must NOT be sold within min_holding_days."""
+    """A position opened today must NOT be sold within min_holding_days.
+
+    Setup: n_long=1, daily rebalance, min_holding_days=5.
+    Day-0 signal: AAPL score=10 → AAPL bought on 2023-01-02.
+    Day-1 signal: GOOG score=10 → engine wants to sell AAPL and buy GOOG.
+    Lock must prevent that SELL for at least 5 trading days.
+    """
     tickers = ["AAPL", "GOOG", "MSFT"]
     prices = _make_prices(60, tickers)
-    # Signal on day 0 selects AAPL; signal on day 1 selects GOOG only.
-    # With min_holding_days=5, AAPL should NOT be sold on day 1.
     signal_day0 = date(2022, 12, 28)
     signal_day1 = date(2023, 1, 3)   # one trading day after 2023-01-02
     signals = pd.DataFrame([
         {"ticker": "AAPL", "score_date": signal_day0, "alpha_score": 10.0},
         {"ticker": "GOOG", "score_date": signal_day0, "alpha_score": 1.0},
-        # On day 1, GOOG becomes the top-1 signal
         {"ticker": "GOOG", "score_date": signal_day1, "alpha_score": 10.0},
         {"ticker": "AAPL", "score_date": signal_day1, "alpha_score": 1.0},
     ])
@@ -383,19 +386,22 @@ def test_min_holding_days_prevents_early_sell():
     fill_sim = FillSimulator(fill_model="perfect")
     result = BacktestEngine().run(config, handler, fill_sim)
 
-    # If min_holding_days is respected, AAPL should NOT appear as a SELL trade
-    # within the first 5 trading days after the first rebalance.
-    if not result.trades.empty:
-        aapl_sells = result.trades[
-            (result.trades["ticker"] == "AAPL") &
-            (result.trades["direction"] == "SELL")
-        ]
-        if not aapl_sells.empty:
-            first_sell_date = aapl_sells["date"].min()
-            # AAPL was bought on 2023-01-02; must not be sold before 5 trading days have passed.
-            assert first_sell_date > date(2023, 1, 6), (
-                f"AAPL sold too early ({first_sell_date}); min_holding_days=5 violated"
-            )
+    trades = result.trades
+    assert not trades.empty, "Expected trades; engine produced none"
+
+    aapl_buys = trades[(trades["ticker"] == "AAPL") & (trades["direction"] == "BUY")]
+    assert not aapl_buys.empty, "AAPL must be bought on the first rebalance"
+
+    aapl_sells = trades[(trades["ticker"] == "AAPL") & (trades["direction"] == "SELL")]
+    assert not aapl_sells.empty, "AAPL must eventually be sold (signal flipped to GOOG)"
+
+    # AAPL bought on 2023-01-02 (trading day 0).
+    # min_holding_days=5 → first allowed sell is trading day 5.
+    # Trading days: Jan2=0, Jan3=1, Jan4=2, Jan5=3, Jan6=4, Jan9=5 → allow sell from Jan9.
+    first_sell = aapl_sells["date"].min()
+    assert first_sell >= date(2023, 1, 9), (
+        f"AAPL sold on {first_sell} but min_holding_days=5 requires >= 2023-01-09"
+    )
 
 
 def test_engine_max_position_weight_via_config():
@@ -450,10 +456,23 @@ def test_loader_adjust_prices_no_actions():
 
 
 def test_loader_adjust_prices_split():
-    """A 2-for-1 split halves prices before ex-date."""
+    """A 2-for-1 split: pre-split unadjusted=300, post-split unadjusted=150.
+    Adjustment should bring pre-split adj_close down to 150 (300 * 0.5).
+    Post-split prices remain at 150 (adj_factor=1).
+    """
     from backtesting.loader import _adjust_prices
-    prices = _make_loader_prices()
     split_date = date(2023, 1, 10)
+
+    # Use different prices before and after the split so the boundary is testable.
+    rows = []
+    for i in range(20):
+        d = date(2023, 1, 2) + timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        close = 300.0 if d < split_date else 150.0   # realistic: price halves on ex-date
+        rows.append({"ticker": "AAPL", "date": d, "close": close, "source": "yfinance"})
+    prices = pd.DataFrame(rows)
+
     corp = pd.DataFrame([{
         "ticker": "AAPL",
         "ex_date": split_date,
@@ -463,8 +482,10 @@ def test_loader_adjust_prices_split():
     result = _adjust_prices(prices, corp)
     before_split = result[result["date"] < split_date]
     after_split = result[result["date"] >= split_date]
-    assert all(abs(before_split["close"] - 75.0) < 1e-3)
-    assert all(abs(after_split["close"] - 150.0) < 1e-3)
+    # Pre-split unadjusted=300, factor=0.5 → adj_close=150
+    assert all(abs(before_split["close"] - 150.0) < 1e-3), before_split["close"].tolist()
+    # Post-split unadjusted=150, factor=1.0 → adj_close=150
+    assert all(abs(after_split["close"] - 150.0) < 1e-3), after_split["close"].tolist()
 
 
 # ------------------------------------------------------------------

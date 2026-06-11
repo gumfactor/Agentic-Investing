@@ -174,7 +174,8 @@ class BacktestEngine:
                         sim_idx = date_index[sim_date]
                         locked = {
                             t for t, entry in portfolio.entry_dates.items()
-                            if sim_idx - date_index.get(entry, 0) < min_holding_days
+                            # entry is always set inside the simulation so must be in date_index.
+                            if sim_idx - date_index[entry] < min_holding_days
                         }
                         if locked:
                             orders = [
@@ -191,6 +192,10 @@ class BacktestEngine:
                     )
                     portfolio.apply_fills(sell_fills)
                     all_fills.extend(sell_fills)
+
+                    # Recompute NAV after sells so the buy-scaling denominator
+                    # reflects actual current portfolio value, not the pre-sell state.
+                    nav = portfolio.nav(close_prices)
 
                     # Pass 2: scale buys to 99.5% of available cash so transaction
                     # costs cannot push cash below zero on the initial full deployment.

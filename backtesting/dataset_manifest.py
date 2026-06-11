@@ -166,7 +166,10 @@ def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
         data = json.loads(response.read())
     except S3Error as exc:
         raise FileNotFoundError(f"No manifest at {bucket}/{key}") from exc
-    return DatasetManifest(**data)
+    # Filter to known fields so manifests written by a newer code version
+    # (with extra fields) can still be loaded by older code without TypeError.
+    known = DatasetManifest.__dataclass_fields__
+    return DatasetManifest(**{k: v for k, v in data.items() if k in known})
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

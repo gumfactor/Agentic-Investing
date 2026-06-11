@@ -107,14 +107,14 @@ def run(
     logger.info("computing_momentum_scores", n_price_rows=len(prices))
     prices["close"] = prices["close"].astype(float)
     momentum_df = compute_momentum_scores(prices)  # returns (ticker, date, mom_*, momentum_score)
-    momentum_df = momentum_df.rename(columns={"date": "score_date"})
 
-    # Restrict to the requested date range.
-    momentum_df["score_date"] = pd.to_datetime(momentum_df["score_date"]).dt.date
-    mask = (momentum_df["score_date"] >= start) & (momentum_df["score_date"] <= end)
+    # Keep "date" column name — combine_factor_scores expects "date", not "score_date".
+    # The scorer renames the column internally when building the output DataFrames.
+    momentum_df["date"] = pd.to_datetime(momentum_df["date"]).dt.date
+    mask = (momentum_df["date"] >= start) & (momentum_df["date"] <= end)
     momentum_df = momentum_df[mask].reset_index(drop=True)
 
-    score_dates = sorted(momentum_df["score_date"].unique())
+    score_dates = sorted(momentum_df["date"].unique())
     logger.info(
         "scores_computed",
         n_score_dates=len(score_dates),
@@ -144,23 +144,26 @@ def run(
     logger.info("writing_to_db", n_batches=len(date_batches), batch_size=batch_size)
 
     for batch_idx, date_batch in enumerate(date_batches):
-        batch_mask = momentum_df["score_date"].isin(date_batch)
+        batch_mask = momentum_df["date"].isin(date_batch)
         batch_df = momentum_df[batch_mask]
 
-        # Build factor_scores rows (one row per ticker × score_date).
-        factor_rows = batch_df[["ticker", "score_date", "momentum_score"]].copy()
+        # factor_scores needs score_date column; rename here for the DB write.
+        factor_rows = (
+            batch_df[["ticker", "date", "momentum_score"]]
+            .copy()
+            .rename(columns={"date": "score_date", "momentum_score": "z_score"})
+        )
         factor_rows["factor_name"] = "momentum"
         factor_rows["strategy_id"] = strategy_id
-        factor_rows = factor_rows.rename(columns={"momentum_score": "z_score"})
 
-        # Build alpha_scores via combine_factor_scores for each date.
+        # combine_factor_scores expects "date" column — pass the original.
         alpha_frames = []
         for sd in date_batch:
-            day_df = batch_df[batch_df["score_date"] == sd].copy()
+            day_df = batch_df[batch_df["date"] == sd].copy()
             if day_df.empty:
                 continue
             _, alpha_df = combine_factor_scores(
-                factor_scores={"momentum": day_df[["ticker", "score_date", "momentum_score"]]},
+                factor_scores={"momentum": day_df[["ticker", "date", "momentum_score"]]},
                 score_col_map={"momentum": "momentum_score"},
                 strategy_id=strategy_id,
                 score_date=sd,
