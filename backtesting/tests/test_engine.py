@@ -535,3 +535,111 @@ def test_build_manifest_schema_hashes_differ_by_columns():
     m1 = build_manifest("v1", "v1", {"a": df1}, {}, {})
     m2 = build_manifest("v1", "v1", {"a": df2}, {}, {})
     assert m1.schema_hashes["a"] != m2.schema_hashes["a"]
+
+
+# ------------------------------------------------------------------
+# Finding #8 — alpha_scores_sha256 content hash
+# ------------------------------------------------------------------
+
+def test_manifest_alpha_hash_changes_on_score_mutation():
+    """alpha_scores_sha256 must change if any score value changes."""
+    from backtesting.dataset_manifest import build_manifest
+    alpha_a = pd.DataFrame({
+        "ticker": ["AAPL", "GOOG"],
+        "score_date": [date(2023, 1, 2)] * 2,
+        "strategy_id": ["v1"] * 2,
+        "alpha_score": [1.5, 2.5],
+    })
+    alpha_b = alpha_a.copy()
+    alpha_b.loc[0, "alpha_score"] = 1.6  # mutate one score
+
+    m_a = build_manifest("v1", "v1", {"alpha_scores": alpha_a}, {}, {})
+    m_b = build_manifest("v1", "v1", {"alpha_scores": alpha_b}, {}, {})
+    assert m_a.alpha_scores_sha256 != m_b.alpha_scores_sha256
+
+
+def test_manifest_alpha_hash_stable_under_row_reorder():
+    """alpha_scores_sha256 must be identical regardless of DataFrame row order."""
+    from backtesting.dataset_manifest import build_manifest
+    alpha = pd.DataFrame({
+        "ticker": ["AAPL", "GOOG"],
+        "score_date": [date(2023, 1, 2)] * 2,
+        "strategy_id": ["v1"] * 2,
+        "alpha_score": [1.5, 2.5],
+    })
+    alpha_reversed = alpha.iloc[::-1].reset_index(drop=True)
+
+    m1 = build_manifest("v1", "v1", {"alpha_scores": alpha}, {}, {})
+    m2 = build_manifest("v1", "v1", {"alpha_scores": alpha_reversed}, {}, {})
+    assert m1.alpha_scores_sha256 == m2.alpha_scores_sha256
+
+
+def test_manifest_alpha_hash_empty():
+    """Empty alpha_scores produces a non-empty sentinel hash (not empty string)."""
+    from backtesting.dataset_manifest import build_manifest
+    empty = pd.DataFrame(columns=["ticker", "score_date", "alpha_score"])
+    m = build_manifest("v1", "v1", {"alpha_scores": empty}, {}, {})
+    assert len(m.alpha_scores_sha256) == 64  # full SHA-256 hex digest
+
+
+# ------------------------------------------------------------------
+# Finding #10 — strategy_id guard in loader
+# ------------------------------------------------------------------
+
+def _mock_snapshots(prices, alpha, benchmark):
+    """Build a MagicMock ParquetSnapshots that serves pre-loaded DataFrames.
+
+    corporate_actions raises FileNotFoundError (optional snapshot) so the
+    loader falls back to an empty frame, matching the production default.
+    """
+    from unittest.mock import MagicMock
+
+    data = {"daily_prices": prices, "alpha_scores": alpha, "benchmark": benchmark}
+
+    def _load(data_type, _snap_date):
+        if data_type == "corporate_actions":
+            raise FileNotFoundError("no corp actions snapshot in test")
+        return data[data_type]
+
+    mock = MagicMock()
+    mock.load_snapshot.side_effect = _load
+    return mock
+
+
+def test_loader_raises_if_strategy_id_column_absent():
+    """load_from_snapshot must raise ValueError when strategy_id column is missing."""
+    from backtesting.loader import load_from_snapshot
+
+    prices = _make_loader_prices(["AAPL"])
+    alpha_no_sid = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "score_date": [date(2023, 1, 2)],
+        "alpha_score": [1.0],  # no strategy_id column
+    })
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 2)], "close": [400.0]})
+
+    with pytest.raises(ValueError, match="strategy_id"):
+        load_from_snapshot(
+            "2023-01-02", {"name": "v1"},
+            snapshots=_mock_snapshots(prices, alpha_no_sid, benchmark),
+        )
+
+
+def test_loader_warns_when_no_scores_for_strategy():
+    """load_from_snapshot returns a DataHandler with empty signals when strategy filter yields nothing."""
+    from backtesting.loader import load_from_snapshot
+
+    prices = _make_loader_prices(["AAPL"])
+    alpha_wrong_sid = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "score_date": [date(2023, 1, 2)],
+        "strategy_id": ["other_strategy"],
+        "alpha_score": [1.0],
+    })
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 2)], "close": [400.0]})
+
+    handler = load_from_snapshot(
+        "2023-01-02", {"name": "v1"},
+        snapshots=_mock_snapshots(prices, alpha_wrong_sid, benchmark),
+    )
+    assert handler.get_latest_signals(date(2023, 1, 3)).empty

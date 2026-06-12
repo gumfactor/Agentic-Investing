@@ -62,8 +62,10 @@ def load_from_snapshot(
             are absent for data_version.
         ValueError: if a required column is missing from a loaded snapshot.
     """
-    from data.storage.parquet_snapshots import ParquetSnapshots  # lazy: avoids minio at import time
-    snaps = snapshots or ParquetSnapshots()
+    if snapshots is None:
+        from data.storage.parquet_snapshots import ParquetSnapshots  # lazy: avoids minio at import time
+        snapshots = ParquetSnapshots()
+    snaps = snapshots
     snap_date = date.fromisoformat(data_version)
     strategy_id = config.get("name", "v1")
 
@@ -92,10 +94,26 @@ def load_from_snapshot(
     benchmark = snaps.load_snapshot("benchmark", snap_date)
 
     # ── Filter alpha_scores to this strategy ─────────────────────────────────
-    if "strategy_id" in alpha_scores.columns:
-        alpha_scores = alpha_scores[
-            alpha_scores["strategy_id"] == strategy_id
-        ].reset_index(drop=True)
+    # The strategy_id column is required by the alpha_scores schema (migration 002).
+    # If it is absent the snapshot was built incorrectly; passing it through
+    # would silently mix signals from every strategy into DataHandler.
+    if "strategy_id" not in alpha_scores.columns:
+        raise ValueError(
+            f"alpha_scores snapshot for data_version={data_version!r} is missing "
+            f"the 'strategy_id' column. Re-pin the snapshot using a pipeline version "
+            f"that writes strategy_id, or verify the correct snapshot was loaded."
+        )
+    alpha_scores = alpha_scores[
+        alpha_scores["strategy_id"] == strategy_id
+    ].reset_index(drop=True)
+
+    if alpha_scores.empty:
+        logger.warning(
+            "loader_no_alpha_scores_for_strategy",
+            data_version=data_version,
+            strategy_id=strategy_id,
+            note="backtest will hold only cash — verify backfill has been run for this strategy_id",
+        )
 
     # ── Apply price adjustment ────────────────────────────────────────────────
     prices_adj = _adjust_prices(prices_raw, corp_actions)

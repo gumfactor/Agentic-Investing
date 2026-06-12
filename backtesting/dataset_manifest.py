@@ -75,6 +75,9 @@ class DatasetManifest:
     row_counts: dict[str, int]           # data_type → number of rows
     date_ranges: dict[str, list[str]]    # data_type → [min_date, max_date]
     schema_hashes: dict[str, str]        # data_type → sha256[:16] of sorted columns
+    # SHA-256 of (score_date, ticker, alpha_score) rows sorted deterministically.
+    # Detects any post-snapshot mutation of score values; "" for legacy manifests.
+    alpha_scores_sha256: str = ""
 
 
 def build_manifest(
@@ -113,6 +116,9 @@ def build_manifest(
             "|".join(sorted(df.columns)).encode()
         ).hexdigest()[:16]
 
+    alpha_df = dataframes.get("alpha_scores", pd.DataFrame())
+    scores_hash = _alpha_scores_hash(alpha_df)
+
     return DatasetManifest(
         version=version,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -123,6 +129,7 @@ def build_manifest(
         row_counts=row_counts,
         date_ranges=date_ranges,
         schema_hashes=schema_hashes,
+        alpha_scores_sha256=scores_hash,
     )
 
 
@@ -173,6 +180,29 @@ def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _alpha_scores_hash(alpha_scores: pd.DataFrame) -> str:
+    """SHA-256 fingerprint of the alpha score values.
+
+    Rows are sorted by (score_date, ticker) before hashing so the result is
+    stable regardless of DataFrame construction order.  Uses a canonical
+    string encoding — not .tobytes() — so the hash is platform-independent.
+
+    An empty or missing alpha_scores DataFrame returns the SHA-256 of an
+    empty byte string, which is a valid sentinel distinct from any real hash.
+    """
+    required = {"alpha_score", "score_date", "ticker"}
+    if alpha_scores.empty or not required.issubset(alpha_scores.columns):
+        return hashlib.sha256(b"").hexdigest()
+
+    sorted_df = alpha_scores.sort_values(["score_date", "ticker"])
+    rows = (
+        sorted_df[["score_date", "ticker", "alpha_score"]]
+        .astype(str)
+        .apply("|".join, axis=1)
+    )
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()
+
 
 def _git_commit() -> str:
     """Return the current HEAD commit hash, or 'unknown' on failure."""
