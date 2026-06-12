@@ -778,3 +778,84 @@ def test_engine_reproducible_cross_process():
             assert result["trade_directions"] == ref["trade_directions"], (
                 f"Trade direction sequence differs at PYTHONHASHSEED={seed}"
             )
+
+
+# ------------------------------------------------------------------
+# PIT safety audit script tests
+# ------------------------------------------------------------------
+
+def _make_audit_prices(n_days: int = 700, tickers: list[str] | None = None) -> pd.DataFrame:
+    """Prices with enough history for momentum (needs 252+21 trading days)."""
+    if tickers is None:
+        tickers = ["AAPL", "GOOG", "MSFT"]
+    start = date(2021, 1, 4)
+    dates = []
+    d = start
+    while len(dates) < n_days:
+        if d.weekday() < 5:
+            dates.append(d)
+        d += timedelta(days=1)
+    rng = np.random.default_rng(99)
+    rows = []
+    for t in tickers:
+        base = {"AAPL": 150.0, "GOOG": 2800.0, "MSFT": 300.0}.get(t, 100.0)
+        prices = base * np.cumprod(1 + rng.normal(0, 0.01, n_days))
+        for dt, p in zip(dates, prices):
+            rows.append({"ticker": t, "date": dt, "close": float(p)})
+    return pd.DataFrame(rows)
+
+
+def test_audit_structural_pass(tmp_path):
+    """Structural check passes because DataHandler uses strict < for score_date."""
+    import importlib
+    audit = importlib.import_module("scripts.audit_pit_safety")
+    violations = audit._structural_audit()
+    assert violations == [], f"Unexpected structural violations: {violations}"
+
+
+def test_audit_empirical_clean(tmp_path):
+    """Empirical audit reports zero violations on correctly computed scores."""
+    import importlib
+    from signals.factors.momentum import compute_momentum_scores
+
+    audit = importlib.import_module("scripts.audit_pit_safety")
+
+    prices_df = _make_audit_prices()
+    raw_scores = compute_momentum_scores(prices_df)
+    scores_df = raw_scores.rename(columns={"date": "score_date", "momentum_score": "z_score"})
+    scores_df["factor_name"] = "momentum"
+    scores_df["strategy_id"] = "v1"
+
+    prices_file = str(tmp_path / "prices.parquet")
+    scores_file = str(tmp_path / "scores.parquet")
+    prices_df.to_parquet(prices_file)
+    scores_df.to_parquet(scores_file)
+
+    n_checked, n_violations, _ = audit._empirical_audit(prices_df, scores_df, sample_size=50, seed=42)
+    assert n_checked > 0, "Audit checked no pairs"
+    assert n_violations == 0, f"Expected 0 violations; got {n_violations}"
+
+
+def test_audit_empirical_detects_corrupted_scores(tmp_path):
+    """Empirical audit reports violations when stored scores are wrong."""
+    import importlib
+    from signals.factors.momentum import compute_momentum_scores
+
+    audit = importlib.import_module("scripts.audit_pit_safety")
+
+    prices_df = _make_audit_prices()
+    raw_scores = compute_momentum_scores(prices_df)
+    scores_df = raw_scores.rename(columns={"date": "score_date", "momentum_score": "z_score"})
+    scores_df["factor_name"] = "momentum"
+    scores_df["strategy_id"] = "v1"
+
+    # Corrupt 5 scores with nonsense values
+    corrupted = scores_df.copy()
+    corrupted.iloc[:5, corrupted.columns.get_loc("z_score")] = 999.0
+
+    n_checked, n_violations, violation_records = audit._empirical_audit(
+        prices_df, corrupted, sample_size=len(corrupted), seed=0
+    )
+    assert n_violations >= 5, (
+        f"Expected at least 5 violations for 5 corrupted rows; got {n_violations}"
+    )
