@@ -643,3 +643,73 @@ def test_loader_warns_when_no_scores_for_strategy():
         snapshots=_mock_snapshots(prices, alpha_wrong_sid, benchmark),
     )
     assert handler.get_latest_signals(date(2023, 1, 3)).empty
+
+
+# ------------------------------------------------------------------
+# scripts/backfill_momentum_scores.py — Finding #4 history guard
+# ------------------------------------------------------------------
+
+def _make_backfill_prices(n_trading_days: int, tickers=("AAPL",)) -> pd.DataFrame:
+    """Generate a price DataFrame with exactly n_trading_days rows per ticker."""
+    from datetime import date as _date, timedelta as _td
+    rows = []
+    d = _date(2018, 1, 2)
+    count = 0
+    while count < n_trading_days:
+        if d.weekday() < 5:
+            for t in tickers:
+                rows.append({"ticker": t, "date": d, "close": 100.0, "source": "test"})
+            count += 1
+        d += _td(days=1)
+    return pd.DataFrame(rows)
+
+
+def test_backfill_raises_on_insufficient_history():
+    """backfill run() must raise ValueError when lookback < 273 trading days."""
+    from unittest.mock import MagicMock
+    from scripts.backfill_momentum_scores import run
+
+    # 100 trading days before start — far below the 273 required.
+    start = date(2023, 6, 1)
+    prices = _make_backfill_prices(n_trading_days=100)
+    prices["date"] = pd.to_datetime(prices["date"]).dt.date
+
+    mock_snaps = MagicMock()
+    mock_snaps.load_snapshot.return_value = prices
+
+    with pytest.raises(ValueError, match="Insufficient price history"):
+        run(
+            snapshot_date=date(2026, 6, 10),
+            start=start,
+            end=date(2023, 12, 31),
+            strategy_id="v1",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+        )
+
+
+def test_backfill_passes_with_sufficient_history():
+    """backfill run() proceeds past the guard when >= 273 trading days of lookback exist."""
+    from unittest.mock import MagicMock
+    from scripts.backfill_momentum_scores import run
+
+    # 273 + 50 trading days — enough lookback, plus some dates after start for scores.
+    prices_all = _make_backfill_prices(n_trading_days=273 + 50)
+    prices_all["date"] = pd.to_datetime(prices_all["date"]).dt.date
+    # start is the (273+1)-th trading day so exactly 273 precede it.
+    start = sorted(prices_all["date"].unique())[273]
+
+    mock_snaps = MagicMock()
+    mock_snaps.load_snapshot.return_value = prices_all
+
+    # dry_run=True exits before DB writes; should not raise.
+    run(
+        snapshot_date=date(2026, 6, 10),
+        start=start,
+        end=prices_all["date"].max(),
+        strategy_id="v1",
+        batch_size=20,
+        dry_run=True,
+        snapshots=mock_snaps,
+    )

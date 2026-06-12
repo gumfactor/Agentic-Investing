@@ -79,28 +79,36 @@ def run(
     strategy_id: str,
     batch_size: int,
     dry_run: bool,
+    snapshots=None,  # injectable for testing; None → construct from env vars
 ) -> None:
-    from data.storage.parquet_snapshots import ParquetSnapshots
     from data.storage.timescale_writer import TimescaleWriter
     from signals.factors.momentum import compute_momentum_scores
     from signals.scoring.scorer import combine_factor_scores
 
-    snaps = ParquetSnapshots()
+    if snapshots is None:
+        from data.storage.parquet_snapshots import ParquetSnapshots
+        snapshots = ParquetSnapshots()
+    snaps = snapshots
 
     # ── Load price snapshot ───────────────────────────────────────────────────
     logger.info("loading_price_snapshot", snapshot_date=str(snapshot_date))
     prices = snaps.load_snapshot("daily_prices", snapshot_date)
 
-    # Validate we have enough history (need 252+21 trading days before start).
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
-    min_price_date = prices["date"].min()
-    required_lookback = start - timedelta(days=400)  # ~273 trading days, generous buffer
-    if min_price_date > required_lookback:
-        logger.warning(
-            "insufficient_price_history",
-            min_price_date=str(min_price_date),
-            recommended_start=str(required_lookback),
-            note="12-month momentum window requires ~273 trading days of history before --start",
+
+    # ── Hard guard: require sufficient lookback before --start ────────────────
+    # The 12-month momentum window uses 252 trading-day rows; the skip buffer
+    # adds another 21.  A calendar-day proxy is imprecise because market
+    # holidays vary by year.  Count actual distinct trading dates in the
+    # snapshot that fall strictly before --start instead.
+    _MIN_LOOKBACK_DAYS = 252 + 21  # rows, not calendar days
+    lookback_days = prices[prices["date"] < start]["date"].nunique()
+    if lookback_days < _MIN_LOOKBACK_DAYS:
+        raise ValueError(
+            f"Insufficient price history: the snapshot has {lookback_days} trading "
+            f"days before --start {start}, but the 12-month momentum window requires "
+            f"at least {_MIN_LOOKBACK_DAYS}. Either extend the snapshot to cover an "
+            f"earlier start date or move --start later."
         )
 
     # ── Compute momentum scores for all dates in one vectorised pass ──────────
