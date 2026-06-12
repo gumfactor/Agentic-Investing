@@ -1,6 +1,11 @@
 """Tests for BacktestEngine and supporting functions."""
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from datetime import date, timedelta
 
 import numpy as np
@@ -713,3 +718,63 @@ def test_backfill_passes_with_sufficient_history():
         dry_run=True,
         snapshots=mock_snaps,
     )
+
+
+# ------------------------------------------------------------------
+# Cross-process reproducibility (PRD exit criterion)
+# ------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_engine_reproducible_cross_process():
+    """NAV series, returns, and trade sequence must be bit-for-bit identical
+    across three independent subprocesses with different PYTHONHASHSEED values.
+
+    Python's hash randomisation (PEP 456) shuffles dict/set iteration order
+    across processes.  The sorted() fix in compute_orders() must hold across
+    process boundaries — this test proves it does.
+
+    The worker runs as a module so the repo's package layout resolves cleanly:
+        PYTHONHASHSEED=<n> python -m backtesting.tests._backtest_subprocess_worker <out>
+    """
+    _SEEDS = (0, 1, 42)
+    _WORKER = "backtesting.tests._backtest_subprocess_worker"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outputs = []
+        for seed in _SEEDS:
+            out_path = os.path.join(tmpdir, f"result_{seed}.json")
+            env = {**os.environ, "PYTHONHASHSEED": str(seed)}
+            proc = subprocess.run(
+                [sys.executable, "-m", _WORKER, out_path],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            assert proc.returncode == 0, (
+                f"Worker subprocess (PYTHONHASHSEED={seed}) exited with "
+                f"code {proc.returncode}:\n{proc.stderr}"
+            )
+            with open(out_path) as fh:
+                outputs.append(json.load(fh))
+
+        ref = outputs[0]
+        for result, seed in zip(outputs[1:], _SEEDS[1:]):
+            assert result["nav_series"] == ref["nav_series"], (
+                f"NAV series differs between PYTHONHASHSEED={_SEEDS[0]} "
+                f"and PYTHONHASHSEED={seed}"
+            )
+            assert result["returns"] == ref["returns"], (
+                f"Returns series differs at PYTHONHASHSEED={seed}"
+            )
+            assert result["config_hash"] == ref["config_hash"], (
+                f"Config hash differs at PYTHONHASHSEED={seed}"
+            )
+            assert result["trade_tickers"] == ref["trade_tickers"], (
+                f"Trade ticker sequence differs at PYTHONHASHSEED={seed}:\n"
+                f"  seed=0:   {ref['trade_tickers']}\n"
+                f"  seed={seed}: {result['trade_tickers']}"
+            )
+            assert result["trade_directions"] == ref["trade_directions"], (
+                f"Trade direction sequence differs at PYTHONHASHSEED={seed}"
+            )
