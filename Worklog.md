@@ -12,6 +12,92 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-14
+
+### Session 16 - Historical backfill and reproducible dataset bundle
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/phase-3`
+**Implementation commit:** `e70a5b1`
+
+---
+
+#### What was done
+
+Completed and validated the historical momentum backfill for the price history
+currently available in TimescaleDB.
+
+- Strategy ID: `v1`
+- Score coverage: `2022-07-11` through `2024-12-31`
+- Trading dates: 624
+- `factor_scores` rows: 310,301
+- `alpha_scores` rows: 310,301
+- Integrity checks: no duplicates, no null scores, exact factor/alpha
+  correspondence, and valid rank/universe-size fields on every date
+
+The intended `2020-01-02` start remains unavailable because price history
+begins on `2021-06-09`. The 273-trading-day momentum lookback makes
+`2022-07-11` the earliest supported score date.
+
+#### Complete bundle pinning
+
+Expanded `scripts/pin_snapshot.py` from a prices-only snapshot helper into a
+complete backtest bundle command:
+
+```powershell
+python -m scripts.pin_snapshot --strategy-id v1 --benchmark SPY
+```
+
+The command reads prices, strategy-specific alpha scores, and corporate
+actions from TimescaleDB; downloads and validates SPY benchmark coverage; pins
+all four datasets under one date; and writes the dataset manifest.
+
+Validated bundle:
+
+`rqis-snapshots/manifests/2026-06-14/manifest.json`
+
+| Dataset | Rows | Coverage |
+|---------|-----:|----------|
+| `daily_prices` | 626,960 | 2021-06-09 to 2026-06-12 |
+| `alpha_scores` | 310,301 | 2022-07-11 to 2024-12-31 |
+| `corporate_actions` | 7,950 | 2021-06-09 to 2026-06-12 |
+| `benchmark` (SPY) | 1,259 | 2021-06-09 to 2026-06-12 |
+
+The manifest records the four object paths, row counts, date ranges, schema
+hashes, alpha-score content hash, strategy ID, and producing git commit.
+
+#### End-to-end validation
+
+`load_from_snapshot("2026-06-14", config)` successfully loaded all four pinned
+datasets. A perfect-fill backtest then completed over all 624 trading dates:
+
+- Trades: 2,050
+- Final NAV: $5,020,387.21
+- Total return: 402.04%
+- CAGR: 92.06%
+- Sharpe: 1.316
+- Maximum drawdown: -13.79%
+
+These figures validate execution of the data and engine path; they are not an
+investment-performance acceptance decision. The next operator step is to log
+the validated run to MLflow with the manifest path as `data_version`.
+
+#### MLflow command
+
+```powershell
+python -c "import yaml; from backtesting.loader import load_from_snapshot; from backtesting.engine.event_loop import BacktestEngine; from backtesting.engine.fill_simulator import FillSimulator; from backtesting.experiment_tracking.mlflow_logger import BacktestLogger; c=yaml.safe_load(open('config/strategy/v1_base_momentum.yaml')); c.update({'strategy_id':'v1','data_version':'rqis-snapshots/manifests/2026-06-14/manifest.json'}); c['backtest'].update({'start_date':'2022-07-11','end_date':'2024-12-31'}); r=BacktestEngine().run(c,load_from_snapshot('2026-06-14',c),FillSimulator(fill_model='perfect')); print(BacktestLogger().log_run(c,r,'base_momentum/momentum'))"
+```
+
+[DECISION] Bundle pinning remains a separate operator step after database
+backfills. This prevents incomplete or partially written backfills from being
+published as immutable research datasets.
+
+[SAFETY] The existing `v1_base_momentum.yaml` was not modified. Runtime-only
+fields (`strategy_id`, `data_version`, and the supported backtest dates) are
+injected by the invocation, preserving C6.
+
+---
+
 ## 2026-06-10
 
 ### Session 15 — Phase 3: Codex architectural fixes (#1, #3, #4, #7)

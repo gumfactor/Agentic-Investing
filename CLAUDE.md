@@ -39,18 +39,19 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 0 | PRD + Project Setup | **Complete** | Week 1 |
 | 1 | Data Foundation | **Complete** | Week 6 |
 | 2 | Signal Library | **Complete** | Week 12 |
-| 3 | Backtesting Engine | **Next** | Week 18 |
+| 3 | Backtesting Engine | **Live validation complete** | Week 18 |
 | 4 | Portfolio + Paper Trading | Not started | Week 26 |
 | 5 | Reporting + Live Trading | Not started | Week 36 |
 
-**Active branch:** `phase-2` (Phase 2 closeout; create the Phase 3 branch before
-starting backtesting implementation)
+**Active branch:** `claude/phase-3`
 
-**What this means for you:** Phase 2 is complete. The point-in-time-safe signal
-research workflow is operational, momentum is the only currently accepted
-production factor, and rejected candidate factors remain diagnostic-only.
-Phase 3 backtesting is next. No broker connections exist yet and no real capital
-is at risk. Safety constraints C1–C9 still apply as design rules.
+**What this means for you:** Phase 2 is complete and the Phase 3 engine has
+passed a live pinned-data validation for the supported `2022-07-11` through
+`2024-12-31` window. The reproducible bundle version is `2026-06-14`, with
+manifest `rqis-snapshots/manifests/2026-06-14/manifest.json`. The remaining
+operator step is to log the validated run to MLflow and prepare the Phase 3 PR.
+No broker connections exist yet and no real capital is at risk. Safety
+constraints C1–C9 still apply as design rules.
 
 ---
 
@@ -141,6 +142,29 @@ Reference `.env.example` for the full list.
 - No bare `except:` — always catch specific exceptions.
 - No `print()` in library code — use `structlog.get_logger()`.
 - Tests live in `tests/` subdirectories mirroring the module structure they test.
+
+### Phase 3 operational commands
+
+Pin a complete backtest bundle after a successful score backfill:
+
+```powershell
+python -m scripts.pin_snapshot --strategy-id v1 --benchmark SPY
+```
+
+The command pins `daily_prices`, `alpha_scores`, `corporate_actions`, and the
+SPY benchmark under one snapshot date, then writes a dataset manifest. Use the
+manifest path, not a prices-only object path, as the MLflow `data_version`.
+
+Current validated bundle:
+
+`rqis-snapshots/manifests/2026-06-14/manifest.json`
+
+Current supported backtest window:
+
+`2022-07-11` through `2024-12-31`
+
+The older `2020-01-02` start requires additional price ingestion beginning
+roughly in late 2018 so the 273-trading-day momentum lookback is available.
 
 ---
 
