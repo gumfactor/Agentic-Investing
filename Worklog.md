@@ -79,14 +79,26 @@ datasets. A perfect-fill backtest then completed over all 624 trading dates:
 - Maximum drawdown: -13.79%
 
 These figures validate execution of the data and engine path; they are not an
-investment-performance acceptance decision. The next operator step is to log
-the validated run to MLflow with the manifest path as `data_version`.
+investment-performance acceptance decision.
 
 #### MLflow command
 
 ```powershell
 python -c "import yaml; from backtesting.loader import load_from_snapshot; from backtesting.engine.event_loop import BacktestEngine; from backtesting.engine.fill_simulator import FillSimulator; from backtesting.experiment_tracking.mlflow_logger import BacktestLogger; c=yaml.safe_load(open('config/strategy/v1_base_momentum.yaml')); c.update({'strategy_id':'v1','data_version':'rqis-snapshots/manifests/2026-06-14/manifest.json'}); c['backtest'].update({'start_date':'2022-07-11','end_date':'2024-12-31'}); r=BacktestEngine().run(c,load_from_snapshot('2026-06-14',c),FillSimulator(fill_model='perfect')); print(BacktestLogger().log_run(c,r,'base_momentum/momentum'))"
 ```
+
+The first live logging attempt recorded metrics but failed during artifact
+upload because the `mlflow` MinIO bucket had not been provisioned. After
+creating the expected bucket, the same pinned-data run completed successfully:
+
+- MLflow run ID: `5b376a139b9b4ae7bb9c8c79674f2bf7`
+- Status: `FINISHED`
+- Artifacts: config, returns, metrics, and trades
+- Data version: `rqis-snapshots/manifests/2026-06-14/manifest.json`
+
+Added an idempotent `minio-init` Compose service to provision the raw,
+snapshot, and MLflow buckets before MLflow starts. This matches the documented
+fresh-stack behavior in `.env.example`.
 
 [DECISION] Bundle pinning remains a separate operator step after database
 backfills. This prevents incomplete or partially written backfills from being
