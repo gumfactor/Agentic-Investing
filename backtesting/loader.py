@@ -66,6 +66,9 @@ def load_from_snapshot(
         ValueError: if a required column is missing from a loaded snapshot.
     """
     if snapshots is None:
+        from dotenv import load_dotenv
+
+        load_dotenv()
         from data.storage.parquet_snapshots import (
             ParquetSnapshots,  # lazy: avoids minio at import time
         )

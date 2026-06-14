@@ -100,6 +100,17 @@ Added an idempotent `minio-init` Compose service to provision the raw,
 snapshot, and MLflow buckets before MLflow starts. This matches the documented
 fresh-stack behavior in `.env.example`.
 
+The documented one-line operator command initially still failed when launched
+from an activated virtualenv because `load_from_snapshot()` did not load
+`.env` before constructing its default `ParquetSnapshots` client. The loader
+now calls `load_dotenv()` only when no snapshot client is injected. The exact
+documented command was rerun without an environment wrapper and completed:
+
+- MLflow run ID: `1529f48f1e2647e8ac1f842bff39b3e6`
+- Exit status: `0`
+- Trades: 2,050
+- Sharpe: 1.316
+
 [DECISION] Bundle pinning remains a separate operator step after database
 backfills. This prevents incomplete or partially written backfills from being
 published as immutable research datasets.

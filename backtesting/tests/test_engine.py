@@ -611,6 +611,31 @@ def _mock_snapshots(prices, alpha, benchmark):
     return mock
 
 
+def test_loader_loads_dotenv_before_constructing_default_snapshots(monkeypatch):
+    """The documented local command must work without manually exporting .env."""
+    from backtesting.loader import load_from_snapshot
+    from data.storage import parquet_snapshots
+
+    monkeypatch.delenv("MINIO_ENDPOINT", raising=False)
+
+    def _load_dotenv():
+        monkeypatch.setenv("MINIO_ENDPOINT", "localhost:9000")
+        return True
+
+    class _ExpectedStop(Exception):
+        pass
+
+    def _construct_snapshots():
+        assert os.environ["MINIO_ENDPOINT"] == "localhost:9000"
+        raise _ExpectedStop
+
+    monkeypatch.setattr("dotenv.load_dotenv", _load_dotenv)
+    monkeypatch.setattr(parquet_snapshots, "ParquetSnapshots", _construct_snapshots)
+
+    with pytest.raises(_ExpectedStop):
+        load_from_snapshot("2023-01-02", {"strategy_id": "v1"})
+
+
 def test_loader_raises_if_strategy_id_column_absent():
     """load_from_snapshot must raise ValueError when strategy_id column is missing."""
     from backtesting.loader import load_from_snapshot

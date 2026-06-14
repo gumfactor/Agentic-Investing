@@ -48,9 +48,10 @@ It is built to eventually trade real capital. Every decision you make must treat
 **What this means for you:** Phase 2 is complete and the Phase 3 engine has
 passed a live pinned-data validation for the supported `2022-07-11` through
 `2024-12-31` window. The reproducible bundle version is `2026-06-14`, with
-manifest `rqis-snapshots/manifests/2026-06-14/manifest.json`. The validated
-MLflow run is `5b376a139b9b4ae7bb9c8c79674f2bf7`. The remaining operator step
-is to prepare the Phase 3 PR.
+manifest `rqis-snapshots/manifests/2026-06-14/manifest.json`. The operator
+command was validated without manually exporting `.env`; the resulting MLflow
+run is `1529f48f1e2647e8ac1f842bff39b3e6`. The remaining operator step is to
+prepare the Phase 3 PR.
 No broker connections exist yet and no real capital is at risk. Safety
 constraints C1–C9 still apply as design rules.
 
