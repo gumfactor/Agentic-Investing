@@ -18,7 +18,8 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `claude/phase-3`
-**Implementation commit:** `e70a5b1`
+**Implementation and validation commits:** `f40fc2c`, `e70a5b1`, `428d9c3`,
+`7c29499`, `9980735`, `3931e97`
 
 ---
 
@@ -38,6 +39,12 @@ currently available in TimescaleDB.
 The intended `2020-01-02` start remains unavailable because price history
 begins on `2021-06-09`. The 273-trading-day momentum lookback makes
 `2022-07-11` the earliest supported score date.
+
+The 273-session requirement consists of 252 trading days for the 12-month
+lookback plus the most recent 21 trading days skipped by the 12-1 momentum
+definition. A score before `2022-07-11` would therefore use an incomplete
+window and would not be comparable to later scores. Reaching a `2020-01-02`
+score date requires price ingestion beginning roughly in late 2018.
 
 #### Complete bundle pinning
 
@@ -123,6 +130,20 @@ Result: `CLEAN`, with zero point-in-time violations. The CLI now loads `.env`,
 uses ASCII-safe output on Windows, supports the standard bundle's
 momentum-only alpha snapshot when factor scores are absent, and fails closed
 if no empirical pairs can be checked.
+
+#### Final Phase 3 validation gates
+
+| Gate | Result | Evidence |
+|------|--------|----------|
+| Historical backfill | PASS for supported data window | 310,301 factor rows and 310,301 alpha rows across 624 dates; `2022-07-11` to `2024-12-31`; zero duplicates |
+| Pinned end-to-end backtest | PASS | 2,050 trades; Sharpe 1.316; manifest-backed `data_version` |
+| MLflow persistence / C7 | PASS | Operator-confirmed run `2c81ae77c94246bfbf50e47365362c6d`, status `FINISHED`, config and data artifacts present |
+| PIT safety audit | PASS | 500 sampled pairs, zero violations, exit code 0 |
+
+The original `2020-01-02` start was not silently treated as passing. It is a
+documented data-availability limitation, while the full validation workflow
+passed for the earliest methodologically valid window supported by current
+prices. Phase 3 is ready for PR closeout on that stated scope.
 
 [DECISION] Bundle pinning remains a separate operator step after database
 backfills. This prevents incomplete or partially written backfills from being
