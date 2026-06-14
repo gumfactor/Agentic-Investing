@@ -31,21 +31,23 @@ Usage
         --start 2020-01-02 --end 2024-12-31 \\
         --strategy-id v1
 
-Environment variables required (unless --dry-run):
-    DATABASE_URL   — TimescaleDB connection string
-    MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY — MinIO credentials
+Environment variables required:
+    MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY - MinIO credentials
+    DATABASE_URL - TimescaleDB connection string (live runs only)
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 import structlog
+from dotenv import load_dotenv
 
 logger = structlog.get_logger(__name__)
+
+load_dotenv()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -135,7 +137,7 @@ def run(
         print(
             f"[DRY RUN] Would write {len(momentum_df):,} factor_score rows "
             f"across {len(score_dates):,} dates "
-            f"({start} → {end}, strategy_id={strategy_id!r})."
+            f"({start} to {end}, strategy_id={strategy_id!r})."
         )
         print(momentum_df.head(10).to_string(index=False))
         return
