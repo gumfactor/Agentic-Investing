@@ -157,9 +157,10 @@ def _structural_audit() -> list[str]:
     source = inspect.getsource(DataHandler.get_latest_signals)
     violations: list[str] = []
 
-    if 'score_date" < sim_date' in source or "score_date < sim_date" in source:
+    # Match the actual implementation pattern: self._alpha_scores["score_date"] < sim_date
+    if '"score_date"] < sim_date' in source:
         logger.info("structural_check_passed", check="score_date_strict_lt")
-    elif 'score_date" <= sim_date' in source or "score_date <= sim_date" in source:
+    elif '"score_date"] <= sim_date' in source:
         violations.append(
             "DataHandler.get_latest_signals uses '<=' for score_date filter — "
             "should be '<' (strictly less-than) to enforce the 1-day execution lag."
@@ -213,7 +214,11 @@ def _empirical_audit(
             reason="missing score column: expected z_score, momentum_score, or alpha_score",
         )
         return 0, 0, []
-    factor_filter = scores["factor_name"] == "momentum" if "factor_name" in scores.columns else pd.Series([True] * len(scores))
+    factor_filter = (
+        scores["factor_name"] == "momentum"
+        if "factor_name" in scores.columns
+        else pd.Series(True, index=scores.index)
+    )
     momentum_scores = scores[factor_filter].copy()
 
     if momentum_scores.empty:

@@ -99,7 +99,7 @@ services:
 
   # ─── Experiment tracking ─────────────────────────────────────────────────────
   minio-init:
-    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    image: minio/mc:RELEASE.2024-01-16T16-07-38Z
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >

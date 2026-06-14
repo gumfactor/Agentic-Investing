@@ -184,9 +184,13 @@ def _build_fold_dates(
 
         if window_type == "expanding":
             tr_start = first_date
-        else:  # rolling
+        elif window_type == "rolling":
             tr_start_idx = max(0, test_start_idx - approx_train_days)
             tr_start = trading_dates[tr_start_idx]
+        else:
+            raise ValueError(
+                f"Unknown window_type: {window_type!r}. Expected 'expanding' or 'rolling'."
+            )
 
         tr_end = trading_dates[test_start_idx - 1]
         te_start = trading_dates[test_start_idx]

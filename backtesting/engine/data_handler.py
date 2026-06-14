@@ -2,8 +2,11 @@
 
 DataHandler wraps pre-loaded DataFrames and enforces the temporal horizon:
 only data whose observation date is <= simulation_date is visible to the engine.
-No DB I/O occurs here — the caller loads data and passes DataFrames in.
+Alpha scores use a stricter filter — score_date < sim_date (strictly less-than)
+to enforce a 1-day execution lag: signals computed from day-t closing prices
+are only tradeable from day t+1 onwards.
 
+No DB I/O occurs here — the caller loads data and passes DataFrames in.
 This separation makes the engine fully testable without a database.
 """
 

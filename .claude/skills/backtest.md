@@ -24,7 +24,7 @@ All output is written to MLflow and optionally to local parquet files.
 | Input | Type | Notes |
 |-------|------|-------|
 | `config_path` | str | Path to strategy YAML, e.g. `config/strategy/v1_base_momentum.yaml` |
-| `data_version` | str | DVC/MinIO snapshot ID (required per C7 — refuse to run without it) |
+| `data_version` | str | Dataset manifest path, e.g. `rqis-snapshots/manifests/2026-06-14/manifest.json` (required per C7 — refuse to run without it) |
 | `experiment_name` | str | MLflow experiment, e.g. `base_momentum/momentum` |
 
 ### Optional inputs
@@ -54,7 +54,7 @@ All output is written to MLflow and optionally to local parquet files.
 
 ```
 Run a backtest of config/strategy/v1_base_momentum.yaml.
-Data version: rqis-snapshots/snapshots/daily_prices/2026-06-08/data.parquet
+Data version: rqis-snapshots/manifests/2026-06-14/manifest.json
 MLflow experiment: base_momentum/momentum
 ```
 
@@ -72,7 +72,7 @@ from backtesting.experiment_tracking.mlflow_logger import BacktestLogger
 # 1. Load config
 with open("config/strategy/v1_base_momentum.yaml") as f:
     config = yaml.safe_load(f)
-config["data_version"] = "rqis-snapshots/snapshots/daily_prices/2026-06-08/data.parquet"
+config["data_version"] = "rqis-snapshots/manifests/2026-06-14/manifest.json"
 
 # 2. Load data (prices and pre-computed alpha_scores from DB or parquet)
 # prices: long DataFrame with ticker, date, close
