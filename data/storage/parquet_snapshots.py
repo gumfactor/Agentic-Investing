@@ -145,6 +145,12 @@ class ParquetSnapshots:
                     pass
         return sorted(dates, reverse=True)
 
+    def save_dataset_manifest(self, manifest) -> str:
+        """Save a DatasetManifest alongside this snapshot collection."""
+        from backtesting.dataset_manifest import save_manifest
+
+        return save_manifest(manifest, self._client, self._bucket)
+
     def save_raw_response(self, data: bytes, source: str, data_type: str, batch_id: str) -> str:
         """Store a raw API response before transformation.
 

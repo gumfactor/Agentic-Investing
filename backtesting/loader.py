@@ -25,16 +25,19 @@ used and all adj_factors default to 1.0 (no adjustment).
 from __future__ import annotations
 
 from datetime import date
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import structlog
 
+from backtesting.engine.data_handler import DataHandler
 from data.normalization.corporate_actions import (
     apply_adjustment_factors,
     compute_adjustment_factors,
 )
-from backtesting.engine.data_handler import DataHandler
+
+if TYPE_CHECKING:
+    from data.storage.parquet_snapshots import ParquetSnapshots
 
 logger = structlog.get_logger(__name__)
 
@@ -42,15 +45,15 @@ logger = structlog.get_logger(__name__)
 def load_from_snapshot(
     data_version: str,
     config: dict,
-    snapshots: Optional[ParquetSnapshots] = None,
+    snapshots: ParquetSnapshots | None = None,
 ) -> DataHandler:
     """Load a DataHandler from versioned MinIO snapshots with price adjustment.
 
     Args:
         data_version: Snapshot date string ('YYYY-MM-DD').  All required data
             types must have a snapshot pinned on this date.
-        config: Strategy config dict.  Used to filter alpha_scores by
-            strategy_id (``config["name"]`` or ``"v1"`` as fallback).
+        config: Strategy config dict. Used to filter alpha_scores by
+            ``strategy_id``, then ``name``, or ``"v1"`` as fallback.
         snapshots: ParquetSnapshots instance.  If None, one is created from
             MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY env vars.
 
@@ -63,11 +66,14 @@ def load_from_snapshot(
         ValueError: if a required column is missing from a loaded snapshot.
     """
     if snapshots is None:
-        from data.storage.parquet_snapshots import ParquetSnapshots  # lazy: avoids minio at import time
+        from data.storage.parquet_snapshots import (
+            ParquetSnapshots,  # lazy: avoids minio at import time
+        )
+
         snapshots = ParquetSnapshots()
     snaps = snapshots
     snap_date = date.fromisoformat(data_version)
-    strategy_id = config.get("name", "v1")
+    strategy_id = config.get("strategy_id", config.get("name", "v1"))
 
     logger.info(
         "loader_start",

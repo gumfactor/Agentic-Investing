@@ -650,6 +650,29 @@ def test_loader_warns_when_no_scores_for_strategy():
     assert handler.get_latest_signals(date(2023, 1, 3)).empty
 
 
+def test_loader_prefers_explicit_strategy_id_over_display_name():
+    """A human-readable config name must not hide scores stored under strategy_id."""
+    from backtesting.loader import load_from_snapshot
+
+    prices = _make_loader_prices(["AAPL"])
+    alpha = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "score_date": [date(2023, 1, 2)],
+        "strategy_id": ["v1"],
+        "alpha_score": [1.0],
+    })
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 2)], "close": [400.0]})
+
+    handler = load_from_snapshot(
+        "2023-01-02",
+        {"name": "base_momentum", "strategy_id": "v1"},
+        snapshots=_mock_snapshots(prices, alpha, benchmark),
+    )
+
+    signals = handler.get_latest_signals(date(2023, 1, 3))
+    assert signals["ticker"].tolist() == ["AAPL"]
+
+
 # ------------------------------------------------------------------
 # scripts/backfill_momentum_scores.py — Finding #4 history guard
 # ------------------------------------------------------------------
