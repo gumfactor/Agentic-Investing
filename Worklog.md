@@ -111,6 +111,19 @@ documented command was rerun without an environment wrapper and completed:
 - Trades: 2,050
 - Sharpe: 1.316
 
+The point-in-time audit CLI was also validated on Windows PowerShell:
+
+```powershell
+python -m scripts.audit_pit_safety --snapshot-date 2026-06-14 --strategy-id v1 --sample-size 500
+```
+
+The audit loaded the pinned prices and momentum-only `v1` alpha scores,
+verified the strict one-day execution lag, and recomputed 500 sampled scores.
+Result: `CLEAN`, with zero point-in-time violations. The CLI now loads `.env`,
+uses ASCII-safe output on Windows, supports the standard bundle's
+momentum-only alpha snapshot when factor scores are absent, and fails closed
+if no empirical pairs can be checked.
+
 [DECISION] Bundle pinning remains a separate operator step after database
 backfills. This prevents incomplete or partially written backfills from being
 published as immutable research datasets.

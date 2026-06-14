@@ -884,6 +884,63 @@ def test_audit_empirical_clean(tmp_path):
     assert n_violations == 0, f"Expected 0 violations; got {n_violations}"
 
 
+def test_audit_empirical_accepts_momentum_only_alpha_scores():
+    """Pinned v1 alpha scores can be audited when factor scores are absent."""
+    import importlib
+
+    from signals.factors.momentum import compute_momentum_scores
+
+    audit = importlib.import_module("scripts.audit_pit_safety")
+    prices_df = _make_audit_prices()
+    scores_df = compute_momentum_scores(prices_df).rename(
+        columns={"date": "score_date", "momentum_score": "alpha_score"}
+    )
+    scores_df["strategy_id"] = "v1"
+
+    n_checked, n_violations, _ = audit._empirical_audit(
+        prices_df, scores_df, sample_size=50, seed=42
+    )
+
+    assert n_checked == 50
+    assert n_violations == 0
+
+
+def test_audit_snapshot_falls_back_to_v1_alpha_scores(monkeypatch):
+    """The standard backtest bundle omits factor_scores but includes alpha_scores."""
+    import importlib
+
+    from data.storage import parquet_snapshots
+
+    audit = importlib.import_module("scripts.audit_pit_safety")
+    prices_df = _make_audit_prices()
+    alpha_df = pd.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "score_date": [date(2023, 1, 3)],
+            "strategy_id": ["v1"],
+            "alpha_score": [1.0],
+        }
+    )
+
+    class _Snapshots:
+        def load_snapshot(self, data_type, snapshot_date):
+            assert snapshot_date == date(2026, 6, 14)
+            if data_type == "daily_prices":
+                return prices_df
+            if data_type == "factor_scores":
+                raise FileNotFoundError
+            if data_type == "alpha_scores":
+                return alpha_df
+            raise AssertionError(data_type)
+
+    monkeypatch.setattr(parquet_snapshots, "ParquetSnapshots", _Snapshots)
+
+    prices, scores = audit._load_from_snapshot(date(2026, 6, 14), "v1")
+
+    assert prices is prices_df
+    assert scores.equals(alpha_df)
+
+
 def test_audit_empirical_detects_corrupted_scores(tmp_path):
     """Empirical audit reports violations when stored scores are wrong."""
     import importlib

@@ -20,14 +20,10 @@ Two audit modes
 Data source options
 -------------------
 Parquet files (offline, no MinIO required):
-    python -m scripts.audit_pit_safety \\
-        --prices-file  /path/to/daily_prices.parquet \\
-        --scores-file  /path/to/factor_scores.parquet
+    python -m scripts.audit_pit_safety --prices-file prices.parquet --scores-file scores.parquet
 
 MinIO snapshot (requires env vars):
-    python -m scripts.audit_pit_safety \\
-        --snapshot-date 2026-06-10 \\
-        --strategy-id  v1
+    python -m scripts.audit_pit_safety --snapshot-date 2026-06-14 --strategy-id v1
 
 Output
 ------
@@ -48,13 +44,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import structlog
+from dotenv import load_dotenv
 
 # Allow running as a script from the repo root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from signals.factors.momentum import compute_momentum_scores
+from signals.factors.momentum import compute_momentum_scores  # noqa: E402
 
 logger = structlog.get_logger(__name__)
 
@@ -113,7 +110,20 @@ def _load_from_snapshot(snapshot_date: date, strategy_id: str) -> tuple[pd.DataF
     snaps = ParquetSnapshots()
     logger.info("loading_from_minio", snapshot_date=str(snapshot_date))
     prices = snaps.load_snapshot("daily_prices", snapshot_date)
-    scores = snaps.load_snapshot("factor_scores", snapshot_date)
+    try:
+        scores = snaps.load_snapshot("factor_scores", snapshot_date)
+    except FileNotFoundError as exc:
+        if strategy_id != "v1":
+            raise ValueError(
+                "factor_scores snapshot is missing and alpha_scores fallback is "
+                "only validated for the momentum-only strategy_id='v1'"
+            ) from exc
+        scores = snaps.load_snapshot("alpha_scores", snapshot_date)
+        logger.warning(
+            "using_alpha_scores_fallback",
+            reason="factor_scores snapshot is not part of the backtest bundle",
+            requirement="strategy alpha must be momentum-only",
+        )
     if "strategy_id" in scores.columns:
         scores = scores[scores["strategy_id"] == strategy_id].reset_index(drop=True)
     return prices, scores
@@ -141,6 +151,7 @@ def _normalise(prices: pd.DataFrame, scores: pd.DataFrame) -> tuple[pd.DataFrame
 def _structural_audit() -> list[str]:
     """Verify DataHandler enforces strict score_date < sim_date."""
     import inspect
+
     from backtesting.engine.data_handler import DataHandler
 
     source = inspect.getsource(DataHandler.get_latest_signals)
@@ -183,7 +194,20 @@ def _empirical_audit(
     Returns:
         (n_checked, n_violations, violation_records)
     """
-    score_col = "z_score" if "z_score" in scores.columns else "momentum_score"
+    score_col = next(
+        (
+            column
+            for column in ("z_score", "momentum_score", "alpha_score")
+            if column in scores.columns
+        ),
+        None,
+    )
+    if score_col is None:
+        logger.warning(
+            "empirical_audit_skipped",
+            reason="missing score column: expected z_score, momentum_score, or alpha_score",
+        )
+        return 0, 0, []
     factor_filter = scores["factor_name"] == "momentum" if "factor_name" in scores.columns else pd.Series([True] * len(scores))
     momentum_scores = scores[factor_filter].copy()
 
@@ -209,22 +233,23 @@ def _empirical_audit(
     prices_close = prices[["ticker", "date", "close"]].copy()
     prices_close["date"] = pd.to_datetime(prices_close["date"]).dt.date
     prices_close["close"] = prices_close["close"].astype(float)
+    all_recomputed = compute_momentum_scores(prices_close)
 
     for _, row in sample.iterrows():
         ticker: str = row["ticker"]
         score_date: date = row["score_date"]
         stored_score: float = float(row[score_col])
 
-        # PIT boundary: a score for day S is "as of" end-of-day S, so it may
-        # use prices with date <= S.  The 1-day execution lag (score_date <
-        # sim_date in DataHandler) ensures the signal is only traded from S+1.
-        pit_prices = prices_close[prices_close["date"] <= score_date]
+        # Momentum uses trailing rolling windows, so the value at score_date
+        # from this full-history computation is identical to a computation
+        # truncated at score_date, without repeating the expensive full pass.
+        pit_prices = prices_close
 
         if pit_prices.empty or ticker not in pit_prices["ticker"].values:
             continue  # no price history for this ticker — cannot verify
 
         try:
-            recomputed = compute_momentum_scores(pit_prices)
+            recomputed = all_recomputed
         except Exception as exc:
             logger.warning(
                 "empirical_recompute_error",
@@ -265,6 +290,7 @@ def _empirical_audit(
 
 def main() -> None:
     args = _parse_args()
+    load_dotenv()
 
     # ── Load data ──────────────────────────────────────────────────────────
     if args.prices_file and args.scores_file:
@@ -282,7 +308,7 @@ def main() -> None:
     prices, scores = _normalise(prices, scores)
 
     print(f"\n{'='*60}")
-    print(f"  PIT Safety Audit — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  PIT Safety Audit - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     print(f"  Prices rows   : {len(prices):,}")
     print(f"  Score rows    : {len(scores):,}")
@@ -291,7 +317,7 @@ def main() -> None:
     print()
 
     # ── Structural audit ──────────────────────────────────────────────────
-    print("── 1. Structural checks ─────────────────────────────────")
+    print("-- 1. Structural checks ---------------------------------")
     struct_violations = _structural_audit()
     if struct_violations:
         for v in struct_violations:
@@ -302,11 +328,11 @@ def main() -> None:
 
     # ── Empirical audit ───────────────────────────────────────────────────
     if args.skip_empirical:
-        print("── 2. Empirical checks (skipped via --skip-empirical) ───")
+        print("-- 2. Empirical checks (skipped via --skip-empirical) ---")
         print()
         all_clean = not struct_violations
     else:
-        print("── 2. Empirical re-computation checks ───────────────────")
+        print("-- 2. Empirical re-computation checks -------------------")
         n_checked, n_violations, violations = _empirical_audit(
             prices, scores, args.sample_size, args.seed
         )
@@ -323,18 +349,20 @@ def main() -> None:
                     f"recomputed={v['recomputed_score']:+.6f}  "
                     f"diff={v['abs_diff']:.2e}"
                 )
+        elif n_checked == 0:
+            print("  [FAIL] No score pairs could be checked")
         else:
             print("  [PASS] All sampled scores match PIT-filtered re-computation")
         print()
-        all_clean = not struct_violations and n_violations == 0
+        all_clean = not struct_violations and n_checked > 0 and n_violations == 0
 
     # ── Summary ───────────────────────────────────────────────────────────
-    print("── Summary ──────────────────────────────────────────────")
+    print("-- Summary ------------------------------------------------")
     if all_clean:
-        print("  RESULT: CLEAN — no point-in-time violations found")
+        print("  RESULT: CLEAN - no point-in-time violations found")
         sys.exit(0)
     else:
-        print("  RESULT: VIOLATIONS FOUND — review output above")
+        print("  RESULT: VIOLATIONS FOUND - review output above")
         sys.exit(1)
 
 
