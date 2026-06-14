@@ -185,11 +185,16 @@ def _empirical_audit(
 ) -> tuple[int, int, list[dict]]:
     """Re-compute momentum scores per sampled (ticker, score_date) and compare.
 
-    For each sampled pair, we:
-      1. Filter prices to ``date < score_date`` (strictly).
-      2. Re-run ``compute_momentum_scores`` on this PIT-filtered subset.
-      3. Compare the re-computed ``momentum_score`` to the stored ``z_score``
-         (factor_scores uses the column ``z_score`` for the normalised score).
+    Runs ``compute_momentum_scores`` once on the full price history, then for
+    each sampled ``(ticker, score_date)`` pair looks up the result at exactly
+    that date and compares it to the stored score.  Momentum uses purely
+    backward-looking rolling windows (``wide.shift(skip_days)``), so the score
+    at date d is identical whether the computation uses prices[:d] or the full
+    history — no repeated per-sample passes are needed.
+
+    A mismatch means the stored score cannot be reproduced from the price data:
+    it was either computed with different prices, a different code version, or
+    future price data (look-ahead bias).
 
     Returns:
         (n_checked, n_violations, violation_records)
@@ -235,35 +240,21 @@ def _empirical_audit(
     prices_close["close"] = prices_close["close"].astype(float)
     all_recomputed = compute_momentum_scores(prices_close)
 
+    tickers_with_prices = set(prices_close["ticker"].unique())
+
     for _, row in sample.iterrows():
         ticker: str = row["ticker"]
         score_date: date = row["score_date"]
         stored_score: float = float(row[score_col])
 
-        # Momentum uses trailing rolling windows, so the value at score_date
-        # from this full-history computation is identical to a computation
-        # truncated at score_date, without repeating the expensive full pass.
-        pit_prices = prices_close
-
-        if pit_prices.empty or ticker not in pit_prices["ticker"].values:
+        if ticker not in tickers_with_prices:
             continue  # no price history for this ticker — cannot verify
-
-        try:
-            recomputed = all_recomputed
-        except Exception as exc:
-            logger.warning(
-                "empirical_recompute_error",
-                ticker=ticker,
-                score_date=str(score_date),
-                error=str(exc),
-            )
-            continue
 
         # Look up the score at exactly score_date (same date, same ticker).
         # Comparing at the same date is the correct test: if the stored score
         # used data beyond score_date the recomputed value will differ.
-        match = recomputed[
-            (recomputed["ticker"] == ticker) & (recomputed["date"] == score_date)
+        match = all_recomputed[
+            (all_recomputed["ticker"] == ticker) & (all_recomputed["date"] == score_date)
         ]
         if match.empty:
             continue  # insufficient price history for this date

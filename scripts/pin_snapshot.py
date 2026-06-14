@@ -16,19 +16,12 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
-import yfinance as yf
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from backtesting.dataset_manifest import build_manifest
-from data.ingestion.market.yfinance_client import YFinanceClient
-from data.storage.parquet_snapshots import ParquetSnapshots
 
 load_dotenv()
-
-_YFINANCE_CACHE_DIR = Path(
-    os.environ.get("YFINANCE_CACHE_DIR", ".yfinance-cache")
-).resolve()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -54,8 +47,12 @@ def pin_bundle(
 ) -> str:
     """Build and save a complete backtest bundle, returning its manifest path."""
     engine = engine or create_engine(os.environ["DATABASE_URL"])
-    snapshots = snapshots or ParquetSnapshots()
-    market_client = market_client or YFinanceClient(batch_size=1, inter_batch_delay=0)
+    if snapshots is None:
+        from data.storage.parquet_snapshots import ParquetSnapshots  # lazy: pulls in minio
+        snapshots = ParquetSnapshots()
+    if market_client is None:
+        from data.ingestion.market.yfinance_client import YFinanceClient  # lazy: pulls in yfinance
+        market_client = YFinanceClient(batch_size=1, inter_batch_delay=0)
 
     prices = pd.read_sql(
         "SELECT * FROM daily_prices ORDER BY ticker, date",
@@ -132,9 +129,14 @@ def pin_bundle(
 
 
 def main() -> None:
+    import yfinance as yf
+
     args = _parse_args()
-    _YFINANCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    yf.set_tz_cache_location(str(_YFINANCE_CACHE_DIR))
+    yfinance_cache_dir = Path(
+        os.environ.get("YFINANCE_CACHE_DIR", ".yfinance-cache")
+    ).resolve()
+    yfinance_cache_dir.mkdir(parents=True, exist_ok=True)
+    yf.set_tz_cache_location(str(yfinance_cache_dir))
     manifest_path = pin_bundle(
         strategy_id=args.strategy_id,
         benchmark_ticker=args.benchmark,
