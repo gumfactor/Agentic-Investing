@@ -98,6 +98,28 @@ services:
       - rqis
 
   # ─── Experiment tracking ─────────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:RELEASE.2024-01-16T16-07-38Z
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}" &&
+        mc mb --ignore-existing "local/$${MINIO_BUCKET_RAW}" &&
+        mc mb --ignore-existing "local/$${MINIO_BUCKET_SNAPSHOTS}" &&
+        mc mb --ignore-existing "local/$${MINIO_BUCKET_MLFLOW}"
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET_RAW: ${MINIO_BUCKET_RAW:-rqis-raw}
+      MINIO_BUCKET_SNAPSHOTS: ${MINIO_BUCKET_SNAPSHOTS:-rqis-snapshots}
+      MINIO_BUCKET_MLFLOW: ${MINIO_BUCKET_MLFLOW:-mlflow}
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - rqis
+
   mlflow:
     build:
       context: .
@@ -118,8 +140,8 @@ services:
     depends_on:
       timescaledb:
         condition: service_healthy
-      minio:
-        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     networks:
       - rqis
 

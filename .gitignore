@@ -65,6 +65,9 @@ airflow/plugins/__pycache__/
 # MLflow
 mlruns/
 
+# Local market-data client cache
+.yfinance-cache/
+
 # DVC
 .dvc/cache/
 .dvc/tmp/

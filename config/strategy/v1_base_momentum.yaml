@@ -1,0 +1,41 @@
+version: 1
+name: base_momentum
+description: "Long-only momentum strategy. Ranks S&P 500 by 12-1 month price momentum and holds the top 50 names equal-weight."
+created: "2026-06-10"
+# data_version must be set at runtime before a backtest is logged (C7).
+# Pass --data-version flag to the backtest CLI, or set it in the YAML copy used for each run.
+data_version: ""
+
+universe:
+  source: sp500
+  min_market_cap_usd: 500000000
+  min_adv_usd: 1000000
+
+factors:
+  momentum:
+    weight: 1.0
+    score_col: momentum_score
+
+portfolio:
+  method: equal_weight   # equal_weight | mean_variance | risk_parity
+  n_long: 50
+  target_volatility: 0.10
+  max_position_weight: 0.05
+  rebalance_frequency: monthly   # daily | weekly | monthly
+  min_holding_days: 21
+
+execution:
+  fill_model: transaction_cost   # transaction_cost | perfect
+  bid_ask_spread_bps: 10
+  market_impact_coeff: 0.5
+  commission_per_share: 0.005
+
+backtest:
+  start_date: "2020-01-02"
+  end_date: "2024-12-31"
+  initial_capital: 1000000.0
+  benchmark: SPY
+
+reporting:
+  save_positions: true
+  save_trades: true

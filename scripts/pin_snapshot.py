@@ -1,42 +1,148 @@
-"""Pin the current daily_prices table as a versioned parquet snapshot in MinIO.
+"""Pin a complete, versioned backtest dataset bundle in MinIO.
 
-Run this after a successful backfill to record the Phase 1 dataset version.
-The returned path should be stored as the data_version in any MLflow backtest
-run that uses this data (C7).
+The bundle contains daily prices, strategy-specific alpha scores, corporate
+actions, and benchmark prices under one snapshot date. A manifest records the
+object paths, row counts, date ranges, schema hashes, and producing git commit.
 
 Usage:
-    python scripts/pin_snapshot.py
+    python -m scripts.pin_snapshot --strategy-id v1 --benchmark SPY
 """
 
-import sys
+from __future__ import annotations
+
+import argparse
+import os
+from datetime import date
 from pathlib import Path
 
-# Ensure the project root is on sys.path when the script is run directly.
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
+import pandas as pd
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+from backtesting.dataset_manifest import build_manifest
+
 load_dotenv()
 
-from datetime import date
-import os
 
-import pandas as pd
-from sqlalchemy import create_engine
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Pin a complete backtest dataset bundle.")
+    parser.add_argument("--strategy-id", required=True, help="Strategy ID to include.")
+    parser.add_argument("--benchmark", default="SPY", help="Benchmark ticker (default: SPY).")
+    parser.add_argument(
+        "--snapshot-date",
+        default=str(date.today()),
+        help="Bundle version date (YYYY-MM-DD; default: today).",
+    )
+    return parser.parse_args()
 
-from data.storage.parquet_snapshots import ParquetSnapshots
+
+def pin_bundle(
+    strategy_id: str,
+    benchmark_ticker: str,
+    snapshot_date: date,
+    *,
+    engine=None,
+    snapshots=None,
+    market_client=None,
+) -> str:
+    """Build and save a complete backtest bundle, returning its manifest path."""
+    engine = engine or create_engine(os.environ["DATABASE_URL"])
+    if snapshots is None:
+        from data.storage.parquet_snapshots import ParquetSnapshots  # lazy: pulls in minio
+        snapshots = ParquetSnapshots()
+    if market_client is None:
+        from data.ingestion.market.yfinance_client import YFinanceClient  # lazy: pulls in yfinance
+        market_client = YFinanceClient(batch_size=1, inter_batch_delay=0)
+
+    prices = pd.read_sql(
+        "SELECT * FROM daily_prices ORDER BY ticker, date",
+        engine,
+    )
+    alpha_scores = pd.read_sql(
+        text(
+            """
+            SELECT *
+            FROM alpha_scores
+            WHERE strategy_id = :strategy_id
+            ORDER BY score_date, ticker
+            """
+        ),
+        engine,
+        params={"strategy_id": strategy_id},
+    )
+    corporate_actions = pd.read_sql(
+        "SELECT * FROM corporate_actions ORDER BY ticker, ex_date",
+        engine,
+    )
+
+    if prices.empty:
+        raise ValueError("daily_prices is empty; cannot pin a backtest bundle")
+    if alpha_scores.empty:
+        raise ValueError(f"No alpha_scores found for strategy_id={strategy_id!r}")
+
+    price_start = pd.to_datetime(prices["date"]).min().date()
+    price_end = pd.to_datetime(prices["date"]).max().date()
+    benchmark, _ = market_client.fetch_market_data(
+        [benchmark_ticker],
+        start=price_start,
+        end=price_end,
+    )
+    if benchmark.empty:
+        raise ValueError(
+            f"No benchmark data returned for {benchmark_ticker} "
+            f"between {price_start} and {price_end}"
+        )
+
+    benchmark_dates = pd.to_datetime(benchmark["date"])
+    alpha_start = pd.to_datetime(alpha_scores["score_date"]).min()
+    alpha_end = pd.to_datetime(alpha_scores["score_date"]).max()
+    if benchmark_dates.min() > alpha_start or benchmark_dates.max() < alpha_end:
+        raise ValueError(
+            f"Benchmark coverage {benchmark_dates.min().date()} to "
+            f"{benchmark_dates.max().date()} does not cover alpha scores "
+            f"{alpha_start.date()} to {alpha_end.date()}"
+        )
+
+    dataframes = {
+        "daily_prices": prices,
+        "alpha_scores": alpha_scores,
+        "corporate_actions": corporate_actions,
+        "benchmark": benchmark,
+    }
+    object_paths = {
+        data_type: snapshots.save_snapshot(
+            df,
+            data_type=data_type,
+            snapshot_date=snapshot_date,
+        )
+        for data_type, df in dataframes.items()
+    }
+    snapshot_dates = {data_type: snapshot_date for data_type in dataframes}
+    manifest = build_manifest(
+        version=str(snapshot_date),
+        strategy_id=strategy_id,
+        dataframes=dataframes,
+        object_paths=object_paths,
+        snapshot_dates=snapshot_dates,
+    )
+    return snapshots.save_dataset_manifest(manifest)
 
 
 def main() -> None:
-    engine = create_engine(os.environ["DATABASE_URL"])
+    import yfinance as yf
 
-    print("Reading daily_prices from TimescaleDB...")
-    df = pd.read_sql("SELECT * FROM daily_prices ORDER BY ticker, date", engine)
-    print(f"  {len(df):,} rows, {df['ticker'].nunique()} tickers")
-
-    snap = ParquetSnapshots()
-    path = snap.save_snapshot(df, data_type="daily_prices", snapshot_date=date.today())
-    print(f"\nPhase 1 dataset pinned at: {path}")
-    print("Store this path as data_version in MLflow when running backtests.")
+    args = _parse_args()
+    yfinance_cache_dir = Path(
+        os.environ.get("YFINANCE_CACHE_DIR", ".yfinance-cache")
+    ).resolve()
+    yfinance_cache_dir.mkdir(parents=True, exist_ok=True)
+    yf.set_tz_cache_location(str(yfinance_cache_dir))
+    manifest_path = pin_bundle(
+        strategy_id=args.strategy_id,
+        benchmark_ticker=args.benchmark,
+        snapshot_date=date.fromisoformat(args.snapshot_date),
+    )
+    print(f"Backtest dataset bundle pinned: {manifest_path}")
 
 
 if __name__ == "__main__":

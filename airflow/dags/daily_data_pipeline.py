@@ -158,13 +158,19 @@ def _write_ohlcv(**context: Any) -> int:
 
 
 def _save_snapshot(**context: Any) -> str:
+    import os
+
     import pandas as pd
+    from sqlalchemy import create_engine
+
     from data.storage.parquet_snapshots import ParquetSnapshots
 
-    df_json: str = context["ti"].xcom_pull(key="ohlcv_df_json", task_ids="fetch_ohlcv")
     window_end: str = context["ti"].xcom_pull(key="window_end", task_ids="fetch_ohlcv")
 
-    df = pd.read_json(df_json, orient="records")
+    # A pinned daily_prices snapshot is a complete backtest dataset, not just
+    # the rolling repair window fetched by this DAG run.
+    engine = create_engine(os.environ["DATABASE_URL"])
+    df = pd.read_sql("SELECT * FROM daily_prices ORDER BY ticker, date", engine)
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
 
