@@ -91,3 +91,16 @@ class TestPortfolioBeta:
     def test_beta_empty_weights_returns_zero(self):
         beta = portfolio_beta(pd.Series(dtype=float), pd.DataFrame(), pd.Series(dtype=float))
         assert beta == 0.0
+
+    def test_beta_asset_with_sparse_nan_does_not_crash(self):
+        """Asset returns with NaN on some dates must not cause cov array-length mismatch."""
+        rng = np.random.default_rng(5)
+        dates = pd.date_range("2024-01-01", periods=50)
+        bench = pd.Series(rng.normal(0, 0.01, 50), index=dates)
+        # Asset A has NaN on dates 10,20,30 — those rows must be dropped from both arrays
+        asset_a = pd.Series(rng.normal(0, 0.01, 50), index=dates)
+        asset_a.iloc[[10, 20, 30]] = float("nan")
+        asset_returns = pd.DataFrame({"A": asset_a})
+        weights = pd.Series({"A": 1.0})
+        beta = portfolio_beta(weights, asset_returns, bench)
+        assert isinstance(beta, float)

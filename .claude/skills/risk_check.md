@@ -79,8 +79,16 @@ with open("config/settings.yaml") as f:
     import yaml
     settings = yaml.safe_load(f)
 
-monitor = RiskMonitor.from_config(settings["risk"])
+# peak_nav MUST be loaded from a persisted source (file, DB).
+# A fresh RiskMonitor starts with peak_nav=0; the first snapshot sets the current NAV as
+# the peak and reports 0% drawdown — the hard -10% breach will never fire across restarts.
+# During Phase 4 paper trading: persist peak_nav to disk after each snapshot and reload here.
+prior_peak_nav: float  # load from persistence layer, e.g. float(open("state/peak_nav").read())
+monitor = RiskMonitor.from_config(settings["risk"], peak_nav=prior_peak_nav)
 alert_manager = AlertManager()
+# Circuit breaker state is also in-memory. For Phase 4 paper trading, run risk_check and
+# execute_trade in the same long-running process so the CB instance is shared.
+# Cross-process CB persistence is a Phase 5 item (see docs/deferred_items.md).
 circuit_breaker = CircuitBreaker()
 
 # Build portfolio weights from positions + prices

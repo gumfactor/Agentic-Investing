@@ -96,10 +96,28 @@ class OrderManager:
         approved: list[Order] = []
         rejected: list[Order] = []
 
-        for order, passed, reason in self._compliance.check_batch(staged, context):
+        for order in staged:
+            passed, reason = self._compliance.check(order, context)
             if passed:
                 order.transition(OrderStatus.PENDING)
                 approved.append(order)
+                # Update the simulated context weights after each approval so that
+                # subsequent orders in the same batch see the cumulative post-trade exposure.
+                # Without this, two BUY orders each adding 3% to a sector at 20% both pass
+                # a 25% cap — neither sees the other's 3% delta.
+                total_nav = context.get("total_nav", 0.0)
+                if order.limit_price and total_nav > 0:
+                    import pandas as pd
+                    trade_w = (order.quantity * order.limit_price) / total_nav
+                    cur_w = context.get("current_weights", pd.Series(dtype=float)).copy()
+                    if order.side == OrderSide.BUY:
+                        cur_w[order.ticker] = float(cur_w.get(order.ticker, 0.0)) + trade_w
+                    else:
+                        cur_w[order.ticker] = max(0.0, float(cur_w.get(order.ticker, 0.0)) - trade_w)
+                    context = {**context, "current_weights": cur_w}
+                    # Invalidate derived sector_weights so _check_sector_concentration
+                    # re-derives from the updated current_weights on the next order.
+                    context.pop("sector_weights", None)
             else:
                 order.transition(OrderStatus.REJECTED, reason=reason)
                 rejected.append(order)

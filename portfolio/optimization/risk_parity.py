@@ -95,13 +95,31 @@ class RiskParityOptimizer(BaseOptimizer):
                     advice="Equal-weight fallback exceeds max_position_weight. Consider increasing cap or universe size.",
                 )
 
-        # Post-hoc position cap (approximate; changes ERC property slightly)
+        # Post-hoc position cap (approximate; changes ERC property slightly).
+        # Uses iterative capped normalization: a single clip+renormalize can push the
+        # clipped weights back above the cap (e.g. 3 assets, cap=0.40, weights [0.5,0.3,0.2]
+        # → clip → [0.4,0.3,0.2] → normalize → [0.44,0.33,0.22], first still over cap).
         max_w = constraints_obj.max_position_weight
         if w_val.max() > max_w + 1e-6:
-            w_val = np.clip(w_val, 0.0, max_w)
-            w_sum = w_val.sum()
-            if w_sum > 1e-9:
-                w_val = w_val / w_sum
+            w = w_val.copy()
+            for _ in range(n + 1):
+                w_sum = w.sum()
+                if w_sum > 1e-9:
+                    w = w / w_sum
+                over = w > max_w
+                if not over.any():
+                    break
+                w[over] = max_w
+                free_mass = 1.0 - max_w * over.sum()
+                free = ~over
+                if free.any() and w[free].sum() > 1e-9 and free_mass > 0:
+                    w[free] = w[free] / w[free].sum() * free_mass
+                else:
+                    break
+            # Final renorm for floating-point residual
+            if w.sum() > 1e-9:
+                w = w / w.sum()
+            w_val = w
             status = f"{status}+clipped"
 
         if "clipped" in status:

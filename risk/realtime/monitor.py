@@ -85,6 +85,7 @@ class RiskMonitor:
         warn_var: float = 0.015,
         warn_beta: float = 1.3,
         warn_concentration: float = 0.04,
+        peak_nav: float = 0.0,
     ) -> None:
         self._hard = {
             "drawdown": hard_drawdown,
@@ -98,11 +99,22 @@ class RiskMonitor:
             "beta": warn_beta,
             "concentration": warn_concentration,
         }
-        self._peak_nav: float = 0.0
+        # Seed from a persisted value so drawdown is measured from the true historical peak
+        # across process restarts, not just the current session's first observed NAV.
+        # Pass peak_nav=<prior_peak> when constructing from a persisted source.
+        self._peak_nav: float = peak_nav
 
     @classmethod
-    def from_config(cls, cfg: dict) -> "RiskMonitor":
-        """Build from the 'risk' section of settings.yaml."""
+    def from_config(cls, cfg: dict, peak_nav: float = 0.0) -> "RiskMonitor":
+        """Build from the 'risk' section of settings.yaml.
+
+        Parameters
+        ----------
+        peak_nav:
+            Seed the historical peak NAV from a persisted value so drawdown is
+            computed from the true all-time high, not reset to 0% on each restart.
+            Load from your persistence layer (DB, file) and pass here.
+        """
         return cls(
             hard_drawdown=cfg.get("hard_drawdown_threshold", -0.10),
             hard_var=cfg.get("hard_var_1d_threshold", 0.025),
@@ -112,6 +124,7 @@ class RiskMonitor:
             warn_var=cfg.get("warn_var_1d_threshold", 0.015),
             warn_beta=cfg.get("warn_beta_threshold", 1.3),
             warn_concentration=cfg.get("warn_concentration_threshold", 0.04),
+            peak_nav=peak_nav,
         )
 
     def snapshot(

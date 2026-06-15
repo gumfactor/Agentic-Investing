@@ -121,6 +121,10 @@ def portfolio_beta(
     ret = asset_returns[tickers].dropna(how="all")
     bench = benchmark_returns.reindex(ret.index).dropna()
     ret = ret.reindex(bench.index).dropna(how="any")
+    # Re-align bench to ret after dropna(how="any") may have removed rows where
+    # individual assets had NaN. Without this, bench.values and ret[t].values have
+    # different lengths and np.cov raises ValueError.
+    bench = bench.reindex(ret.index)
 
     if len(ret) < 20:
         logger.warning(

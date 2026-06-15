@@ -142,6 +142,16 @@ class TestRiskParityOptimizer:
         result = optimizer.run(expected_returns, covariance, c)
         assert (result.weights <= 0.30 + 1e-3).all()
 
+    def test_position_cap_respected_after_iterative_normalization(self, expected_returns, covariance):
+        """Tight cap (0.25) with 5 assets — iterative normalization must not overshoot."""
+        c = PortfolioConstraints(max_position_weight=0.25)
+        optimizer = RiskParityOptimizer()
+        result = optimizer.run(expected_returns, covariance, c)
+        # All weights must be at or below the cap after iterative renormalization
+        assert (result.weights <= 0.25 + 1e-6).all(), (
+            f"Weight cap violated: {result.weights.max():.6f} > 0.25"
+        )
+
     def test_custom_budget(self, expected_returns, covariance):
         n = len(TICKERS)
         budget = np.array([0.30, 0.20, 0.20, 0.20, 0.10])

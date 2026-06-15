@@ -84,7 +84,6 @@ def _check_sector_concentration(order: Order, ctx: dict) -> tuple[bool, str]:
     """Reject if post-trade sector weight exceeds the limit."""
     max_sector_weight: float = ctx.get("max_sector_weight", 0.25)
     sector_map: dict[str, str] = ctx.get("sector_map", {})
-    sector_weights: dict[str, float] = ctx.get("sector_weights", {})
     total_nav: float = ctx.get("total_nav", 0.0)
 
     if total_nav <= 0 or order.limit_price is None or not sector_map:
@@ -93,6 +92,16 @@ def _check_sector_concentration(order: Order, ctx: dict) -> tuple[bool, str]:
     sector = sector_map.get(order.ticker)
     if sector is None:
         return True, ""
+
+    # Prefer explicit sector_weights from ctx; fall back to deriving from current_weights
+    # so the check works correctly even when the caller omits sector_weights.
+    sector_weights: dict[str, float] = ctx.get("sector_weights", {})
+    if not sector_weights:
+        current_weights: pd.Series = ctx.get("current_weights", pd.Series(dtype=float))
+        for tkr, w in current_weights.items():
+            sec = sector_map.get(str(tkr))
+            if sec:
+                sector_weights[sec] = sector_weights.get(sec, 0.0) + float(w)
 
     current_sec_w = sector_weights.get(sector, 0.0)
     trade_w = (order.quantity * order.limit_price) / total_nav
