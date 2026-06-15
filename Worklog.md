@@ -12,6 +12,126 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-15
+
+### Session 17 — Phase 4: Portfolio Construction + Paper Trading
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/elegant-newton-vtzrmh`
+
+---
+
+#### What was done
+
+Implemented all 7 Phase 4 milestones from empty scaffolding:
+
+**M4.1 — MVO and risk-parity optimizers** (`portfolio/optimization/`)
+- `mvo.py`: CVXPY-based max-Sharpe, min-variance, and mean-variance modes.
+  Max-Sharpe uses the Markowitz variable-substitution trick for a convex QP.
+- `risk_parity.py`: Spinu (2013) convex reformulation (`0.5 yᵀΣy − bᵀ log y`)
+  solves via CLARABEL with L-BFGS-B fallback; far more numerically stable than
+  pairwise-variance SLSQP.
+- `base.py`: Abstract `BaseOptimizer` with shared `_align_inputs` and
+  `_validate_covariance` (checks PSD via eigendecomposition).
+
+**M4.2 — Constraint handler + risk model** (`portfolio/risk_model/`)
+- `constraints.py`: `PortfolioConstraints` dataclass — single-name cap,
+  sector cap, factor bounds, turnover limit, target vol, beta limit.
+- `covariance.py`: `build_covariance()` supporting sample, Ledoit-Wolf, and OAS
+  estimators; `returns_from_prices()` with PIT-safe as-of date cutoff.
+
+**M4.3 — Rebalancing trigger** (`portfolio/rebalancing/`)
+- `trigger.py`: Calendar (daily/weekly/monthly) + L1 drift trigger.
+  First rebalance always fires; subsequent rebalances respect `min_holding_days`.
+
+**M4.3 (continued) — OMS state machine + pre-trade compliance** (`execution/oms/`)
+- `order.py`: `Order` dataclass with enforced state machine
+  (STAGED→PENDING→SUBMITTED→FILLED/REJECTED/CANCELLED); invalid transitions raise.
+- `compliance.py`: Five pre-trade checks — circuit breaker gate, wash-sale,
+  position concentration, sector concentration, minimum notional.
+- `order_manager.py`: `OrderManager` orchestrating stage→compliance→display→submit
+  lifecycle; enforces C1 by requiring caller to show `pending_orders_display()`
+  to operator and receive "YES" before `submit_pending()`.
+
+**M4.4 — IBKR paper trading integration** (`execution/brokers/`)
+- `base.py`: `BaseBroker` ABC (connect/disconnect/submit/get_fill/get_positions).
+- `ibkr.py`: `IBKRBroker` via `ib_insync`. Validates `PAPER_TRADING` env var at
+  construction; enforces C8 (PAPER_RUN_CLEARED gate) and C9 (port from env only).
+  Uses LimitOrder or MarketOrder based on `limit_price`; polls `trade.orderStatus`.
+- `cost_model/estimator.py`: Almgren-Chriss square-root impact + bid-ask spread
+  + per-share commission; matches backtesting fill_simulator model.
+
+**M4.5 — Three new Claude skills**
+- `.claude/skills/portfolio_construct.md`: Safe; stages orders only.
+- `.claude/skills/risk_check.md`: Safe; read-only.
+- `.claude/skills/execute_trade.md`: **Not safe to invoke autonomously**.
+  Documents the mandatory C1 protocol (display → operator "YES" → submit).
+
+**M4.6 — Real-time risk monitor + alerts** (`risk/realtime/`, `risk/alerts/`)
+- `var.py`: Historical VaR (non-parametric), parametric VaR (variance-covariance),
+  CVaR (Expected Shortfall), portfolio beta vs. benchmark.
+- `monitor.py`: `RiskMonitor` computes full risk snapshot per call; checks
+  drawdown, VaR, beta, concentration against warning + hard thresholds.
+  `RiskMonitor.from_config()` reads directly from `settings.yaml['risk']` section.
+- `alert_manager.py`: `AlertManager` dispatches alerts via pluggable handler list;
+  `fire_from_snapshot()` convenience for monitoring loop integration.
+
+**M4.7 — Circuit breaker** (`risk/circuit_breaker.py`)
+- CLOSED/OPEN state machine; trips on any HARD breach in a `RiskSnapshot`.
+- Reset requires non-empty `operator` and `reason_code` strings (C4 enforcement).
+- Does NOT auto-reset on clean snapshots — only a human call to `reset()` closes it.
+- Full trip and reset history tracked for audit.
+
+**Strategy config:** `config/strategy/v2_mvo_momentum.yaml` — multi-factor MVO
+portfolio using momentum (50% wt), value (25%), quality (25%).
+
+**Tests:** 79 unit tests across portfolio/tests/, execution/tests/, risk/tests/.
+All 79 pass as of this session.
+
+---
+
+#### [DECISION] Spinu (2013) formulation for risk parity
+Using the unconstrained convex form `0.5 yᵀΣy − bᵀ log(y)` instead of the
+Maillard pairwise-variance SLSQP form. The Spinu form is strictly convex, has
+no equality constraints (which cause linesearch issues in SLSQP), and is
+natively solvable by CLARABEL. The solution is y_i ∝ 1/σ_i (inverse-vol) for
+diagonal covariance, which is the known analytical ERC result. Position caps are
+applied post-hoc with renormalization (changes ERC property slightly but avoids
+breaking convexity).
+
+#### [DECISION] Normalize before clipping in risk parity
+The Spinu formulation returns unnormalized y-values; clipping must happen AFTER
+normalization to sum=1, otherwise all weights get clipped to the position cap
+and renormalized to equal-weight.
+
+#### [DECISION] CircuitBreaker is intentionally separate from RiskMonitor
+The monitor computes metrics and sets `circuit_breaker_tripped=True` in the
+snapshot, but does NOT mutate any shared state. The `CircuitBreaker` object
+evaluates the snapshot and holds the CLOSED/OPEN state. This separation makes
+both independently unit-testable and keeps the monitor a pure function.
+
+#### [SAFETY] C1 enforcement in OrderManager
+`OrderManager.submit_pending()` has no internal "YES" check — it blindly submits.
+The C1 gate is enforced at the SKILL level (execute_trade.md protocol), not in
+the library, because the skill is the correct boundary for human interaction.
+This means code calling `submit_pending()` directly bypasses C1. Document this
+in future code review.
+
+---
+
+#### Next steps (Phase 4 exit criteria)
+
+1. Connect IBKR paper account and run `IBKRBroker.connect()` against port 7497
+2. Integrate `portfolio_construct` skill with the live DataHandler and alpha scores
+3. Implement the daily monitoring loop (Airflow DAG or script) that calls
+   `risk_check` each morning and feeds `RiskSnapshot` to the circuit breaker
+4. Run a fire-drill test: manually trip the circuit breaker, verify all order
+   submission is blocked, then reset with a reason code
+5. Begin 4-week paper trading run (Phase 4 exit criterion; required before C8
+   gate opens for live trading)
+
+---
+
 ## 2026-06-14
 
 ### Session 16 - Historical backfill and reproducible dataset bundle
