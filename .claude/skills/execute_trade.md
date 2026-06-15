@@ -108,7 +108,13 @@ context = {
     "sector_map": sector_map,
     "min_order_notional": 100.0,
 }
-om = OrderManager(broker=broker)
+# PHASE 4 REQUIREMENT: portfolio_construct and execute_trade must run in the same
+# long-lived process. A fresh OrderManager starts with an empty _orders dict —
+# staged orders from a separate process invocation are lost. DB persistence of OMS
+# state is deferred to Phase 5 (see docs/deferred_items.md).
+# Similarly, the CircuitBreaker instance above must be shared with risk_check within
+# the same process; a new instance always starts CLOSED regardless of prior state.
+om = OrderManager(broker=broker, circuit_breaker=circuit_breaker)
 approved, rejected = om.run_compliance(context)
 
 if rejected:

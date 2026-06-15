@@ -92,18 +92,6 @@ class MVOOptimizer(BaseOptimizer):
 
         result_weights = result_weights / raw_sum if raw_sum > 1e-9 else result_weights
 
-        # Check if fallback weights violate position cap
-        if "fallback" in status:
-            max_w = constraints.max_position_weight
-            if result_weights.max() > max_w + 1e-6:
-                logger.warning(
-                    "mvo_fallback_violates_position_cap",
-                    max_weight=round(float(result_weights.max()), 4),
-                    cap=max_w,
-                    n_assets=n,
-                    advice="Equal-weight fallback exceeds max_position_weight. Consider increasing cap or universe size.",
-                )
-
         logger.info(
             "mvo_optimization_complete",
             mode=self.mode,
@@ -189,9 +177,13 @@ class MVOOptimizer(BaseOptimizer):
                 )
             else:
                 logger.warning("mvo_max_sharpe_failed", status=prob.status)
-            # Fallback: equal weight
-            w_val = np.ones(n) / n
-            return w_val, 0.0, f"fallback:{prob.status}"
+            # Fallback: constrained min-variance — respects position/sector caps unlike equal-weight.
+            logger.warning(
+                "mvo_max_sharpe_falling_back_to_min_variance",
+                failed_status=prob.status,
+            )
+            w_val, obj, mv_status = self._solve_min_variance(Sigma, n, constraints, tickers)
+            return w_val, obj, f"fallback_min_variance:{mv_status}"
 
         w_val = (y.value / kappa.value).clip(0.0)
         return w_val, float(prob.value), prob.status
