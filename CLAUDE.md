@@ -40,21 +40,33 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 1 | Data Foundation | **Complete** | Week 6 |
 | 2 | Signal Library | **Complete** | Week 12 |
 | 3 | Backtesting Engine | **Live validation complete** | Week 18 |
-| 4 | Portfolio + Paper Trading | Not started | Week 26 |
+| 4 | Portfolio + Paper Trading | **Implementation complete — paper run pending** | Week 26 |
 | 5 | Reporting + Live Trading | Not started | Week 36 |
 
-**Active branch:** `claude/phase-3`
+**Active branch:** `claude/elegant-newton-vtzrmh`
 
-**What this means for you:** Phase 2 is complete and the Phase 3 engine has
-passed a live pinned-data validation for the supported `2022-07-11` through
-`2024-12-31` window. The reproducible bundle version is `2026-06-14`, with
-manifest `rqis-snapshots/manifests/2026-06-14/manifest.json`. The operator
-command was validated without manually exporting `.env`; operator-confirmed
-MLflow run `2c81ae77c94246bfbf50e47365362c6d` is `FINISHED` with artifacts and
-the manifest recorded as `data_version`. The 500-pair PIT audit exited 0 with
-zero violations. Phase 3 is ready for PR closeout on this supported scope.
-No broker connections exist yet and no real capital is at risk. Safety
-constraints C1–C9 still apply as design rules.
+**What this means for you:** Phase 4 implementation is complete as of 2026-06-15.
+All three module trees (portfolio/, execution/, risk/) are now fully implemented:
+
+- **portfolio/optimization/**: MVO (max-Sharpe/min-variance) + Risk-Parity (Spinu 2013)
+- **portfolio/risk_model/**: Ledoit-Wolf covariance + PortfolioConstraints
+- **portfolio/rebalancing/**: Calendar + drift trigger
+- **execution/oms/**: Order state machine (STAGED→FILLED) + ComplianceEngine
+- **execution/brokers/**: IBKRBroker (paper port 7497 / live port 7496)
+- **execution/cost_model/**: Almgren-Chriss cost estimator
+- **risk/realtime/**: Historical/parametric VaR, CVaR, beta, RiskMonitor
+- **risk/alerts/**: AlertManager with pluggable dispatch
+- **risk/circuit_breaker.py**: CLOSED/OPEN state machine (C4-compliant)
+
+Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
+`execute_trade` (requires "YES" — C1).
+
+**79 unit tests pass.**
+
+Exit criterion for Phase 4: 4 consecutive weeks of paper trading with zero
+critical bugs; circuit breaker fire-drill test. Paper trading has NOT yet begun.
+No real capital is at risk. The IBKR paper account connection (port 7497)
+has not yet been established.
 
 ---
 

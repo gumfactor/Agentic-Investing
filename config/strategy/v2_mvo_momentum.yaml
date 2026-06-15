@@ -1,0 +1,62 @@
+# Phase 4 strategy: MVO-optimized momentum portfolio.
+# Uses the same factor set as v1 but replaces equal-weight construction
+# with max-Sharpe MVO and enforces constraint handler limits.
+#
+# NEVER modify this file after it has been used in a live/paper session.
+# Create v3_* instead (C6).
+
+name: mvo_momentum
+version: 2
+
+universe:
+  source: sp500_wikipedia
+  filters:
+    min_market_cap_usd: 500_000_000
+    min_adv_usd: 1_000_000
+    min_price_usd: 5.00
+    allowed_security_types: [CS, ADR]
+
+factors:
+  momentum:
+    weight: 0.50
+    score_col: momentum_score
+  value:
+    weight: 0.25
+    score_col: value_score
+  quality:
+    weight: 0.25
+    score_col: quality_score
+
+portfolio:
+  method: mvo                        # 'mvo', 'risk_parity', or 'equal_weight'
+  optimizer_mode: max_sharpe         # 'max_sharpe', 'min_variance', 'mean_variance'
+  n_long: 50                         # top-N alpha names in the candidate pool
+  rebalance_frequency: monthly
+  min_holding_days: 21
+  drift_threshold: 0.20              # early rebalance if L1 drift > 20%
+
+constraints:
+  max_position_weight: 0.05
+  max_sector_weight: 0.25
+  max_portfolio_beta: 1.50
+  min_order_notional: 100.0          # skip orders below $100
+
+risk_model:
+  covariance_method: ledoit_wolf
+  covariance_lookback_days: 252
+  covariance_min_days: 126
+
+execution:
+  fill_model: transaction_cost
+  bid_ask_spread_bps: 10
+  commission_per_share: 0.005
+  broker: ibkr
+  paper_trading: true                # enforce PAPER_TRADING env var
+  algo: market                       # 'market' or 'twap'
+
+backtest:
+  start_date: "2022-07-11"
+  end_date: "2024-12-31"
+  initial_capital: 1000000.0
+  benchmark: SPY
+  data_version: "rqis-snapshots/manifests/2026-06-14/manifest.json"

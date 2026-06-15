@@ -12,6 +12,331 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-15
+
+### Session 19 — Phase 4: Third Adversarial Review + Final Fixes
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/phase-4`
+**Commits:** `b6da357`
+**PR:** https://github.com/gumfactor/Agentic-Investing/pull/6
+
+---
+
+#### What was done
+
+1. **Ran a third consolidated adversarial review** (single subagent, all 18 Phase 4 files).
+   Review focused specifically on round-2 changes and cross-cutting safety invariants.
+
+2. **Applied 6 fixes** from review findings (102 tests still pass):
+
+   - **order_manager.py — double-submit guard uses (ticker, side) tuples** [MEDIUM fix]
+     Previously used ticker strings alone. A legitimate SELL was silently REJECTED if a
+     SUBMITTED BUY for the same ticker existed — a normal rebalance pattern (e.g. partially
+     liquidating a long position separately from a new buy). Now uses `(ticker, side.value)`
+     tuples so BUY and SELL for the same ticker are independent.
+
+   - **order_manager.py — within-batch duplicate guard added to submission loop** [MEDIUM fix]
+     The pre-pass guard only checked pre-existing SUBMITTED orders. Two PENDING orders for the
+     same (ticker, side) in the same batch both passed and both got submitted. The submission
+     loop now also checks `submitted_keys` (updated after each successful submit) so the second
+     duplicate is caught and rejected before reaching the broker.
+
+   - **order_manager.py — CB fallback log upgraded from WARNING to ERROR** [LOW fix]
+     When `circuit_breaker_open` is absent from context and no CircuitBreaker is provided,
+     the safe-by-default logic rejects all orders. This is a critical configuration error;
+     WARNING was insufficient to surface it without active log monitoring.
+
+   - **alert_manager.py — eviction count corrected** [MEDIUM fix]
+     When unacknowledged hard alerts exceeded `max_alerts`, the evictable pool had fewer
+     items than `n_to_evict`. The log said `n_evicted=N` but actual evictions were 0 (or
+     fewer). Fixed to log `actual_evict = min(n_to_evict, len(evictable))`.
+
+   - **compliance.py — wash-sale fails safe when as_of_date absent** [MEDIUM fix]
+     Previously returned `True` (pass) when `recent_loss_buys` was populated but
+     `as_of_date` was missing. A Phase 5 developer adding `recent_loss_buys` to the context
+     without also adding `as_of_date` would silently disable the check. Now returns `False`
+     (reject) in this case. Today this has zero production impact (recent_loss_buys is never
+     populated), but the correct failure mode is documented for Phase 5.
+
+   - **mvo.py — min-variance infeasibility log message corrected** [LOW fix]
+     `_solve_min_variance` was logging "Max-Sharpe requires at least one positive return"
+     — a copy-paste error from the max-Sharpe solver. Min-variance has no such requirement;
+     the real cause is usually over-tight constraints. Message now says so.
+
+3. **Updated risk_check.md** to document that `fire_from_snapshot()` mutates AlertManager's
+   dedup state — not truly read-only. Recommends a separate AlertManager for diagnostic runs.
+
+4. **Deferred 3 items to Phase 5** (added to `docs/deferred_items.md`):
+   - Stuck PENDING orders: no retry counter/expiry (operator decision: defer to Phase 5)
+   - `ibkr.py` `port=0` treated as falsy (cosmetic; port 0 never used in practice)
+   - Monthly trigger doesn't explicitly check `days_since >= min_holding_days` (relies on
+     outer guard; only fails if `advance_day()` not called in backtesting)
+
+---
+
+#### Key decisions recorded
+
+**[DECISION] Stuck PENDING retry — deferred to Phase 5 (operator)**
+Rationale: Paper trading has no real financial risk from a stale PENDING order. The fix
+requires per-order retry counters, expiry timestamps, and a mechanism to detect whether
+a prior `placeOrder()` call reached the broker. All of this becomes clear when the
+fills-history store (Phase 5) exists. Documenting in `deferred_items.md`.
+
+**[DECISION] Double-submit guard uses (ticker, side) not ticker alone**
+Rationale: A rebalance batch can legitimately contain a SELL of existing AAPL and a BUY of
+additional AAPL (e.g. trimming one strategy's position while another adds). A ticker-only
+guard would incorrectly block the second order. Using (ticker, side) preserves the original
+intent (prevent actual duplicate orders) while allowing this pattern.
+
+---
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/oms/order_manager.py` | (ticker, side) guard; within-batch dedup in loop; CB fallback ERROR |
+| `execution/oms/compliance.py` | Wash-sale fails safe when as_of_date absent |
+| `risk/alerts/alert_manager.py` | Correct eviction count logging |
+| `portfolio/optimization/mvo.py` | Fix min-variance infeasibility log message |
+| `.claude/skills/risk_check.md` | Document AlertManager state mutation |
+| `docs/deferred_items.md` | 3 new deferred items with Phase 5 action plans |
+
+---
+
+#### Test count
+
+102 tests passing (unchanged from end of Session 18).
+
+---
+
+#### Status: Phase 4 complete — ready for paper trading
+
+All three rounds of adversarial review are done. No open MEDIUM+ issues remain.
+
+**To begin paper trading:**
+1. Start IBKR TWS or Gateway on paper port 7497
+2. Set `IBKR_PORT=7497` and `PAPER_TRADING=true` in `.env`
+3. Run the daily pipeline end-to-end with paper account
+4. Monitor `RiskMonitor.snapshot()` output each session
+5. Fire circuit breaker drill (manually set drawdown > -10% threshold; verify CB trips and
+   all orders are blocked; reset with `cb.reset(operator, reason_code)`)
+6. After 4 clean weeks with zero critical bugs → Phase 5
+
+---
+
+### Session 18 — Phase 4 Adversarial Review Fixes + Design Decisions
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/elegant-newton-vtzrmh`
+**Commits:** `5627810`, `e96da19`
+
+---
+
+#### What was done
+
+1. **Applied all adversarial review fixes** across 11 files (82 tests pass):
+   - `compliance.py`: `circuit_breaker_open` defaults to `True` (safe-by-default); SELL on
+     over-limit positions correctly allowed (risk-reducing); wash-sale stub comment added.
+   - `order_manager.py`: CircuitBreaker auto-injection into compliance context; TOCTOU gap
+     closed in `submit_pending()` with pre-submission CB re-check.
+   - `ibkr.py`: live port (7496) requires `PAPER_TRADING=false` explicitly; CB state
+     re-validated in `connect()`; `get_account_value()` raises instead of returning 0.0.
+   - `trigger.py`: weekly rebalance uses `and` not `or` (was firing on any day ≥ 5d).
+   - `constraints.py`: `from_config()` calls `validate()` and maps all config fields.
+   - `covariance.py`: guard inf returns from zero-price delisting events; warn on dropped rows.
+   - `mvo.py`: log sum-constraint violation when solver returns `optimal_inaccurate`.
+   - `circuit_breaker.py`: `RiskSnapshot` import moved to `TYPE_CHECKING`; `evaluate()`
+     records TripEvents for subsequent breaches while OPEN (audit trail continuity).
+   - `alert_manager.py`: dedup window (3600s default); memory cap (10k alerts); hard breaches
+     bypass dedup; `fire_from_snapshot()` uses duck-typed snapshot (no circular import).
+   - `monitor.py`: warn when VaR falls back to parametric or is unknown (< 30 obs).
+   - `test_oms.py`: updated 5 tests to pass `circuit_breaker_open=False` explicitly.
+
+2. **Resolved all 7 design decisions** with operator:
+   - **D1 (C1 code enforcement):** Leave as documentation-only at code level (option b).
+     Python cannot meaningfully verify a human said "YES"; skill-layer protocol is the gate.
+   - **D2 (dead constraint fields):** Created `docs/deferred_items.md` listing
+     `target_volatility`, `max_portfolio_beta`, `factor_bounds`, `min_adv_fraction`
+     with Phase 5 action items. No code removal.
+   - **D3 (wash-sale stub):** Added Phase 5 caveat comment; stub stays in default checks so
+     it fires correctly when `recent_loss_buys` is eventually populated.
+   - **D4 (sector concentration gap):** Deferred to Phase 5; documented in `deferred_items.md`.
+   - **D5 (partial fills):** Added `PARTIALLY_FILLED` state to OMS state machine.
+     Non-terminal; `reconcile_fills()` re-polls it each cycle. Added `is_partial` property
+     and `fill_fraction` helper. 3 new tests (82 total).
+   - **D6 (circuit breaker persistence):** Deferred to Phase 5; documented in `deferred_items.md`.
+   - **D7 (VaR < 30 obs):** Monitor already uses parametric fallback when covariance is
+     provided; unknown VaR (no covariance, < 30 obs) logs a warning with advice.
+
+---
+
+#### Key decisions recorded
+
+**[DECISION] C1 enforcement stays documentation-only (D1)**
+Rationale: A `confirmed: bool = False` parameter is a bypassable speedbump, not a true
+gate — any caller can pass `confirmed=True` without actually confirming. The real enforcement
+is the `execute_trade` skill protocol which displays the order table and requires literal
+"YES" before calling `submit_pending()`. Python cannot verify a human responded. If the
+system grows to multi-user or API access, revisit a nonce/token mechanism (option c).
+
+**[DECISION] PARTIALLY_FILLED is a non-terminal order state (D5)**
+Rationale: IBKR frequently returns partial fills on larger orders. Treating a 30%-filled
+order as FILLED would misrepresent portfolio state and potentially double-fill on the next
+cycle. The non-terminal state allows re-polling without re-submitting.
+
+**[DECISION] Dead PortfolioConstraints fields deferred with explicit documentation (D2)**
+Rationale: Removing them loses the designed constraint surface; implementing them now adds
+scope creep with no paper-trading benefit. Documenting in `deferred_items.md` ensures future
+sessions don't mistake inaction for completeness.
+
+---
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/oms/order.py` | Added PARTIALLY_FILLED state, transitions, is_partial, fill_fraction |
+| `execution/oms/order_manager.py` | reconcile_fills() handles partial vs full; polls PARTIALLY_FILLED |
+| `execution/oms/compliance.py` | Safe-by-default CB; SELL check fix; wash-sale stub comment |
+| `execution/tests/test_oms.py` | 5 ctx fixes + 3 PARTIALLY_FILLED tests (82 total) |
+| `docs/deferred_items.md` | New: catalogue of intentionally deferred items with Phase 5 action items |
+| (+ 7 others from review fixes — see commit 5627810) | |
+
+---
+
+#### Next steps
+
+Phase 4 implementation and review are complete. Exit criterion:
+- 4 consecutive weeks of paper trading with zero critical bugs
+- Circuit breaker fire-drill test
+
+**To begin paper trading:**
+1. Start IBKR TWS or Gateway on paper port 7497
+2. Set `IBKR_PORT=7497` and `PAPER_TRADING=true` in `.env`
+3. Run the daily pipeline end-to-end with paper account
+4. Monitor `RiskMonitor.snapshot()` output each session
+
+---
+
+### Session 17 — Phase 4: Portfolio Construction + Paper Trading
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/elegant-newton-vtzrmh`
+
+---
+
+#### What was done
+
+Implemented all 7 Phase 4 milestones from empty scaffolding:
+
+**M4.1 — MVO and risk-parity optimizers** (`portfolio/optimization/`)
+- `mvo.py`: CVXPY-based max-Sharpe, min-variance, and mean-variance modes.
+  Max-Sharpe uses the Markowitz variable-substitution trick for a convex QP.
+- `risk_parity.py`: Spinu (2013) convex reformulation (`0.5 yᵀΣy − bᵀ log y`)
+  solves via CLARABEL with L-BFGS-B fallback; far more numerically stable than
+  pairwise-variance SLSQP.
+- `base.py`: Abstract `BaseOptimizer` with shared `_align_inputs` and
+  `_validate_covariance` (checks PSD via eigendecomposition).
+
+**M4.2 — Constraint handler + risk model** (`portfolio/risk_model/`)
+- `constraints.py`: `PortfolioConstraints` dataclass — single-name cap,
+  sector cap, factor bounds, turnover limit, target vol, beta limit.
+- `covariance.py`: `build_covariance()` supporting sample, Ledoit-Wolf, and OAS
+  estimators; `returns_from_prices()` with PIT-safe as-of date cutoff.
+
+**M4.3 — Rebalancing trigger** (`portfolio/rebalancing/`)
+- `trigger.py`: Calendar (daily/weekly/monthly) + L1 drift trigger.
+  First rebalance always fires; subsequent rebalances respect `min_holding_days`.
+
+**M4.3 (continued) — OMS state machine + pre-trade compliance** (`execution/oms/`)
+- `order.py`: `Order` dataclass with enforced state machine
+  (STAGED→PENDING→SUBMITTED→FILLED/REJECTED/CANCELLED); invalid transitions raise.
+- `compliance.py`: Five pre-trade checks — circuit breaker gate, wash-sale,
+  position concentration, sector concentration, minimum notional.
+- `order_manager.py`: `OrderManager` orchestrating stage→compliance→display→submit
+  lifecycle; enforces C1 by requiring caller to show `pending_orders_display()`
+  to operator and receive "YES" before `submit_pending()`.
+
+**M4.4 — IBKR paper trading integration** (`execution/brokers/`)
+- `base.py`: `BaseBroker` ABC (connect/disconnect/submit/get_fill/get_positions).
+- `ibkr.py`: `IBKRBroker` via `ib_insync`. Validates `PAPER_TRADING` env var at
+  construction; enforces C8 (PAPER_RUN_CLEARED gate) and C9 (port from env only).
+  Uses LimitOrder or MarketOrder based on `limit_price`; polls `trade.orderStatus`.
+- `cost_model/estimator.py`: Almgren-Chriss square-root impact + bid-ask spread
+  + per-share commission; matches backtesting fill_simulator model.
+
+**M4.5 — Three new Claude skills**
+- `.claude/skills/portfolio_construct.md`: Safe; stages orders only.
+- `.claude/skills/risk_check.md`: Safe; read-only.
+- `.claude/skills/execute_trade.md`: **Not safe to invoke autonomously**.
+  Documents the mandatory C1 protocol (display → operator "YES" → submit).
+
+**M4.6 — Real-time risk monitor + alerts** (`risk/realtime/`, `risk/alerts/`)
+- `var.py`: Historical VaR (non-parametric), parametric VaR (variance-covariance),
+  CVaR (Expected Shortfall), portfolio beta vs. benchmark.
+- `monitor.py`: `RiskMonitor` computes full risk snapshot per call; checks
+  drawdown, VaR, beta, concentration against warning + hard thresholds.
+  `RiskMonitor.from_config()` reads directly from `settings.yaml['risk']` section.
+- `alert_manager.py`: `AlertManager` dispatches alerts via pluggable handler list;
+  `fire_from_snapshot()` convenience for monitoring loop integration.
+
+**M4.7 — Circuit breaker** (`risk/circuit_breaker.py`)
+- CLOSED/OPEN state machine; trips on any HARD breach in a `RiskSnapshot`.
+- Reset requires non-empty `operator` and `reason_code` strings (C4 enforcement).
+- Does NOT auto-reset on clean snapshots — only a human call to `reset()` closes it.
+- Full trip and reset history tracked for audit.
+
+**Strategy config:** `config/strategy/v2_mvo_momentum.yaml` — multi-factor MVO
+portfolio using momentum (50% wt), value (25%), quality (25%).
+
+**Tests:** 79 unit tests across portfolio/tests/, execution/tests/, risk/tests/.
+All 79 pass as of this session.
+
+---
+
+#### [DECISION] Spinu (2013) formulation for risk parity
+Using the unconstrained convex form `0.5 yᵀΣy − bᵀ log(y)` instead of the
+Maillard pairwise-variance SLSQP form. The Spinu form is strictly convex, has
+no equality constraints (which cause linesearch issues in SLSQP), and is
+natively solvable by CLARABEL. The solution is y_i ∝ 1/σ_i (inverse-vol) for
+diagonal covariance, which is the known analytical ERC result. Position caps are
+applied post-hoc with renormalization (changes ERC property slightly but avoids
+breaking convexity).
+
+#### [DECISION] Normalize before clipping in risk parity
+The Spinu formulation returns unnormalized y-values; clipping must happen AFTER
+normalization to sum=1, otherwise all weights get clipped to the position cap
+and renormalized to equal-weight.
+
+#### [DECISION] CircuitBreaker is intentionally separate from RiskMonitor
+The monitor computes metrics and sets `circuit_breaker_tripped=True` in the
+snapshot, but does NOT mutate any shared state. The `CircuitBreaker` object
+evaluates the snapshot and holds the CLOSED/OPEN state. This separation makes
+both independently unit-testable and keeps the monitor a pure function.
+
+#### [SAFETY] C1 enforcement in OrderManager
+`OrderManager.submit_pending()` has no internal "YES" check — it blindly submits.
+The C1 gate is enforced at the SKILL level (execute_trade.md protocol), not in
+the library, because the skill is the correct boundary for human interaction.
+This means code calling `submit_pending()` directly bypasses C1. Document this
+in future code review.
+
+---
+
+#### Next steps (Phase 4 exit criteria)
+
+1. Connect IBKR paper account and run `IBKRBroker.connect()` against port 7497
+2. Integrate `portfolio_construct` skill with the live DataHandler and alpha scores
+3. Implement the daily monitoring loop (Airflow DAG or script) that calls
+   `risk_check` each morning and feeds `RiskSnapshot` to the circuit breaker
+4. Run a fire-drill test: manually trip the circuit breaker, verify all order
+   submission is blocked, then reset with a reason code
+5. Begin 4-week paper trading run (Phase 4 exit criterion; required before C8
+   gate opens for live trading)
+
+---
+
 ## 2026-06-14
 
 ### Session 16 - Historical backfill and reproducible dataset bundle
