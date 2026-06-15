@@ -215,7 +215,8 @@ class MVOOptimizer(BaseOptimizer):
                 logger.error(
                     "mvo_min_variance_infeasible",
                     status=prob.status,
-                    advice="All expected returns may be negative. Max-Sharpe requires at least one positive return.",
+                    advice="Min-variance problem is infeasible. Check that constraints are compatible "
+                           "(e.g. max_position_weight is not too tight for the number of assets).",
                 )
             else:
                 logger.warning("mvo_min_variance_failed", status=prob.status)

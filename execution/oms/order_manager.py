@@ -86,9 +86,10 @@ class OrderManager:
             context = {**context, "circuit_breaker_open": self._circuit_breaker.is_open}
         elif "circuit_breaker_open" not in context:
             context = {**context, "circuit_breaker_open": True}
-            logger.warning(
+            logger.error(
                 "compliance_context_missing_circuit_breaker",
-                advice="Pass circuit_breaker_open=False explicitly or provide a CircuitBreaker to OrderManager.",
+                advice="Pass circuit_breaker_open=False explicitly or provide a CircuitBreaker to OrderManager. "
+                       "Defaulting to circuit_breaker_open=True — ALL orders will be rejected this run.",
             )
 
         staged = [o for o in self._orders.values() if o.status == OrderStatus.STAGED]
@@ -149,18 +150,21 @@ class OrderManager:
 
         pending = [o for o in self._orders.values() if o.status == OrderStatus.PENDING]
 
-        # Double-submission guard: warn if any pending ticker already has a live SUBMITTED order.
-        # This catches accidental double-calls (e.g. network timeout before state transition).
-        submitted_tickers = {
-            o.ticker for o in self._orders.values() if o.status == OrderStatus.SUBMITTED
+        # Double-submission guard: reject any PENDING order whose (ticker, side) already has a
+        # SUBMITTED order.  Uses (ticker, side) — not ticker alone — so a SELL is not blocked
+        # by a pre-existing SUBMITTED BUY for the same ticker (a legitimate rebalance pattern).
+        submitted_keys: set[tuple[str, str]] = {
+            (o.ticker, o.side.value) for o in self._orders.values() if o.status == OrderStatus.SUBMITTED
         }
         for order in pending:
-            if order.ticker in submitted_tickers:
+            key = (order.ticker, order.side.value)
+            if key in submitted_keys:
                 logger.error(
                     "double_submission_risk",
                     ticker=order.ticker,
+                    side=order.side.value,
                     order_id=order.order_id[:8],
-                    advice="A SUBMITTED order for this ticker already exists. "
+                    advice="A SUBMITTED order for this (ticker, side) already exists. "
                            "Skipping to prevent duplicate order at broker.",
                 )
                 order.transition(OrderStatus.REJECTED, reason="double_submission_prevented")
@@ -174,12 +178,26 @@ class OrderManager:
                 order.transition(OrderStatus.REJECTED, reason="circuit_breaker_opened_mid_batch")
                 logger.error("circuit_breaker_opened_mid_batch", order_id=order.order_id[:8])
                 continue
+            # Within-batch duplicate guard: catches two PENDING orders for the same
+            # (ticker, side) in the same batch (e.g. portfolio construction bug).
+            key = (order.ticker, order.side.value)
+            if key in submitted_keys:
+                logger.error(
+                    "double_submission_risk_within_batch",
+                    ticker=order.ticker,
+                    side=order.side.value,
+                    order_id=order.order_id[:8],
+                    advice="A second PENDING order for the same (ticker, side) found in this batch. "
+                           "Skipping to prevent duplicate order at broker.",
+                )
+                order.transition(OrderStatus.REJECTED, reason="double_submission_prevented")
+                continue
             try:
                 broker_id = self._broker.submit_order(order)
                 order.broker_order_id = broker_id
                 order.transition(OrderStatus.SUBMITTED)
                 submitted.append(order)
-                submitted_tickers.add(order.ticker)
+                submitted_keys.add(key)
                 logger.info(
                     "order_submitted",
                     order_id=order.order_id[:8],

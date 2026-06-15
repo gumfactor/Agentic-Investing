@@ -111,7 +111,11 @@ snap = monitor.snapshot(
     sector_map=sector_map,
 )
 
-# Fire alerts (informational only — does not mutate circuit breaker state)
+# Fire alerts (informational only — does not mutate circuit breaker state).
+# NOTE: fire_from_snapshot() updates AlertManager's dedup window for warning-severity alerts.
+# If risk_check is called before the daily monitoring pipeline, the pipeline's first call to
+# fire_from_snapshot() within the same dedup window will suppress those warning alerts.
+# To avoid this, use a separate AlertManager instance for diagnostic risk_check runs.
 alerts = alert_manager.fire_from_snapshot(snap)
 
 # Read circuit breaker state — READ-ONLY. Do NOT call circuit_breaker.evaluate()
@@ -135,7 +139,11 @@ if snap.breaches:
 
 ## Safety notes
 
-- Read-only — no broker calls, no state mutations.
+- No broker calls, no circuit-breaker mutations.
+- **AlertManager state IS mutated**: `fire_from_snapshot()` updates the dedup window for
+  warning-severity alerts. If you share an AlertManager instance with the monitoring pipeline,
+  calling risk_check before the pipeline may suppress warning alerts for up to `dedup_seconds`.
+  Use a dedicated AlertManager instance for diagnostic-only risk_check runs.
 - If the circuit breaker is OPEN, report that prominently.  The operator must
   reset it manually (C4) before trading can resume.
 - If any HARD breach is detected, do **not** proceed to `execute_trade`.

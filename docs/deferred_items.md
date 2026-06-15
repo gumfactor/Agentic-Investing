@@ -64,3 +64,50 @@ memory only.  A process restart loses the entire audit trail.
 **Phase 5 action:** Add an Alembic migration for an append-only
 `circuit_breaker_events` table (C3-safe — no UPDATE/DELETE).  Persist
 TripEvent and ResetEvent on write.  Load history from DB on startup.
+
+---
+
+## Stuck PENDING Orders — No Retry Counter or Expiry
+
+`OrderManager.submit_pending()` catches `(ConnectionError, TimeoutError, OSError)` and
+leaves the order in PENDING for retry.  There is no retry counter, no age-out timer,
+and no operator alert when an order has been PENDING for an extended period.
+
+Risks:
+1. A stale PENDING order (from a prior session's failed submission) may be re-submitted
+   after market conditions have changed materially.
+2. If `placeOrder()` reached the broker before the socket error, the retry will submit
+   a duplicate order.
+
+**Phase 5 action:** Add `max_retries: int` and `pending_expiry_seconds: int` fields to
+OrderManager.  Track a per-order retry counter and first-pending timestamp.  After N
+retries (or after T seconds), transition to REJECTED and emit an `ERROR`-level alert.
+For live trading: before retrying, check `get_positions()` to verify the position was
+not already filled from an earlier attempt.
+
+---
+
+## IBKRBroker — port=0 Treated as Falsy
+
+`execution/brokers/ibkr.py` line 65:
+```python
+raw_port = port or int(os.environ.get("IBKR_PORT", "7497"))
+```
+If `port=0` is explicitly passed, it is treated as falsy and the env var branch is taken,
+silently ignoring the explicit argument.  Unlikely in practice (port 0 is not a valid
+IB port) but latent API confusion.
+
+**Phase 5 action:** Change to `port if port is not None else int(os.environ.get(...))`.
+
+---
+
+## Monthly Rebalance Trigger — Implicit min_holding_days Dependency
+
+`portfolio/rebalancing/trigger.py`: for `MONTHLY` frequency, `_is_calendar_rebalance_day`
+checks `today.month != self._last_rebalance_date.month` but does NOT explicitly check
+`days_since >= min_holding_days`.  The outer `should_rebalance` guard catches this for
+the live path, but in test/backtest contexts where `_trading_days_since` is not correctly
+maintained via `advance_day()`, a monthly rebalance can fire after 0 trading days.
+
+**Phase 5 action:** Add an explicit `and days_since >= self._min_holding_days` guard
+inside `_is_calendar_rebalance_day` for `MONTHLY` (matching the `WEEKLY` pattern).

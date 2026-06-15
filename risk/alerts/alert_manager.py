@@ -121,11 +121,14 @@ class AlertManager:
             hard_unacked = [a for a in self._alerts if a.severity == "hard" and not a.acknowledged]
             evictable = [a for a in self._alerts if not (a.severity == "hard" and not a.acknowledged)]
             n_to_evict = max(0, len(self._alerts) - self._max_alerts)
-            if n_to_evict > 0:
-                evictable = evictable[n_to_evict:]
+            # Actual evictions bounded by evictable pool size: if hard_unacked exceeds the cap,
+            # we preserve all hard alerts even though the total count stays above max_alerts.
+            actual_evict = min(n_to_evict, len(evictable))
+            if actual_evict > 0:
+                evictable = evictable[actual_evict:]
                 logger.error(
                     "alert_manager_evicted_oldest_alerts",
-                    n_evicted=n_to_evict,
+                    n_evicted=actual_evict,
                     hard_unacked_preserved=len(hard_unacked),
                 )
             self._alerts = hard_unacked + evictable

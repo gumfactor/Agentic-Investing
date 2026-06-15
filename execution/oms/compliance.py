@@ -44,7 +44,9 @@ def _check_wash_sale(order: Order, ctx: dict) -> tuple[bool, str]:
         return True, ""
     as_of: date | None = ctx.get("as_of_date")
     if as_of is None:
-        return True, ""  # cannot evaluate wash-sale without as_of_date
+        # recent_loss_buys is populated but as_of_date is missing — fail safe rather than
+        # silently passing, which would disable the check when the caller has partial context.
+        return False, f"wash-sale: as_of_date missing with recent_loss_buys populated; rejecting {order.ticker} sell (safe default)"
     if (as_of - buy_date).days < 30:
         reason = f"wash-sale: {order.ticker} bought at loss {buy_date}; 30-day lock"
         return False, reason
