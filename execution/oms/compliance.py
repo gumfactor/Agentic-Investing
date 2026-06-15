@@ -53,17 +53,24 @@ def _check_position_concentration(order: Order, ctx: dict) -> tuple[bool, str]:
 
     current_w = float(current_weights.get(order.ticker, 0.0))
     trade_w = (order.quantity * order.limit_price) / total_nav
+
     if order.side == OrderSide.BUY:
         post_trade_w = current_w + trade_w
+        # Only block BUYs that push ABOVE the limit
+        if post_trade_w > max_weight + 1e-6:
+            reason = (
+                f"concentration: {order.ticker} post-trade weight {post_trade_w:.2%} "
+                f"> limit {max_weight:.2%}"
+            )
+            return False, reason
     else:
+        # SELLs that reduce an already-over-limit position are always allowed
+        # (they are risk-reducing); only block sells that somehow increase weight
         post_trade_w = max(0.0, current_w - trade_w)
+        if post_trade_w > current_w + 1e-6:
+            reason = f"concentration: sell would increase {order.ticker} weight"
+            return False, reason
 
-    if post_trade_w > max_weight + 1e-6:
-        reason = (
-            f"concentration: {order.ticker} post-trade weight {post_trade_w:.2%} "
-            f"> limit {max_weight:.2%}"
-        )
-        return False, reason
     return True, ""
 
 
@@ -108,8 +115,12 @@ def _check_min_order_size(order: Order, ctx: dict) -> tuple[bool, str]:
 
 
 def _check_circuit_breaker(order: Order, ctx: dict) -> tuple[bool, str]:
-    """Reject all orders when the circuit breaker is open."""
-    if ctx.get("circuit_breaker_open", False):
+    """Reject all orders when the circuit breaker is open.
+
+    Defaults to True (open/blocking) when the key is absent — safe-by-default.
+    Callers must explicitly pass circuit_breaker_open=False to allow orders through.
+    """
+    if ctx.get("circuit_breaker_open", True):
         return False, "circuit_breaker_open"
     return True, ""
 

@@ -63,6 +63,7 @@ class TestComplianceEngine:
         import pandas as pd
         engine = ComplianceEngine()
         ctx = {
+            "circuit_breaker_open": False,
             "max_position_weight": 0.05,
             "current_weights": pd.Series({"AAPL": 0.049}),
             "total_nav": 1_000_000.0,
@@ -78,6 +79,7 @@ class TestComplianceEngine:
     def test_wash_sale_blocks_sell(self):
         engine = ComplianceEngine()
         ctx = {
+            "circuit_breaker_open": False,
             "recent_loss_buys": {"AAPL": date(2024, 1, 1)},
             "as_of_date": date(2024, 1, 15),
         }
@@ -89,6 +91,7 @@ class TestComplianceEngine:
     def test_wash_sale_allows_buy(self):
         engine = ComplianceEngine()
         ctx = {
+            "circuit_breaker_open": False,
             "recent_loss_buys": {"AAPL": date(2024, 1, 1)},
             "as_of_date": date(2024, 1, 15),
         }
@@ -98,7 +101,7 @@ class TestComplianceEngine:
 
     def test_min_notional_rejected(self):
         engine = ComplianceEngine()
-        ctx = {"min_order_notional": 1000.0}
+        ctx = {"circuit_breaker_open": False, "min_order_notional": 1000.0}
         o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=1, limit_price=50.0)
         passed, reason = engine.check(o, ctx)
         assert not passed
@@ -106,7 +109,7 @@ class TestComplianceEngine:
 
     def test_clean_order_passes(self):
         engine = ComplianceEngine()
-        ctx = {"min_order_notional": 0.0}
+        ctx = {"circuit_breaker_open": False, "min_order_notional": 0.0}
         o = self._order()
         passed, reason = engine.check(o, ctx)
         assert passed
@@ -133,7 +136,7 @@ class TestOrderManager:
         om = OrderManager()
         o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, limit_price=150.0)
         om.stage(o)
-        ctx = {"min_order_notional": 0.0}
+        ctx = {"circuit_breaker_open": False, "min_order_notional": 0.0}
         approved, rejected = om.run_compliance(ctx)
         assert len(approved) == 1
         assert len(rejected) == 0
@@ -151,7 +154,7 @@ class TestOrderManager:
         om = OrderManager()
         o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, limit_price=150.0)
         om.stage(o)
-        om.run_compliance({"min_order_notional": 0.0})
+        om.run_compliance({"circuit_breaker_open": False, "min_order_notional": 0.0})
         rows = om.pending_orders_display()
         assert len(rows) == 1
         assert rows[0]["ticker"] == "AAPL"

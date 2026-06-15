@@ -69,8 +69,23 @@ class IBKRBroker(BaseBroker):
         self._validate_paper_trading_flag()
 
     def _validate_paper_trading_flag(self) -> None:
-        """Enforce C8: live trading gate requires 4 weeks of clean paper run."""
+        """Enforce C8/C9: live trading gate requires explicit opt-in + 4-week paper run.
+
+        Rules:
+        - Port 7496 (live) requires PAPER_TRADING=false explicitly set.
+          An unset PAPER_TRADING env var defaults to paper mode even if port=7496
+          was passed — prevents accidental live connection (C9).
+        - PAPER_TRADING=false requires PAPER_RUN_CLEARED=true (C8).
+        - PAPER_TRADING=false with port != 7496 is a configuration error (C9).
+        """
         paper_env = os.environ.get("PAPER_TRADING", "true").lower()
+
+        # Block live port unless PAPER_TRADING is explicitly disabled
+        if self._port == 7496 and paper_env != "false":
+            raise EnvironmentError(
+                f"IBKR_PORT={self._port} (live) requires PAPER_TRADING=false to be explicitly set. "
+                "Default/unset PAPER_TRADING is treated as paper mode (C9)."
+            )
         if paper_env == "false" and self._port != 7496:
             raise EnvironmentError(
                 "PAPER_TRADING=false but IBKR_PORT is not 7496.  "
@@ -87,6 +102,8 @@ class IBKRBroker(BaseBroker):
     # ── Connection ────────────────────────────────────────────────────────────
 
     def connect(self) -> None:
+        # Re-validate env vars at connection time; they may have changed since __init__
+        self._validate_paper_trading_flag()
         self._ib = IB()
         self._ib.connect(self._host, self._port, clientId=self._client_id, timeout=self._timeout)
         logger.info(
@@ -166,7 +183,11 @@ class IBKRBroker(BaseBroker):
         for av in self._ib.accountValues():
             if av.tag == "NetLiquidation" and av.currency == "USD":
                 return float(av.value)
-        return 0.0
+        # Never return 0.0 silently — a NAV of zero corrupts all weight calculations
+        raise RuntimeError(
+            "NetLiquidation not found in IBKR account values. "
+            "Position data may not have arrived yet; retry after a short delay."
+        )
 
     @property
     def is_paper(self) -> bool:

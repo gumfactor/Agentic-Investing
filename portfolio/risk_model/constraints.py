@@ -54,10 +54,14 @@ class PortfolioConstraints:
     @classmethod
     def from_config(cls, cfg: dict) -> PortfolioConstraints:
         """Build from a config dict (e.g. settings.yaml portfolio section)."""
-        return cls(
+        obj = cls(
             max_position_weight=cfg.get("max_position_weight", 0.05),
             max_sector_weight=cfg.get("max_sector_weight", 0.25),
             max_names=cfg.get("max_names", 100),
             target_volatility=cfg.get("target_volatility"),
             max_portfolio_beta=cfg.get("max_portfolio_beta", 1.5),
+            max_turnover=cfg.get("max_turnover", 1.0),
+            allow_short=cfg.get("allow_short", False),
         )
+        obj.validate()
+        return obj

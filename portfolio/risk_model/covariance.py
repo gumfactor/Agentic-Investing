@@ -58,7 +58,17 @@ def build_covariance(
     if dropped:
         logger.warning("covariance_dropped_sparse_tickers", n_dropped=dropped)
 
-    X = daily_returns[good_cols].dropna(how="any")
+    # Guard against inf returns from zero prices before dropping rows
+    clean = daily_returns[good_cols].replace([float("inf"), float("-inf")], float("nan"))
+    X = clean.dropna(how="any")
+
+    n_dropped_rows = len(daily_returns) - len(X)
+    if n_dropped_rows > 0:
+        logger.warning(
+            "covariance_dropped_rows_with_nan_or_inf",
+            n_dropped=n_dropped_rows,
+            remaining=len(X),
+        )
 
     if len(X) < min_days:
         raise ValueError(
@@ -117,4 +127,6 @@ def returns_from_prices(
     mask = prices.index <= pd.Timestamp(as_of)
     window = prices.loc[mask].tail(lookback_days + 1)
     returns = window.pct_change().iloc[1:]
+    # Replace inf values that arise from zero or near-zero prices (e.g., delisting)
+    returns = returns.replace([float("inf"), float("-inf")], float("nan"))
     return returns

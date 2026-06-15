@@ -79,7 +79,18 @@ class MVOOptimizer(BaseOptimizer):
             )
 
         result_weights = pd.Series(weights, index=tickers, dtype=float).clip(lower=0.0)
-        result_weights = result_weights / result_weights.sum() if result_weights.sum() > 1e-9 else result_weights
+        raw_sum = float(result_weights.sum())
+
+        # For optimal_inaccurate: log sum-constraint violation before normalizing
+        if "inaccurate" in status and abs(raw_sum - 1.0) > 0.05:
+            logger.warning(
+                "mvo_inaccurate_sum_violation",
+                status=status,
+                raw_sum=round(raw_sum, 4),
+                advice="Consider tightening solver tolerance or using fallback mode.",
+            )
+
+        result_weights = result_weights / raw_sum if raw_sum > 1e-9 else result_weights
 
         logger.info(
             "mvo_optimization_complete",

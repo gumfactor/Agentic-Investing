@@ -20,9 +20,12 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import structlog
+
+if TYPE_CHECKING:
+    from risk.realtime.monitor import RiskSnapshot
 
 logger = structlog.get_logger(__name__)
 
@@ -85,30 +88,47 @@ class CircuitBreaker:
     def is_closed(self) -> bool:
         return self._state == CircuitBreakerState.CLOSED
 
-    def evaluate(self, snapshot: "RiskSnapshot") -> bool:  # type: ignore[name-defined]
-        """Check snapshot and trip if a hard breach is present.
+    def evaluate(self, snapshot: "RiskSnapshot") -> bool:
+        """Check snapshot and trip / record breach if hard breach is present.
 
-        Returns True if the circuit breaker was (or remains) tripped.
+        - CLOSED → OPEN: first hard breach; trips the breaker.
+        - Already OPEN + new hard breach: records an additional TripEvent for
+          the audit trail (breaker stays open; severity may have changed).
+
+        Returns True if the circuit breaker is (or remains) open.
         """
-        from risk.realtime.monitor import RiskSnapshot
+        if not snapshot.circuit_breaker_tripped:
+            return self.is_open
 
-        if snapshot.circuit_breaker_tripped and self._state == CircuitBreakerState.CLOSED:
-            worst_breach = next(
-                (b for b in snapshot.breaches if b["severity"] == "hard"), None
-            )
-            metric = worst_breach["metric"] if worst_breach else "unknown"
-            value = worst_breach["value"] if worst_breach else 0.0
-            threshold = worst_breach["threshold"] if worst_breach else 0.0
+        worst_breach = next(
+            (b for b in snapshot.breaches if b["severity"] == "hard"), None
+        )
+        metric = worst_breach["metric"] if worst_breach else "unknown"
+        value = worst_breach["value"] if worst_breach else 0.0
+        threshold = worst_breach["threshold"] if worst_breach else 0.0
+        snap_date = snapshot.as_of.isoformat()
 
-            self._trip(
+        if self._state == CircuitBreakerState.CLOSED:
+            # First trip: transition CLOSED → OPEN
+            self._trip(metric=metric, value=value, threshold=threshold, snapshot_date=snap_date)
+        else:
+            # Already OPEN: record the ongoing / escalating breach for audit trail
+            event = TripEvent(
+                tripped_at=datetime.now(timezone.utc),
                 metric=metric,
                 value=value,
                 threshold=threshold,
-                snapshot_date=snapshot.as_of.isoformat(),
+                snapshot_date=snap_date,
             )
-            return True
+            self._trip_history.append(event)
+            logger.warning(
+                "circuit_breaker_breach_while_open",
+                metric=metric,
+                value=round(value, 6),
+                snapshot_date=snap_date,
+            )
 
-        return self.is_open
+        return True
 
     def _trip(
         self,

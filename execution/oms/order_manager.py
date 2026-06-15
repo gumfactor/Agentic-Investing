@@ -21,6 +21,7 @@ from execution.oms.order import Order, OrderSide, OrderStatus
 
 if TYPE_CHECKING:
     from execution.brokers.base import BaseBroker
+    from risk.circuit_breaker import CircuitBreaker
 
 logger = structlog.get_logger(__name__)
 
@@ -34,15 +35,22 @@ class OrderManager:
         ComplianceEngine instance.  Defaults to the standard check suite.
     broker:
         Broker implementation.  Must be set before calling submit_pending().
+    circuit_breaker:
+        Optional CircuitBreaker instance.  When provided, run_compliance()
+        automatically injects `circuit_breaker_open` into the context dict
+        and submit_pending() re-checks the breaker state immediately before
+        any order is sent to the broker.
     """
 
     def __init__(
         self,
         compliance: ComplianceEngine | None = None,
         broker: "BaseBroker | None" = None,
+        circuit_breaker: "CircuitBreaker | None" = None,
     ) -> None:
         self._compliance = compliance or ComplianceEngine()
         self._broker = broker
+        self._circuit_breaker = circuit_breaker
         self._orders: dict[str, Order] = {}
 
     # ── Staging ──────────────────────────────────────────────────────────────
@@ -69,7 +77,21 @@ class OrderManager:
 
         Returns (approved, rejected) lists.  Approved orders are transitioned
         to PENDING; rejected to REJECTED.
+
+        If a CircuitBreaker was provided at construction, its current state is
+        automatically injected into the context (callers need not set it manually).
         """
+        # Auto-inject circuit breaker state so compliance check is never skipped
+        if self._circuit_breaker is not None:
+            context = {**context, "circuit_breaker_open": self._circuit_breaker.is_open}
+        elif "circuit_breaker_open" not in context:
+            # Safe default: if no CB and no explicit key, treat as open (block orders).
+            # Callers must explicitly pass circuit_breaker_open=False to allow through.
+            logger.warning(
+                "compliance_context_missing_circuit_breaker",
+                advice="Pass circuit_breaker_open=False explicitly or provide a CircuitBreaker to OrderManager.",
+            )
+
         staged = [o for o in self._orders.values() if o.status == OrderStatus.STAGED]
         approved: list[Order] = []
         rejected: list[Order] = []
@@ -109,10 +131,22 @@ class OrderManager:
         IMPORTANT: The caller MUST have received explicit "YES" confirmation
         from the operator before calling this method (safety rule C1).
 
-        Returns list of submitted Order objects.
+        Raises
+        ------
+        RuntimeError if no broker is configured.
+        RuntimeError if the circuit breaker is open (C4 — prevents TOCTOU gap
+            between run_compliance() and submission).
         """
         if self._broker is None:
             raise RuntimeError("No broker configured. Set OrderManager._broker before submitting.")
+
+        # Re-check circuit breaker immediately before submission (TOCTOU fix).
+        # A breach may have fired between run_compliance() and this call.
+        if self._circuit_breaker is not None and self._circuit_breaker.is_open:
+            raise RuntimeError(
+                "Circuit breaker is OPEN. Order submission blocked (C4). "
+                "A human operator must reset it with circuit_breaker.reset(operator, reason_code)."
+            )
 
         pending = [o for o in self._orders.values() if o.status == OrderStatus.PENDING]
         submitted: list[Order] = []

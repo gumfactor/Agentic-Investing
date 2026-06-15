@@ -156,11 +156,24 @@ class RiskMonitor:
         # ── VaR / CVaR ───────────────────────────────────────────────────────
         var_1d = 0.0
         cvar_1d = 0.0
-        if len(portfolio_returns) >= 30:
+        n_obs = len(portfolio_returns)
+        if n_obs >= 30:
             var_1d = historical_var(portfolio_returns)
             cvar_1d = conditional_var(portfolio_returns)
         elif covariance is not None and len(weights) > 0:
             var_1d = parametric_var(weights, covariance)
+            logger.warning(
+                "risk_var_insufficient_history_using_parametric",
+                n_obs=n_obs,
+                min_required=30,
+            )
+        else:
+            logger.warning(
+                "risk_var_insufficient_history_unknown",
+                n_obs=n_obs,
+                min_required=30,
+                advice="VaR is 0.0 — provide covariance matrix for parametric fallback.",
+            )
 
         # ── Beta ─────────────────────────────────────────────────────────────
         beta = portfolio_beta(weights, asset_returns, benchmark_returns)

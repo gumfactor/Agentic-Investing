@@ -125,7 +125,8 @@ class RebalanceTrigger:
         if self.frequency == RebalanceFrequency.DAILY:
             return True
         elif self.frequency == RebalanceFrequency.WEEKLY:
-            return today.weekday() == 0 or days_since >= 5
+            # Rebalance on Monday AND at least 5 trading days since last rebalance
+            return today.weekday() == 0 and days_since >= 5
         elif self.frequency == RebalanceFrequency.MONTHLY:
             return (
                 today.month != self._last_rebalance_date.month

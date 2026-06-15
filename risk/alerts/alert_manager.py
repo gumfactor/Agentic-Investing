@@ -50,12 +50,28 @@ class AlertManager:
     handlers:
         Optional list of callables that receive each Alert.  The default
         handler is a structlog emit.
+    dedup_seconds:
+        Minimum seconds between repeated alerts for the same metric at the
+        same severity.  Prevents alert flooding when a breach persists across
+        monitoring ticks.  Default: 3600 (1 hour).
+    max_alerts:
+        Maximum number of alerts to retain in memory.  Oldest are evicted
+        once this limit is reached.  Default: 10_000.
     """
 
-    def __init__(self, handlers: list[AlertHandler] | None = None) -> None:
+    def __init__(
+        self,
+        handlers: list[AlertHandler] | None = None,
+        dedup_seconds: int = 3600,
+        max_alerts: int = 10_000,
+    ) -> None:
         self._handlers: list[AlertHandler] = handlers or [self._default_handler]
         self._alerts: list[Alert] = []
         self._counter: int = 0
+        self._dedup_seconds = dedup_seconds
+        self._max_alerts = max_alerts
+        # (metric, severity) → last fired datetime
+        self._last_fired: dict[tuple[str, str], datetime] = {}
 
     def fire(
         self,
@@ -64,11 +80,29 @@ class AlertManager:
         value: float,
         threshold: float,
         message: str = "",
-    ) -> Alert:
-        """Create and dispatch an alert.
+        force: bool = False,
+    ) -> Alert | None:
+        """Create and dispatch an alert, subject to deduplication.
 
-        Returns the Alert object (stored internally and returned for testing).
+        Returns the Alert object (stored internally), or None if suppressed by
+        the deduplication window.
+
+        Parameters
+        ----------
+        force:
+            If True, bypass deduplication (use for HARD severity escalations).
         """
+        key = (metric, severity)
+        now = datetime.now(timezone.utc)
+
+        if not force and severity != "hard":
+            last = self._last_fired.get(key)
+            if last is not None:
+                elapsed = (now - last).total_seconds()
+                if elapsed < self._dedup_seconds:
+                    return None  # suppress duplicate
+
+        self._last_fired[key] = now
         self._counter += 1
         alert = Alert(
             alert_id=f"ALERT-{self._counter:06d}",
@@ -79,6 +113,11 @@ class AlertManager:
             message=message or f"{metric}={value:.4f} crossed threshold {threshold:.4f}",
         )
         self._alerts.append(alert)
+
+        # Evict oldest alerts beyond the memory cap
+        if len(self._alerts) > self._max_alerts:
+            self._alerts = self._alerts[-self._max_alerts :]
+
         for handler in self._handlers:
             try:
                 handler(alert)
@@ -86,19 +125,24 @@ class AlertManager:
                 logger.error("alert_handler_failed", handler=handler.__name__, error=str(exc))
         return alert
 
-    def fire_from_snapshot(self, snapshot: "RiskSnapshot") -> list[Alert]:
-        """Fire alerts for all breaches in a RiskSnapshot."""
-        from risk.realtime.monitor import RiskSnapshot  # local import to avoid circularity
+    def fire_from_snapshot(self, snapshot: object) -> list[Alert]:
+        """Fire alerts for all breaches in a RiskSnapshot.
 
+        Hard-severity alerts always bypass the deduplication window (force=True)
+        so hard breaches are never silently suppressed.
+        """
         fired: list[Alert] = []
-        for breach in snapshot.breaches:
+        for breach in getattr(snapshot, "breaches", []):
+            is_hard = breach["severity"] == "hard"
             alert = self.fire(
                 severity=breach["severity"],
                 metric=breach["metric"],
                 value=breach["value"],
                 threshold=breach["threshold"],
+                force=is_hard,
             )
-            fired.append(alert)
+            if alert is not None:
+                fired.append(alert)
         return fired
 
     def acknowledge(self, alert_id: str) -> bool:
