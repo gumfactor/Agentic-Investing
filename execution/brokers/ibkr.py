@@ -18,6 +18,9 @@ import os
 import time
 from typing import Optional
 
+_ORDER_ID_TIMEOUT_SECONDS = 5.0
+_ORDER_ID_POLL_INTERVAL = 0.05
+
 import structlog
 
 from execution.brokers.base import BaseBroker
@@ -135,7 +138,18 @@ class IBKRBroker(BaseBroker):
             ib_order = MarketOrder(action, order.quantity)
 
         trade = self._ib.placeOrder(contract, ib_order)
-        self._ib.sleep(0.1)  # allow TWS to assign an orderId
+
+        # Poll the event loop until TWS assigns a real orderId (0 = not yet assigned).
+        # Using ib.sleep() pumps the asyncio event loop so the callback can fire.
+        deadline = time.time() + _ORDER_ID_TIMEOUT_SECONDS
+        while trade.order.orderId == 0:
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"IBKR did not assign an orderId within {_ORDER_ID_TIMEOUT_SECONDS}s "
+                    f"for {order.ticker} {action} {order.quantity}. "
+                    "Order may still be live at broker — check TWS before retrying."
+                )
+            self._ib.sleep(_ORDER_ID_POLL_INTERVAL)
 
         broker_id = str(trade.order.orderId)
         self._submitted[broker_id] = trade

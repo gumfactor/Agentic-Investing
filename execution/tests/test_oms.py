@@ -195,3 +195,81 @@ class TestOrderManager:
         om._orders[o.order_id] = o
         result = om.cancel_order(o.order_id)
         assert not result
+
+    def test_toctou_circuit_breaker_opens_between_compliance_and_submit(self):
+        """CB opens after compliance passes but before submit_pending() — must be caught."""
+        from unittest.mock import MagicMock
+        from risk.circuit_breaker import CircuitBreaker
+
+        cb = CircuitBreaker()
+        mock_broker = MagicMock()
+        om = OrderManager(broker=mock_broker, circuit_breaker=cb)
+
+        o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, limit_price=150.0)
+        om.stage(o)
+        om.run_compliance({"min_order_notional": 0.0})
+        assert o.status == OrderStatus.PENDING
+
+        # Trip CB externally between compliance and submission
+        snap = MagicMock()
+        snap.circuit_breaker_tripped = True
+        snap.breaches = [{"severity": "hard", "metric": "drawdown", "value": -0.15, "threshold": -0.10}]
+        import datetime
+        snap.as_of = datetime.date.today()
+        cb.evaluate(snap)
+        assert cb.is_open
+
+        with pytest.raises(RuntimeError, match="Circuit breaker"):
+            om.submit_pending()
+
+    def test_end_to_end_breach_trips_and_blocks_orders(self):
+        """Full safety chain: RiskMonitor hard breach → CB trips → OrderManager blocks."""
+        import datetime
+        import numpy as np
+        import pandas as pd
+        from unittest.mock import MagicMock
+        from risk.realtime.monitor import RiskMonitor
+        from risk.circuit_breaker import CircuitBreaker
+
+        # Monitor with very tight thresholds
+        monitor = RiskMonitor(
+            hard_drawdown=-0.05, warn_drawdown=-0.02,
+            hard_var=0.20, warn_var=0.15,
+            hard_beta=5.0, warn_beta=4.0,
+            hard_concentration=0.50, warn_concentration=0.40,
+        )
+        cb = CircuitBreaker()
+
+        # First snapshot sets peak NAV
+        rng = np.random.default_rng(42)
+        portfolio_returns = pd.Series(rng.normal(0.001, 0.008, 60))
+        asset_returns = pd.DataFrame({"AAPL": portfolio_returns})
+        benchmark_returns = pd.Series(rng.normal(0.001, 0.007, 60))
+        weights = pd.Series({"AAPL": 0.10})
+
+        monitor.snapshot(
+            datetime.date(2024, 1, 1), 1_000_000.0, weights,
+            portfolio_returns, asset_returns, benchmark_returns,
+        )
+
+        # Second snapshot with hard drawdown (-10% from peak)
+        snap = monitor.snapshot(
+            datetime.date(2024, 1, 2), 940_000.0, weights,
+            portfolio_returns, asset_returns, benchmark_returns,
+        )
+        assert snap.circuit_breaker_tripped
+
+        # Trip the circuit breaker
+        cb.evaluate(snap)
+        assert cb.is_open
+
+        # OrderManager should block submission
+        mock_broker = MagicMock()
+        om = OrderManager(broker=mock_broker, circuit_breaker=cb)
+        o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, limit_price=150.0)
+        om.stage(o)
+        approved, _ = om.run_compliance({"min_order_notional": 0.0})
+        assert len(approved) == 0  # blocked by CB-injected context
+
+        with pytest.raises(RuntimeError, match="Circuit breaker"):
+            om.submit_pending()

@@ -148,6 +148,24 @@ class OrderManager:
             )
 
         pending = [o for o in self._orders.values() if o.status == OrderStatus.PENDING]
+
+        # Double-submission guard: warn if any pending ticker already has a live SUBMITTED order.
+        # This catches accidental double-calls (e.g. network timeout before state transition).
+        submitted_tickers = {
+            o.ticker for o in self._orders.values() if o.status == OrderStatus.SUBMITTED
+        }
+        for order in pending:
+            if order.ticker in submitted_tickers:
+                logger.error(
+                    "double_submission_risk",
+                    ticker=order.ticker,
+                    order_id=order.order_id[:8],
+                    advice="A SUBMITTED order for this ticker already exists. "
+                           "Skipping to prevent duplicate order at broker.",
+                )
+                order.transition(OrderStatus.REJECTED, reason="double_submission_prevented")
+        pending = [o for o in pending if o.status == OrderStatus.PENDING]
+
         submitted: list[Order] = []
 
         for order in pending:
@@ -161,6 +179,7 @@ class OrderManager:
                 order.broker_order_id = broker_id
                 order.transition(OrderStatus.SUBMITTED)
                 submitted.append(order)
+                submitted_tickers.add(order.ticker)
                 logger.info(
                     "order_submitted",
                     order_id=order.order_id[:8],
@@ -169,7 +188,17 @@ class OrderManager:
                     side=order.side.value,
                     quantity=order.quantity,
                 )
+            except (ConnectionError, TimeoutError, OSError) as exc:
+                # Transient network error — leave order in PENDING so it can be retried.
+                logger.error(
+                    "order_submission_network_error",
+                    order_id=order.order_id[:8],
+                    ticker=order.ticker,
+                    error=str(exc),
+                    advice="Order left in PENDING status. Retry submit_pending() after connection recovers.",
+                )
             except Exception as exc:
+                # Permanent broker rejection (margin violation, unknown symbol, etc.)
                 order.transition(OrderStatus.REJECTED, reason=str(exc))
                 logger.error(
                     "order_submission_failed",

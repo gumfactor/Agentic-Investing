@@ -90,13 +90,18 @@ weights = pd.Series({
     for t in positions if prices.get(t, 0) > 0
 })
 
+# as_of must be provided by the caller — never use date.today() directly.
+# (Using wall-clock date violates the simulation clock convention and produces
+# incorrect results when run after market hours.)
+as_of: date  # caller must supply this — e.g. date(2024, 6, 15)
+
 # Historical returns (from DB)
-returns = returns_from_prices(prices_df, as_of=date.today())
+returns = returns_from_prices(prices_df, as_of=as_of)
 cov = build_covariance(returns)
 
 # Compute risk snapshot
 snap = monitor.snapshot(
-    as_of=date.today(),
+    as_of=as_of,
     nav=total_nav,
     weights=weights,
     portfolio_returns=portfolio_return_series,
@@ -106,18 +111,20 @@ snap = monitor.snapshot(
     sector_map=sector_map,
 )
 
-# Fire alerts
+# Fire alerts (informational only — does not mutate circuit breaker state)
 alerts = alert_manager.fire_from_snapshot(snap)
 
-# Evaluate circuit breaker
-circuit_breaker.evaluate(snap)
+# Read circuit breaker state — READ-ONLY. Do NOT call circuit_breaker.evaluate()
+# here; that is a state mutation that can trip the breaker. risk_check is
+# diagnostic only. The monitoring pipeline calls evaluate() separately.
+cb_state = circuit_breaker.state.value  # "CLOSED" or "OPEN"
 
 # Report
 print(f"Drawdown: {snap.drawdown:.2%}")
 print(f"VaR 1d 99%: {snap.var_1d_99:.2%}")
 print(f"Beta: {snap.portfolio_beta:.2f}")
 print(f"Max conc: {snap.max_concentration:.2%}")
-print(f"Circuit breaker: {circuit_breaker.state.value}")
+print(f"Circuit breaker: {cb_state}")
 if snap.breaches:
     print(f"\n⚠ {len(snap.breaches)} BREACH(ES):")
     for b in snap.breaches:

@@ -43,6 +43,7 @@ Step 1: Verify circuit breaker is CLOSED
 
 Step 2: Run pre-trade compliance on all PENDING orders
         If any order REJECTED → remove it from submission list, show reason.
+        If ALL orders are rejected → stop. Do NOT ask for YES on an empty batch.
 
 Step 3: Display the full order table to the operator:
         ┌──────────┬────────┬──────┬──────────┬────────────┐
@@ -56,15 +57,21 @@ Step 3: Display the full order table to the operator:
 Step 4: Ask operator: "Type YES to submit these orders, or anything else to cancel."
         Wait for response.
 
-Step 5a: If response == "YES" (exact, case-sensitive):
+        The confirmation must be the EXACT 3-character string `YES` with no
+        surrounding text. Inputs like "yes please", "YES go ahead", or "yes"
+        do not count. If in doubt, ask the operator to type only `YES`.
+
+Step 5a: If response == "YES" (exact, case-sensitive, nothing else):
          → Call order_manager.submit_pending()
          → Log submission to audit trail
          → Poll for fills (up to timeout_seconds)
          → Report fill summary
 
-Step 5b: If response is anything other than "YES":
-         → Cancel all PENDING orders
-         → Report: "Execution cancelled. Orders returned to STAGED status."
+Step 5b: If response is anything other than exact "YES":
+         → Cancel all PENDING orders (they transition to CANCELLED — this is
+           IRREVERSIBLE. They cannot be re-used. Run portfolio_construct again
+           if a fresh batch is needed.)
+         → Report: "Execution cancelled. Orders have been CANCELLED (not staged)."
          → Stop
 ```
 
