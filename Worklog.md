@@ -14,6 +14,117 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-15
 
+### Session 19 — Phase 4: Third Adversarial Review + Final Fixes
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/phase-4`
+**Commits:** `b6da357`
+**PR:** https://github.com/gumfactor/Agentic-Investing/pull/6
+
+---
+
+#### What was done
+
+1. **Ran a third consolidated adversarial review** (single subagent, all 18 Phase 4 files).
+   Review focused specifically on round-2 changes and cross-cutting safety invariants.
+
+2. **Applied 6 fixes** from review findings (102 tests still pass):
+
+   - **order_manager.py — double-submit guard uses (ticker, side) tuples** [MEDIUM fix]
+     Previously used ticker strings alone. A legitimate SELL was silently REJECTED if a
+     SUBMITTED BUY for the same ticker existed — a normal rebalance pattern (e.g. partially
+     liquidating a long position separately from a new buy). Now uses `(ticker, side.value)`
+     tuples so BUY and SELL for the same ticker are independent.
+
+   - **order_manager.py — within-batch duplicate guard added to submission loop** [MEDIUM fix]
+     The pre-pass guard only checked pre-existing SUBMITTED orders. Two PENDING orders for the
+     same (ticker, side) in the same batch both passed and both got submitted. The submission
+     loop now also checks `submitted_keys` (updated after each successful submit) so the second
+     duplicate is caught and rejected before reaching the broker.
+
+   - **order_manager.py — CB fallback log upgraded from WARNING to ERROR** [LOW fix]
+     When `circuit_breaker_open` is absent from context and no CircuitBreaker is provided,
+     the safe-by-default logic rejects all orders. This is a critical configuration error;
+     WARNING was insufficient to surface it without active log monitoring.
+
+   - **alert_manager.py — eviction count corrected** [MEDIUM fix]
+     When unacknowledged hard alerts exceeded `max_alerts`, the evictable pool had fewer
+     items than `n_to_evict`. The log said `n_evicted=N` but actual evictions were 0 (or
+     fewer). Fixed to log `actual_evict = min(n_to_evict, len(evictable))`.
+
+   - **compliance.py — wash-sale fails safe when as_of_date absent** [MEDIUM fix]
+     Previously returned `True` (pass) when `recent_loss_buys` was populated but
+     `as_of_date` was missing. A Phase 5 developer adding `recent_loss_buys` to the context
+     without also adding `as_of_date` would silently disable the check. Now returns `False`
+     (reject) in this case. Today this has zero production impact (recent_loss_buys is never
+     populated), but the correct failure mode is documented for Phase 5.
+
+   - **mvo.py — min-variance infeasibility log message corrected** [LOW fix]
+     `_solve_min_variance` was logging "Max-Sharpe requires at least one positive return"
+     — a copy-paste error from the max-Sharpe solver. Min-variance has no such requirement;
+     the real cause is usually over-tight constraints. Message now says so.
+
+3. **Updated risk_check.md** to document that `fire_from_snapshot()` mutates AlertManager's
+   dedup state — not truly read-only. Recommends a separate AlertManager for diagnostic runs.
+
+4. **Deferred 3 items to Phase 5** (added to `docs/deferred_items.md`):
+   - Stuck PENDING orders: no retry counter/expiry (operator decision: defer to Phase 5)
+   - `ibkr.py` `port=0` treated as falsy (cosmetic; port 0 never used in practice)
+   - Monthly trigger doesn't explicitly check `days_since >= min_holding_days` (relies on
+     outer guard; only fails if `advance_day()` not called in backtesting)
+
+---
+
+#### Key decisions recorded
+
+**[DECISION] Stuck PENDING retry — deferred to Phase 5 (operator)**
+Rationale: Paper trading has no real financial risk from a stale PENDING order. The fix
+requires per-order retry counters, expiry timestamps, and a mechanism to detect whether
+a prior `placeOrder()` call reached the broker. All of this becomes clear when the
+fills-history store (Phase 5) exists. Documenting in `deferred_items.md`.
+
+**[DECISION] Double-submit guard uses (ticker, side) not ticker alone**
+Rationale: A rebalance batch can legitimately contain a SELL of existing AAPL and a BUY of
+additional AAPL (e.g. trimming one strategy's position while another adds). A ticker-only
+guard would incorrectly block the second order. Using (ticker, side) preserves the original
+intent (prevent actual duplicate orders) while allowing this pattern.
+
+---
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/oms/order_manager.py` | (ticker, side) guard; within-batch dedup in loop; CB fallback ERROR |
+| `execution/oms/compliance.py` | Wash-sale fails safe when as_of_date absent |
+| `risk/alerts/alert_manager.py` | Correct eviction count logging |
+| `portfolio/optimization/mvo.py` | Fix min-variance infeasibility log message |
+| `.claude/skills/risk_check.md` | Document AlertManager state mutation |
+| `docs/deferred_items.md` | 3 new deferred items with Phase 5 action plans |
+
+---
+
+#### Test count
+
+102 tests passing (unchanged from end of Session 18).
+
+---
+
+#### Status: Phase 4 complete — ready for paper trading
+
+All three rounds of adversarial review are done. No open MEDIUM+ issues remain.
+
+**To begin paper trading:**
+1. Start IBKR TWS or Gateway on paper port 7497
+2. Set `IBKR_PORT=7497` and `PAPER_TRADING=true` in `.env`
+3. Run the daily pipeline end-to-end with paper account
+4. Monitor `RiskMonitor.snapshot()` output each session
+5. Fire circuit breaker drill (manually set drawdown > -10% threshold; verify CB trips and
+   all orders are blocked; reset with `cb.reset(operator, reason_code)`)
+6. After 4 clean weeks with zero critical bugs → Phase 5
+
+---
+
 ### Session 18 — Phase 4 Adversarial Review Fixes + Design Decisions
 
 **Operator:** mshane@thecanadalist.ca
