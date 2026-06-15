@@ -28,6 +28,14 @@ def _make_snapshot(circuit_tripped: bool, breaches: list | None = None) -> RiskS
     )
 
 
+def _make_hard_snap() -> RiskSnapshot:
+    """Create a RiskSnapshot with a hard breach that trips the circuit breaker."""
+    return _make_snapshot(
+        circuit_tripped=True,
+        breaches=[{"metric": "drawdown", "severity": "hard", "value": -0.12, "threshold": -0.10}],
+    )
+
+
 class TestCircuitBreaker:
     def test_initially_closed(self):
         cb = CircuitBreaker()
@@ -112,3 +120,13 @@ class TestCircuitBreaker:
         assert status["state"] == "CLOSED"
         assert status["is_open"] is False
         assert status["n_trips"] == 0
+
+    def test_evaluate_while_open_appends_trip_event(self):
+        cb = CircuitBreaker()
+        snap1 = _make_hard_snap()
+        cb.evaluate(snap1)
+        assert len(cb.trip_history()) == 1
+        snap2 = _make_hard_snap()
+        cb.evaluate(snap2)
+        assert len(cb.trip_history()) == 2
+        assert cb.is_open  # still open

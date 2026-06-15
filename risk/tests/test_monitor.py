@@ -115,8 +115,17 @@ class TestRiskMonitor:
         mon = RiskMonitor.from_config(cfg)
         assert mon._hard["drawdown"] == -0.15
 
-    def test_worst_severity_none_when_clean(self, monitor, weights, portfolio_returns, asset_returns, benchmark_returns):
-        # Use very low concentration and small portfolio — should be clean
+    def test_worst_severity_none_when_clean(self, monitor, portfolio_returns, asset_returns, benchmark_returns):
+        # Use a monitor with high thresholds so nothing breaches
+        permissive_monitor = RiskMonitor(
+            hard_drawdown=-0.50, warn_drawdown=-0.40,
+            hard_var=0.20, warn_var=0.15,
+            hard_beta=5.0, warn_beta=4.0,
+            hard_concentration=0.50, warn_concentration=0.40,
+        )
         small_weights = pd.Series({"AAPL": 0.02, "MSFT": 0.02})
-        snap = monitor.snapshot(date(2024, 6, 15), 1_000_000.0, small_weights, portfolio_returns, asset_returns, benchmark_returns)
-        assert snap.worst_severity in (BreachSeverity.NONE, BreachSeverity.WARNING)
+        snap = permissive_monitor.snapshot(
+            date(2024, 6, 15), 1_000_000.0, small_weights,
+            portfolio_returns, asset_returns, benchmark_returns,
+        )
+        assert snap.worst_severity == BreachSeverity.NONE

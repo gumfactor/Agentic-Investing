@@ -103,6 +103,13 @@ class CircuitBreaker:
         worst_breach = next(
             (b for b in snapshot.breaches if b["severity"] == "hard"), None
         )
+        if worst_breach is None and snapshot.circuit_breaker_tripped:
+            logger.error(
+                "circuit_breaker_tripped_but_no_hard_breach_in_snapshot",
+                n_breaches=len(snapshot.breaches),
+                advice="RiskSnapshot is inconsistent: circuit_breaker_tripped=True but no hard breach found. "
+                       "Tripping breaker with metric='unknown' for safety.",
+            )
         metric = worst_breach["metric"] if worst_breach else "unknown"
         value = worst_breach["value"] if worst_breach else 0.0
         threshold = worst_breach["threshold"] if worst_breach else 0.0
@@ -189,11 +196,12 @@ class CircuitBreaker:
         self._reset_history.append(event)
         self._state = CircuitBreakerState.CLOSED
 
-        logger.warning(
+        logger.error(
             "circuit_breaker_reset",
             operator=event.operator,
             reason_code=event.reason_code,
             reset_at=event.reset_at.isoformat(),
+            message="Circuit breaker manually reset by operator. Review trip history before resuming trading.",
         )
 
     def trip_history(self) -> list[TripEvent]:

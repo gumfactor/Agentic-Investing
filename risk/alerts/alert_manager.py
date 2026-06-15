@@ -90,7 +90,9 @@ class AlertManager:
         Parameters
         ----------
         force:
-            If True, bypass deduplication (use for HARD severity escalations).
+            If True, bypass deduplication. For hard-severity alerts this is redundant
+            (hard severity already bypasses dedup) but serves as an explicit intent
+            signal in call sites like fire_from_snapshot().
         """
         key = (metric, severity)
         now = datetime.now(timezone.utc)
@@ -114,15 +116,27 @@ class AlertManager:
         )
         self._alerts.append(alert)
 
-        # Evict oldest alerts beyond the memory cap
+        # Evict oldest alerts beyond the memory cap, but never evict unacknowledged hard alerts
         if len(self._alerts) > self._max_alerts:
-            self._alerts = self._alerts[-self._max_alerts :]
+            hard_unacked = [a for a in self._alerts if a.severity == "hard" and not a.acknowledged]
+            evictable = [a for a in self._alerts if not (a.severity == "hard" and not a.acknowledged)]
+            n_to_evict = max(0, len(self._alerts) - self._max_alerts)
+            if n_to_evict > 0:
+                evictable = evictable[n_to_evict:]
+                logger.error(
+                    "alert_manager_evicted_oldest_alerts",
+                    n_evicted=n_to_evict,
+                    hard_unacked_preserved=len(hard_unacked),
+                )
+            self._alerts = hard_unacked + evictable
+            # Re-sort by fired_at to maintain chronological order
+            self._alerts.sort(key=lambda a: a.fired_at)
 
         for handler in self._handlers:
             try:
                 handler(alert)
             except Exception as exc:
-                logger.error("alert_handler_failed", handler=handler.__name__, error=str(exc))
+                logger.error("alert_handler_failed", handler=getattr(handler, "__name__", repr(handler)), error=str(exc))
         return alert
 
     def fire_from_snapshot(self, snapshot: object) -> list[Alert]:

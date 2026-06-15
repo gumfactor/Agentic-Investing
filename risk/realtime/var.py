@@ -123,6 +123,13 @@ def portfolio_beta(
     ret = ret.reindex(bench.index).dropna(how="any")
 
     if len(ret) < 20:
+        logger.warning(
+            "portfolio_beta_insufficient_history",
+            n_obs=len(ret),
+            min_required=20,
+            default_beta=1.0,
+            advice="Beta is estimated as 1.0; actual beta unknown for first 20 trading days.",
+        )
         return 1.0  # default when insufficient history
 
     betas = {}
