@@ -53,7 +53,7 @@ class RiskSnapshot:
         if not self.breaches:
             return BreachSeverity.NONE
         severities = [b["severity"] for b in self.breaches]
-        if BreachSeverity.HARD in severities:
+        if BreachSeverity.HARD.value in severities:
             return BreachSeverity.HARD
         return BreachSeverity.WARNING
 
@@ -146,6 +146,16 @@ class RiskMonitor:
         sector_map:
             Optional {ticker: sector} for sector concentration.
         """
+        # Validate NAV before using it — a zero or negative NAV produces a silent wrong drawdown
+        if nav <= 0.0:
+            logger.error(
+                "risk_monitor_invalid_nav",
+                nav=nav,
+                as_of=as_of.isoformat(),
+                advice="NAV must be positive. Treating as zero drawdown but this is a data error.",
+            )
+            nav = self._peak_nav if self._peak_nav > 0 else 1.0
+
         # Update peak NAV
         if nav > self._peak_nav:
             self._peak_nav = nav
@@ -160,8 +170,20 @@ class RiskMonitor:
         if n_obs >= 30:
             var_1d = historical_var(portfolio_returns)
             cvar_1d = conditional_var(portfolio_returns)
+            if var_1d == 0.0:
+                logger.warning(
+                    "risk_var_at_floor",
+                    advice="All recent portfolio returns are positive; historical VaR is 0.0. "
+                           "VaR threshold checks will not fire. Consider parametric fallback.",
+                )
         elif covariance is not None and len(weights) > 0:
+            from scipy.stats import norm
             var_1d = parametric_var(weights, covariance)
+            # Parametric CVaR for normal: E[loss | loss > VaR] = phi(z) / (1-conf) * sigma
+            confidence = 0.99
+            z = norm.ppf(confidence)
+            sigma_daily = var_1d / z if z > 0 else 0.0
+            cvar_1d = float(norm.pdf(z) / (1 - confidence)) * sigma_daily
             logger.warning(
                 "risk_var_insufficient_history_using_parametric",
                 n_obs=n_obs,
