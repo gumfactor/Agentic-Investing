@@ -42,7 +42,9 @@ def _check_wash_sale(order: Order, ctx: dict) -> tuple[bool, str]:
     buy_date = recent_buys.get(order.ticker)
     if buy_date is None:
         return True, ""
-    as_of: date = ctx.get("as_of_date", date.today())
+    as_of: date | None = ctx.get("as_of_date")
+    if as_of is None:
+        return True, ""  # cannot evaluate wash-sale without as_of_date
     if (as_of - buy_date).days < 30:
         reason = f"wash-sale: {order.ticker} bought at loss {buy_date}; 30-day lock"
         return False, reason
@@ -71,13 +73,8 @@ def _check_position_concentration(order: Order, ctx: dict) -> tuple[bool, str]:
             )
             return False, reason
     else:
-        # SELLs that reduce an already-over-limit position are always allowed
-        # (they are risk-reducing); only block sells that somehow increase weight
-        post_trade_w = max(0.0, current_w - trade_w)
-        if post_trade_w > current_w + 1e-6:
-            reason = f"concentration: sell would increase {order.ticker} weight"
-            return False, reason
-
+        # SELLs always reduce (or maintain) weight; pass through
+        pass
     return True, ""
 
 
@@ -115,6 +112,8 @@ def _check_min_order_size(order: Order, ctx: dict) -> tuple[bool, str]:
     """Skip orders below the minimum notional threshold."""
     min_notional: float = ctx.get("min_order_notional", 100.0)
     price = order.limit_price or 0.0
+    if price == 0.0:
+        return True, ""  # market order — notional unknown pre-fill, skip check
     notional = order.quantity * price
     if notional < min_notional:
         return False, f"below_min_notional:{notional:.2f}<{min_notional}"

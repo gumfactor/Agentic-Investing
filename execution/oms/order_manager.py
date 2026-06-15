@@ -85,8 +85,7 @@ class OrderManager:
         if self._circuit_breaker is not None:
             context = {**context, "circuit_breaker_open": self._circuit_breaker.is_open}
         elif "circuit_breaker_open" not in context:
-            # Safe default: if no CB and no explicit key, treat as open (block orders).
-            # Callers must explicitly pass circuit_breaker_open=False to allow through.
+            context = {**context, "circuit_breaker_open": True}
             logger.warning(
                 "compliance_context_missing_circuit_breaker",
                 advice="Pass circuit_breaker_open=False explicitly or provide a CircuitBreaker to OrderManager.",
@@ -152,6 +151,11 @@ class OrderManager:
         submitted: list[Order] = []
 
         for order in pending:
+            # Re-check circuit breaker before each order (breach may fire mid-batch)
+            if self._circuit_breaker is not None and self._circuit_breaker.is_open:
+                order.transition(OrderStatus.REJECTED, reason="circuit_breaker_opened_mid_batch")
+                logger.error("circuit_breaker_opened_mid_batch", order_id=order.order_id[:8])
+                continue
             try:
                 broker_id = self._broker.submit_order(order)
                 order.broker_order_id = broker_id
@@ -196,11 +200,28 @@ class OrderManager:
 
         for order in active:
             if order.broker_order_id is None:
+                logger.error(
+                    "reconcile_skipped_missing_broker_id",
+                    order_id=order.order_id[:8],
+                    ticker=order.ticker,
+                    status=order.status.value,
+                    advice="Order is stuck — no broker_order_id was recorded at submission.",
+                )
                 continue
             fill = self._broker.get_fill(order.broker_order_id)
             if fill is None:
                 continue
-            order.filled_quantity = fill["filled_quantity"]
+            new_qty = fill["filled_quantity"]
+            if new_qty < order.filled_quantity - 1e-9:
+                logger.error(
+                    "fill_went_backwards",
+                    order_id=order.order_id[:8],
+                    ticker=order.ticker,
+                    previous_qty=order.filled_quantity,
+                    reported_qty=new_qty,
+                )
+                continue  # do not overwrite; preserve prior fill record
+            order.filled_quantity = new_qty
             order.avg_fill_price = fill["avg_price"]
 
             if fill["filled_quantity"] >= order.quantity - 1e-6:

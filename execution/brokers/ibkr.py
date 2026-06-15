@@ -104,6 +104,9 @@ class IBKRBroker(BaseBroker):
     def connect(self) -> None:
         # Re-validate env vars at connection time; they may have changed since __init__
         self._validate_paper_trading_flag()
+        if self._ib is not None and self._ib.isConnected():
+            logger.warning("ibkr_already_connected", host=self._host, port=self._port)
+            return
         self._ib = IB()
         self._ib.connect(self._host, self._port, clientId=self._client_id, timeout=self._timeout)
         logger.info(
@@ -156,16 +159,33 @@ class IBKRBroker(BaseBroker):
 
         self._ib.sleep(0)  # pump event loop
         status = trade.orderStatus.status
-        filled = trade.orderStatus.filled
+        filled_qty = trade.orderStatus.filled
         avg_price = trade.orderStatus.avgFillPrice
 
-        if status in ("Filled",) and filled > 0:
-            return {
-                "filled_quantity": float(filled),
-                "avg_price": float(avg_price),
-                "status": status,
-            }
+        if status == "Filled":
+            result = {"filled_quantity": filled_qty, "avg_price": avg_price, "status": "Filled"}
+            # Evict completed order from tracking dict
+            del self._submitted[broker_order_id]
+            return result
+        elif status in {"Cancelled", "Inactive"}:
+            del self._submitted[broker_order_id]
+            return None
+        elif status == "PartiallyFilled" and filled_qty > 0:
+            return {"filled_quantity": filled_qty, "avg_price": avg_price, "status": "PartiallyFilled"}
         return None
+
+    # ── Order cancellation ───────────────────────────────────────────────────
+
+    def cancel_order(self, broker_order_id: str) -> bool:
+        """Request cancellation of a live order."""
+        self._require_connection()
+        trade = self._submitted.get(broker_order_id)
+        if trade is None:
+            logger.warning("ibkr_cancel_unknown_order", broker_order_id=broker_order_id)
+            return False
+        self._ib.cancelOrder(trade.order)
+        logger.info("ibkr_cancel_requested", broker_order_id=broker_order_id, ticker=trade.contract.symbol)
+        return True
 
     # ── Account state ─────────────────────────────────────────────────────────
 

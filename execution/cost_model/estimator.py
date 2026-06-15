@@ -52,6 +52,10 @@ def estimate_costs(
     Dict with keys: commission, spread_cost, impact_cost, total_cost,
                     total_cost_bps, participation_rate.
     """
+    if quantity <= 0:
+        raise ValueError(f"quantity must be positive; got {quantity}")
+    if price <= 0:
+        raise ValueError(f"price must be positive; got {price}")
     notional = quantity * price
     participation = quantity / max(daily_volume, 1.0)
 
@@ -93,12 +97,25 @@ def estimate_batch_costs(
     -------
     DataFrame with cost breakdown per order.
     """
+    if orders.empty:
+        return pd.DataFrame(columns=["ticker", "side", "quantity", "total_cost", "total_cost_bps"])
     rows = []
     for _, row in orders.iterrows():
         ticker = row["ticker"]
-        md = market_data.loc[ticker] if ticker in market_data.index else None
-        adv = float(md["adv_30d"]) if md is not None else 1_000_000.0
-        dvol = float(md["daily_vol"]) if md is not None else 0.015
+        if ticker not in market_data.index:
+            logger.warning(
+                "cost_model_missing_market_data",
+                ticker=ticker,
+                fallback_adv=1_000_000,
+                fallback_daily_vol=0.015,
+                advice="Cost estimate is unreliable — provide market data for this ticker.",
+            )
+            adv = 1_000_000
+            dvol = 0.015
+        else:
+            md = market_data.loc[ticker]
+            adv = float(md["adv_30d"])
+            dvol = float(md["daily_vol"])
         result = estimate_costs(
             ticker=ticker,
             quantity=float(row["quantity"]),

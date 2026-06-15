@@ -92,6 +92,14 @@ class Order:
             raise ValueError(
                 f"Invalid transition {self.status} → {new_status} for order {self.order_id}"
             )
+        if new_status == OrderStatus.FILLED and self.filled_quantity < self.quantity - 1e-6:
+            import structlog
+            structlog.get_logger(__name__).warning(
+                "order_filled_with_incomplete_quantity",
+                order_id=self.order_id[:8],
+                filled_qty=self.filled_quantity,
+                ordered_qty=self.quantity,
+            )
         self.status = new_status
         self.updated_at = datetime.now(timezone.utc)
         if new_status == OrderStatus.REJECTED:
@@ -107,10 +115,20 @@ class Order:
 
     @property
     def fill_fraction(self) -> float:
-        """Fraction of the order filled so far (0.0–1.0)."""
+        """Fraction of the order filled so far (0.0–1.0). Logs an error if overfilled."""
         if self.quantity <= 0:
             return 0.0
-        return min(self.filled_quantity / self.quantity, 1.0)
+        fraction = self.filled_quantity / self.quantity
+        if fraction > 1.0 + 1e-6:
+            import structlog
+            structlog.get_logger(__name__).error(
+                "order_overfilled",
+                order_id=self.order_id[:8],
+                ticker=self.ticker,
+                filled_qty=self.filled_quantity,
+                ordered_qty=self.quantity,
+            )
+        return min(fraction, 1.0)
 
     @property
     def notional(self) -> float | None:

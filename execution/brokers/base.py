@@ -47,6 +47,14 @@ class BaseBroker(ABC):
         """
 
     @abstractmethod
+    def cancel_order(self, broker_order_id: str) -> bool:
+        """Cancel a live order at the broker.
+
+        Returns True if the cancellation request was accepted.
+        The order may not be immediately cancelled — check get_fill() for final status.
+        """
+
+    @abstractmethod
     def get_positions(self) -> dict[str, float]:
         """Return current broker positions as {ticker: shares}."""
 
