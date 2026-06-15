@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>RQIS Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #21262d;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --green: #3fb950;
+      --red: #f85149;
+      --yellow: #d29922;
+      --blue: #58a6ff;
+      --purple: #bc8cff;
+      --orange: #f0883e;
+      --accent: #1f6feb;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── HEADER ── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(22, 27, 34, 0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 13px 16px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .logo { font-size: 17px; font-weight: 800; color: var(--blue); letter-spacing: -0.5px; }
+    .logo sub { font-size: 11px; font-weight: 400; color: var(--muted); margin-left: 5px; vertical-align: middle; }
+    .header-right { display: flex; align-items: center; gap: 9px; }
+    .badge {
+      font-size: 10px; font-weight: 700; padding: 3px 9px;
+      border-radius: 20px; letter-spacing: 0.6px; text-transform: uppercase;
+    }
+    .badge-paper { background: rgba(210,153,34,0.18); color: var(--yellow); border: 1px solid rgba(210,153,34,0.35); }
+    .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: blink 2.4s ease-in-out infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+    /* ── LAYOUT ── */
+    main { padding: 14px 12px 88px; max-width: 700px; margin: 0 auto; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+
+    /* ── CARDS ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .card-label {
+      font-size: 10px; font-weight: 700; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 1px; margin-bottom: 13px;
+    }
+
+    /* ── HERO NAV CARD ── */
+    .nav-card {
+      background: linear-gradient(135deg, #0d1f3c 0%, var(--surface) 100%);
+      border: 1px solid rgba(88,166,255,0.2);
+    }
+    .nav-label { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+    .nav-value { font-size: 34px; font-weight: 800; letter-spacing: -1.5px; color: var(--text); line-height: 1; }
+    .nav-change { font-size: 15px; font-weight: 600; margin-top: 6px; }
+    .up { color: var(--green); }
+    .dn { color: var(--red); }
+    .nu { color: var(--muted); }
+
+    /* ── TIMEFRAME PILLS ── */
+    .tf-row { display: flex; gap: 6px; margin: 14px 0 2px; }
+    .tf {
+      flex: 1; text-align: center; padding: 6px 0;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--muted); font-size: 12px; font-weight: 600;
+      cursor: pointer; transition: background .15s, color .15s, border-color .15s;
+      user-select: none;
+    }
+    .tf.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    /* ── CHART WRAPPERS ── */
+    .ch { position: relative; height: 175px; margin-top: 12px; }
+    .ch-sm { position: relative; height: 120px; }
+    .ch-md { position: relative; height: 150px; }
+
+    /* ── METRIC GRID ── */
+    .mg { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+    .mg-4 { grid-template-columns: 1fr 1fr; }
+    .m {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 14px;
+    }
+    .m-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .m-value { font-size: 22px; font-weight: 800; line-height: 1.05; }
+    .m-sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+    /* ── TABLE ── */
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      text-align: left; font-size: 10px; font-weight: 700; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.6px;
+      padding: 0 6px 8px; border-bottom: 1px solid var(--border);
+    }
+    thead th:last-child { text-align: right; }
+    tbody td { padding: 10px 6px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    tbody td:last-child { text-align: right; }
+    tbody tr:last-child td { border-bottom: none; }
+    .tkr { font-weight: 700; font-size: 13px; }
+    .wbar { display: inline-block; height: 4px; background: var(--accent); border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+
+    /* ── DONUT + LEGEND ── */
+    .donut-wrap { display: flex; align-items: center; gap: 14px; }
+    .donut-c { position: relative; width: 140px; height: 140px; flex-shrink: 0; }
+    .leg-item { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; font-size: 12px; }
+    .leg-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .leg-name { flex: 1; color: var(--muted); }
+    .leg-pct { font-weight: 700; }
+
+    /* ── SIGNAL ROWS ── */
+    .sig-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 0; border-bottom: 1px solid var(--border);
+    }
+    .sig-row:last-child { border-bottom: none; }
+    .sig-tkr { font-weight: 700; width: 50px; flex-shrink: 0; font-size: 13px; }
+    .sig-bar-wrap { flex: 1; }
+    .bar-bg { background: var(--surface2); border-radius: 4px; height: 7px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 4px; }
+    .sig-label { font-size: 10px; color: var(--muted); margin-top: 3px; }
+    .sig-val { width: 34px; text-align: right; font-weight: 700; font-size: 13px; }
+
+    /* ── LIMIT BARS ── */
+    .limit-row { margin-bottom: 16px; }
+    .limit-row:last-child { margin-bottom: 0; }
+    .limit-meta { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 5px; }
+    .limit-name { color: var(--text); }
+    .limit-vals { color: var(--muted); }
+
+    /* ── CIRCUIT BREAKER ── */
+    .cb {
+      display: flex; align-items: center; gap: 12px; padding: 14px;
+      border-radius: 10px; background: rgba(63,185,80,.07);
+      border: 1px solid rgba(63,185,80,.3);
+    }
+    .cb-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--green); flex-shrink: 0; animation: blink 3s ease-in-out infinite; }
+    .cb-title { font-weight: 700; font-size: 14px; }
+    .cb-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    /* ── ORDER ITEMS ── */
+    .ord { padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .ord:last-child { border-bottom: none; }
+    .ord-top { display: flex; justify-content: space-between; align-items: flex-start; }
+    .ord-info { font-size: 13px; font-weight: 600; }
+    .buy { color: var(--green); font-weight: 800; font-size: 12px; margin-right: 3px; }
+    .sell { color: var(--red); font-weight: 800; font-size: 12px; margin-right: 3px; }
+    .ord-meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .chip {
+      font-size: 10px; font-weight: 700; padding: 2px 9px;
+      border-radius: 20px; letter-spacing: 0.4px; flex-shrink: 0; margin-left: 8px;
+    }
+    .chip-filled { background: rgba(63,185,80,.15); color: var(--green); }
+    .chip-staged  { background: rgba(88,166,255,.15); color: var(--blue); }
+    .chip-submit  { background: rgba(210,153,34,.15); color: var(--yellow); }
+
+    /* ── ALERT ITEMS ── */
+    .alrt { display: flex; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .alrt:last-child { border-bottom: none; }
+    .alrt-icon {
+      width: 34px; height: 34px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px; flex-shrink: 0;
+    }
+    .alrt-title { font-size: 13px; line-height: 1.4; }
+    .alrt-time { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+    /* ── BOTTOM NAV ── */
+    nav.bnav {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(22,27,34,0.96);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-top: 1px solid var(--border);
+      display: flex;
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    .ni {
+      flex: 1; display: flex; flex-direction: column; align-items: center;
+      padding: 10px 0 12px; cursor: pointer; border: none;
+      background: none; color: var(--muted); font-size: 10px; font-weight: 500;
+      gap: 4px; transition: color .15s; position: relative;
+    }
+    .ni.active { color: var(--blue); }
+    .ni svg { width: 21px; height: 21px; }
+    .nbadge {
+      position: absolute; top: 7px; right: calc(50% - 20px);
+      background: var(--red); color: #fff; font-size: 9px; font-weight: 800;
+      min-width: 15px; height: 15px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center; padding: 0 3px;
+    }
+
+    /* ── SECTION LABEL ── */
+    .slabel {
+      font-size: 10px; font-weight: 700; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 10px 2px;
+    }
+
+    /* ── RESPONSIVE ── */
+    @media (min-width: 580px) {
+      main { padding: 20px 20px 90px; }
+      .mg-4 { grid-template-columns: repeat(4, 1fr); }
+      .nav-value { font-size: 40px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ════════════════════════════════ HEADER ════════════════════════════════ -->
+<header>
+  <div class="logo">RQIS <sub>Quantitative Investment System</sub></div>
+  <div class="header-right">
+    <span class="badge badge-paper">Paper</span>
+    <div class="live-dot" title="Connected to IBKR port 7497"></div>
+  </div>
+</header>
+
+<!-- ════════════════════════════════ MAIN ════════════════════════════════ -->
+<main>
+
+  <!-- ╔══════════════════════╗ -->
+  <!-- ║  PORTFOLIO TAB       ║ -->
+  <!-- ╚══════════════════════╝ -->
+  <div class="tab active" id="tab-portfolio">
+
+    <div class="card nav-card">
+      <div class="nav-label">Portfolio NAV · Jun 15, 2026</div>
+      <div class="nav-value">$1,247,832</div>
+      <div class="nav-change up">▲ $3,421 &nbsp;+0.27% today</div>
+      <div class="tf-row">
+        <div class="tf active" data-tf="1W">1W</div>
+        <div class="tf" data-tf="1M">1M</div>
+        <div class="tf" data-tf="3M">3M</div>
+        <div class="tf" data-tf="YTD">YTD</div>
+      </div>
+      <div class="ch"><canvas id="eqChart"></canvas></div>
+    </div>
+
+    <div class="mg mg-4">
+      <div class="m"><div class="m-label">MTD Return</div><div class="m-value up">+1.54%</div><div class="m-sub up">+$18,903</div></div>
+      <div class="m"><div class="m-label">YTD Return</div><div class="m-value up">+7.71%</div><div class="m-sub up">+$89,234</div></div>
+      <div class="m"><div class="m-label">Sharpe (3M)</div><div class="m-value">1.43</div><div class="m-sub nu">annualized</div></div>
+      <div class="m"><div class="m-label">Max Drawdown</div><div class="m-value dn">−4.2%</div><div class="m-sub nu">YTD peak→trough</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Allocation</div>
+      <div class="donut-wrap">
+        <div class="donut-c"><canvas id="allocChart"></canvas></div>
+        <div class="donut-legend">
+          <div class="leg-item"><div class="leg-dot" style="background:#58a6ff"></div><span class="leg-name">AAPL</span><span class="leg-pct">15.2%</span></div>
+          <div class="leg-item"><div class="leg-dot" style="background:#bc8cff"></div><span class="leg-name">MSFT</span><span class="leg-pct">12.8%</span></div>
+          <div class="leg-item"><div class="leg-dot" style="background:#3fb950"></div><span class="leg-name">GOOGL</span><span class="leg-pct">11.4%</span></div>
+          <div class="leg-item"><div class="leg-dot" style="background:#f0883e"></div><span class="leg-name">NVDA</span><span class="leg-pct">9.6%</span></div>
+          <div class="leg-item"><div class="leg-dot" style="background:#79c0ff"></div><span class="leg-name">Other</span><span class="leg-pct">47.0%</span></div>
+          <div class="leg-item"><div class="leg-dot" style="background:#30363d"></div><span class="leg-name">Cash</span><span class="leg-pct">4.0%</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Holdings</div>
+      <table>
+        <thead><tr><th>Ticker</th><th>Weight</th><th>Price</th><th>P&L Today</th></tr></thead>
+        <tbody>
+          <tr><td><span class="tkr">AAPL</span></td><td><span class="wbar" style="width:30px"></span>15.2%</td><td>$234.50</td><td class="up">+$1,240</td></tr>
+          <tr><td><span class="tkr">MSFT</span></td><td><span class="wbar" style="width:26px"></span>12.8%</td><td>$428.90</td><td class="up">+$892</td></tr>
+          <tr><td><span class="tkr">GOOGL</span></td><td><span class="wbar" style="width:23px"></span>11.4%</td><td>$178.20</td><td class="dn">−$234</td></tr>
+          <tr><td><span class="tkr">NVDA</span></td><td><span class="wbar" style="width:19px"></span>9.6%</td><td>$890.30</td><td class="up">+$2,103</td></tr>
+          <tr><td><span class="tkr">JPM</span></td><td><span class="wbar" style="width:16px"></span>8.2%</td><td>$233.10</td><td class="up">+$187</td></tr>
+          <tr><td><span class="tkr">BRK.B</span></td><td><span class="wbar" style="width:16px"></span>7.9%</td><td>$376.40</td><td class="dn">−$112</td></tr>
+          <tr><td><span class="tkr">V</span></td><td><span class="wbar" style="width:13px"></span>6.4%</td><td>$374.20</td><td class="up">+$334</td></tr>
+          <tr><td><span class="tkr">Cash</span></td><td><span class="wbar" style="width:8px"></span>4.3%</td><td>—</td><td class="nu">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div><!-- /portfolio tab -->
+
+
+  <!-- ╔══════════════════════╗ -->
+  <!-- ║  RISK TAB            ║ -->
+  <!-- ╚══════════════════════╝ -->
+  <div class="tab" id="tab-risk">
+
+    <div class="card">
+      <div class="card-label">Circuit Breaker</div>
+      <div class="cb">
+        <div class="cb-dot"></div>
+        <div>
+          <div class="cb-title">CLOSED — Trading Active</div>
+          <div class="cb-sub">No limit breach · Last manual reset: 2026-06-10</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Return Distribution (1-day, 90d rolling)</div>
+      <div class="ch-sm"><canvas id="varChart"></canvas></div>
+      <div style="display:flex; gap:14px; margin-top:10px; font-size:11px; color:var(--muted);">
+        <span><span style="color:var(--red)">■</span> VaR 99%</span>
+        <span><span style="color:var(--yellow)">■</span> VaR 95%</span>
+        <span><span style="color:var(--blue)">■</span> Normal days</span>
+      </div>
+    </div>
+
+    <div class="mg">
+      <div class="m"><div class="m-label">VaR 95% (1d)</div><div class="m-value dn">−$18,247</div><div class="m-sub nu">−1.46% NAV</div></div>
+      <div class="m"><div class="m-label">VaR 99% (1d)</div><div class="m-value dn">−$27,832</div><div class="m-sub nu">−2.23% NAV</div></div>
+      <div class="m"><div class="m-label">CVaR / ES</div><div class="m-value dn">−$34,112</div><div class="m-sub nu">−2.73% NAV</div></div>
+      <div class="m"><div class="m-label">Portfolio Beta</div><div class="m-value">0.87</div><div class="m-sub nu">vs SPY</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Limit Utilization</div>
+      <div class="limit-row">
+        <div class="limit-meta"><span class="limit-name">Max Single Stock (AAPL 15.2%)</span><span class="limit-vals">76% of 20% limit</span></div>
+        <div class="bar-bg"><div class="bar-fill" style="width:76%; background:var(--green)"></div></div>
+      </div>
+      <div class="limit-row">
+        <div class="limit-meta"><span class="limit-name">Max Sector — Tech (49%)</span><span class="limit-vals" style="color:var(--yellow)">98% of 50% limit ⚠</span></div>
+        <div class="bar-bg"><div class="bar-fill" style="width:98%; background:var(--yellow)"></div></div>
+      </div>
+      <div class="limit-row">
+        <div class="limit-meta"><span class="limit-name">Daily Loss Limit (−$3,421)</span><span class="limit-vals">14% of −$25k limit</span></div>
+        <div class="bar-bg"><div class="bar-fill" style="width:14%; background:var(--green)"></div></div>
+      </div>
+      <div class="limit-row">
+        <div class="limit-meta"><span class="limit-name">Max Drawdown (−4.2%)</span><span class="limit-vals">28% of −15% limit</span></div>
+        <div class="bar-bg"><div class="bar-fill" style="width:28%; background:var(--green)"></div></div>
+      </div>
+    </div>
+
+    <div class="mg mg-4">
+      <div class="m"><div class="m-label">Vol (Ann.)</div><div class="m-value">12.4%</div><div class="m-sub nu">30d realized</div></div>
+      <div class="m"><div class="m-label">Tracking Err</div><div class="m-value">6.8%</div><div class="m-sub nu">vs SPY</div></div>
+      <div class="m"><div class="m-label">Info Ratio</div><div class="m-value up">0.92</div><div class="m-sub nu">YTD</div></div>
+      <div class="m"><div class="m-label">Sortino</div><div class="m-value up">1.87</div><div class="m-sub nu">YTD</div></div>
+    </div>
+
+  </div><!-- /risk tab -->
+
+
+  <!-- ╔══════════════════════╗ -->
+  <!-- ║  SIGNALS TAB         ║ -->
+  <!-- ╚══════════════════════╝ -->
+  <div class="tab" id="tab-signals">
+
+    <div class="card" style="padding: 14px 16px;">
+      <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+        <div>
+          <div style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; margin-bottom:2px;">Snapshot</div>
+          <div style="font-weight:700; font-size:14px;">2026-06-14</div>
+        </div>
+        <div style="width:1px; height:30px; background:var(--border)"></div>
+        <div>
+          <div style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; margin-bottom:2px;">Universe</div>
+          <div style="font-weight:700; font-size:14px;">S&P 500</div>
+        </div>
+        <div style="width:1px; height:30px; background:var(--border)"></div>
+        <div>
+          <div style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; margin-bottom:2px;">Scored</div>
+          <div style="font-weight:700; font-size:14px; color:var(--green);">500 / 500</div>
+        </div>
+        <div style="width:1px; height:30px; background:var(--border)"></div>
+        <div>
+          <div style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; margin-bottom:2px;">Strategy</div>
+          <div style="font-weight:700; font-size:14px;">v1_base_momentum</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="slabel">Top Ranked — Long Candidates</div>
+    <div class="card">
+      <div class="sig-row">
+        <span class="sig-tkr">NVDA</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:89%; background:linear-gradient(90deg,#3fb950,#58a6ff)"></div></div>
+          <div class="sig-label">Momentum ↑↑ · Quality ↑ · Value ↔</div>
+        </div>
+        <span class="sig-val up">0.89</span>
+      </div>
+      <div class="sig-row">
+        <span class="sig-tkr">MSFT</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:84%; background:linear-gradient(90deg,#3fb950,#58a6ff)"></div></div>
+          <div class="sig-label">Quality ↑↑ · Momentum ↑ · Value ↔</div>
+        </div>
+        <span class="sig-val up">0.84</span>
+      </div>
+      <div class="sig-row">
+        <span class="sig-tkr">AAPL</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:81%; background:linear-gradient(90deg,#3fb950,#58a6ff)"></div></div>
+          <div class="sig-label">Momentum ↑ · Quality ↑ · Value ↔</div>
+        </div>
+        <span class="sig-val up">0.81</span>
+      </div>
+      <div class="sig-row">
+        <span class="sig-tkr">META</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:77%; background:linear-gradient(90deg,#3fb950,#58a6ff)"></div></div>
+          <div class="sig-label">Momentum ↑↑ · Value ↑ · Quality ↔</div>
+        </div>
+        <span class="sig-val up">0.77</span>
+      </div>
+      <div class="sig-row">
+        <span class="sig-tkr">AMZN</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:74%; background:linear-gradient(90deg,#3fb950,#58a6ff)"></div></div>
+          <div class="sig-label">Quality ↑ · Momentum ↔ · Value ↓</div>
+        </div>
+        <span class="sig-val up">0.74</span>
+      </div>
+    </div>
+
+    <div class="slabel">Bottom Ranked — Avoid / Exit</div>
+    <div class="card">
+      <div class="sig-row">
+        <span class="sig-tkr">T</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:18%; background:var(--red)"></div></div>
+          <div class="sig-label">Momentum ↓↓ · Quality ↓ · Value ↔</div>
+        </div>
+        <span class="sig-val dn">0.18</span>
+      </div>
+      <div class="sig-row">
+        <span class="sig-tkr">VZ</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:21%; background:var(--red)"></div></div>
+          <div class="sig-label">Momentum ↓↓ · Value ↓ · Quality ↔</div>
+        </div>
+        <span class="sig-val dn">0.21</span>
+      </div>
+      <div class="sig-row">
+        <span class="sig-tkr">INTC</span>
+        <div class="sig-bar-wrap">
+          <div class="bar-bg"><div class="bar-fill" style="width:24%; background:var(--red)"></div></div>
+          <div class="sig-label">Momentum ↓ · Quality ↓ · Value ↔</div>
+        </div>
+        <span class="sig-val dn">0.24</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Factor Attribution — YTD</div>
+      <div class="ch-md"><canvas id="factorChart"></canvas></div>
+    </div>
+
+  </div><!-- /signals tab -->
+
+
+  <!-- ╔══════════════════════╗ -->
+  <!-- ║  ORDERS TAB          ║ -->
+  <!-- ╚══════════════════════╝ -->
+  <div class="tab" id="tab-orders">
+
+    <div class="mg mg-4">
+      <div class="m"><div class="m-label">Staged</div><div class="m-value" style="color:var(--blue)">2</div><div class="m-sub nu">next rebalance</div></div>
+      <div class="m"><div class="m-label">Filled Today</div><div class="m-value up">4</div><div class="m-sub nu">$13,982 traded</div></div>
+      <div class="m"><div class="m-label">Next Rebalance</div><div class="m-value" style="font-size:17px">Jun 16</div><div class="m-sub nu">09:30 ET</div></div>
+      <div class="m"><div class="m-label">Est. Turnover</div><div class="m-value">3.4%</div><div class="m-sub nu">$42,430</div></div>
+    </div>
+
+    <div class="slabel">Staged — Pending Next Rebalance</div>
+    <div class="card">
+      <div class="ord">
+        <div class="ord-top">
+          <div>
+            <div class="ord-info"><span class="buy">BUY</span>45 NVDA @ MKT</div>
+            <div class="ord-meta">Est. $890.30 · $40,064 notional · AC cost ~$98</div>
+            <div class="ord-meta">Signal #1 · Target weight 9.6% → 11.2%</div>
+          </div>
+          <span class="chip chip-staged">STAGED</span>
+        </div>
+      </div>
+      <div class="ord">
+        <div class="ord-top">
+          <div>
+            <div class="ord-info"><span class="sell">SELL</span>300 INTC @ MKT</div>
+            <div class="ord-meta">Est. $19.40 · $5,820 notional · AC cost ~$14</div>
+            <div class="ord-meta">Signal #498 · Exiting — target weight → 0%</div>
+          </div>
+          <span class="chip chip-staged">STAGED</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="slabel">Today's Fills</div>
+    <div class="card">
+      <div class="ord">
+        <div class="ord-top">
+          <div>
+            <div class="ord-info"><span class="buy">BUY</span>12 META @ $598.20</div>
+            <div class="ord-meta">$7,178 filled · Slippage +$0.08/sh · Algo: VWAP</div>
+            <div class="ord-meta">09:32:14 ET · IBKR Paper ·7497</div>
+          </div>
+          <span class="chip chip-filled">FILLED</span>
+        </div>
+      </div>
+      <div class="ord">
+        <div class="ord-top">
+          <div>
+            <div class="ord-info"><span class="sell">SELL</span>250 T @ $17.30</div>
+            <div class="ord-meta">$4,325 filled · Slippage −$0.03/sh · Algo: VWAP</div>
+            <div class="ord-meta">09:31:47 ET · IBKR Paper · port 7497</div>
+          </div>
+          <span class="chip chip-filled">FILLED</span>
+        </div>
+      </div>
+      <div class="ord">
+        <div class="ord-top">
+          <div>
+            <div class="ord-info"><span class="buy">BUY</span>5 BRK.B @ $376.15</div>
+            <div class="ord-meta">$1,881 filled · Slippage +$0.02/sh · Algo: VWAP</div>
+            <div class="ord-meta">09:30:58 ET · IBKR Paper · port 7497</div>
+          </div>
+          <span class="chip chip-filled">FILLED</span>
+        </div>
+      </div>
+      <div class="ord">
+        <div class="ord-top">
+          <div>
+            <div class="ord-info"><span class="sell">SELL</span>15 VZ @ $41.20</div>
+            <div class="ord-meta">$618 filled · Slippage −$0.01/sh · Algo: VWAP</div>
+            <div class="ord-meta">09:30:52 ET · IBKR Paper · port 7497</div>
+          </div>
+          <span class="chip chip-filled">FILLED</span>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /orders tab -->
+
+
+  <!-- ╔══════════════════════╗ -->
+  <!-- ║  ALERTS TAB          ║ -->
+  <!-- ╚══════════════════════╝ -->
+  <div class="tab" id="tab-alerts">
+
+    <div class="card">
+      <div class="alrt">
+        <div class="alrt-icon" style="background:rgba(210,153,34,.15)">⚠️</div>
+        <div>
+          <div class="alrt-title">Tech sector at 49% — approaching 50% concentration limit</div>
+          <div class="alrt-time">Today 15:42 · Risk Monitor · WARN</div>
+        </div>
+      </div>
+      <div class="alrt">
+        <div class="alrt-icon" style="background:rgba(88,166,255,.12)">📅</div>
+        <div>
+          <div class="alrt-title">Portfolio rebalance scheduled for Jun 16 at 09:30 ET</div>
+          <div class="alrt-time">Today 15:00 · Scheduler · INFO</div>
+        </div>
+      </div>
+      <div class="alrt">
+        <div class="alrt-icon" style="background:rgba(63,185,80,.12)">✅</div>
+        <div>
+          <div class="alrt-title">Daily score run complete — 500 / 500 signals updated</div>
+          <div class="alrt-time">Today 06:35 · Signal Engine · INFO</div>
+        </div>
+      </div>
+      <div class="alrt">
+        <div class="alrt-icon" style="background:rgba(63,185,80,.12)">✅</div>
+        <div>
+          <div class="alrt-title">OHLCV ingestion complete — 2026-06-14 data loaded to TimescaleDB</div>
+          <div class="alrt-time">Today 06:12 · Airflow / data_pipeline · INFO</div>
+        </div>
+      </div>
+      <div class="alrt">
+        <div class="alrt-icon" style="background:rgba(88,166,255,.12)">📦</div>
+        <div>
+          <div class="alrt-title">Backtest snapshot pinned: rqis-snapshots/manifests/2026-06-14/manifest.json</div>
+          <div class="alrt-time">Yesterday 18:30 · MLflow · INFO</div>
+        </div>
+      </div>
+      <div class="alrt">
+        <div class="alrt-icon" style="background:rgba(88,166,255,.12)">🔌</div>
+        <div>
+          <div class="alrt-title">IBKR paper account connected — port 7497 — latency 4ms</div>
+          <div class="alrt-time">Yesterday 09:28 · IBKRBroker · INFO</div>
+        </div>
+      </div>
+      <div class="alrt">
+        <div class="alrt-icon" style="background:rgba(63,185,80,.12)">🛡️</div>
+        <div>
+          <div class="alrt-title">ComplianceEngine check passed — 0 violations on last rebalance</div>
+          <div class="alrt-time">Yesterday 09:30 · OMS · INFO</div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /alerts tab -->
+
+</main>
+
+
+<!-- ════════════════════════════════ BOTTOM NAV ════════════════════════════════ -->
+<nav class="bnav">
+  <button class="ni active" data-tab="portfolio">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="3" width="9" height="9" rx="1.5"/><rect x="13" y="3" width="9" height="9" rx="1.5"/>
+      <rect x="2" y="14" width="9" height="7" rx="1.5"/><rect x="13" y="14" width="9" height="7" rx="1.5"/>
+    </svg>
+    Portfolio
+  </button>
+  <button class="ni" data-tab="risk">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 2l9 4.5v5C21 17.5 17 22 12 22S3 17.5 3 11.5v-5L12 2z"/>
+      <path d="M12 8v4"/><circle cx="12" cy="15" r="1" fill="currentColor"/>
+    </svg>
+    Risk
+  </button>
+  <button class="ni" data-tab="signals">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/>
+      <polyline points="16 7 22 7 22 13"/>
+    </svg>
+    Signals
+  </button>
+  <button class="ni" data-tab="orders" style="position:relative;">
+    <div class="nbadge">2</div>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+      <polyline points="14 2 14 8 20 8"/>
+      <line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="12" y2="17"/>
+    </svg>
+    Orders
+  </button>
+  <button class="ni" data-tab="alerts">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
+      <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+    </svg>
+    Alerts
+  </button>
+</nav>
+
+
+<!-- ════════════════════════════════ SCRIPTS ════════════════════════════════ -->
+<script>
+// ── Tab navigation ──────────────────────────────────────────────────────────
+document.querySelectorAll('.ni').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const name = btn.dataset.tab;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.ni').forEach(n => n.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    btn.classList.add('active');
+    // lazy-init charts that live in hidden tabs
+    if (name === 'risk' && !varChartInit) initVarChart();
+    if (name === 'signals' && !factorChartInit) initFactorChart();
+  });
+});
+
+// ── Timeframe filter ────────────────────────────────────────────────────────
+document.querySelectorAll('.tf').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tf').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    updateEqChart(btn.dataset.tf);
+  });
+});
+
+// ── Seeded LCG random for deterministic fake data ──────────────────────────
+function lcg(seed) {
+  let s = seed >>> 0;
+  return () => { s = (Math.imul(1664525, s) + 1013904223) >>> 0; return s / 0x100000000; };
+}
+
+// ── Equity curve generator ─────────────────────────────────────────────────
+function makeCurve(days, start, targetReturn) {
+  const rng = lcg(12345);
+  const dailyDrift = targetReturn / days;
+  const vol = 0.0085;
+  const out = [start];
+  for (let i = 1; i < days; i++) {
+    const r = dailyDrift + vol * (rng() - 0.5) * 3.2;
+    out.push(out[i-1] * (1 + r));
+  }
+  return out;
+}
+
+function makeLabels(endYMD, count) {
+  const out = []; const d = new Date(endYMD + 'T00:00:00');
+  for (let i = count - 1; i >= 0; i--) {
+    const t = new Date(d); t.setDate(d.getDate() - i);
+    out.push(t.toLocaleDateString('en-US', { month:'short', day:'numeric' }));
+  }
+  return out;
+}
+
+const TF_CONFIG = {
+  '1W':  { days: 7,   start: 1239200, ret: 0.007  },
+  '1M':  { days: 22,  start: 1229000, ret: 0.0154 },
+  '3M':  { days: 65,  start: 1190000, ret: 0.048  },
+  'YTD': { days: 115, start: 1157975, ret: 0.0771 },
+};
+
+// ── Shared Chart.js defaults ───────────────────────────────────────────────
+const GRID_COLOR  = 'rgba(48,54,61,0.6)';
+const TICK_COLOR  = '#8b949e';
+const TIP_STYLE   = { backgroundColor:'rgba(22,27,34,0.95)', borderColor:'#30363d', borderWidth:1, titleColor:'#8b949e', bodyColor:'#e6edf3' };
+
+// ── Equity chart ───────────────────────────────────────────────────────────
+let eqChart;
+function initEqChart() {
+  const ctx = document.getElementById('eqChart').getContext('2d');
+  const cfg = TF_CONFIG['YTD'];
+  const data = makeCurve(cfg.days, cfg.start, cfg.ret);
+  const labels = makeLabels('2026-06-15', cfg.days);
+  const grad = ctx.createLinearGradient(0, 0, 0, 175);
+  grad.addColorStop(0, 'rgba(88,166,255,0.22)');
+  grad.addColorStop(1, 'rgba(88,166,255,0)');
+  eqChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{ data, borderColor:'#58a6ff', borderWidth:2, fill:true, backgroundColor:grad, tension:0.42, pointRadius:0, pointHoverRadius:5 }] },
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      interaction:{ intersect:false, mode:'index' },
+      plugins: {
+        legend:{ display:false },
+        tooltip:{ ...TIP_STYLE, callbacks:{ label: c => `  $${c.raw.toLocaleString('en-US',{maximumFractionDigits:0})}` } }
+      },
+      scales: {
+        x: { ticks:{ color:TICK_COLOR, maxTicksLimit:5, font:{size:11} }, grid:{ color:GRID_COLOR }, border:{ color:GRID_COLOR } },
+        y: { ticks:{ color:TICK_COLOR, font:{size:11}, callback: v=>'$'+(v/1000).toFixed(0)+'K' }, grid:{ color:GRID_COLOR }, border:{ color:GRID_COLOR } }
+      }
+    }
+  });
+}
+
+function updateEqChart(tf) {
+  const c = TF_CONFIG[tf];
+  const data = makeCurve(c.days, c.start, c.ret);
+  eqChart.data.labels = makeLabels('2026-06-15', c.days);
+  eqChart.data.datasets[0].data = data;
+  eqChart.update('active');
+}
+
+// ── Allocation donut ───────────────────────────────────────────────────────
+function initAllocChart() {
+  const ctx = document.getElementById('allocChart').getContext('2d');
+  new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['AAPL','MSFT','GOOGL','NVDA','Other','Cash'],
+      datasets: [{ data:[15.2,12.8,11.4,9.6,47.0,4.0], backgroundColor:['#58a6ff','#bc8cff','#3fb950','#f0883e','#79c0ff','#30363d'], borderColor:'#161b22', borderWidth:2 }]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false, cutout:'70%',
+      plugins: {
+        legend:{ display:false },
+        tooltip:{ ...TIP_STYLE, callbacks:{ label: c=>`  ${c.label}: ${c.raw}%` } }
+      }
+    }
+  });
+}
+
+// ── VaR distribution ───────────────────────────────────────────────────────
+let varChartInit = false;
+function initVarChart() {
+  varChartInit = true;
+  const ctx = document.getElementById('varChart').getContext('2d');
+  const rng = lcg(77);
+  const bins = []; const colors = [];
+  for (let i = -6; i <= 4.1; i += 0.3) {
+    bins.push(i);
+    const x = (i - 0.25) / 1.25;
+    const h = Math.exp(-0.5 * x * x) * (0.85 + rng() * 0.3);
+    colors.push(i < -2.23 ? 'rgba(248,81,73,.75)' : i < -1.46 ? 'rgba(210,153,34,.75)' : 'rgba(88,166,255,.45)');
+  }
+  new Chart(ctx, {
+    type:'bar',
+    data: {
+      labels: bins.map(v=>v.toFixed(1)+'%'),
+      datasets:[{ data: bins.map((v,i) => { const x=(v-0.25)/1.25; return Math.exp(-0.5*x*x)*(0.85+lcg(i*7)()*0.3); }), backgroundColor:colors, borderWidth:0, borderRadius:2 }]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false}, tooltip:{enabled:false} },
+      scales: {
+        x:{ ticks:{ color:TICK_COLOR, maxTicksLimit:6, font:{size:10} }, grid:{display:false}, border:{color:GRID_COLOR} },
+        y:{ display:false }
+      }
+    }
+  });
+}
+
+// ── Factor attribution bar chart ───────────────────────────────────────────
+let factorChartInit = false;
+function initFactorChart() {
+  factorChartInit = true;
+  const ctx = document.getElementById('factorChart').getContext('2d');
+  const factors = ['Momentum','Quality','Value','Low Vol','Size'];
+  const vals = [4.2, 2.1, 0.8, -0.4, 0.9];
+  new Chart(ctx, {
+    type:'bar',
+    data: {
+      labels: factors,
+      datasets:[{
+        data: vals,
+        backgroundColor: vals.map(v => v >= 0 ? 'rgba(63,185,80,.7)' : 'rgba(248,81,73,.7)'),
+        borderRadius:5, borderWidth:0
+      }]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false, indexAxis:'y',
+      plugins: {
+        legend:{display:false},
+        tooltip:{ ...TIP_STYLE, callbacks:{ label: c=>`  ${c.raw>0?'+':''}${c.raw}% YTD attribution` } }
+      },
+      scales: {
+        x:{ ticks:{ color:TICK_COLOR, font:{size:11}, callback:v=>v+'%' }, grid:{ color:GRID_COLOR }, border:{ color:GRID_COLOR } },
+        y:{ ticks:{ color:TICK_COLOR, font:{size:12} }, grid:{display:false}, border:{color:GRID_COLOR} }
+      }
+    }
+  });
+}
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  initEqChart();
+  initAllocChart();
+  // Risk and Signals charts init lazily when tabs are opened
+});
+</script>
+</body>
+</html>
