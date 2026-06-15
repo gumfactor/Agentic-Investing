@@ -119,9 +119,6 @@ class RebalanceTrigger:
         self._trading_days_since += 1
 
     def _is_calendar_rebalance_day(self, today: date, days_since: int) -> bool:
-        if self._last_rebalance_date is None:
-            return True  # First rebalance always fires
-
         if self.frequency == RebalanceFrequency.DAILY:
             return True
         elif self.frequency == RebalanceFrequency.WEEKLY:

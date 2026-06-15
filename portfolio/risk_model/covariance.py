@@ -55,8 +55,13 @@ def build_covariance(
     col_nan_frac = daily_returns.isna().mean()
     good_cols = col_nan_frac[col_nan_frac <= 0.20].index.tolist()
     dropped = len(daily_returns.columns) - len(good_cols)
+    dropped_tickers = col_nan_frac[col_nan_frac > 0.20].index.tolist()
     if dropped:
-        logger.warning("covariance_dropped_sparse_tickers", n_dropped=dropped)
+        logger.warning(
+            "covariance_dropped_sparse_tickers",
+            n_dropped=dropped,
+            tickers=dropped_tickers,
+        )
 
     # Guard against inf returns from zero prices before dropping rows
     clean = daily_returns[good_cols].replace([float("inf"), float("-inf")], float("nan"))

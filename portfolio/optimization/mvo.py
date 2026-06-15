@@ -92,6 +92,18 @@ class MVOOptimizer(BaseOptimizer):
 
         result_weights = result_weights / raw_sum if raw_sum > 1e-9 else result_weights
 
+        # Check if fallback weights violate position cap
+        if "fallback" in status:
+            max_w = constraints.max_position_weight
+            if result_weights.max() > max_w + 1e-6:
+                logger.warning(
+                    "mvo_fallback_violates_position_cap",
+                    max_weight=round(float(result_weights.max()), 4),
+                    cap=max_w,
+                    n_assets=n,
+                    advice="Equal-weight fallback exceeds max_position_weight. Consider increasing cap or universe size.",
+                )
+
         logger.info(
             "mvo_optimization_complete",
             mode=self.mode,
@@ -169,7 +181,14 @@ class MVOOptimizer(BaseOptimizer):
         prob.solve(solver=self.solver, warm_start=True)
 
         if prob.status not in ("optimal", "optimal_inaccurate") or kappa.value is None:
-            logger.warning("mvo_max_sharpe_failed", status=prob.status)
+            if prob.status == "infeasible":
+                logger.error(
+                    "mvo_max_sharpe_infeasible",
+                    status=prob.status,
+                    advice="All expected returns may be negative. Max-Sharpe requires at least one positive return.",
+                )
+            else:
+                logger.warning("mvo_max_sharpe_failed", status=prob.status)
             # Fallback: equal weight
             w_val = np.ones(n) / n
             return w_val, 0.0, f"fallback:{prob.status}"
@@ -192,7 +211,14 @@ class MVOOptimizer(BaseOptimizer):
         prob.solve(solver=self.solver, warm_start=True)
 
         if prob.status not in ("optimal", "optimal_inaccurate") or w.value is None:
-            logger.warning("mvo_min_variance_failed", status=prob.status)
+            if prob.status == "infeasible":
+                logger.error(
+                    "mvo_min_variance_infeasible",
+                    status=prob.status,
+                    advice="All expected returns may be negative. Max-Sharpe requires at least one positive return.",
+                )
+            else:
+                logger.warning("mvo_min_variance_failed", status=prob.status)
             w_val = np.ones(n) / n
             return w_val, 0.0, f"fallback:{prob.status}"
 
@@ -216,7 +242,15 @@ class MVOOptimizer(BaseOptimizer):
         prob.solve(solver=self.solver, warm_start=True)
 
         if prob.status not in ("optimal", "optimal_inaccurate") or w.value is None:
-            logger.warning("mvo_mean_variance_failed", status=prob.status, gamma=gamma)
+            if prob.status == "infeasible":
+                logger.error(
+                    "mvo_mean_variance_infeasible",
+                    status=prob.status,
+                    gamma=gamma,
+                    advice="All expected returns may be negative. Max-Sharpe requires at least one positive return.",
+                )
+            else:
+                logger.warning("mvo_mean_variance_failed", status=prob.status, gamma=gamma)
             w_val = np.ones(n) / n
             return w_val, 0.0, f"fallback:{prob.status}"
 

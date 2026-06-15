@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 
 @dataclass
 class PortfolioConstraints:
@@ -50,18 +54,29 @@ class PortfolioConstraints:
             raise ValueError(f"max_sector_weight={self.max_sector_weight} not in (0, 1]")
         if self.max_names < 1:
             raise ValueError("max_names must be ≥ 1")
+        if self.max_sector_weight < self.max_position_weight:
+            logger.warning(
+                "constraints_sector_cap_below_position_cap",
+                max_sector_weight=self.max_sector_weight,
+                max_position_weight=self.max_position_weight,
+                advice="max_sector_weight < max_position_weight: position cap is redundant for all tickers with sector assignment.",
+            )
 
     @classmethod
     def from_config(cls, cfg: dict) -> PortfolioConstraints:
         """Build from a config dict (e.g. settings.yaml portfolio section)."""
         obj = cls(
             max_position_weight=cfg.get("max_position_weight", 0.05),
-            max_sector_weight=cfg.get("max_sector_weight", 0.25),
+            min_position_weight=cfg.get("min_position_weight", 0.001),
             max_names=cfg.get("max_names", 100),
+            max_sector_weight=cfg.get("max_sector_weight", 0.25),
+            max_turnover=cfg.get("max_turnover", 1.0),
+            min_adv_fraction=cfg.get("min_adv_fraction", 0.01),
             target_volatility=cfg.get("target_volatility"),
             max_portfolio_beta=cfg.get("max_portfolio_beta", 1.5),
-            max_turnover=cfg.get("max_turnover", 1.0),
             allow_short=cfg.get("allow_short", False),
+            # factor_bounds requires structured config; omit if not provided
+            factor_bounds=cfg.get("factor_bounds", {}),
         )
         obj.validate()
         return obj

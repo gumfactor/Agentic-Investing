@@ -83,6 +83,18 @@ class RiskParityOptimizer(BaseOptimizer):
         if w_sum > 1e-9:
             w_val = w_val / w_sum
 
+        # Check if fallback (scipy) weights violate position cap before clipping
+        if "fallback" in status or "approx" in status:
+            max_w_check = constraints_obj.max_position_weight
+            if w_val.max() > max_w_check + 1e-6:
+                logger.warning(
+                    "risk_parity_fallback_violates_position_cap",
+                    max_weight=round(float(w_val.max()), 4),
+                    cap=max_w_check,
+                    n_assets=n,
+                    advice="Equal-weight fallback exceeds max_position_weight. Consider increasing cap or universe size.",
+                )
+
         # Post-hoc position cap (approximate; changes ERC property slightly)
         max_w = constraints_obj.max_position_weight
         if w_val.max() > max_w + 1e-6:
@@ -91,6 +103,14 @@ class RiskParityOptimizer(BaseOptimizer):
             if w_sum > 1e-9:
                 w_val = w_val / w_sum
             status = f"{status}+clipped"
+
+        if "clipped" in status:
+            logger.warning(
+                "risk_parity_erc_violated_by_clipping",
+                status=status,
+                advice="Position cap forced weight clipping. Equal Risk Contribution property is no longer satisfied. "
+                       "The returned objective value is pre-clip and no longer meaningful.",
+            )
 
         weights = pd.Series(w_val, index=tickers, dtype=float)
 

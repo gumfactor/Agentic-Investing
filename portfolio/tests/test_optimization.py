@@ -70,16 +70,31 @@ class TestMVOOptimizer:
         assert abs(result.weights.sum() - 1.0) < 1e-4
 
     def test_sector_constraint(self, expected_returns, covariance):
-        sector_map = {t: "Tech" for t in TICKERS}
+        # Put first 3 tickers in "Tech" and last 2 in "Energy".
+        # Cap "Tech" at 60% — the optimizer must constrain Tech total ≤ 0.60.
+        sector_map = {
+            "AAPL": "Tech", "MSFT": "Tech", "GOOGL": "Tech",
+            "AMZN": "Energy", "NVDA": "Energy",
+        }
+        sector_cap = 0.60
         c = PortfolioConstraints(
             max_position_weight=0.40,
-            max_sector_weight=0.60,
+            max_sector_weight=sector_cap,
             sector_map=sector_map,
         )
-        optimizer = MVOOptimizer(mode="max_sharpe")
+        optimizer = MVOOptimizer(mode="min_variance")
         result = optimizer.run(expected_returns, covariance, c)
-        # All assets in same sector → sector weight = total weight ≤ 60% ≤ 1
-        assert result.weights.sum() <= 1.0 + 1e-4
+        assert abs(result.weights.sum() - 1.0) < 1e-4
+        # Tech sector weight must be ≤ cap
+        tech_weight = result.weights[["AAPL", "MSFT", "GOOGL"]].sum()
+        assert tech_weight <= sector_cap + 1e-4, (
+            f"Tech sector weight {tech_weight:.4f} exceeds cap {sector_cap}"
+        )
+        # Energy sector weight must also be ≤ cap
+        energy_weight = result.weights[["AMZN", "NVDA"]].sum()
+        assert energy_weight <= sector_cap + 1e-4, (
+            f"Energy sector weight {energy_weight:.4f} exceeds cap {sector_cap}"
+        )
 
     def test_mismatched_tickers_use_intersection(self, covariance):
         mu = pd.Series([0.10, 0.12], index=["AAPL", "EXTRA"])
