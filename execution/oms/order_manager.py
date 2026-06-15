@@ -179,17 +179,22 @@ class OrderManager:
     # ── Fill reconciliation ───────────────────────────────────────────────────
 
     def reconcile_fills(self) -> list[Order]:
-        """Poll broker for fill status on all SUBMITTED orders.
+        """Poll broker for fill status on all SUBMITTED and PARTIALLY_FILLED orders.
 
-        Returns orders that transitioned to FILLED this cycle.
+        Returns orders that transitioned to FILLED this cycle.  Orders with
+        a partial fill are transitioned to PARTIALLY_FILLED and remain active
+        for subsequent reconciliation cycles.
         """
         if self._broker is None:
             raise RuntimeError("No broker configured.")
 
-        submitted = [o for o in self._orders.values() if o.status == OrderStatus.SUBMITTED]
+        active = [
+            o for o in self._orders.values()
+            if o.status in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED}
+        ]
         newly_filled: list[Order] = []
 
-        for order in submitted:
+        for order in active:
             if order.broker_order_id is None:
                 continue
             fill = self._broker.get_fill(order.broker_order_id)
@@ -197,15 +202,29 @@ class OrderManager:
                 continue
             order.filled_quantity = fill["filled_quantity"]
             order.avg_fill_price = fill["avg_price"]
-            order.transition(OrderStatus.FILLED)
-            newly_filled.append(order)
-            logger.info(
-                "order_filled",
-                order_id=order.order_id[:8],
-                ticker=order.ticker,
-                filled_qty=fill["filled_quantity"],
-                avg_price=fill["avg_price"],
-            )
+
+            if fill["filled_quantity"] >= order.quantity - 1e-6:
+                # Full fill
+                order.transition(OrderStatus.FILLED)
+                newly_filled.append(order)
+                logger.info(
+                    "order_filled",
+                    order_id=order.order_id[:8],
+                    ticker=order.ticker,
+                    filled_qty=fill["filled_quantity"],
+                    avg_price=fill["avg_price"],
+                )
+            else:
+                # Partial fill — stay active, re-polled next cycle
+                order.transition(OrderStatus.PARTIALLY_FILLED)
+                logger.warning(
+                    "order_partially_filled",
+                    order_id=order.order_id[:8],
+                    ticker=order.ticker,
+                    filled_qty=fill["filled_quantity"],
+                    ordered_qty=order.quantity,
+                    pct_filled=round(fill["filled_quantity"] / order.quantity, 3),
+                )
 
         return newly_filled
 

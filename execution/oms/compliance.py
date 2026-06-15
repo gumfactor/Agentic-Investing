@@ -28,7 +28,14 @@ CheckFn = Callable[[Order, dict], tuple[bool, str]]
 
 
 def _check_wash_sale(order: Order, ctx: dict) -> tuple[bool, str]:
-    """Reject sells within 30 days of a loss-realizing buy of the same ticker."""
+    """Reject sells within 30 days of a loss-realizing buy of the same ticker.
+
+    STUB — Phase 5: ctx["recent_loss_buys"] is never populated in live contexts
+    because trade-history tracking (execution/oms/trade_history.py) has not been
+    built yet.  The check fires correctly when populated (used in tests), but
+    provides no protection in production until the fill-history store exists.
+    See docs/deferred_items.md.
+    """
     if order.side != OrderSide.SELL:
         return True, ""
     recent_buys: dict[str, date] = ctx.get("recent_loss_buys", {})

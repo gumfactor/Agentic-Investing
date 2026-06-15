@@ -38,6 +38,23 @@ class TestOrder:
             o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, status=status)
             assert o.is_terminal
 
+    def test_partially_filled_not_terminal(self):
+        o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, status=OrderStatus.SUBMITTED)
+        o.transition(OrderStatus.PARTIALLY_FILLED)
+        assert not o.is_terminal
+        assert o.is_partial
+
+    def test_partially_filled_to_filled_transition(self):
+        o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, status=OrderStatus.SUBMITTED)
+        o.transition(OrderStatus.PARTIALLY_FILLED)
+        o.transition(OrderStatus.FILLED)
+        assert o.is_terminal
+
+    def test_fill_fraction(self):
+        o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100)
+        o.filled_quantity = 40.0
+        assert o.fill_fraction == pytest.approx(0.40)
+
     def test_to_display_row_has_required_keys(self):
         o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, limit_price=150.0)
         row = o.to_display_row()

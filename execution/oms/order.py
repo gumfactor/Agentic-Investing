@@ -2,15 +2,17 @@
 
 State transitions:
     STAGED → PENDING → SUBMITTED → FILLED
-                    ↘ REJECTED
-                    ↘ CANCELLED
+                               ↘ PARTIALLY_FILLED → FILLED
+                               ↘ REJECTED              ↘ REJECTED
+                               ↘ CANCELLED             ↘ CANCELLED
 
-STAGED  : order created by portfolio construction; not yet compliance-checked
-PENDING : compliance checks passed; ready for broker submission
-SUBMITTED : sent to broker; awaiting fill confirmation
-FILLED  : broker confirmed full or partial fill
-REJECTED : compliance rejected or broker refused
-CANCELLED : operator cancelled before submission
+STAGED           : order created by portfolio construction; not yet compliance-checked
+PENDING          : compliance checks passed; ready for broker submission
+SUBMITTED        : sent to broker; awaiting fill confirmation
+PARTIALLY_FILLED : broker confirmed a partial fill; remainder still working
+FILLED           : broker confirmed full fill (filled_quantity == quantity)
+REJECTED         : compliance rejected or broker refused
+CANCELLED        : operator cancelled before full fill
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ class OrderStatus(str, Enum):
     STAGED = "STAGED"
     PENDING = "PENDING"
     SUBMITTED = "SUBMITTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"
     REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
@@ -40,7 +43,18 @@ class OrderStatus(str, Enum):
 _TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.STAGED: {OrderStatus.PENDING, OrderStatus.REJECTED, OrderStatus.CANCELLED},
     OrderStatus.PENDING: {OrderStatus.SUBMITTED, OrderStatus.REJECTED, OrderStatus.CANCELLED},
-    OrderStatus.SUBMITTED: {OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELLED},
+    OrderStatus.SUBMITTED: {
+        OrderStatus.FILLED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+    },
+    OrderStatus.PARTIALLY_FILLED: {
+        OrderStatus.FILLED,
+        OrderStatus.PARTIALLY_FILLED,   # subsequent partial fills
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELLED,
+    },
     OrderStatus.FILLED: set(),
     OrderStatus.REJECTED: set(),
     OrderStatus.CANCELLED: set(),
@@ -86,6 +100,17 @@ class Order:
     @property
     def is_terminal(self) -> bool:
         return self.status in {OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELLED}
+
+    @property
+    def is_partial(self) -> bool:
+        return self.status == OrderStatus.PARTIALLY_FILLED
+
+    @property
+    def fill_fraction(self) -> float:
+        """Fraction of the order filled so far (0.0–1.0)."""
+        if self.quantity <= 0:
+            return 0.0
+        return min(self.filled_quantity / self.quantity, 1.0)
 
     @property
     def notional(self) -> float | None:
