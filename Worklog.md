@@ -14,6 +14,100 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-15
 
+### Session 18 — Phase 4 Adversarial Review Fixes + Design Decisions
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/elegant-newton-vtzrmh`
+**Commits:** `5627810`, `e96da19`
+
+---
+
+#### What was done
+
+1. **Applied all adversarial review fixes** across 11 files (82 tests pass):
+   - `compliance.py`: `circuit_breaker_open` defaults to `True` (safe-by-default); SELL on
+     over-limit positions correctly allowed (risk-reducing); wash-sale stub comment added.
+   - `order_manager.py`: CircuitBreaker auto-injection into compliance context; TOCTOU gap
+     closed in `submit_pending()` with pre-submission CB re-check.
+   - `ibkr.py`: live port (7496) requires `PAPER_TRADING=false` explicitly; CB state
+     re-validated in `connect()`; `get_account_value()` raises instead of returning 0.0.
+   - `trigger.py`: weekly rebalance uses `and` not `or` (was firing on any day ≥ 5d).
+   - `constraints.py`: `from_config()` calls `validate()` and maps all config fields.
+   - `covariance.py`: guard inf returns from zero-price delisting events; warn on dropped rows.
+   - `mvo.py`: log sum-constraint violation when solver returns `optimal_inaccurate`.
+   - `circuit_breaker.py`: `RiskSnapshot` import moved to `TYPE_CHECKING`; `evaluate()`
+     records TripEvents for subsequent breaches while OPEN (audit trail continuity).
+   - `alert_manager.py`: dedup window (3600s default); memory cap (10k alerts); hard breaches
+     bypass dedup; `fire_from_snapshot()` uses duck-typed snapshot (no circular import).
+   - `monitor.py`: warn when VaR falls back to parametric or is unknown (< 30 obs).
+   - `test_oms.py`: updated 5 tests to pass `circuit_breaker_open=False` explicitly.
+
+2. **Resolved all 7 design decisions** with operator:
+   - **D1 (C1 code enforcement):** Leave as documentation-only at code level (option b).
+     Python cannot meaningfully verify a human said "YES"; skill-layer protocol is the gate.
+   - **D2 (dead constraint fields):** Created `docs/deferred_items.md` listing
+     `target_volatility`, `max_portfolio_beta`, `factor_bounds`, `min_adv_fraction`
+     with Phase 5 action items. No code removal.
+   - **D3 (wash-sale stub):** Added Phase 5 caveat comment; stub stays in default checks so
+     it fires correctly when `recent_loss_buys` is eventually populated.
+   - **D4 (sector concentration gap):** Deferred to Phase 5; documented in `deferred_items.md`.
+   - **D5 (partial fills):** Added `PARTIALLY_FILLED` state to OMS state machine.
+     Non-terminal; `reconcile_fills()` re-polls it each cycle. Added `is_partial` property
+     and `fill_fraction` helper. 3 new tests (82 total).
+   - **D6 (circuit breaker persistence):** Deferred to Phase 5; documented in `deferred_items.md`.
+   - **D7 (VaR < 30 obs):** Monitor already uses parametric fallback when covariance is
+     provided; unknown VaR (no covariance, < 30 obs) logs a warning with advice.
+
+---
+
+#### Key decisions recorded
+
+**[DECISION] C1 enforcement stays documentation-only (D1)**
+Rationale: A `confirmed: bool = False` parameter is a bypassable speedbump, not a true
+gate — any caller can pass `confirmed=True` without actually confirming. The real enforcement
+is the `execute_trade` skill protocol which displays the order table and requires literal
+"YES" before calling `submit_pending()`. Python cannot verify a human responded. If the
+system grows to multi-user or API access, revisit a nonce/token mechanism (option c).
+
+**[DECISION] PARTIALLY_FILLED is a non-terminal order state (D5)**
+Rationale: IBKR frequently returns partial fills on larger orders. Treating a 30%-filled
+order as FILLED would misrepresent portfolio state and potentially double-fill on the next
+cycle. The non-terminal state allows re-polling without re-submitting.
+
+**[DECISION] Dead PortfolioConstraints fields deferred with explicit documentation (D2)**
+Rationale: Removing them loses the designed constraint surface; implementing them now adds
+scope creep with no paper-trading benefit. Documenting in `deferred_items.md` ensures future
+sessions don't mistake inaction for completeness.
+
+---
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/oms/order.py` | Added PARTIALLY_FILLED state, transitions, is_partial, fill_fraction |
+| `execution/oms/order_manager.py` | reconcile_fills() handles partial vs full; polls PARTIALLY_FILLED |
+| `execution/oms/compliance.py` | Safe-by-default CB; SELL check fix; wash-sale stub comment |
+| `execution/tests/test_oms.py` | 5 ctx fixes + 3 PARTIALLY_FILLED tests (82 total) |
+| `docs/deferred_items.md` | New: catalogue of intentionally deferred items with Phase 5 action items |
+| (+ 7 others from review fixes — see commit 5627810) | |
+
+---
+
+#### Next steps
+
+Phase 4 implementation and review are complete. Exit criterion:
+- 4 consecutive weeks of paper trading with zero critical bugs
+- Circuit breaker fire-drill test
+
+**To begin paper trading:**
+1. Start IBKR TWS or Gateway on paper port 7497
+2. Set `IBKR_PORT=7497` and `PAPER_TRADING=true` in `.env`
+3. Run the daily pipeline end-to-end with paper account
+4. Monitor `RiskMonitor.snapshot()` output each session
+
+---
+
 ### Session 17 — Phase 4: Portfolio Construction + Paper Trading
 
 **Operator:** mshane@thecanadalist.ca
