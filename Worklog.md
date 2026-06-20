@@ -14,6 +14,68 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 33 - Tiny Step 7 Paper Submission Probe
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending documentation commit
+
+---
+
+#### What was done
+
+Ran a deliberately small Step 7 paper submission probe instead of submitting the
+full 50-order allocation. A derived local blotter was created from the validated
+whole-share Step 6 artifact with three one-share BUY orders:
+
+| Ticker | Side | Shares | Limit | Notional |
+|--------|------|--------|-------|----------|
+| APA | BUY | 1 | `33.03` | `33.03` |
+| HAL | BUY | 1 | `34.93` | `34.93` |
+| HPE | BUY | 1 | `47.41` | `47.41` |
+
+Total submitted notional was approximately `115.37` USD.
+
+#### Evidence
+
+- Tiny blotter artifact: `local/paper_stage_blotter_small.json`
+- Reviewed tiny blotter SHA-256:
+  `92a60fd176198b55b482437c0bbb53a9c9506ae150c11e324f6c357e2c9605b2`
+- Step 7 dry-run passed for the tiny blotter.
+- Step 7.5 what-if validation passed:
+  - Artifact: `local/paper_whatif_validation_small.json`
+  - Accepted: `3/3`
+  - Rejected: `0/3`
+  - Fractional quantity rows: `0`
+- Step 7 paper submission passed:
+  - Artifact: `local/paper_submit_reconciliation_small.json`
+  - Status: `SUBMITTED`
+  - Broker order IDs: APA `3`, HAL `4`, HPE `5`
+  - Initial fill poll: `None` for all three orders
+- Step 8 audit record passed:
+  - Artifact: `local/paper_run_audit_small.json`
+  - Run id: `7a0cbfad-9ceb-4cb8-82c4-604acdb9f3ea`
+  - Operator-visible status: `SUBMITTED`
+
+#### Safety
+
+- This was an IBKR simulated trading account run on paper port `7497`.
+- No live-money order path was used.
+- The full 50-order allocation was not submitted.
+- The test intentionally used three tiny one-share orders so the pipeline could
+  be exercised without allocating the paper account.
+
+#### Status and next actions
+
+- Step 7 has now been exercised successfully with a tiny paper submission.
+- Monitor the three paper orders in TWS. Because this was run on Saturday, the
+  initial fill poll did not report fills.
+- Before any larger paper submission, decide whether to cancel/observe these
+  tiny orders and whether to keep using tiny probes or graduate to the full
+  paper allocation.
+
+---
+
 ### Session 32 - Whole-Share Cent-Rounded Paper What-If Pass
 
 **Operator:** mshane@thecanadalist.ca
