@@ -15,6 +15,7 @@ Safety rules enforced here:
 from __future__ import annotations
 
 from datetime import date
+import math
 import os
 import time
 from typing import Optional
@@ -335,8 +336,8 @@ class IBKRBroker(BaseBroker):
             rate = float(raw)
         except ValueError as exc:
             raise RuntimeError(f"Configured FX rate {pair} is not numeric: {raw!r}") from exc
-        if rate <= 0:
-            raise RuntimeError(f"Configured FX rate {pair} must be positive; got {rate}")
+        if not math.isfinite(rate) or rate <= 0:
+            raise RuntimeError(f"Configured FX rate {pair} must be finite and positive; got {rate}")
         return rate
 
     @staticmethod

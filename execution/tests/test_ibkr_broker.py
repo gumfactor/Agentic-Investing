@@ -145,7 +145,17 @@ def test_configured_fx_rate_must_be_positive(monkeypatch):
     monkeypatch.setenv("IBKR_FX_RATE_CAD_USD", "0")
     monkeypatch.setenv("IBKR_FX_RATE_CAD_USD_AS_OF", date.today().isoformat())
 
-    with pytest.raises(RuntimeError, match="must be positive"):
+    with pytest.raises(RuntimeError, match="finite and positive"):
+        broker.get_account_value_in_currency("USD")
+
+
+@pytest.mark.parametrize("raw_rate", ["nan", "inf", "-inf"])
+def test_configured_fx_rate_must_be_finite(monkeypatch, raw_rate):
+    broker = _broker([_account_value("NetLiquidation", "1000000.00", "CAD")])
+    monkeypatch.setenv("IBKR_FX_RATE_CAD_USD", raw_rate)
+    monkeypatch.setenv("IBKR_FX_RATE_CAD_USD_AS_OF", date.today().isoformat())
+
+    with pytest.raises(RuntimeError, match="finite and positive"):
         broker.get_account_value_in_currency("USD")
 
 

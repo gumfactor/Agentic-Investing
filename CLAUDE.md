@@ -43,7 +43,7 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 4 | Portfolio + Paper Trading | **Implementation complete — paper run pending** | Week 26 |
 | 5 | Reporting + Live Trading | Not started | Week 36 |
 
-**Active branch:** `main`
+**Active branch:** `local/linking-to-IBKR`
 
 **What this means for you:** Phase 4 implementation is complete as of 2026-06-15.
 All three module trees (portfolio/, execution/, risk/) are now fully implemented:
@@ -66,7 +66,8 @@ Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
 Exit criterion for Phase 4: 4 consecutive weeks of paper trading with zero
 critical bugs; circuit breaker fire-drill test. Paper trading has NOT yet begun.
 No real capital is at risk. The IBKR paper account connection (port 7497)
-has not yet been established.
+has been smoke-tested, including a Canadian CAD NAV account with USD-equivalent
+NAV conversion.
 
 ---
 
@@ -131,6 +132,26 @@ Full directory tree with file-level detail: `PRD.md` Section 5.
 | `PAPER_TRADING` | `"true"` or `"false"` — NEVER change from `"false"` without operator `"YES"` confirmation (C9) |
 
 Reference `.env.example` for the full list.
+
+---
+
+## Phase 4 paper readiness command
+
+Run this before any daily paper-trading workflow:
+
+```powershell
+$env:PAPER_TRADING='true'
+$env:IBKR_PORT='7497'
+$env:IBKR_FX_RATE_CAD_USD='<current CAD-to-USD rate>'
+$env:IBKR_FX_RATE_CAD_USD_AS_OF=(Get-Date -Format yyyy-MM-dd)
+python -m scripts.paper_readiness_check
+```
+
+The command is read-only. It requires explicit `PAPER_TRADING=true` and
+`IBKR_PORT=7497`, verifies no live-run clearance flag, checks TWS/Gateway socket
+reachability, confirms IBKR paper broker connection, and reads current
+positions, NAV by currency, and finite positive USD-equivalent NAV. It does not
+generate, stage, submit, cancel, or reconcile orders.
 
 ---
 

@@ -12,6 +12,74 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-20
+
+### Session 22 - Step 1 Paper Readiness Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending
+
+---
+
+#### What was done
+
+Implemented Step 1 of the incremental paper-trading workflow: a read-only
+paper-readiness preflight command.
+
+The command is intentionally narrower than a daily trading run. It does not
+load signals, construct portfolios, generate orders, stage orders, submit
+orders, cancel orders, or reconcile fills. It only verifies that the local
+machine can safely talk to the IBKR paper environment today.
+
+Command:
+
+```powershell
+python -m scripts.paper_readiness_check
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_readiness_check.py` | New read-only preflight command for IBKR paper readiness |
+| `tests/test_paper_readiness_check.py` | Unit coverage for env gates, socket gating, broker success/failure, NAV failure, and output formatting |
+| `execution/brokers/ibkr.py` | Hardened manual FX fallback parsing to reject non-finite rates |
+| `execution/tests/test_ibkr_broker.py` | Added non-finite manual FX fallback regression tests |
+| `CLAUDE.md` | Added the Step 1 readiness command and updated current paper-connection status |
+
+#### Safety behavior
+
+- Fails unless `PAPER_TRADING=true` is set explicitly.
+- Fails unless `IBKR_PORT=7497` is set explicitly.
+- Fails if `PAPER_RUN_CLEARED=true` is present, because that is a live-trading
+  clearance flag.
+- Checks the TWS/Gateway socket before constructing the broker.
+- Connects with `IBKRBroker`, confirms `is_paper=True`, reads positions, NAV by
+  currency, and finite positive USD-equivalent NAV.
+- Relies on the broker-level stale FX fallback guard from Session 21.
+- Never submits, stages, cancels, or reconciles orders.
+
+#### Validation
+
+- `pytest tests\test_paper_readiness_check.py execution\tests\test_ibkr_broker.py -q`:
+  34 passed.
+- `pytest portfolio\tests execution\tests risk\tests tests\test_paper_readiness_check.py -q`:
+  138 passed.
+- Full non-integration suite:
+  `python -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  570 passed, 10 warnings.
+- `python -m scripts.paper_readiness_check` against local TWS paper port `7497`:
+  passed, reporting empty positions, `{'CAD': 1000000.0}` NAV by currency, and
+  `740000.0` USD-equivalent NAV with a dated test CAD/USD fallback.
+
+#### Status
+
+Step 1 is implemented and locally validated. Next slice is Step 2: load today's
+strategy inputs without constructing a portfolio or generating orders.
+
+---
+
 ## 2026-06-19
 
 ### Session 21 - IBKR Paper Socket Connected + CAD/USD Account NAV Handling
