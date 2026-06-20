@@ -1,11 +1,11 @@
-"""Interactive Brokers broker implementation using ib_insync.
+﻿"""Interactive Brokers broker implementation using ib_insync.
 
 Paper trading:  IBKR_PORT=7497  (TWS Paper or IB Gateway Paper)
 Live trading:   IBKR_PORT=7496  (TWS Live or IB Gateway Live)
 
 Safety rules enforced here:
 - C1: order submission blocked unless caller has already obtained "YES"
-      (enforced by OrderManager, not here — this class blindly submits)
+      (enforced by OrderManager, not here - this class blindly submits)
 - C8: raises EnvironmentError if PAPER_TRADING=false and 4-week paper-run
       gate has not been cleared (checked via env var PAPER_RUN_CLEARED)
 - C9: the live vs. paper switch is governed entirely by IBKR_PORT +
@@ -14,17 +14,10 @@ Safety rules enforced here:
 
 from __future__ import annotations
 
-from datetime import date
 import math
 import os
 import time
-from typing import Optional
-
-_ORDER_ID_TIMEOUT_SECONDS = 5.0
-_ORDER_ID_POLL_INTERVAL = 0.05
-_FX_RATE_TIMEOUT_SECONDS = 5.0
-_FX_RATE_POLL_INTERVAL = 0.1
-_CONFIGURED_FX_RATE_MAX_AGE_DAYS = 1
+from datetime import date
 
 import structlog
 
@@ -34,11 +27,18 @@ from execution.oms.order import Order, OrderSide
 logger = structlog.get_logger(__name__)
 
 try:
-    from ib_insync import Forex, IB, LimitOrder, MarketOrder, Stock
+    from ib_insync import IB, Forex, LimitOrder, MarketOrder, Stock
+
     _IB_AVAILABLE = True
 except ImportError:
     _IB_AVAILABLE = False
     logger.warning("ib_insync_not_installed", advice="pip install ib-insync")
+
+_ORDER_ID_TIMEOUT_SECONDS = 5.0
+_ORDER_ID_POLL_INTERVAL = 0.05
+_FX_RATE_TIMEOUT_SECONDS = 5.0
+_FX_RATE_POLL_INTERVAL = 0.1
+_CONFIGURED_FX_RATE_MAX_AGE_DAYS = 1
 
 
 class IBKRBroker(BaseBroker):
@@ -71,8 +71,8 @@ class IBKRBroker(BaseBroker):
         self._port = raw_port
         self._client_id = client_id
         self._timeout = timeout
-        self._ib: Optional["IB"] = None
-        self._submitted: dict[str, object] = {}  # broker_order_id → ib Trade
+        self._ib: IB | None = None
+        self._submitted: dict[str, object] = {}  # broker_order_id -> ib Trade
 
         self._validate_paper_trading_flag()
 
@@ -82,7 +82,7 @@ class IBKRBroker(BaseBroker):
         Rules:
         - Port 7496 (live) requires PAPER_TRADING=false explicitly set.
           An unset PAPER_TRADING env var defaults to paper mode even if port=7496
-          was passed — prevents accidental live connection (C9).
+          was passed - prevents accidental live connection (C9).
         - PAPER_TRADING=false requires PAPER_RUN_CLEARED=true (C8).
         - PAPER_TRADING=false with port != 7496 is a configuration error (C9).
         """
@@ -90,24 +90,24 @@ class IBKRBroker(BaseBroker):
 
         # Block live port unless PAPER_TRADING is explicitly disabled
         if self._port == 7496 and paper_env != "false":
-            raise EnvironmentError(
+            raise OSError(
                 f"IBKR_PORT={self._port} (live) requires PAPER_TRADING=false to be explicitly set. "
                 "Default/unset PAPER_TRADING is treated as paper mode (C9)."
             )
         if paper_env == "false" and self._port != 7496:
-            raise EnvironmentError(
+            raise OSError(
                 "PAPER_TRADING=false but IBKR_PORT is not 7496.  "
                 "Set IBKR_PORT=7496 for live trading (C9)."
             )
         if paper_env == "false":
             cleared = os.environ.get("PAPER_RUN_CLEARED", "false").lower()
             if cleared != "true":
-                raise EnvironmentError(
+                raise OSError(
                     "Live trading requires PAPER_RUN_CLEARED=true.  "
                     "Confirm 4 consecutive weeks of clean paper trading before switching (C8)."
                 )
 
-    # ── Connection ────────────────────────────────────────────────────────────
+    # Connection
 
     def connect(self) -> None:
         # Re-validate env vars at connection time; they may have changed since __init__
@@ -130,7 +130,7 @@ class IBKRBroker(BaseBroker):
             logger.info("ibkr_disconnected")
         self._ib = None
 
-    # ── Order submission ──────────────────────────────────────────────────────
+    # Order submission
 
     def submit_order(self, order: Order) -> str:
         self._require_connection()
@@ -138,9 +138,9 @@ class IBKRBroker(BaseBroker):
         action = "BUY" if order.side == OrderSide.BUY else "SELL"
 
         if order.limit_price is not None:
-            ib_order = LimitOrder(action, order.quantity, order.limit_price)
+            ib_order = LimitOrder(action, order.quantity, order.limit_price, tif="DAY")
         else:
-            ib_order = MarketOrder(action, order.quantity)
+            ib_order = MarketOrder(action, order.quantity, tif="DAY")
 
         trade = self._ib.placeOrder(contract, ib_order)
 
@@ -152,7 +152,7 @@ class IBKRBroker(BaseBroker):
                 raise RuntimeError(
                     f"IBKR did not assign an orderId within {_ORDER_ID_TIMEOUT_SECONDS}s "
                     f"for {order.ticker} {action} {order.quantity}. "
-                    "Order may still be live at broker — check TWS before retrying."
+                    "Order may still be live at broker - check TWS before retrying."
                 )
             self._ib.sleep(_ORDER_ID_POLL_INTERVAL)
 
@@ -168,7 +168,62 @@ class IBKRBroker(BaseBroker):
         )
         return broker_id
 
-    # ── Fill polling ──────────────────────────────────────────────────────────
+    def what_if_order(self, order: Order) -> dict:
+        """Ask IBKR to validate an order without transmitting it."""
+        self._require_connection()
+        contract = Stock(order.ticker, "SMART", "USD")
+        action = "BUY" if order.side == OrderSide.BUY else "SELL"
+
+        if order.limit_price is not None:
+            ib_order = LimitOrder(action, order.quantity, order.limit_price, tif="DAY")
+        else:
+            ib_order = MarketOrder(action, order.quantity, tif="DAY")
+
+        errors: list[str] = []
+
+        def record_error(req_id, error_code, error_string, error_contract=None) -> None:
+            errors.append(f"IBKR error {error_code}: {error_string}")
+
+        self._ib.errorEvent += record_error
+        try:
+            order_state = self._ib.whatIfOrder(contract, ib_order)
+        finally:
+            self._ib.errorEvent -= record_error
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        result = {
+            "status": getattr(order_state, "status", ""),
+            "init_margin_before": getattr(order_state, "initMarginBefore", ""),
+            "init_margin_change": getattr(order_state, "initMarginChange", ""),
+            "init_margin_after": getattr(order_state, "initMarginAfter", ""),
+            "maint_margin_before": getattr(order_state, "maintMarginBefore", ""),
+            "maint_margin_change": getattr(order_state, "maintMarginChange", ""),
+            "maint_margin_after": getattr(order_state, "maintMarginAfter", ""),
+            "equity_with_loan_before": getattr(order_state, "equityWithLoanBefore", ""),
+            "equity_with_loan_change": getattr(order_state, "equityWithLoanChange", ""),
+            "equity_with_loan_after": getattr(order_state, "equityWithLoanAfter", ""),
+            "commission": getattr(order_state, "commission", ""),
+            "min_commission": getattr(order_state, "minCommission", ""),
+            "max_commission": getattr(order_state, "maxCommission", ""),
+            "commission_currency": getattr(order_state, "commissionCurrency", ""),
+            "warning_text": getattr(order_state, "warningText", ""),
+            "completed_status": getattr(order_state, "completedStatus", ""),
+        }
+        if not any(str(value).strip() for value in result.values()):
+            raise RuntimeError("IBKR what-if returned an empty order state")
+        logger.info(
+            "ibkr_what_if_order",
+            ticker=order.ticker,
+            side=action,
+            quantity=order.quantity,
+            limit=order.limit_price,
+            status=result["status"],
+            warning=result["warning_text"],
+        )
+        return result
+
+    # Fill polling
 
     def get_fill(self, broker_order_id: str) -> dict | None:
         self._require_connection()
@@ -193,7 +248,7 @@ class IBKRBroker(BaseBroker):
             return {"filled_quantity": filled_qty, "avg_price": avg_price, "status": "PartiallyFilled"}
         return None
 
-    # ── Order cancellation ───────────────────────────────────────────────────
+    # Order cancellation
 
     def cancel_order(self, broker_order_id: str) -> bool:
         """Request cancellation of a live order."""
@@ -206,7 +261,7 @@ class IBKRBroker(BaseBroker):
         logger.info("ibkr_cancel_requested", broker_order_id=broker_order_id, ticker=trade.contract.symbol)
         return True
 
-    # ── Account state ─────────────────────────────────────────────────────────
+    # Account state
 
     def get_positions(self) -> dict[str, float]:
         self._require_connection()
@@ -397,6 +452,4 @@ class IBKRBroker(BaseBroker):
 
     def _require_connection(self) -> None:
         if self._ib is None or not self._ib.isConnected():
-            raise RuntimeError(
-                "Not connected to IBKR. Call connect() first."
-            )
+            raise RuntimeError("Not connected to IBKR. Call connect() first.")

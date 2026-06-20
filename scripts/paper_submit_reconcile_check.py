@@ -287,6 +287,33 @@ def _display_review_hashes(blotter_path: Path, blotter: Mapping[str, Any], recor
     recorder.info(f"Candidate rows sha256: {blotter.get('candidate_rows_sha256')}")
 
 
+def _validate_api_submittable_quantities(rows: Sequence[Mapping[str, Any]]) -> None:
+    fractional: list[str] = []
+    for row in rows:
+        shares = float(row["estimated_shares"])
+        if abs(shares - round(shares)) > 1e-9:
+            fractional.append(f"{row['sequence']} {row['ticker']} {shares:.6f}")
+    if fractional:
+        raise RuntimeError(
+            "IBKR TWS API rejects fractional-sized stock orders; regenerate a whole-share blotter. "
+            f"Fractional rows: {', '.join(fractional)}"
+        )
+
+
+def _validate_api_submittable_prices(rows: Sequence[Mapping[str, Any]]) -> None:
+    invalid: list[str] = []
+    for row in rows:
+        price = float(row["reference_price"])
+        cents = round(price * 100)
+        if abs(price - cents / 100) > 1e-9:
+            invalid.append(f"{row['sequence']} {row['ticker']} {price:.6f}")
+    if invalid:
+        raise RuntimeError(
+            "IBKR TWS API rejected sub-cent stock limit prices; regenerate a cent-rounded blotter. "
+            f"Invalid rows: {', '.join(invalid)}"
+        )
+
+
 def _order_from_row(row: Mapping[str, Any], strategy_id: str) -> Order:
     return Order(
         ticker=str(row["ticker"]).strip().upper(),
@@ -447,6 +474,8 @@ def run(
             raise RuntimeError(
                 "--reviewed-blotter-sha256 must match the exact Step 6 blotter file displayed during dry-run"
             )
+        _validate_api_submittable_quantities(rows)
+        _validate_api_submittable_prices(rows)
         if args.output is None:
             raise RuntimeError("--output is required when --confirm YES is supplied")
         if args.output.resolve() == args.blotter.resolve():

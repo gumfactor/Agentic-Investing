@@ -14,6 +14,202 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 32 - Whole-Share Cent-Rounded Paper What-If Pass
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending commit for whole-share/tick-size Step 7.5 slice
+
+---
+
+#### What was done
+
+Closed the IBKR paper what-if blocker found in Session 31. The Step 6 blotter
+now defaults to API-compatible whole-share stock quantities and cent-rounded
+limit prices for US equities. The Step 7 submit/reconcile path now rejects
+fractional share quantities and sub-cent limit prices before opening a broker
+connection. IBKR order construction now sets `tif="DAY"` explicitly for both
+submitted orders and what-if orders, avoiding TWS preset warnings being treated
+as validation failures.
+
+#### Evidence
+
+- Regenerated `local/paper_stage_blotter.json` with `quantity_mode=whole_shares`.
+- The regenerated blotter contains `50` candidate rows, `0` fractional quantity
+  rows, and `0` sub-cent price rows.
+- Step 7 dry-run passed against the regenerated blotter.
+- Step 7.5 paper what-if validation passed against TWS/Gateway paper port
+  `7497`:
+  - Status: `PASS`
+  - Accepted: `50/50`
+  - Rejected: `0/50`
+  - Fractional quantity rows: `0`
+  - Source blotter SHA-256:
+    `8a588805182c4e08d7e3fb170dab05344b38c8f8f4223f466125e508dcff966f`
+- No real or paper orders were transmitted. The validation used IBKR what-if
+  requests only.
+
+#### Verification
+
+- Focused tests:
+  `python -m pytest tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_whatif_check.py execution\tests\test_ibkr_broker.py -q`
+  passed: `56 passed`.
+- Broader paper/execution/risk suite:
+  `python -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py tests\test_paper_whatif_check.py execution\tests risk\tests -q`
+  passed: `209 passed`.
+- Focused ruff check over the touched paper-preflight files and tests passed.
+
+#### Status and next actions
+
+- The whole-share/tick-size Step 7.5 slice is complete.
+- The next decision is whether to run Step 7 with `--confirm YES` to submit the
+  validated paper orders. That must remain an explicit operator approval step.
+- Keep TWS/Gateway open on paper port `7497` for any submission attempt.
+
+---
+
+### Session 31 - IBKR Fractional Share What-If Validation
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** uncommitted Step 7.5 implementation
+
+---
+
+#### What was done
+
+Added and ran a Step 7.5 IBKR paper what-if validation slice to test whether
+the current fractional-share Step 6 blotter can be submitted through the TWS
+API without transmitting real paper orders.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/brokers/base.py` | Added default fail-closed `what_if_order()` broker contract |
+| `execution/brokers/ibkr.py` | Added IBKR `what_if_order()` using `IB.whatIfOrder()` and API error-event capture |
+| `scripts/paper_whatif_check.py` | New Step 7.5 command that validates a Step 6 blotter with paper what-if requests and writes a local artifact |
+| `tests/test_paper_whatif_check.py` | Unit tests for successful artifact creation, fractional quantities, broker rejects, environment gates, overwrite protection, and no submit/cancel/reconcile path |
+| `execution/tests/test_ibkr_broker.py` | Regression tests for IBKR what-if error-event capture and empty order-state fail-closed behavior |
+
+#### Live validation result
+
+Command:
+
+```powershell
+python -m scripts.paper_whatif_check --blotter .\local\paper_stage_blotter.json --output .\local\paper_whatif_validation.json --client-id 12 --overwrite
+```
+
+Result: **failed closed as intended**.
+
+- Artifact: `local/paper_whatif_validation.json`
+- Orders tested: `50`
+- Fractional quantity rows: `50`
+- Accepted by IBKR API what-if: `0`
+- Rejected by IBKR API what-if: `50`
+- IBKR error for every row: `10243` -
+  `Fractional-sized order cannot be placed via API. Please use desktop version to place this order.`
+
+#### Safety
+
+- The command connected only to paper TWS/Gateway on port `7497`.
+- It used IBKR what-if validation, not order transmission.
+- No `YES` was consumed.
+- No broker order IDs were created in the Step 6/7 workflow.
+- No fills, cancellations, or reconciliation were attempted.
+
+#### Status and next actions
+
+- Fractional-share submission via this TWS API path is blocked.
+- The next engineering slice should create a whole-share paper blotter path:
+  round each order to whole shares, leave residual cash, rerun Step 5/6, then
+  rerun Step 7.5 what-if validation.
+- Do not run Step 7 `--confirm YES` against the fractional Step 6 blotter.
+
+---
+
+### Session 30 - Paper Preflight Live Dry-Run Initiation
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** uncommitted operational log entry
+
+---
+
+#### What was done
+
+Initiated the next paper-trading priorities after completing Steps 1-8:
+
+1. Refreshed stale `v1_base_momentum` alpha scores through the latest available
+   `daily_prices` date.
+2. Ran the manual paper preflight chain through Step 7 dry-run and Step 8 audit.
+3. Performed an operator-review rehearsal summary over the generated blotter.
+
+#### Evidence
+
+- Before refresh: `daily_prices` latest date was `2026-06-18`, while
+  `v1_base_momentum` `alpha_scores` stopped at `2026-06-09`.
+- Refreshed `v1_base_momentum` scores for trading dates `2026-06-10`,
+  `2026-06-11`, `2026-06-12`, `2026-06-15`, `2026-06-16`, `2026-06-17`, and
+  `2026-06-18`.
+- Wrote `3,514` `factor_scores` rows and `3,514` `alpha_scores` rows using the
+  existing idempotent upsert path.
+- Verified Step 2:
+  `python -m scripts.paper_inputs_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum`
+  passed.
+- Verified Step 3:
+  `python -m scripts.paper_target_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum`
+  passed.
+- Verified Step 1 after supplying an ephemeral Bank of Canada FX override:
+  `IBKR_FX_RATE_USD_CAD=1.4171`, `IBKR_FX_RATE_USD_CAD_AS_OF=2026-06-19`.
+  TWS/Gateway paper socket was reachable on `127.0.0.1:7497`, broker connected
+  in paper mode, positions were empty, CAD NAV was `1,000,000.00`, and
+  USD-equivalent NAV was `705,666.50`.
+- Created local operator artifact `local/paper_portfolio_snapshot.json`
+  representing the empty paper account as all cash, with `as_of=2026-06-20`.
+- Step 4 order candidates passed: 50 BUY candidates from cash to target.
+- Step 5 risk/compliance passed: gross target weight `1.000000`, max target
+  position weight `0.020000`, turnover weight `1.000000`.
+- Step 6 wrote `local/paper_stage_blotter.json`, run id
+  `476df5d5-c467-49be-a965-835957c98a9f`, candidate rows checksum
+  `6faccf5594cc7fc067e44f13cb799dd895b8f892300c3669b0a4b64d203a965a`.
+- Step 7 dry-run passed with reviewed blotter file SHA-256
+  `073f35c9720992cc5c0c62681ee5575f61cd6efc7769936f3b03292f8b633588`.
+- Step 8 wrote `local/paper_run_audit.json`, run id
+  `d5f6bdbd-fa6e-4c9f-810f-c03fa11ac228`, status `DRY_RUN`, artifact checksum
+  `7c4ccd43467483ce509566a6e7b115ff50534a40ae65f4ad9c84f4d7613417a0`.
+
+#### Operator review rehearsal
+
+- The paper account had no existing positions, so the target transition is
+  100% cash to 50 long positions.
+- Blotter contains 50 BUY orders and no SELL orders.
+- Total estimated notional is `705,666.50` USD, with `14,113.33` USD per order.
+- Each target position is `2.00%`; no candidate exceeds the configured
+  `5.00%` position cap.
+- All 50 candidate quantities are fractional shares. This is acceptable only if
+  the IBKR paper account supports fractional US stock orders for this route and
+  order type; otherwise the blotter needs a whole-share sizing/rounding slice
+  before paper submission.
+- Lowest reference-price/highest-share examples: APA `427.288236` shares at
+  `33.03`, HAL `404.046092` shares at `34.93`, HPE `297.686775` shares at
+  `47.41`.
+- Highest reference-price/lowest-share examples: SNDK `6.459929` shares at
+  `2184.75`, FIX `7.173558` shares at `1967.41`, MU `12.445727` shares at
+  `1133.99`.
+
+#### Status and next actions
+
+- Priorities 1 and 2 are complete through the dry-run/audit boundary.
+- Priority 3 is initiated; final human approval is still required before any
+  Step 7 `--confirm YES`.
+- Do not submit until the operator explicitly accepts the reviewed blotter hash
+  and fractional-share behavior.
+- The manual FX override was not persisted to `.env`; future readiness checks
+  will need a fresh FX rate or a persisted same-day manual rate.
+
+---
+
 ### Session 29 - Step 8 Paper Run Audit Record
 
 **Operator:** mshane@thecanadalist.ca

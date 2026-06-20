@@ -16,6 +16,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import sys
 import uuid
@@ -54,6 +55,7 @@ from scripts.paper_risk_compliance_check import (
 from scripts.paper_target_check import construct_target_portfolio
 
 BLOTTER_SCHEMA_VERSION = "paper_stage_blotter.v1"
+US_STOCK_MIN_PRICE_INCREMENT = 0.01
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -116,6 +118,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Optional per-candidate minimum notional for the read-only ComplianceEngine check.",
     )
+    parser.add_argument(
+        "--allow-fractional-shares",
+        action="store_true",
+        help=(
+            "Keep fractional estimated_shares in the local artifact. Default floors to whole "
+            "shares because the IBKR TWS API rejects fractional-sized stock orders."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -143,6 +153,67 @@ def _candidate_rows(candidates: tuple[OrderCandidate, ...]) -> list[dict[str, An
             }
         )
     return rows
+
+
+def _whole_share_candidates(
+    candidates: tuple[OrderCandidate, ...],
+    *,
+    nav: float,
+) -> tuple[OrderCandidate, ...]:
+    rounded: list[OrderCandidate] = []
+    for candidate in candidates:
+        whole_shares = math.floor(candidate.estimated_shares)
+        if whole_shares <= 0:
+            continue
+        reference_price = _api_limit_price(candidate.reference_price, candidate.direction)
+        notional = whole_shares * reference_price
+        weight_delta = notional / nav
+        signed_delta = weight_delta if candidate.direction == "BUY" else -weight_delta
+        rounded.append(
+            OrderCandidate(
+                ticker=candidate.ticker,
+                direction=candidate.direction,
+                current_weight=candidate.current_weight,
+                target_weight=candidate.current_weight + signed_delta,
+                delta_weight=signed_delta,
+                reference_price=reference_price,
+                estimated_shares=float(whole_shares),
+                estimated_notional=notional,
+            )
+        )
+    return tuple(rounded)
+
+
+def _api_limit_price(price: float, direction: str) -> float:
+    if not math.isfinite(price) or price <= 0:
+        raise RuntimeError(f"Reference price must be finite and positive; got {price!r}")
+    ticks = price / US_STOCK_MIN_PRICE_INCREMENT
+    if direction == "BUY":
+        rounded = math.ceil(ticks - 1e-12) * US_STOCK_MIN_PRICE_INCREMENT
+    elif direction == "SELL":
+        rounded = math.floor(ticks + 1e-12) * US_STOCK_MIN_PRICE_INCREMENT
+    else:
+        raise RuntimeError(f"Unsupported order direction for limit price rounding: {direction!r}")
+    return round(rounded, 2)
+
+
+def _rounding_summary(
+    original: tuple[OrderCandidate, ...],
+    rounded: tuple[OrderCandidate, ...],
+    *,
+    quantity_mode: str,
+) -> dict[str, Any]:
+    original_notional = sum(candidate.estimated_notional for candidate in original)
+    rounded_notional = sum(candidate.estimated_notional for candidate in rounded)
+    return {
+        "quantity_mode": quantity_mode,
+        "original_candidate_count": len(original),
+        "rounded_candidate_count": len(rounded),
+        "dropped_zero_share_count": len(original) - len(rounded),
+        "original_estimated_notional": original_notional,
+        "rounded_estimated_notional": rounded_notional,
+        "residual_cash_from_rounding": max(0.0, original_notional - rounded_notional),
+    }
 
 
 def _rows_checksum(rows: list[dict[str, Any]]) -> str:
@@ -181,6 +252,7 @@ def _build_artifact(
     summary: GateSummary,
     limits: GateLimits,
     output_path: Path,
+    rounding: Mapping[str, Any],
 ) -> dict[str, Any]:
     row_checksum = _rows_checksum(rows)
     provenance = {
@@ -196,6 +268,7 @@ def _build_artifact(
             "allow_shorts": limits.allow_shorts,
             "max_turnover_weight": limits.max_turnover_weight,
             "min_order_notional": limits.min_order_notional,
+            "quantity_mode": rounding["quantity_mode"],
         },
     }
     provenance["gate_inputs_sha256"] = _stable_sha256(provenance["gate_inputs"])
@@ -235,6 +308,7 @@ def _build_artifact(
             "max_turnover_weight": limits.max_turnover_weight,
             "min_order_notional": limits.min_order_notional,
         },
+        "rounding_summary": dict(rounding),
         "candidate_rows_sha256": row_checksum,
         "candidate_rows": rows,
         "next_step_hint": "Operator review artifact only; Step 7 must revalidate before any OMS registration.",
@@ -334,11 +408,27 @@ def run(
             recorder=recorder,
         )
         if target is not None:
-            candidates = build_order_candidates(
+            raw_candidates = build_order_candidates(
                 target=target,
                 snapshot=snapshot,
                 min_delta_weight=args.min_delta_weight,
             )
+            quantity_mode = "fractional" if args.allow_fractional_shares else "whole_shares"
+            candidates = (
+                raw_candidates
+                if args.allow_fractional_shares
+                else _whole_share_candidates(raw_candidates, nav=snapshot.nav)
+            )
+            rounding = _rounding_summary(
+                raw_candidates,
+                candidates,
+                quantity_mode=quantity_mode,
+            )
+            if raw_candidates and not candidates:
+                raise RuntimeError(
+                    "Whole-share rounding dropped all order candidates; "
+                    "increase account size, lower prices, or run only a diagnostic fractional blotter."
+                )
             summary = _check_candidates(
                 target=target,
                 snapshot=snapshot,
@@ -359,6 +449,7 @@ def run(
                     summary=summary,
                     limits=limits,
                     output_path=args.output,
+                    rounding=rounding,
                 )
                 artifact["artifact_sha256"] = _artifact_checksum(artifact)
                 _write_artifact(args.output, artifact, overwrite=args.overwrite)

@@ -158,12 +158,66 @@ def test_run_writes_stage_only_blotter_after_step_five_passes(tmp_path, capsys):
         "human_yes_consumed": False,
     }
     assert artifact["risk_compliance_summary"]["candidate_count"] == 3
-    assert artifact["risk_compliance_summary"]["turnover_weight"] == 1.5
+    assert artifact["risk_compliance_summary"]["turnover_weight"] == 2600.0 / 1800.0
+    assert artifact["rounding_summary"]["quantity_mode"] == "whole_shares"
+    assert artifact["rounding_summary"]["original_candidate_count"] == 3
+    assert artifact["rounding_summary"]["rounded_candidate_count"] == 3
+    assert artifact["rounding_summary"]["dropped_zero_share_count"] == 0
+    assert artifact["rounding_summary"]["residual_cash_from_rounding"] == 100.0
     assert artifact["candidate_rows_sha256"] == check._rows_checksum(rows)
     assert artifact["artifact_sha256"] == check._artifact_checksum(artifact)
     assert [row["ticker"] for row in rows] == ["NVDA", "AAPL", "MSFT"]
+    assert [row["estimated_shares"] for row in rows] == [10.0, 2.0, 2.0]
+    assert [row["estimated_notional"] for row in rows] == [1300.0, 400.0, 900.0]
     assert all(row["review_status"] == "LOCAL_STAGE_ONLY" for row in rows)
     assert all("broker" not in row for row in rows)
+
+
+def test_whole_share_rounding_drops_zero_share_orders(tmp_path, capsys):
+    config_path = tmp_path / "strategy.yaml"
+    portfolio_path = tmp_path / "portfolio.json"
+    output_path = tmp_path / "paper_stage_blotter.json"
+    _write_config(config_path, n_long=2, max_position_weight=0.60)
+    _write_portfolio(portfolio_path, {"as_of": "2026-06-20", "cash": 100.0, "positions": []})
+
+    result = check.run(
+        _pass_args(config_path, portfolio_path, output_path),
+        env=_env(),
+        engine_factory=lambda _url: _engine(),
+        today_fn=lambda: date(2026, 6, 20),
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "Whole-share rounding dropped all order candidates" in out
+    assert not output_path.exists()
+
+
+def test_api_limit_price_rounding_is_side_aware():
+    assert check._api_limit_price(434.459991, "BUY") == 434.46
+    assert check._api_limit_price(434.451, "BUY") == 434.46
+    assert check._api_limit_price(434.459991, "SELL") == 434.45
+    assert check._api_limit_price(434.451, "SELL") == 434.45
+
+
+def test_fractional_mode_is_explicit_and_records_metadata(tmp_path, capsys):
+    config_path = tmp_path / "strategy.yaml"
+    portfolio_path = tmp_path / "portfolio.json"
+    output_path = tmp_path / "paper_stage_blotter.json"
+    _write_config(config_path, n_long=2, max_position_weight=0.60)
+    _write_portfolio(portfolio_path, {"as_of": "2026-06-20", "cash": 1000.0, "positions": []})
+
+    result = check.run(
+        [*_pass_args(config_path, portfolio_path, output_path), "--allow-fractional-shares"],
+        env=_env(),
+        engine_factory=lambda _url: _engine(),
+        today_fn=lambda: date(2026, 6, 20),
+    )
+
+    assert result == 0
+    artifact = json.loads(output_path.read_text(encoding="utf-8"))
+    assert artifact["rounding_summary"]["quantity_mode"] == "fractional"
+    assert any(row["estimated_shares"] != round(row["estimated_shares"]) for row in artifact["candidate_rows"])
 
 
 def test_run_refuses_to_overwrite_existing_artifact_without_flag(tmp_path, capsys):

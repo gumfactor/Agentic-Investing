@@ -33,11 +33,11 @@ def _write_blotter(tmp_path: Path, *, mutate: Any = None) -> Path:
             "direction": "BUY",
             "review_status": "LOCAL_STAGE_ONLY",
             "current_weight": 0.0,
-            "target_weight": 0.5,
-            "delta_weight": 0.5,
+            "target_weight": 0.4,
+            "delta_weight": 0.4,
             "reference_price": 200.0,
-            "estimated_shares": 2.5,
-            "estimated_notional": 500.0,
+            "estimated_shares": 2.0,
+            "estimated_notional": 400.0,
         },
         {
             "sequence": 2,
@@ -323,7 +323,7 @@ def test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation(tmp_path
     assert fake.connected is True
     assert fake.disconnected is True
     assert [(order.ticker, order.side.value, order.quantity, order.limit_price) for order in fake.orders] == [
-        ("AAPL", "BUY", 2.5, 200.0),
+        ("AAPL", "BUY", 2.0, 200.0),
         ("MSFT", "SELL", 1.0, 450.0),
     ]
 
@@ -346,6 +346,70 @@ def test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation(tmp_path
         "live_orders_allowed": False,
     }
     assert artifact["artifact_sha256"] == check._reconciliation_checksum(artifact)
+
+
+def test_confirm_yes_rejects_fractional_quantities_before_broker_connection(tmp_path, capsys):
+    def mutate(artifact: dict[str, Any]) -> None:
+        artifact["candidate_rows"][0]["estimated_shares"] = 2.5
+        artifact["candidate_rows"][0]["estimated_notional"] = 500.0
+        artifact["candidate_rows_sha256"] = stage._rows_checksum(artifact["candidate_rows"])
+
+    blotter_path = _write_blotter(tmp_path, mutate=mutate)
+    output_path = tmp_path / "paper_reconciliation.json"
+    fake = FakeBroker()
+
+    result = check.run(
+        [
+            "--blotter",
+            str(blotter_path),
+            "--confirm",
+            "YES",
+            "--reviewed-blotter-sha256",
+            stage._file_sha256(blotter_path),
+            "--output",
+            str(output_path),
+        ],
+        env=_env(),
+        broker_factory=lambda: fake,
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "IBKR TWS API rejects fractional-sized stock orders" in out
+    assert fake.connected is False
+    assert not output_path.exists()
+
+
+def test_confirm_yes_rejects_sub_cent_limit_prices_before_broker_connection(tmp_path, capsys):
+    def mutate(artifact: dict[str, Any]) -> None:
+        artifact["candidate_rows"][0]["reference_price"] = 200.001
+        artifact["candidate_rows"][0]["estimated_notional"] = 400.002
+        artifact["candidate_rows_sha256"] = stage._rows_checksum(artifact["candidate_rows"])
+
+    blotter_path = _write_blotter(tmp_path, mutate=mutate)
+    output_path = tmp_path / "paper_reconciliation.json"
+    fake = FakeBroker()
+
+    result = check.run(
+        [
+            "--blotter",
+            str(blotter_path),
+            "--confirm",
+            "YES",
+            "--reviewed-blotter-sha256",
+            stage._file_sha256(blotter_path),
+            "--output",
+            str(output_path),
+        ],
+        env=_env(),
+        broker_factory=lambda: fake,
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "sub-cent stock limit prices" in out
+    assert fake.connected is False
+    assert not output_path.exists()
 
 
 def test_partial_submission_failure_writes_attempt_artifact(tmp_path, capsys):

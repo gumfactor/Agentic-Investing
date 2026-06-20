@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from execution.brokers.ibkr import IBKRBroker
+from execution.oms.order import Order, OrderSide
 
 
 class FakeIB:
@@ -48,6 +49,74 @@ class FakeIBForFx(FakeIB):
 
     def cancelMktData(self, contract):
         self.cancelled_contract = contract
+
+
+class FakeEvent:
+    def __init__(self) -> None:
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self.handlers.remove(handler)
+        return self
+
+    def emit(self, *args):
+        for handler in list(self.handlers):
+            handler(*args)
+
+
+class FakeIBForWhatIf(FakeIB):
+    def __init__(self, *, emit_error: bool = False, empty_state: bool = False) -> None:
+        super().__init__([])
+        self.errorEvent = FakeEvent()
+        self.emit_error = emit_error
+        self.empty_state = empty_state
+        self.last_order = None
+
+    def whatIfOrder(self, _contract, _order):
+        self.last_order = _order
+        if self.emit_error:
+            self.errorEvent.emit(3, 10243, "Fractional-sized order cannot be placed via API.", None)
+        if self.empty_state:
+            return SimpleNamespace(
+                status="",
+                initMarginBefore="",
+                maintMarginBefore="",
+                equityWithLoanBefore="",
+                initMarginChange="",
+                maintMarginChange="",
+                equityWithLoanChange="",
+                initMarginAfter="",
+                maintMarginAfter="",
+                equityWithLoanAfter="",
+                commission="",
+                minCommission="",
+                maxCommission="",
+                commissionCurrency="",
+                warningText="",
+                completedStatus="",
+            )
+        return SimpleNamespace(
+            status="PreSubmitted",
+            initMarginBefore="1000",
+            maintMarginBefore="1000",
+            equityWithLoanBefore="1000",
+            initMarginChange="10",
+            maintMarginChange="5",
+            equityWithLoanChange="0",
+            initMarginAfter="1010",
+            maintMarginAfter="1005",
+            equityWithLoanAfter="1000",
+            commission="1",
+            minCommission="1",
+            maxCommission="1",
+            commissionCurrency="USD",
+            warningText="",
+            completedStatus="",
+        )
 
 
 def _account_value(tag: str, value: str, currency: str):
@@ -234,3 +303,34 @@ def test_account_value_raises_when_no_net_liquidation():
 
     with pytest.raises(RuntimeError, match="NetLiquidation not found"):
         broker.get_account_values_by_currency()
+
+
+def test_what_if_order_raises_on_ibkr_error_event():
+    broker = _broker([])
+    broker._ib = FakeIBForWhatIf(emit_error=True)
+
+    order = Order(ticker="AAPL", side=OrderSide.BUY, quantity=2.5, limit_price=200.0)
+
+    with pytest.raises(RuntimeError, match="Fractional-sized order cannot be placed via API"):
+        broker.what_if_order(order)
+
+
+def test_what_if_order_raises_on_empty_order_state():
+    broker = _broker([])
+    broker._ib = FakeIBForWhatIf(empty_state=True)
+
+    order = Order(ticker="AAPL", side=OrderSide.BUY, quantity=2.5, limit_price=200.0)
+
+    with pytest.raises(RuntimeError, match="empty order state"):
+        broker.what_if_order(order)
+
+
+def test_what_if_order_returns_margin_summary():
+    broker = _broker([])
+    fake_ib = FakeIBForWhatIf()
+    broker._ib = fake_ib
+
+    order = Order(ticker="AAPL", side=OrderSide.BUY, quantity=1.0, limit_price=200.0)
+
+    assert broker.what_if_order(order)["status"] == "PreSubmitted"
+    assert fake_ib.last_order.tif == "DAY"
