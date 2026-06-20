@@ -424,7 +424,12 @@ def run(
                 candidates,
                 quantity_mode=quantity_mode,
             )
-            if raw_candidates and not candidates:
+            if raw_candidates and len(candidates) != len(raw_candidates):
+                if candidates:
+                    raise RuntimeError(
+                        "Whole-share rounding dropped some order candidates; "
+                        "regenerate with enough account size for every leg or run only a diagnostic fractional blotter."
+                    )
                 raise RuntimeError(
                     "Whole-share rounding dropped all order candidates; "
                     "increase account size, lower prices, or run only a diagnostic fractional blotter."

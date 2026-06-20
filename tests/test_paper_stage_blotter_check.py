@@ -193,6 +193,33 @@ def test_whole_share_rounding_drops_zero_share_orders(tmp_path, capsys):
     assert not output_path.exists()
 
 
+def test_whole_share_rounding_fails_when_only_some_legs_drop(tmp_path, capsys):
+    config_path = tmp_path / "strategy.yaml"
+    portfolio_path = tmp_path / "portfolio.json"
+    output_path = tmp_path / "paper_stage_blotter.json"
+    _write_config(config_path, n_long=2, max_position_weight=0.60)
+    _write_portfolio(
+        portfolio_path,
+        {
+            "as_of": "2026-06-20",
+            "cash": 0.0,
+            "positions": [{"ticker": "NVDA", "quantity": 1.0, "price": 130.0}],
+        },
+    )
+
+    result = check.run(
+        _pass_args(config_path, portfolio_path, output_path),
+        env=_env(),
+        engine_factory=lambda _url: _engine(),
+        today_fn=lambda: date(2026, 6, 20),
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "Whole-share rounding dropped some order candidates" in out
+    assert not output_path.exists()
+
+
 def test_api_limit_price_rounding_is_side_aware():
     assert check._api_limit_price(434.459991, "BUY") == 434.46
     assert check._api_limit_price(434.451, "BUY") == 434.46

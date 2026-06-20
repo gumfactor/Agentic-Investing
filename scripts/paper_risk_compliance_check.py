@@ -207,6 +207,17 @@ def _current_quantity_by_ticker(snapshot: PortfolioSnapshot) -> dict[str, float]
     return {position.ticker: position.quantity for position in snapshot.positions}
 
 
+def _post_trade_weights(
+    target: TargetPortfolio,
+    snapshot: PortfolioSnapshot,
+    candidates: tuple[OrderCandidate, ...],
+) -> dict[str, float]:
+    weights = {ticker.upper(): float(weight) for ticker, weight in snapshot.current_weights.items()}
+    for candidate in candidates:
+        weights[candidate.ticker.upper()] = float(candidate.target_weight)
+    return {ticker: weight for ticker, weight in weights.items() if abs(weight) > 1e-12}
+
+
 def _check_candidates(
     *,
     target: TargetPortfolio,
@@ -216,7 +227,8 @@ def _check_candidates(
     recorder: CheckRecorder,
 ) -> GateSummary | None:
     ok = True
-    target_weights = {position.ticker.upper(): float(position.target_weight) for position in target.positions}
+    raw_target_weights = {position.ticker.upper(): float(position.target_weight) for position in target.positions}
+    post_trade_weights = _post_trade_weights(target, snapshot, candidates)
     current_quantities = _current_quantity_by_ticker(snapshot)
 
     for idx, candidate in enumerate(candidates, start=1):
@@ -239,22 +251,30 @@ def _check_candidates(
                 )
                 ok = False
 
-    for ticker, weight in target_weights.items():
+    for ticker, weight in raw_target_weights.items():
         if not math.isfinite(weight):
             recorder.fail(f"Target weight for {ticker} is not finite")
             ok = False
         if not limits.allow_shorts and weight < -1e-9:
             recorder.fail(f"Target weight for {ticker} is short ({weight:.8f}) but shorts are disabled")
             ok = False
+
+    for ticker, weight in post_trade_weights.items():
+        if not math.isfinite(weight):
+            recorder.fail(f"Post-trade weight for {ticker} is not finite")
+            ok = False
+        if not limits.allow_shorts and weight < -1e-9:
+            recorder.fail(f"Post-trade weight for {ticker} is short ({weight:.8f}) but shorts are disabled")
+            ok = False
         if abs(weight) > limits.max_position_weight + 1e-9:
             recorder.fail(
-                f"Target weight for {ticker} {weight:.6f} exceeds max position "
+                f"Post-trade weight for {ticker} {weight:.6f} exceeds max position "
                 f"{limits.max_position_weight:.6f}"
             )
             ok = False
 
-    gross_target_weight = sum(abs(weight) for weight in target_weights.values())
-    max_target_weight = max((abs(weight) for weight in target_weights.values()), default=0.0)
+    gross_target_weight = sum(abs(weight) for weight in post_trade_weights.values())
+    max_target_weight = max((abs(weight) for weight in post_trade_weights.values()), default=0.0)
     turnover_weight = sum(abs(candidate.delta_weight) for candidate in candidates)
     if not math.isfinite(gross_target_weight):
         recorder.fail("Gross target weight is not finite")

@@ -325,10 +325,24 @@ def _order_from_row(row: Mapping[str, Any], strategy_id: str) -> Order:
     )
 
 
-def _default_broker_factory() -> PaperBroker:
+def _default_broker_factory(client_id: int | None = None) -> PaperBroker:
     from execution.brokers.ibkr import IBKRBroker
 
-    return IBKRBroker()
+    kwargs = {} if client_id is None else {"client_id": client_id}
+    return IBKRBroker(**kwargs)
+
+
+def _resolve_client_id(env: Mapping[str, str]) -> int | None:
+    raw_client_id = env.get("IBKR_CLIENT_ID")
+    if raw_client_id is None or str(raw_client_id).strip() == "":
+        return None
+    try:
+        parsed = int(str(raw_client_id).strip())
+    except ValueError as exc:
+        raise RuntimeError(f"IBKR_CLIENT_ID must be an integer; got {raw_client_id!r}") from exc
+    if parsed <= 0:
+        raise RuntimeError(f"IBKR_CLIENT_ID must be positive; got {parsed!r}")
+    return parsed
 
 
 def _validate_broker_paper_metadata(broker: PaperBroker) -> None:
@@ -340,14 +354,27 @@ def _validate_broker_paper_metadata(broker: PaperBroker) -> None:
         raise RuntimeError(f"Broker adapter connection_mode must be 'paper'; got {mode!r}")
 
 
+def _broker_from_factory(
+    broker_factory: Callable[..., PaperBroker],
+    client_id: int | None,
+) -> PaperBroker:
+    if client_id is None:
+        return broker_factory()
+    try:
+        return broker_factory(client_id)
+    except TypeError:
+        return broker_factory(client_id=client_id)
+
+
 def _submit_orders(
     artifact: Mapping[str, Any],
-    broker_factory: Callable[[], PaperBroker],
+    broker_factory: Callable[..., PaperBroker],
     *,
+    client_id: int | None,
     now_fn: Callable[[], datetime],
     on_progress: Callable[[list[dict[str, Any]], str, int | None, str | None], None] | None = None,
 ) -> list[dict[str, Any]]:
-    broker = broker_factory()
+    broker = _broker_from_factory(broker_factory, client_id)
     connected = False
     try:
         _validate_broker_paper_metadata(broker)
@@ -442,7 +469,7 @@ def _build_reconciliation_artifact(
 def run(
     argv: list[str] | None = None,
     env: Mapping[str, str] | None = None,
-    broker_factory: Callable[[], PaperBroker] = _default_broker_factory,
+    broker_factory: Callable[..., PaperBroker] = _default_broker_factory,
     now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
     run_id_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
 ) -> int:
@@ -454,6 +481,7 @@ def run(
 
     try:
         env_ok = _paper_env_is_valid(env_map, recorder)
+        client_id = _resolve_client_id(env_map)
         blotter = validate_blotter(args.blotter)
         rows = blotter["candidate_rows"]
         _display_orders(rows, recorder)
@@ -522,6 +550,7 @@ def run(
             broker_responses = _submit_orders(
                 blotter,
                 broker_factory,
+                client_id=client_id,
                 now_fn=now_fn,
                 on_progress=write_progress,
             )

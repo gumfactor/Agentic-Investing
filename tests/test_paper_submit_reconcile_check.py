@@ -348,6 +348,62 @@ def test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation(tmp_path
     assert artifact["artifact_sha256"] == check._reconciliation_checksum(artifact)
 
 
+def test_confirm_yes_passes_configured_client_id_to_broker_factory(tmp_path, capsys):
+    blotter_path = _write_blotter(tmp_path)
+    output_path = tmp_path / "paper_reconciliation.json"
+    fake = FakeBroker()
+    client_ids: list[int | None] = []
+
+    def broker_factory(client_id: int | None) -> FakeBroker:
+        client_ids.append(client_id)
+        return fake
+
+    result = check.run(
+        [
+            "--blotter",
+            str(blotter_path),
+            "--confirm",
+            "YES",
+            "--reviewed-blotter-sha256",
+            stage._file_sha256(blotter_path),
+            "--output",
+            str(output_path),
+        ],
+        env={**_env(), "IBKR_CLIENT_ID": "7"},
+        broker_factory=broker_factory,
+    )
+
+    assert result == 0
+    assert client_ids == [7]
+
+
+def test_confirm_yes_rejects_invalid_configured_client_id(tmp_path, capsys):
+    blotter_path = _write_blotter(tmp_path)
+    output_path = tmp_path / "paper_reconciliation.json"
+    fake = FakeBroker()
+
+    result = check.run(
+        [
+            "--blotter",
+            str(blotter_path),
+            "--confirm",
+            "YES",
+            "--reviewed-blotter-sha256",
+            stage._file_sha256(blotter_path),
+            "--output",
+            str(output_path),
+        ],
+        env={**_env(), "IBKR_CLIENT_ID": "not-an-int"},
+        broker_factory=lambda: fake,
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "IBKR_CLIENT_ID must be an integer" in out
+    assert fake.connected is False
+    assert not output_path.exists()
+
+
 def test_confirm_yes_rejects_fractional_quantities_before_broker_connection(tmp_path, capsys):
     def mutate(artifact: dict[str, Any]) -> None:
         artifact["candidate_rows"][0]["estimated_shares"] = 2.5

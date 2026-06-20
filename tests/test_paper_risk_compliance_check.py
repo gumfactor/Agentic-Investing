@@ -268,7 +268,7 @@ def test_run_fails_position_limit_from_override(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert result == 1
-    assert "Target weight for" in out
+    assert "Post-trade weight for" in out
     assert "exceeds max position 0.400000" in out
 
 
@@ -444,3 +444,51 @@ def test_check_candidates_rejects_sell_beyond_local_holding():
 
     assert summary is None
     assert any("shares but local snapshot holds" in issue for issue in recorder.issues)
+
+
+def test_check_candidates_rejects_rounded_post_trade_weight_over_cap():
+    recorder = check.CheckRecorder()
+    target = TargetPortfolio(
+        strategy_id="v1_base_momentum",
+        method="equal_weight",
+        as_of_date=date(2026, 6, 20),
+        positions=(TargetPosition("AAPL", 0.05, 10.0, 1.0),),
+        cash_weight=0.95,
+    )
+    snapshot = PortfolioSnapshot(
+        as_of=date(2026, 6, 20),
+        cash=0.0,
+        positions=(CurrentPosition(ticker="AAPL", quantity=10.0, price=10.0),),
+    )
+    limits = check.GateLimits(
+        max_position_weight=0.05,
+        max_gross_target_weight=1.0,
+        allow_shorts=False,
+        max_turnover_weight=None,
+        min_order_notional=0.0,
+    )
+
+    summary = check._check_candidates(
+        target=target,
+        snapshot=snapshot,
+        candidates=(
+            OrderCandidate(
+                ticker="AAPL",
+                direction="SELL",
+                current_weight=1.0,
+                target_weight=0.10,
+                delta_weight=-0.90,
+                reference_price=10.0,
+                estimated_shares=9.0,
+                estimated_notional=90.0,
+            ),
+        ),
+        limits=limits,
+        recorder=recorder,
+    )
+
+    assert summary is None
+    assert any(
+        "Post-trade weight for AAPL 0.100000 exceeds max position 0.050000" in issue
+        for issue in recorder.issues
+    )
