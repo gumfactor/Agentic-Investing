@@ -14,6 +14,119 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 26 - Step 5 Paper Risk/Compliance Preflight
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending
+
+---
+
+#### What was done
+
+Implemented Step 5 of the incremental paper-trading workflow: a read-only risk
+and compliance preflight command over Step 4 order candidates.
+
+The command intentionally stays before OMS staging and broker boundaries. It
+reuses the Step 4 candidate path, validates the candidate rows, evaluates local
+risk limits, and runs an in-memory `ComplianceEngine` adapter with explicit
+local context.
+
+Command:
+
+```powershell
+python -m scripts.paper_risk_compliance_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_risk_compliance_check.py` | New read-only Step 5 command that evaluates schema, risk, and compliance gates over Step 4 candidates |
+| `tests/test_paper_risk_compliance_check.py` | Unit coverage for pass path, stale target blocking, required strategy ID, gross/concentration/turnover failures, invalid schema, short blocking, and sell-size blocking |
+| `CLAUDE.md` | Added the Step 5 operator command, safety boundary, local-only overrides, and stale-input/live-state blocker |
+| `Worklog.md` | Recorded the Step 5 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL`, explicit `--strategy-id`, and explicit
+  `--portfolio-input`.
+- Reuses the Step 3/4 target and candidate gates, so stale or invalid strategy
+  inputs still fail closed before risk/compliance reporting.
+- Reads current portfolio state only from the local JSON snapshot supplied by
+  the operator; it does not connect to IBKR or inspect broker state.
+- Validates candidate direction/schema, finite current/target/delta weights,
+  finite positive reference prices, estimated shares, and estimated notionals.
+- Defaults to long-only behavior: short target weights and SELL quantities above
+  local holdings fail unless the strategy config or `--allow-shorts`
+  explicitly allows shorts.
+- Enforces max single-name target weight from `portfolio.max_position_weight`
+  or `--max-position-weight`, max gross target weight, and optional
+  `--max-turnover-weight`.
+- Uses an in-memory `ComplianceEngine` data-only adapter with
+  `circuit_breaker_open=False`, local current weights, local NAV, and optional
+  `--min-order-notional`; live circuit-breaker state, wash-sale history, and
+  sector maps are not inspected by this slice.
+- Creates transient OMS `Order` DTOs only for in-memory
+  `ComplianceEngine.check()` calls; they are never registered with
+  `OrderManager.stage()`.
+- Never stages orders, submits/cancels/reconciles broker orders, resets/trips
+  live circuit breakers, or asks for/consumes human `YES`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_risk_compliance_check.py -q`:
+  14 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py -q`:
+  52 passed.
+- `.\.venv\Scripts\python.exe -m pytest execution\tests\test_oms.py risk\tests -q`:
+  74 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py execution\tests risk\tests -q`:
+  160 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_risk_compliance_check.py tests\test_paper_risk_compliance_check.py`:
+  passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace, but all collected tests passed.
+
+#### Adversarial review
+
+Attempted independent `codex review --uncommitted` in read-only mode. The local
+CLI could not reach the OpenAI API under the sandbox. Escalation was requested
+only for `codex review`, but was rejected because it would export uncommitted
+repo code/docs to an external API. No workaround was attempted.
+
+Local adversarial review findings fixed:
+
+- `--max-gross-target-weight` incorrectly used a `(0, 1]` validator. Fixed so
+  gross target limits may be any finite positive value, while the default stays
+  `1.0`.
+- Short permission was CLI-only. Fixed so Step 5 also respects explicit
+  strategy config flags (`portfolio.allow_shorts: true` or
+  `portfolio.long_only: false`).
+- Invalid candidate rows could still be adapted into transient compliance
+  `Order` objects after schema failure. Fixed by running the
+  `ComplianceEngine` adapter only after candidate/target risk validation has
+  passed.
+
+Independent supervisor review findings fixed:
+
+- The success output and docs overstated the local `ComplianceEngine` adapter's
+  coverage. Fixed by reporting it as a data-only adapter and explicitly stating
+  that live circuit-breaker state, wash-sale history, and sector maps are not
+  inspected in this slice.
+- The docs did not say that transient OMS `Order` DTOs are created for
+  `ComplianceEngine.check()`. Fixed by documenting that they are never
+  registered with `OrderManager.stage()`.
+
+#### Status
+
+Step 5 code is implemented and locally validated. Live risk/compliance preflight
+remains blocked until stale `alpha_scores` are refreshed, because the command
+intentionally fails closed through the reused Step 3 target gate.
+
+---
+
 ### Session 25 - Step 4 Paper Order Candidate Command
 
 **Operator:** mshane@thecanadalist.ca

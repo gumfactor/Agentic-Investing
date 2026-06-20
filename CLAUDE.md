@@ -222,6 +222,40 @@ fills, or require human `YES`.
 Current live status as of 2026-06-20: this command is expected to fail closed
 through the Step 3 target gate until stale `alpha_scores` are refreshed.
 
+## Phase 4 paper risk/compliance command
+
+Run this after the paper order candidate command passes, using the same explicit
+local snapshot of current cash and positions:
+
+```powershell
+python -m scripts.paper_risk_compliance_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json
+```
+
+The command is a read-only preflight. It reuses the Step 4 order-candidate path,
+then validates candidate schema, finite weights/notionals/shares, long-only
+targets by default unless the strategy config or `--allow-shorts` explicitly
+allows shorts, sell quantities against the local snapshot, per-position
+concentration, max gross target weight, optional turnover, and an in-memory
+`ComplianceEngine` adapter with `circuit_breaker_open=False` supplied
+explicitly. This is a data-only adapter: live circuit-breaker state, wash-sale
+history, and sector maps are not inspected unless supplied as local context in
+a future slice. The adapter creates transient OMS `Order` DTOs only for
+in-memory `ComplianceEngine.check()` calls; they are never registered with
+`OrderManager.stage()`. It never connects to IBKR, instantiates `OrderManager`,
+stages orders, submits/cancels/reconciles broker orders, resets/trips live
+circuit breakers, or asks for/consumes human `YES`.
+
+Useful local-only overrides:
+
+```powershell
+python -m scripts.paper_risk_compliance_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json --max-turnover-weight 0.25 --max-gross-target-weight 1.0
+```
+
+Current live status as of 2026-06-20: this command is expected to fail closed
+through the reused Step 3/4 path until stale `alpha_scores` are refreshed. It
+also depends on the operator-provided local snapshot being fresh and accurate;
+it does not verify broker state directly.
+
 ---
 
 ## Conventions
