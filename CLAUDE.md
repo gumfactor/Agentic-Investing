@@ -174,6 +174,21 @@ Current live status as of 2026-06-20: `daily_prices` is recent through
 2024-12-31; `v1_base_momentum` scores stop at 2026-06-09. Refresh the daily
 signal pipeline before proceeding to portfolio construction.
 
+## Phase 4 paper target command
+
+Run this after the paper input command passes:
+
+```powershell
+python -m scripts.paper_target_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum
+```
+
+The command is read-only. For the current `equal_weight` v1 strategy, it selects
+the top `portfolio.n_long` alpha scores, applies `portfolio.max_position_weight`,
+prints target weights, and leaves any cap-bound residual in cash. It does not
+read IBKR positions, generate order candidates, stage orders, submit orders,
+cancel orders, or reconcile fills. Unsupported portfolio methods fail closed
+until their paper-target semantics are explicitly implemented and reviewed.
+
 ---
 
 ## Conventions

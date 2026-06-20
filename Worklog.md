@@ -14,11 +14,87 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
-### Session 23 - Step 2 Paper Input Readiness Command
+### Session 24 - Step 3 Paper Target Portfolio Command
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `local/linking-to-IBKR`
 **Commits:** pending
+
+---
+
+#### What was done
+
+Implemented Step 3 of the incremental paper-trading workflow: a read-only
+target-portfolio construction command.
+
+The command is intentionally narrower than order generation. It does not read
+broker positions, compute current-vs-target deltas, generate order candidates,
+stage orders, submit orders, cancel orders, or reconcile fills. It only builds
+the desired target weights from already-validated strategy inputs.
+
+Command:
+
+```powershell
+python -m scripts.paper_target_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_target_check.py` | New read-only target portfolio command for the current equal-weight strategy |
+| `tests/test_paper_target_check.py` | Unit coverage for target construction, cap-bound cash residual, stale input blocking, unsupported methods, and invalid caps |
+| `CLAUDE.md` | Added the Step 3 target command and safety boundary |
+| `Worklog.md` | Recorded the Step 3 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL` and explicit `--strategy-id`.
+- Reuses the Step 2 input gate before constructing target weights.
+- Fails if the latest alpha score date is newer than the latest price date.
+- Supports only `portfolio.method: equal_weight` for this first paper target
+  slice; unsupported methods fail closed.
+- Selects the top `portfolio.n_long` valid alpha scores.
+- Breaks equal-score ties deterministically by stored rank, then ticker.
+- Requires top target candidates to have valid latest prices through the Step 2
+  gate and a second construction-time check.
+- Applies `portfolio.max_position_weight`; any residual stays as cash.
+- Never imports or calls broker, OMS, risk, or execution modules.
+
+#### Adversarial review
+
+Independent subagent review found no blocking safety-boundary issues. It flagged
+two worthwhile correctness tightenings: equal-score tie behavior was implicit,
+and score dates could theoretically be newer than the latest price date. Fixed
+by sorting target candidates by alpha score descending, stored rank ascending,
+then ticker, and by failing closed if `alpha_scores.score_date` is newer than
+the latest `daily_prices.date`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_target_check.py -q`:
+  10 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py -q`:
+  25 passed.
+- `.\.venv\Scripts\python.exe -m pytest portfolio\tests tests\test_paper_inputs_check.py tests\test_paper_target_check.py -q`:
+  55 passed.
+- Live read-only command with `--strategy-id v1_base_momentum`:
+  failed as intended before target construction because `alpha_scores` stop at
+  2026-06-09, 11 calendar days before 2026-06-20.
+
+#### Status
+
+Step 3 code is implemented and locally validated. The live paper workflow is
+still blocked from producing target weights until the daily signal pipeline is
+refreshed.
+
+---
+
+### Session 23 - Step 2 Paper Input Readiness Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `e1c753e`
 
 ---
 
