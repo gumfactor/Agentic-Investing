@@ -54,6 +54,16 @@ class BaseBroker(ABC):
         Returns None if the order is not yet filled or status unknown.
         """
 
+    def get_order_status(self, broker_order_id: str) -> dict | None:
+        """Fetch durable broker order/fill status without mutating the order.
+
+        Implementations should query broker state by broker order id and must
+        not submit, cancel, or otherwise mutate orders. The default fails
+        closed so durable reconciliation callers only use brokers that
+        explicitly support this read-only lookup.
+        """
+        raise NotImplementedError("Broker does not support durable order status lookup")
+
     @abstractmethod
     def cancel_order(self, broker_order_id: str) -> bool:
         """Cancel a live order at the broker.

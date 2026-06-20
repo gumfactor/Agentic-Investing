@@ -14,6 +14,76 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 35 - Durable Paper Order Reconciliation Slice
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `main`
+**Commits:** uncommitted P1 implementation
+
+---
+
+#### What was done
+
+Added a read-only durable paper order reconciliation slice for post-Step 7
+paper submissions. The new command validates an existing Step 7
+`paper_submit_reconciliation` artifact, reconnects only to the IBKR paper
+socket, queries current broker order/fill status for each recorded
+`broker_order_id`, and writes a separate local
+`paper_order_reconciliation` artifact for phase-gate evidence.
+
+#### Safety
+
+- Requires `PAPER_TRADING=true` and `IBKR_PORT=7497`.
+- Rejects `PAPER_RUN_CLEARED=true`.
+- Verifies paper broker metadata before and after connection.
+- Never submits orders, cancels orders, resets/trips circuit breakers, mutates
+  prior artifacts, supports live port `7496`, or consumes human `YES`.
+- Per-order broker lookup failures are captured in the output artifact with
+  status `PARTIAL` instead of hiding the uncertainty; unresolved `PARTIAL` or
+  `UNKNOWN` reconciliation exits nonzero after writing the artifact.
+
+#### Verification
+
+- Focused reconciliation and IBKR broker tests:
+  `python -m pytest tests\test_paper_order_reconcile_check.py execution\tests\test_ibkr_broker.py -q`
+  passed: `41 passed`.
+
+#### Status and next actions
+
+- The next operator action for the tiny APA/HAL/HPE paper probe is to run the
+  durable reconciliation command against `local/paper_submit_reconciliation_small.json`
+  once TWS/Gateway paper is available, then retain the generated artifact with
+  the Step 8 audit record.
+
+---
+
+### Session 34 - P0 Paper Trading Orientation Cleanup
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `main`
+**Commits:** uncommitted documentation cleanup
+
+---
+
+#### What was done
+
+Updated the project orientation in `CLAUDE.md` after the successful tiny IBKR
+paper submission probe. The previous orientation still said Phase 4 paper
+trading had not begun, Step 7 was operationally blocked by stale
+`alpha_scores`, and the active branch was `local/linking-to-IBKR`.
+
+#### Current status
+
+- The implementation is merged on `main`.
+- The stale `alpha_scores` blocker was cleared for the 2026-06-20 paper
+  dry-run/submission rehearsal.
+- The full 50-order whole-share blotter passed IBKR paper what-if validation.
+- Only the deliberately tiny three-order paper probe was submitted.
+- Durable post-submission reconciliation of broker order IDs remains the next
+  P1 engineering slice before scaling paper allocation.
+
+---
+
 ### Session 33 - Tiny Step 7 Paper Submission Probe
 
 **Operator:** mshane@thecanadalist.ca

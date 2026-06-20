@@ -248,6 +248,47 @@ class IBKRBroker(BaseBroker):
             return {"filled_quantity": filled_qty, "avg_price": avg_price, "status": "PartiallyFilled"}
         return None
 
+    def get_order_status(self, broker_order_id: str) -> dict | None:
+        """Read current broker order/fill state by broker order id."""
+        self._require_connection()
+        self._ib.sleep(0)
+
+        target_id = str(broker_order_id)
+        trades = list(self._submitted.values())
+        for method_name in ("trades", "openTrades"):
+            method = getattr(self._ib, method_name, None)
+            if method is not None:
+                try:
+                    trades.extend(method())
+                except Exception as exc:
+                    logger.warning("ibkr_order_status_trade_query_failed", method=method_name, error=str(exc))
+
+        trade = self._find_trade_by_order_id(trades, target_id)
+        if trade is not None:
+            return self._order_status_from_trade(trade)
+
+        req_open_orders = getattr(self._ib, "reqOpenOrders", None)
+        if req_open_orders is not None:
+            req_open_orders()
+            self._ib.sleep(0)
+            for method_name in ("trades", "openTrades"):
+                method = getattr(self._ib, method_name, None)
+                if method is not None:
+                    trade = self._find_trade_by_order_id(method(), target_id)
+                    if trade is not None:
+                        return self._order_status_from_trade(trade)
+
+        completed_orders = self._completed_orders()
+        completed_trade = self._find_trade_by_order_id(completed_orders, target_id)
+        if completed_trade is not None:
+            status = self._order_status_from_trade(completed_trade)
+            status["status"] = status["status"] or "Completed"
+            return status
+        completed_order = self._find_order_by_order_id(completed_orders, target_id)
+        if completed_order is not None:
+            return {"broker_order_id": target_id, "status": "Completed", "filled_quantity": None, "avg_price": None}
+        return None
+
     # Order cancellation
 
     def cancel_order(self, broker_order_id: str) -> bool:
@@ -438,6 +479,59 @@ class IBKRBroker(BaseBroker):
         if ask and ask > 0:
             return float(ask)
         return None
+
+    @staticmethod
+    def _order_id(value: object) -> str | None:
+        order_id = getattr(value, "orderId", None)
+        if order_id in {None, ""}:
+            return None
+        return str(order_id)
+
+    @classmethod
+    def _find_trade_by_order_id(cls, trades: list[object], broker_order_id: str) -> object | None:
+        for trade in trades:
+            order = getattr(trade, "order", None)
+            if order is not None and cls._order_id(order) == broker_order_id:
+                return trade
+        return None
+
+    @classmethod
+    def _find_order_by_order_id(cls, orders: list[object], broker_order_id: str) -> object | None:
+        for order in orders:
+            if cls._order_id(order) == broker_order_id:
+                return order
+        return None
+
+    @staticmethod
+    def _order_status_from_trade(trade: object) -> dict:
+        order = getattr(trade, "order", None)
+        status = getattr(trade, "orderStatus", None)
+        return {
+            "broker_order_id": str(getattr(order, "orderId", "")),
+            "status": getattr(status, "status", None),
+            "filled_quantity": getattr(status, "filled", None),
+            "remaining_quantity": getattr(status, "remaining", None),
+            "avg_price": getattr(status, "avgFillPrice", None),
+            "last_fill_price": getattr(status, "lastFillPrice", None),
+            "why_held": getattr(status, "whyHeld", None),
+        }
+
+    def _completed_orders(self) -> list[object]:
+        completed_orders = getattr(self._ib, "completedOrders", None)
+        if completed_orders is not None:
+            if not callable(completed_orders):
+                return list(completed_orders)
+            try:
+                return list(completed_orders())
+            except Exception as exc:
+                logger.warning("ibkr_completed_orders_query_failed", error=str(exc))
+
+        req_completed_orders = getattr(self._ib, "reqCompletedOrders", None)
+        if req_completed_orders is not None:
+            result = req_completed_orders(apiOnly=False)
+            self._ib.sleep(0)
+            return [] if result is None else list(result)
+        return []
 
     @staticmethod
     def _normalize_currency(currency: str | None) -> str:

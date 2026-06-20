@@ -40,12 +40,13 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 1 | Data Foundation | **Complete** | Week 6 |
 | 2 | Signal Library | **Complete** | Week 12 |
 | 3 | Backtesting Engine | **Live validation complete** | Week 18 |
-| 4 | Portfolio + Paper Trading | **Implementation complete — paper run pending** | Week 26 |
+| 4 | Portfolio + Paper Trading | **Implementation complete — tiny paper submission recorded** | Week 26 |
 | 5 | Reporting + Live Trading | Not started | Week 36 |
 
-**Active branch:** `local/linking-to-IBKR`
+**Active branch:** `main`
 
-**What this means for you:** Phase 4 implementation is complete as of 2026-06-15.
+**What this means for you:** Phase 4 implementation is complete and merged to
+`main` as of 2026-06-20.
 All three module trees (portfolio/, execution/, risk/) are now fully implemented:
 
 - **portfolio/optimization/**: MVO (max-Sharpe/min-variance) + Risk-Parity (Spinu 2013)
@@ -61,13 +62,15 @@ All three module trees (portfolio/, execution/, risk/) are now fully implemented
 Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
 `execute_trade` (requires "YES" — C1).
 
-**Last recorded validation:** 536 non-integration tests passed in Session 20.
+**Last recorded validation:** 675 local tests passed on 2026-06-20; the
+paper/execution/risk subset passed with 213 tests.
 
 Exit criterion for Phase 4: 4 consecutive weeks of paper trading with zero
-critical bugs; circuit breaker fire-drill test. Paper trading has NOT yet begun.
-No real capital is at risk. The IBKR paper account connection (port 7497)
-has been smoke-tested, including a Canadian CAD NAV account with USD-equivalent
-NAV conversion.
+critical bugs; circuit breaker fire-drill test. A tiny IBKR paper submission
+probe has succeeded on port 7497, but the 4-week paper-trading phase gate is
+not complete. No real capital is at risk. The IBKR paper account connection
+(port 7497) has been smoke-tested, including a Canadian CAD NAV account with
+USD-equivalent NAV conversion.
 
 ---
 
@@ -169,10 +172,11 @@ required explicitly because stored score IDs can differ from display names and
 YAML versions. It does not connect to IBKR, build target weights, stage orders,
 submit orders, cancel orders, or reconcile fills.
 
-Current live status as of 2026-06-20: `daily_prices` is recent through
-2026-06-18, but `alpha_scores` is stale for paper trading. `v1` scores stop at
-2024-12-31; `v1_base_momentum` scores stop at 2026-06-09. Refresh the daily
-signal pipeline before proceeding to portfolio construction.
+Current live status as of 2026-06-20: `daily_prices` and `v1_base_momentum`
+`alpha_scores` were refreshed through the latest available `daily_prices` date
+of 2026-06-18 for the paper dry-run/submission rehearsal. Future paper runs
+must still rerun this gate and refresh the daily data/signal pipeline whenever
+the latest scores are stale.
 
 ## Phase 4 paper target command
 
@@ -219,8 +223,9 @@ quantities, unique tickers, a fresh `as_of` date, and skips deltas below
 compliance or risk gates, stage orders, submit orders, cancel orders, reconcile
 fills, or require human `YES`.
 
-Current live status as of 2026-06-20: this command is expected to fail closed
-through the Step 3 target gate until stale `alpha_scores` are refreshed.
+Current live status as of 2026-06-20: this command passed during the paper
+dry-run after `v1_base_momentum` scores were refreshed through 2026-06-18.
+Future paper runs must use fresh scores and a fresh broker/account snapshot.
 
 ## Phase 4 paper risk/compliance command
 
@@ -251,10 +256,10 @@ Useful local-only overrides:
 python -m scripts.paper_risk_compliance_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json --max-turnover-weight 0.25 --max-gross-target-weight 1.0
 ```
 
-Current live status as of 2026-06-20: this command is expected to fail closed
-through the reused Step 3/4 path until stale `alpha_scores` are refreshed. It
-also depends on the operator-provided local snapshot being fresh and accurate;
-it does not verify broker state directly.
+Current live status as of 2026-06-20: this command passed during the paper
+dry-run using a local snapshot of the empty IBKR paper account. It depends on
+the operator-provided local snapshot being fresh and accurate; it does not
+verify broker state directly.
 
 ## Phase 4 paper stage-only blotter command
 
@@ -285,10 +290,11 @@ transient Step 5 data-only `ComplianceEngine.check()` adapters inherited from
 the risk/compliance preflight; they are not written to the blotter and are
 never registered with a live or in-memory `OrderManager`.
 
-Current live status as of 2026-06-20: this command is expected to fail closed
-through the reused Step 3/4/5 path until stale `alpha_scores` are refreshed. It
-also depends on the operator-provided local snapshot being fresh and accurate;
-it does not verify broker state directly.
+Current live status as of 2026-06-20: this command produced a whole-share,
+cent-rounded 50-order paper blotter that passed IBKR paper what-if validation.
+The full 50-order allocation was not submitted. It depends on the
+operator-provided local snapshot being fresh and accurate; it does not verify
+broker state directly.
 
 ## Phase 4 paper submit/reconcile preflight command
 
@@ -325,10 +331,46 @@ each accepted broker response, so partial failures still leave an audit record.
 It never modifies the Step 6 blotter in place, never cancels orders, never
 resets/trips circuit breakers, and never supports live orders.
 
-Current live status as of 2026-06-20: Step 7 remains operationally blocked
-until the upstream stale `alpha_scores` blocker is cleared and a fresh Step 6
-blotter can be generated from current inputs. Automated tests use fake broker
+Current live status as of 2026-06-20: Step 7 has been exercised successfully
+with a deliberately tiny three-order IBKR paper submission derived from the
+validated whole-share blotter. Broker order IDs were recorded for APA, HAL, and
+HPE, with no initial fills reported because the probe was run on Saturday. The
+full 50-order allocation was not submitted. Automated tests use fake broker
 adapters only; do not point tests at a real IBKR session.
+
+## Phase 4 durable paper order reconciliation command
+
+Run this after a Step 7 paper submission has produced a reconciliation artifact,
+especially when the initial fill poll was inconclusive:
+
+```powershell
+python -m scripts.paper_order_reconcile_check --reconciliation .\local\paper_submit_reconciliation.json --output .\local\paper_order_reconciliation.json
+```
+
+For the tiny APA/HAL/HPE paper probe from 2026-06-20, use:
+
+```powershell
+python -m scripts.paper_order_reconcile_check --reconciliation .\local\paper_submit_reconciliation_small.json --output .\local\paper_order_reconciliation_small.json
+```
+
+The command is read-only. It validates the Step 7 reconciliation artifact and
+its checksum, requires `PAPER_TRADING=true`, requires `IBKR_PORT=7497`, rejects
+`PAPER_RUN_CLEARED=true`, verifies the broker adapter reports paper mode before
+and after connection, then queries current broker order/fill status for each
+recorded `broker_order_id`. It writes a separate
+`paper_order_reconciliation` artifact with per-order status, missing-status
+records, or query errors.
+
+It never submits orders, cancels orders, resets/trips circuit breakers, mutates
+the Step 7 artifact, supports live port `7496`, or asks for/consumes human
+`YES`. Missing broker statuses are captured in the output artifact with status
+`UNKNOWN`; query errors are captured with status `PARTIAL`. Both unresolved
+states exit nonzero after writing the artifact so the operator can decide
+whether manual TWS follow-up is required before proceeding.
+
+Current live status as of 2026-06-20: this command is the next required
+operational step for the tiny three-order paper probe before scaling paper
+allocation.
 
 ## Phase 4 paper run audit record command
 
@@ -364,9 +406,10 @@ never connects to IBKR, submits/cancels/reconciles broker orders, mutates the
 Step 6 blotter or Step 7 reconciliation artifact, resets/trips circuit breakers,
 or asks for/consumes human `YES`.
 
-Current live status as of 2026-06-20: this command can record the current
-blocked state once a valid Step 6 blotter exists, but upstream paper execution
-remains blocked until stale `alpha_scores` are refreshed.
+Current live status as of 2026-06-20: this command recorded the dry-run audit
+for the 50-order blotter and a `SUBMITTED` audit record for the tiny three-order
+paper probe. Next required operational step is durable post-submission
+reconciliation of the recorded broker order IDs before scaling paper allocation.
 
 ---
 
