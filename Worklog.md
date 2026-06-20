@@ -14,6 +14,132 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 28 - Step 7 Paper Submit/Reconcile Preflight
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending
+
+---
+
+#### What was done
+
+Implemented Step 7 of the incremental paper-trading workflow: a safety-first
+submit/reconcile preflight over the Step 6 stage-only blotter artifact.
+
+Command, dry-run/default:
+
+```powershell
+python -m scripts.paper_submit_reconcile_check --blotter .\local\paper_stage_blotter.json
+```
+
+Command, actual paper submission after operator review:
+
+```powershell
+$reviewed = (Get-FileHash .\local\paper_stage_blotter.json -Algorithm SHA256).Hash.ToLower()
+python -m scripts.paper_submit_reconcile_check --blotter .\local\paper_stage_blotter.json --confirm YES --reviewed-blotter-sha256 $reviewed --output .\local\paper_submit_reconciliation.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_submit_reconcile_check.py` | New Step 7 command that validates/displays Step 6 blotters by default and optionally submits paper orders through a mockable broker adapter |
+| `tests/test_paper_submit_reconcile_check.py` | Unit coverage for dry-run display, env gates, literal confirmation, immutable/separate output boundary, artifact validation failures, fake-broker submission, and non-paper broker rejection |
+| `CLAUDE.md` | Added the Step 7 operator commands, paper-only gates, confirmation boundary, artifact validation contract, and stale-input blocker |
+| `Worklog.md` | Recorded the Step 7 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `PAPER_TRADING=true`, `IBKR_PORT=7497`, and
+  `PAPER_RUN_CLEARED` unset or false even for dry-run validation/display.
+- Refuses live port `7496` completely; Step 7 has no live-order path.
+- Revalidates the Step 6 artifact before any broker attempt: schema/version,
+  `artifact_type`, `paper_only=true`, `stage_only=true`, pre-submission safety
+  flags, `source.step5_required=true`, candidate row checksum, artifact
+  checksum, strategy config checksum, portfolio input checksum, gate-input
+  checksum, operator review rows, and absence of broker IDs or
+  submitted/reconciled statuses.
+- Prints the full order list before any possible submission, satisfying the C1
+  display requirement in the command surface.
+- Defaults to dry-run and does not instantiate/connect a broker unless
+  `--confirm YES` is supplied.
+- Confirmed submission also requires `--reviewed-blotter-sha256` to match the
+  exact Step 6 blotter file displayed during dry-run.
+- Requires a separate `--output` reconciliation artifact for confirmed
+  submission and refuses to write over the Step 6 blotter path.
+- Writes a separate local reconciliation artifact with source blotter checksum,
+  broker response details, initial fill poll results, paper-only safety fields,
+  and artifact checksum.
+- Creates the reconciliation artifact before broker submission and updates it
+  after each accepted broker response, so partial failures still leave an audit
+  record with accepted broker IDs and error details.
+- Uses a no-clobber output write unless `--overwrite` is explicitly supplied.
+- Verifies the injected/default broker reports paper mode before and after
+  connection, and rejects unsafe adapter metadata when exposed.
+- Never modifies the Step 6 artifact in place, never cancels live orders, never
+  resets/trips circuit breakers, and never supports live orders.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_submit_reconcile_check.py -q`:
+  14 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_submit_reconcile_check.py tests\test_paper_submit_reconcile_check.py`:
+  passed after fixing import ordering during the implementation loop.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py -q`:
+  88 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py execution\tests risk\tests -q`:
+  182 passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace. The combined paper/execution/risk run also emits
+an `eventkit` deprecation warning from imported IBKR plumbing. All collected
+tests passed.
+
+#### Adversarial review
+
+Attempted independent `codex review --uncommitted` in read-only mode. The local
+CLI could not reach the OpenAI API under sandboxed network restrictions.
+Escalation was requested only for the read-only review command, but was
+rejected because it would send the uncommitted local diff to an external
+Codex/OpenAI review service. No workaround was attempted.
+
+Local adversarial review finding fixed:
+
+- The first submission implementation checked the broker adapter's `is_paper`
+  flag only after `connect()`. That was safe for the default env-gated
+  `IBKRBroker`, but too weak for injected adapters. Fixed by checking
+  `broker.is_paper` before connection and again after connection, and tightened
+  the non-paper fake-broker test to prove `connect()` is never called.
+
+Local adversarial review found no further required fixes: Step 7 validates the
+Step 6 checksums/provenance before broker access, displays rows before any
+confirmed submission, rejects live-port/live-clearance env, refuses in-place
+blotter output, uses fake brokers in tests, and contains no cancel or circuit
+breaker reset path.
+
+Independent supervisor review findings fixed:
+
+- Partial paper submission could lose the reconciliation record if a later
+  order failed. Fixed by creating the reconciliation artifact before broker
+  submission, updating it after each accepted broker response, and recording
+  `FAILED`/partial state plus error details on exceptions.
+- Literal `YES` was not bound to a specific reviewed order list. Fixed by
+  printing the blotter SHA-256 in dry-run and requiring
+  `--reviewed-blotter-sha256` to match that exact file for confirmed
+  submission.
+- Adapter paper-mode validation was only semantic. Kept the pre/post
+  `is_paper` checks and added optional adapter metadata validation for exposed
+  paper port / connection mode.
+
+#### Status
+
+Step 7 code is implemented and locally validated. Live paper submission remains
+blocked until stale upstream `alpha_scores` are refreshed and a fresh Step 6
+blotter can be generated from current paper inputs.
+
+---
+
 ### Session 27 - Step 6 Stage-Only Paper Blotter
 
 **Operator:** mshane@thecanadalist.ca

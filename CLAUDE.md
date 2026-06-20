@@ -290,6 +290,46 @@ through the reused Step 3/4/5 path until stale `alpha_scores` are refreshed. It
 also depends on the operator-provided local snapshot being fresh and accurate;
 it does not verify broker state directly.
 
+## Phase 4 paper submit/reconcile preflight command
+
+Run this after the stage-only blotter artifact has been generated and reviewed:
+
+```powershell
+python -m scripts.paper_submit_reconcile_check --blotter .\local\paper_stage_blotter.json
+```
+
+The default mode is dry-run validation/display only. It requires
+`PAPER_TRADING=true`, `IBKR_PORT=7497`, and `PAPER_RUN_CLEARED` unset or false
+even for dry-run. It revalidates the Step 6 artifact before any broker attempt:
+schema/version, `paper_only=true`, `stage_only=true`, pre-submission safety
+flags, source/provenance checksums, artifact checksum, candidate row checksum,
+operator review rows, and absence of broker IDs or submitted/reconciled
+statuses. It prints the full order list for C1 review and then stops without
+connecting to IBKR.
+
+Actual paper submission requires the operator to inspect that displayed list
+and pass the literal confirmation plus the exact reviewed blotter checksum:
+
+```powershell
+$reviewed = (Get-FileHash .\local\paper_stage_blotter.json -Algorithm SHA256).Hash.ToLower()
+python -m scripts.paper_submit_reconcile_check --blotter .\local\paper_stage_blotter.json --confirm YES --reviewed-blotter-sha256 $reviewed --output .\local\paper_submit_reconciliation.json
+```
+
+The submission path still refuses live port `7496`, refuses
+`PAPER_RUN_CLEARED=true`, verifies the broker adapter reports paper mode before
+and after connection, submits limit orders using the Step 6 reference prices,
+polls once for initial fill state, disconnects, and writes a separate local
+reconciliation artifact with broker response details and checksums. The
+reconciliation artifact is created before broker submission and updated after
+each accepted broker response, so partial failures still leave an audit record.
+It never modifies the Step 6 blotter in place, never cancels orders, never
+resets/trips circuit breakers, and never supports live orders.
+
+Current live status as of 2026-06-20: Step 7 remains operationally blocked
+until the upstream stale `alpha_scores` blocker is cleared and a fresh Step 6
+blotter can be generated from current inputs. Automated tests use fake broker
+adapters only; do not point tests at a real IBKR session.
+
 ---
 
 ## Conventions
