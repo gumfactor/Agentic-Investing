@@ -14,6 +14,125 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 27 - Step 6 Stage-Only Paper Blotter
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending
+
+---
+
+#### What was done
+
+Implemented Step 6 of the incremental paper-trading workflow: a stage-only,
+local JSON blotter artifact for operator review.
+
+The command intentionally stays outside live OMS registration and broker
+boundaries. It reuses the Step 5 risk/compliance pass path, then writes a local
+artifact only after all reused target, candidate, risk, and compliance gates
+pass.
+
+Command:
+
+```powershell
+python -m scripts.paper_stage_blotter_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json --output .\local\paper_stage_blotter.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_stage_blotter_check.py` | New Step 6 command that creates a local stage-only JSON blotter artifact after Step 5 gates pass |
+| `tests/test_paper_stage_blotter_check.py` | Unit coverage for artifact schema/safety fields/checksum, overwrite protection, fail-before-write behavior, explicit strategy ID, and broker/OMS source boundary |
+| `CLAUDE.md` | Added the Step 6 operator command, artifact contract, safety boundary, overwrite behavior, and stale-input live blocker |
+| `Worklog.md` | Recorded the Step 6 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL`, explicit `--strategy-id`, explicit
+  `--portfolio-input`, and explicit `--output`.
+- Refuses to replace an existing artifact unless `--overwrite` is passed.
+- Reuses the Step 3/4/5 path, so stale strategy inputs, invalid local
+  snapshots, invalid candidate rows, and failed risk/compliance gates fail
+  closed before writing.
+- Writes a plain local JSON artifact with `schema_version`,
+  `artifact_type=paper_stage_only_order_blotter`, `run_id`,
+  `generated_at_utc`, source target/snapshot dates, candidate rows,
+  risk/compliance summary, `paper_only=true`, `stage_only=true`, explicit
+  broker/OMS safety flags, and `candidate_rows_sha256`.
+- Records `strategy_config_sha256`, `portfolio_input_sha256`, a gate-input
+  checksum, and an artifact-level checksum so Step 7 can revalidate provenance.
+- Uses an atomic no-clobber write when `--overwrite` is not supplied.
+- Candidate rows use `review_status=LOCAL_STAGE_ONLY` and do not include broker
+  IDs or submitted statuses.
+- Rejects `PAPER_RUN_CLEARED=true`, because that is a live-trading clearance
+  flag.
+- Never connects to IBKR, instantiates `OrderManager`, registers staged OMS
+  orders, submits/cancels/reconciles broker orders, resets/trips live circuit
+  breakers, or asks for/consumes human `YES`.
+- The only OMS `Order` DTOs involved are the transient Step 5 data-only
+  `ComplianceEngine.check()` adapters inherited from the risk/compliance
+  preflight; they are not written to the blotter and are never registered with
+  a live or in-memory `OrderManager`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_stage_blotter_check.py -q`:
+  8 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_stage_blotter_check.py tests\test_paper_stage_blotter_check.py`:
+  passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py -q`:
+  60 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py execution\tests risk\tests -q`:
+  168 passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace, but all collected tests passed.
+
+#### Adversarial review
+
+Attempted independent `codex exec review --uncommitted --ephemeral` in read-only
+mode. The local CLI could not reach the OpenAI API under the sandbox. Escalation
+was requested only for the read-only review command, but was rejected because it
+would export uncommitted private repo code/docs to an external API. No
+workaround was attempted.
+
+Local adversarial review findings fixed:
+
+- The source-boundary test initially rejected the literal string
+  `order_manager`, which incorrectly matched the artifact safety field
+  `order_manager_registered`. Fixed the test to look for imports,
+  `OrderManager(` construction, and `.stage(` calls instead.
+- The worklog still said adversarial review was pending after the external
+  subagent path was blocked. Fixed this entry to record the attempted subagent
+  review, the rejection reason, and the local fallback review outcome.
+
+Local adversarial review found no required code changes to the artifact writer:
+Step 5 gates run before artifact construction/write, the output path refuses
+overwrite unless `--overwrite` is passed, parent directory creation happens only
+after gates pass, candidate rows contain no broker IDs or submitted order
+statuses, and Step 6 imports no broker, `OrderManager`, or OMS `Order` DTOs.
+
+Independent supervisor review findings fixed:
+
+- Step 7 provenance was under-specified. Fixed by adding file hashes for the
+  strategy config and local portfolio input, a checksum over normalized gate
+  inputs, and an artifact-level checksum.
+- Non-overwrite protection was not atomic. Fixed by using hard-link finalization
+  for no-clobber writes and keeping `replace()` only for explicit overwrite.
+- The worklog overstated import boundaries by saying Step 6 imports no OMS
+  `Order` DTOs despite transitive Step 5 imports. Fixed wording to distinguish
+  direct Step 6 imports from inherited Step 5 transient DTO use.
+- Added a fail-closed guard for `PAPER_RUN_CLEARED=true`.
+
+#### Status
+
+Step 6 code is implemented and locally validated. Live stage-only blotter
+creation remains blocked until stale `alpha_scores` are refreshed, because the
+command intentionally fails closed through the reused Step 3/4/5 gates.
+
+---
+
 ### Session 26 - Step 5 Paper Risk/Compliance Preflight
 
 **Operator:** mshane@thecanadalist.ca

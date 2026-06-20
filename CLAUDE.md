@@ -256,6 +256,40 @@ through the reused Step 3/4 path until stale `alpha_scores` are refreshed. It
 also depends on the operator-provided local snapshot being fresh and accurate;
 it does not verify broker state directly.
 
+## Phase 4 paper stage-only blotter command
+
+Run this after the paper risk/compliance command passes, using the same explicit
+local snapshot of current cash and positions:
+
+```powershell
+python -m scripts.paper_stage_blotter_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json --output .\local\paper_stage_blotter.json
+```
+
+The command creates a local JSON blotter artifact for operator review only. It
+reuses the Step 5 risk/compliance pass path and writes the artifact only after
+those gates pass. The artifact includes `schema_version`,
+`artifact_type=paper_stage_only_order_blotter`, `run_id`,
+`generated_at_utc`, `paper_only=true`, `stage_only=true`, source target and
+snapshot dates, candidate rows, a risk/compliance summary, and a
+`candidate_rows_sha256` checksum for later reconciliation. It also records
+`strategy_config_sha256`, `portfolio_input_sha256`, a gate-input checksum, and
+an artifact-level checksum. Existing output paths fail closed with an atomic
+no-clobber write unless `--overwrite` is passed.
+
+Step 6 uses plain local artifact rows, not live OMS registration. It never
+connects to IBKR, instantiates `OrderManager`, registers staged OMS orders,
+submits/cancels/reconciles broker orders, resets/trips live circuit breakers,
+or asks for/consumes human `YES`. It also rejects `PAPER_RUN_CLEARED=true`
+because that is a live-trading clearance flag. The only OMS `Order` DTOs involved are the
+transient Step 5 data-only `ComplianceEngine.check()` adapters inherited from
+the risk/compliance preflight; they are not written to the blotter and are
+never registered with a live or in-memory `OrderManager`.
+
+Current live status as of 2026-06-20: this command is expected to fail closed
+through the reused Step 3/4/5 path until stale `alpha_scores` are refreshed. It
+also depends on the operator-provided local snapshot being fresh and accurate;
+it does not verify broker state directly.
+
 ---
 
 ## Conventions
