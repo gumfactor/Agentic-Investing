@@ -43,7 +43,7 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 4 | Portfolio + Paper Trading | **Implementation complete — paper run pending** | Week 26 |
 | 5 | Reporting + Live Trading | Not started | Week 36 |
 
-**Active branch:** `claude/elegant-newton-vtzrmh`
+**Active branch:** `main`
 
 **What this means for you:** Phase 4 implementation is complete as of 2026-06-15.
 All three module trees (portfolio/, execution/, risk/) are now fully implemented:
@@ -61,7 +61,7 @@ All three module trees (portfolio/, execution/, risk/) are now fully implemented
 Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
 `execute_trade` (requires "YES" — C1).
 
-**79 unit tests pass.**
+**Last recorded validation:** 536 non-integration tests passed in Session 20.
 
 Exit criterion for Phase 4: 4 consecutive weeks of paper trading with zero
 critical bugs; circuit breaker fire-drill test. Paper trading has NOT yet begun.

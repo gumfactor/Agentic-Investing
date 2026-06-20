@@ -12,6 +12,115 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-17
+
+### Session 20 - Phase 4 Paper-Trading Readiness Handoff
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `main`
+**Commits:** documentation housekeeping only; no code commit yet
+
+---
+
+#### What was done
+
+Reviewed the current project state after Phase 4 PR #6 was merged into `main`.
+The repo orientation now reflects the live branch and the latest recorded
+validation count from Session 20.
+
+Phase 4 implementation remains complete. The next project step is not more
+optimizer, OMS, or risk-monitor implementation; it is starting the operational
+paper-trading gate.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `CLAUDE.md` | Updated active branch from the old feature branch to `main`; replaced stale 79-test note with the latest recorded 536-test Session 20 validation |
+| `Worklog.md` | Added this paper-trading readiness handoff entry |
+
+#### Status
+
+Phase 4 repo-side readiness checks pass. Broker connectivity is still pending:
+IBKR TWS/Gateway has not yet been connected on paper port `7497`, and paper
+trading has not started yet.
+
+#### Next actions
+
+1. Operator starts IBKR TWS or Gateway in paper mode on port `7497`.
+2. Confirm `.env` has `IBKR_PORT=7497` and `PAPER_TRADING=true`.
+3. Run the first paper daily loop through `portfolio_construct`, `risk_check`,
+   and `execute_trade`.
+4. Monitor `RiskMonitor.snapshot()` output each session.
+5. Run the circuit-breaker fire drill and record the result.
+6. Begin the 4-week clean paper-trading clock after the first successful
+   end-to-end paper session and drill.
+
+#### Validation
+
+Paper-trading readiness smoke test started from this repository state:
+
+- `.env` has `IBKR_HOST=127.0.0.1`, `IBKR_PORT=7497`, and
+  `PAPER_TRADING=true`.
+- Installed missing pinned IBKR dependency `ib-insync==0.9.86` into the local
+  `.venv`.
+- `IBKRBroker()` instantiates in paper mode and reports `is_paper=True`.
+- Live-port guard works: `IBKRBroker(port=7496)` is blocked when
+  `PAPER_TRADING=true`.
+- Live-trading gate works: `PAPER_TRADING=false` with live port `7496` is
+  blocked unless `PAPER_RUN_CLEARED=true`.
+- `Test-NetConnection 127.0.0.1:7497` returned closed, as expected before IBKR
+  TWS/Gateway is running.
+- `pytest execution\tests risk\tests -q`: 74 passed.
+- `pytest tests\test_pin_snapshot.py tests\test_validate_signal_ic.py -q`: 8
+  passed.
+
+Portfolio optimizer tests could not run in the current `.venv` because
+`cvxpy==1.4.2` is not installed. Installing the pinned version on Python 3.12
+attempted a native build and failed because Microsoft C++ Build Tools are not
+installed. This is an environment readiness blocker for the full Phase 4 test
+slice, not a trading-account blocker.
+
+[RESOLVED] Python 3.12 CVXPY dependency blocker
+
+The original `cvxpy==1.4.2` pin was bumped during readiness work because it has
+no Windows Python 3.12 wheel and attempts a native build. `cvxpy==1.4.3`
+installed from a wheel, but its transitive OSQP solver stack crashed on Windows
+when imported after pandas. `cvxpy==1.7.1` was also tested and rejected because
+it pulled NumPy 2.x, conflicting with pandas, MLflow, pyarrow, scikit-learn, and
+statsmodels.
+
+Final tested dependency stack:
+
+- `cvxpy==1.6.5`
+- `clarabel==0.11.1`
+- `osqp==1.0.5`
+- existing `numpy==1.26.4`
+- existing `scipy==1.12.0`
+
+Validation after the dependency fix:
+
+- `pip check`: no broken requirements.
+- `PyPortfolioOpt==1.5.5` installed cleanly against the pinned portfolio stack.
+- `import pandas, cvxpy, osqp, pypfopt`: succeeds with pandas `2.2.0`,
+  cvxpy `1.6.5`, osqp `1.0.5`, and PyPortfolioOpt `1.5.5`.
+- Explicit OSQP solve smoke after importing pandas: optimal.
+- `pytest portfolio\tests -q`: 30 passed.
+- `pytest portfolio\tests execution\tests risk\tests -q`: 104 passed.
+- Full non-integration suite:
+  `python -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  536 passed, 9 warnings.
+- `Test-NetConnection 127.0.0.1 -Port 7497`: TCP connection failed, confirming
+  that the broker listener is still pending until IBKR TWS/Gateway is running.
+
+An adversarial subagent review agreed that the dependency fix is reasonable and
+not obviously overfit, but recommended three tightening changes before commit:
+avoid claiming live paper-trading readiness before broker connection, pin the
+default CLARABEL solver version, and fix stale Session 19/102-test wording.
+Those corrections were applied.
+
+---
+
 ## 2026-06-15
 
 ### Session 19 — Phase 4: Third Adversarial Review + Final Fixes
