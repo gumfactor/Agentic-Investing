@@ -330,6 +330,44 @@ until the upstream stale `alpha_scores` blocker is cleared and a fresh Step 6
 blotter can be generated from current inputs. Automated tests use fake broker
 adapters only; do not point tests at a real IBKR session.
 
+## Phase 4 paper run audit record command
+
+Run this as the final preflight/run-record slice after Step 6, and include the
+Step 7 reconciliation artifact when paper submission was actually attempted:
+
+```powershell
+python -m scripts.paper_run_audit_check --blotter .\local\paper_stage_blotter.json --status BLOCKED --blocker "alpha_scores are stale for paper trading" --output .\local\paper_run_audit.json
+```
+
+With a successful Step 7 reconciliation:
+
+```powershell
+python -m scripts.paper_run_audit_check --blotter .\local\paper_stage_blotter.json --reconciliation .\local\paper_submit_reconciliation.json --status SUBMITTED --step1-status PASS --step2-status PASS --step3-status PASS --step4-status PASS --step5-status PASS --output .\local\paper_run_audit.json
+```
+
+The command writes a separate local JSON audit/run record for phase-gate review.
+It validates the Step 6 blotter schema, provenance checksums, candidate checksum,
+and artifact checksum, and validates the Step 7 reconciliation schema/checksums
+when supplied. The audit artifact records `schema_version`, `run_id`,
+`generated_at_utc`, `paper_only=true`, operator-visible status, gate statuses,
+artifact paths, file hashes, git branch/commit/dirty flag, command/schema
+versions, validation summary, unresolved blockers, safety assertions, and next
+action. Existing output paths fail closed with an atomic no-clobber write unless
+`--overwrite` is passed.
+
+Use `BLOCKED` for pre-submission blockers such as stale inputs. Use `FAILED`
+only when Step 7 attempted paper submission and produced a failed reconciliation
+artifact; the command requires that artifact for `FAILED`.
+
+Step 8 is read-only with respect to trading systems and prior artifacts. It
+never connects to IBKR, submits/cancels/reconciles broker orders, mutates the
+Step 6 blotter or Step 7 reconciliation artifact, resets/trips circuit breakers,
+or asks for/consumes human `YES`.
+
+Current live status as of 2026-06-20: this command can record the current
+blocked state once a valid Step 6 blotter exists, but upstream paper execution
+remains blocked until stale `alpha_scores` are refreshed.
+
 ---
 
 ## Conventions

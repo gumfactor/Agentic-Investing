@@ -14,11 +14,124 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 29 - Step 8 Paper Run Audit Record
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** this Step 8 commit
+
+---
+
+#### What was done
+
+Implemented Step 8 of the incremental paper-trading workflow: a final local
+audit/run record writer over existing Step 6 and optional Step 7 artifacts.
+
+Command, current blocked-state record:
+
+```powershell
+python -m scripts.paper_run_audit_check --blotter .\local\paper_stage_blotter.json --status BLOCKED --blocker "alpha_scores are stale for paper trading" --output .\local\paper_run_audit.json
+```
+
+Command, after a successful Step 7 paper submission/reconciliation:
+
+```powershell
+python -m scripts.paper_run_audit_check --blotter .\local\paper_stage_blotter.json --reconciliation .\local\paper_submit_reconciliation.json --status SUBMITTED --step1-status PASS --step2-status PASS --step3-status PASS --step4-status PASS --step5-status PASS --output .\local\paper_run_audit.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_run_audit_check.py` | New Step 8 command that validates existing paper artifacts and writes a separate audit/run record |
+| `tests/test_paper_run_audit_check.py` | Unit coverage for blocked and submitted records, reconciliation validation, status consistency, no-clobber writes, and source-level safety boundary |
+| `CLAUDE.md` | Added the Step 8 operator commands, artifact contract, read-only safety boundary, and stale-input live blocker |
+| `Worklog.md` | Recorded the Step 8 implementation and validation status |
+
+#### Safety behavior
+
+- Requires explicit `--blotter`, `--status`, and `--output`.
+- Validates the Step 6 blotter with the Step 7 blotter validator: schema,
+  `paper_only=true`, `stage_only=true`, pre-submission safety flags,
+  provenance checksums, candidate row checksum, and artifact checksum.
+- Validates a supplied Step 7 reconciliation artifact: schema,
+  `paper_only=true`, artifact checksum, source blotter file checksum, source
+  artifact checksum, source candidate checksum, and no cancel/circuit-breaker/live
+  safety flags.
+- Enforces status consistency: `SUBMITTED`/`COMPLETE` require a submitted
+  reconciliation artifact, `DRY_RUN` cannot include reconciliation, `FAILED`
+  with reconciliation requires failed reconciliation, and `COMPLETE` cannot
+  carry unresolved blockers.
+- Writes a separate local audit artifact with schema/version, run ID,
+  UTC timestamp, paper-only flag, operator-visible status, gate statuses,
+  artifact paths and hashes, git branch/commit/dirty flag, command/schema
+  versions, validation summary, unresolved blockers, safety assertions, and
+  next action.
+- Uses a no-clobber output write unless `--overwrite` is explicitly supplied.
+- Never connects to IBKR, submits/cancels/reconciles broker orders, mutates the
+  Step 6 blotter or Step 7 reconciliation artifact, resets/trips circuit
+  breakers, or asks for/consumes human `YES`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_run_audit_check.py -q`:
+  13 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_run_audit_check.py tests\test_paper_run_audit_check.py`:
+  passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py -q`:
+  101 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py execution\tests risk\tests -q`:
+  195 passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace. The combined paper/execution/risk run also emits
+an `eventkit` deprecation warning from imported IBKR plumbing.
+
+#### Adversarial review
+
+Attempted independent `codex review --uncommitted` in read-only mode. The local
+CLI could not reach the OpenAI API under sandboxed network restrictions.
+Escalation was requested only for the read-only review command, but was
+rejected because it would send the uncommitted private local diff to an
+external Codex/OpenAI review service. No workaround was attempted.
+
+Local adversarial review finding fixed:
+
+- The first Step 8 reconciliation validator checked source checksums and a few
+  no-live-action flags, but did not verify all Step 7 paper-safety metadata.
+  Fixed by requiring `live_port_supported=false`,
+  `safety.operator_confirmed_yes=true`, `safety.paper_env_required=true`,
+  `safety.ibkr_port=7497`, and `order_count == len(broker_responses)`. Added
+  regression tests for live-port metadata and order-count mismatch.
+
+Local adversarial review found no further required fixes: Step 8 delegates
+Step 6 validation to the existing Step 7 blotter validator, validates Step 7
+reconciliation linkage before recording submitted/complete statuses, refuses
+in-place output paths, uses atomic no-clobber writes, and contains no broker,
+OMS registration, cancel, circuit-breaker mutation, or confirmation path.
+
+Independent supervisor review finding fixed:
+
+- `FAILED` could previously be recorded without a Step 7 failure
+  reconciliation artifact, which made the default next action point at an
+  artifact that might not exist. Fixed by requiring a supplied Step 7
+  reconciliation with `status=FAILED`; pre-submission failures should be
+  recorded as `BLOCKED` with explicit blockers. Added regression tests for
+  missing and non-failed reconciliation artifacts.
+
+#### Status
+
+Step 8 code is implemented and locally validated. Live paper execution remains
+blocked until stale upstream `alpha_scores` are refreshed and a fresh Step 6
+blotter can be generated from current paper inputs.
+
+---
+
 ### Session 28 - Step 7 Paper Submit/Reconcile Preflight
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `local/linking-to-IBKR`
-**Commits:** pending
+**Commits:** `c48ae13`
 
 ---
 
@@ -144,7 +257,7 @@ blotter can be generated from current paper inputs.
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `local/linking-to-IBKR`
-**Commits:** pending
+**Commits:** `51054e5`
 
 ---
 
@@ -263,7 +376,7 @@ command intentionally fails closed through the reused Step 3/4/5 gates.
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `local/linking-to-IBKR`
-**Commits:** pending
+**Commits:** `5c0de51`
 
 ---
 
@@ -376,7 +489,7 @@ intentionally fails closed through the reused Step 3 target gate.
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `local/linking-to-IBKR`
-**Commits:** pending
+**Commits:** `2d8f1a9`
 
 ---
 
