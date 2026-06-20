@@ -125,6 +125,8 @@ Full directory tree with file-level detail: `PRD.md` Section 5.
 | `POLYGON_API_KEY` | Polygon.io market data API key (Phase 2+) |
 | `IBKR_HOST` | IBKR TWS/Gateway host (default: `127.0.0.1`) |
 | `IBKR_PORT` | `7497` = paper trading, `7496` = live trading — **never hardcode** |
+| `IBKR_FX_RATE_CAD_USD` | Optional explicit CAD→USD fallback when IBKR FX market data is unavailable; requires fresh `IBKR_FX_RATE_CAD_USD_AS_OF` |
+| `IBKR_FX_RATE_CAD_USD_AS_OF` | Required `YYYY-MM-DD` date for manual CAD→USD fallback; stale dates are rejected |
 | `MLFLOW_TRACKING_URI` | MLflow tracking server URL |
 | `PAPER_TRADING` | `"true"` or `"false"` — NEVER change from `"false"` without operator `"YES"` confirmation (C9) |
 

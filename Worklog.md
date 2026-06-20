@@ -12,6 +12,83 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-19
+
+### Session 21 - IBKR Paper Socket Connected + CAD/USD Account NAV Handling
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending
+
+---
+
+#### What was done
+
+Connected the local repo to the operator's IBKR TWS paper socket on
+`127.0.0.1:7497` and verified that `IBKRBroker.connect()` succeeds in paper
+mode.
+
+The first live account-value smoke test exposed a Canada-specific readiness
+gap: the paper account reports `NetLiquidation`, `AvailableFunds`, and
+`BuyingPower` in CAD, while the broker code assumed `NetLiquidation` would be
+available in USD. Returning zero or silently treating CAD as USD would corrupt
+portfolio weights, order sizing, and risk limits, so the broker now treats
+account NAV as currency-aware state.
+
+An independent adversarial review found a blocking edge case in the first
+implementation: a partial `$LEDGER-NetLiquidationByCurrency` row could override
+a full `NetLiquidation` summary and understate account NAV. The broker now uses
+ledger components only when multiple non-BASE currency components are present;
+otherwise it preserves the summary NAV. The review also removed the stale
+copy-paste FX-rate example from `.env.example` and tightened live FX market data
+requests to use the qualified IBKR contract.
+
+Manual FX fallback safety was then hardened from an operator warning to a
+code-level guard: setting `IBKR_FX_RATE_CAD_USD` now also requires
+`IBKR_FX_RATE_CAD_USD_AS_OF=YYYY-MM-DD`, and the broker rejects missing, future,
+or stale as-of dates before using the manual rate for USD-equivalent NAV.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/brokers/ibkr.py` | Added per-currency `NetLiquidation` retrieval, USD-equivalent NAV conversion, explicit FX fallback handling, and partial-ledger protection |
+| `execution/brokers/base.py` | Preserved the USD `get_account_value()` contract used by execution and risk |
+| `execution/tests/test_ibkr_broker.py` | Added focused CAD/USD account-value, mixed-currency, FX fallback, and invalid currency tests |
+| `.env.example` | Documented optional `IBKR_FX_RATE_CAD_USD` plus required as-of date |
+| `CLAUDE.md` | Added the new IBKR FX fallback environment variables |
+
+#### Validation
+
+- `Test-NetConnection 127.0.0.1 -Port 7497`: TCP socket open.
+- `IBKRBroker.connect()`: succeeds against TWS paper port `7497`.
+- Live account values observed: `NetLiquidation=1000000.00 CAD`,
+  `AvailableFunds=1000000.00 CAD`, `BuyingPower=3333333.33 CAD`.
+- `get_account_values_by_currency()`: returns `{'CAD': 1000000.0}`.
+- `get_account_value_in_currency('CAD')`: returns `1000000.0`.
+- `get_account_value()` with explicit test `IBKR_FX_RATE_CAD_USD=0.74`: returns
+  `740000.0` USD-equivalent.
+- `pytest execution\tests\test_ibkr_broker.py execution\tests\test_oms.py -q`:
+  42 passed.
+- `pytest portfolio\tests execution\tests risk\tests -q`: 121 passed.
+- Full non-integration suite:
+  `python -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  553 passed, 10 warnings.
+
+#### Status
+
+The broker can connect to IBKR paper TWS and read the CAD account NAV. The
+current OMS and IBKR stock-order path are USD-denominated, so
+`get_account_value()` remains a USD-equivalent contract. In the current account,
+IBKR did not return usable CAD/USD market data during the smoke test, so
+USD-based order sizing requires an explicit `IBKR_FX_RATE_CAD_USD` fallback
+unless IBKR FX market data permissions are enabled later. Any manual fallback
+must include a fresh `IBKR_FX_RATE_CAD_USD_AS_OF` date or the broker rejects it.
+Explicit diagnostic calls such as `get_account_value_in_currency("CAD")` are
+supported, but the daily paper-trading path should use USD-equivalent NAV.
+
+---
+
 ## 2026-06-17
 
 ### Session 20 - Phase 4 Paper-Trading Readiness Handoff
