@@ -189,6 +189,39 @@ read IBKR positions, generate order candidates, stage orders, submit orders,
 cancel orders, or reconcile fills. Unsupported portfolio methods fail closed
 until their paper-target semantics are explicitly implemented and reviewed.
 
+## Phase 4 paper order candidate command
+
+Run this after the paper target command passes, using an explicit local snapshot
+of current cash and positions:
+
+```powershell
+python -m scripts.paper_order_candidates_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json
+```
+
+The portfolio snapshot is a local JSON object:
+
+```json
+{
+  "as_of": "2026-06-20",
+  "cash": 1000.0,
+  "positions": [
+    {"ticker": "AAPL", "quantity": 5.0, "price": 200.0}
+  ]
+}
+```
+
+The command is read-only and staging-free. It reuses the Step 3 target-weight
+gate, computes current weights from the local snapshot, then prints deterministic
+SELL-before-BUY order candidates with estimated shares and notional. It requires
+explicit `--strategy-id`, finite positive NAV/prices, non-negative cash and
+quantities, unique tickers, a fresh `as_of` date, and skips deltas below
+`--min-delta-weight`. It does not connect to IBKR, instantiate OMS orders, run
+compliance or risk gates, stage orders, submit orders, cancel orders, reconcile
+fills, or require human `YES`.
+
+Current live status as of 2026-06-20: this command is expected to fail closed
+through the Step 3 target gate until stale `alpha_scores` are refreshed.
+
 ---
 
 ## Conventions

@@ -14,11 +14,120 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
-### Session 24 - Step 3 Paper Target Portfolio Command
+### Session 25 - Step 4 Paper Order Candidate Command
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `local/linking-to-IBKR`
 **Commits:** pending
+
+---
+
+#### What was done
+
+Implemented Step 4 of the incremental paper-trading workflow: a read-only,
+staging-free order candidate generation command.
+
+The command intentionally stops before OMS, compliance, risk, broker, and human
+approval boundaries. It reuses the Step 3 target construction path, reads
+current cash and positions from an explicit local JSON snapshot, computes
+current weights and target deltas, then prints candidate rows only.
+
+Command:
+
+```powershell
+python -m scripts.paper_order_candidates_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json
+```
+
+Portfolio input shape:
+
+```json
+{
+  "as_of": "2026-06-20",
+  "cash": 1000.0,
+  "positions": [
+    {"ticker": "AAPL", "quantity": 5.0, "price": 200.0}
+  ]
+}
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_order_candidates_check.py` | New read-only/staging-free command that computes order candidate deltas from Step 3 targets and a local portfolio snapshot |
+| `tests/test_paper_order_candidates_check.py` | Unit coverage for successful candidates, no-op matches, invalid snapshots, explicit strategy ID, stale target blocking, and invalid thresholds |
+| `CLAUDE.md` | Added the Step 4 operator command, local JSON input shape, safety boundary, and live stale-score blocker |
+| `Worklog.md` | Recorded the Step 4 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL`, explicit `--strategy-id`, and explicit
+  `--portfolio-input`.
+- Reuses the Step 3 target gate, so stale or invalid strategy inputs still fail
+  closed before candidates are generated.
+- Reads current portfolio state only from a local JSON snapshot; it does not
+  connect to IBKR or inspect broker state.
+- Requires finite positive NAV and prices, non-negative cash and quantities,
+  unique tickers, a fresh non-future `as_of` date, and a finite non-negative
+  `--min-delta-weight`.
+- Computes current weights from local cash, quantities, and prices.
+- Uses existing `backtesting.engine.fill_simulator.compute_orders()` for
+  deterministic SELL-before-BUY weight deltas.
+- Prints candidate rows with direction, current/target/delta weights, reference
+  price, estimated shares, and estimated notional.
+- Generates no candidates when current weights already match targets within the
+  minimum delta threshold.
+- Never imports or instantiates `execution.oms.order.Order`, never stages
+  orders, never runs compliance/risk gates, never submits/cancels/reconciles
+  broker orders, and never asks for or consumes human `YES`.
+
+#### Adversarial review
+
+The worker attempted independent `codex review --uncommitted` in read-only mode.
+The CLI could not complete under the sandbox because external API/socket access
+was blocked, and escalation was rejected to avoid exporting uncommitted private
+repo data. The supervisor then ran an independent subagent review of the
+uncommitted Step 4 diff.
+
+Findings fixed:
+
+- Ruff flagged an unused import and import ordering in
+  `scripts/paper_order_candidates_check.py`; fixed with focused Ruff auto-fix.
+- The live Windows probe showed PowerShell-created UTF-8 BOM JSON snapshots were
+  rejected by the strict JSON loader before reaching the stale-score gate; fixed
+  by reading portfolio snapshots with `utf-8-sig` and adding regression coverage.
+- Independent review found that local portfolio snapshots had no freshness
+  guard. Fixed by requiring an `as_of` date, rejecting stale/future snapshots,
+  adding `--max-snapshot-age-days`, printing the snapshot date, and adding
+  regression coverage.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_order_candidates_check.py -q`:
+  13 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py -q`:
+  38 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_order_candidates_check.py tests\test_paper_order_candidates_check.py`:
+  passed.
+- Live read-only command with `--strategy-id v1_base_momentum` and a temporary
+  local JSON snapshot:
+  failed as intended before candidate generation because `alpha_scores` stop at
+  2026-06-09, 11 calendar days before 2026-06-20.
+
+#### Status
+
+Step 4 code is implemented and locally validated. Live order-candidate
+generation remains blocked until the daily signal pipeline refreshes stale
+`alpha_scores`, because the command intentionally fails closed through the Step
+3 target gate.
+
+---
+
+### Session 24 - Step 3 Paper Target Portfolio Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `59cd709`
 
 ---
 
