@@ -14,11 +14,92 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
-### Session 22 - Step 1 Paper Readiness Command
+### Session 23 - Step 2 Paper Input Readiness Command
 
 **Operator:** mshane@thecanadalist.ca
 **Branch:** `local/linking-to-IBKR`
 **Commits:** pending
+
+---
+
+#### What was done
+
+Implemented Step 2 of the incremental paper-trading workflow: a read-only
+strategy-input preflight command.
+
+The command is intentionally narrower than portfolio construction. It does not
+connect to IBKR, optimize weights, create target positions, stage orders,
+submit orders, cancel orders, or reconcile fills. It only verifies that the
+selected strategy has usable current inputs before the next slice runs.
+
+Command:
+
+```powershell
+python -m scripts.paper_inputs_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_inputs_check.py` | New read-only input preflight for strategy config, prices, alpha scores, recency, finite values, and ticker overlap |
+| `tests/test_paper_inputs_check.py` | Unit coverage for successful loads, missing DB/config, strategy ID resolution, stale data, invalid values, and insufficient overlap |
+| `CLAUDE.md` | Added the Step 2 input command and current live-data blocker |
+| `Worklog.md` | Recorded the Step 2 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL` before touching the database.
+- Loads only `daily_prices` and strategy-specific `alpha_scores`.
+- Treats `--strategy-id` as explicit operator input so display names and stored
+  score IDs cannot silently diverge.
+- Fails on stale prices or stale scores; default max age is 7 calendar days.
+- Fails on non-finite alpha scores, missing/invalid closes, or non-positive
+  closes.
+- Requires enough scored tickers with latest prices for `portfolio.n_long`
+  unless a smaller `--min-overlap` is supplied for smoke tests.
+- Requires the top `portfolio.n_long` scored tickers to have latest prices, so
+  lower-ranked overlap cannot mask unpriceable target candidates.
+- Never imports or calls broker, OMS, optimizer, or risk modules.
+
+#### Adversarial review
+
+Independent subagent review found one blocking correctness issue: total ticker
+overlap could pass even if the top `portfolio.n_long` scored candidates lacked
+latest prices. Fixed by requiring the top target-candidate set itself to have
+latest prices. The review also flagged explicit strategy ID handling and cheap
+edge-case coverage; fixed by requiring `--strategy-id` for paper input checks
+and adding regression tests for future dates, negative age limits, non-positive
+overlap, and top-candidate price gaps.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py -q`:
+  15 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_readiness_check.py execution\tests\test_ibkr_broker.py -q`:
+  49 passed.
+- Full non-integration suite:
+  `.\.venv\Scripts\python.exe -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  585 passed, 10 warnings.
+- Live read-only command with `--strategy-id v1`:
+  failed as intended because `alpha_scores` stop at 2024-12-31.
+- Live read-only command with `--strategy-id v1_base_momentum`:
+  failed as intended because `alpha_scores` stop at 2026-06-09, 11 calendar
+  days before 2026-06-20.
+
+#### Status
+
+Step 2 code is implemented and locally validated. The live paper workflow is
+blocked from proceeding to Step 3 until the daily signal pipeline is refreshed
+so alpha scores are current.
+
+---
+
+### Session 22 - Step 1 Paper Readiness Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `965d6e8`
 
 ---
 

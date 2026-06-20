@@ -153,6 +153,27 @@ reachability, confirms IBKR paper broker connection, and reads current
 positions, NAV by currency, and finite positive USD-equivalent NAV. It does not
 generate, stage, submit, cancel, or reconcile orders.
 
+## Phase 4 paper input command
+
+Run this after paper readiness and before portfolio construction:
+
+```powershell
+python -m scripts.paper_inputs_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum
+```
+
+The command is read-only. It loads the strategy config, latest `daily_prices`,
+and latest strategy-specific `alpha_scores` from `DATABASE_URL`, then verifies
+recency, finite alpha scores, positive latest closes, and enough scored tickers
+with latest prices for `portfolio.n_long`. The `--strategy-id` argument is
+required explicitly because stored score IDs can differ from display names and
+YAML versions. It does not connect to IBKR, build target weights, stage orders,
+submit orders, cancel orders, or reconcile fills.
+
+Current live status as of 2026-06-20: `daily_prices` is recent through
+2026-06-18, but `alpha_scores` is stale for paper trading. `v1` scores stop at
+2024-12-31; `v1_base_momentum` scores stop at 2026-06-09. Refresh the daily
+signal pipeline before proceeding to portfolio construction.
+
 ---
 
 ## Conventions
@@ -170,7 +191,7 @@ generate, stage, submit, cancel, or reconcile orders.
 - Volatility: annualized decimal form.
 
 ### Naming
-- Database tables: `snake_case`, plural nouns (`daily_prices`, `signal_scores`).
+- Database tables: `snake_case`, plural nouns (`daily_prices`, `alpha_scores`).
 - Python modules: `snake_case`.
 - Strategy config files: `v{N}_{short_description}.yaml` (e.g., `v1_base_momentum.yaml`).
 - MLflow experiments: `{strategy_name}/{signal_group}` (e.g., `base_momentum/value`).
