@@ -7,7 +7,6 @@ this contract so the OMS can swap brokers without code changes.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
 
 from execution.oms.order import Order
 
@@ -33,6 +32,15 @@ class BaseBroker(ABC):
         ------
         RuntimeError if the broker rejects the order at the API level.
         """
+
+    def what_if_order(self, order: Order) -> dict:
+        """Validate an order with the broker without transmitting it.
+
+        Broker implementations that support a paper what-if path should
+        override this. The default fails closed so callers cannot accidentally
+        treat missing broker support as approval.
+        """
+        raise NotImplementedError("Broker does not support what-if order validation")
 
     @abstractmethod
     def get_fill(self, broker_order_id: str) -> dict | None:

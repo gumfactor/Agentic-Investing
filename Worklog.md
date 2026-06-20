@@ -12,6 +12,1255 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-20
+
+### Session 33 - Tiny Step 7 Paper Submission Probe
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending documentation commit
+
+---
+
+#### What was done
+
+Ran a deliberately small Step 7 paper submission probe instead of submitting the
+full 50-order allocation. A derived local blotter was created from the validated
+whole-share Step 6 artifact with three one-share BUY orders:
+
+| Ticker | Side | Shares | Limit | Notional |
+|--------|------|--------|-------|----------|
+| APA | BUY | 1 | `33.03` | `33.03` |
+| HAL | BUY | 1 | `34.93` | `34.93` |
+| HPE | BUY | 1 | `47.41` | `47.41` |
+
+Total submitted notional was approximately `115.37` USD.
+
+#### Evidence
+
+- Tiny blotter artifact: `local/paper_stage_blotter_small.json`
+- Reviewed tiny blotter SHA-256:
+  `92a60fd176198b55b482437c0bbb53a9c9506ae150c11e324f6c357e2c9605b2`
+- Step 7 dry-run passed for the tiny blotter.
+- Step 7.5 what-if validation passed:
+  - Artifact: `local/paper_whatif_validation_small.json`
+  - Accepted: `3/3`
+  - Rejected: `0/3`
+  - Fractional quantity rows: `0`
+- Step 7 paper submission passed:
+  - Artifact: `local/paper_submit_reconciliation_small.json`
+  - Status: `SUBMITTED`
+  - Broker order IDs: APA `3`, HAL `4`, HPE `5`
+  - Initial fill poll: `None` for all three orders
+- Step 8 audit record passed:
+  - Artifact: `local/paper_run_audit_small.json`
+  - Run id: `7a0cbfad-9ceb-4cb8-82c4-604acdb9f3ea`
+  - Operator-visible status: `SUBMITTED`
+
+#### Safety
+
+- This was an IBKR simulated trading account run on paper port `7497`.
+- No live-money order path was used.
+- The full 50-order allocation was not submitted.
+- The test intentionally used three tiny one-share orders so the pipeline could
+  be exercised without allocating the paper account.
+
+#### Status and next actions
+
+- Step 7 has now been exercised successfully with a tiny paper submission.
+- Monitor the three paper orders in TWS. Because this was run on Saturday, the
+  initial fill poll did not report fills.
+- Before any larger paper submission, decide whether to cancel/observe these
+  tiny orders and whether to keep using tiny probes or graduate to the full
+  paper allocation.
+
+---
+
+### Session 32 - Whole-Share Cent-Rounded Paper What-If Pass
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending commit for whole-share/tick-size Step 7.5 slice
+
+---
+
+#### What was done
+
+Closed the IBKR paper what-if blocker found in Session 31. The Step 6 blotter
+now defaults to API-compatible whole-share stock quantities and cent-rounded
+limit prices for US equities. The Step 7 submit/reconcile path now rejects
+fractional share quantities and sub-cent limit prices before opening a broker
+connection. IBKR order construction now sets `tif="DAY"` explicitly for both
+submitted orders and what-if orders, avoiding TWS preset warnings being treated
+as validation failures.
+
+#### Evidence
+
+- Regenerated `local/paper_stage_blotter.json` with `quantity_mode=whole_shares`.
+- The regenerated blotter contains `50` candidate rows, `0` fractional quantity
+  rows, and `0` sub-cent price rows.
+- Step 7 dry-run passed against the regenerated blotter.
+- Step 7.5 paper what-if validation passed against TWS/Gateway paper port
+  `7497`:
+  - Status: `PASS`
+  - Accepted: `50/50`
+  - Rejected: `0/50`
+  - Fractional quantity rows: `0`
+  - Source blotter SHA-256:
+    `8a588805182c4e08d7e3fb170dab05344b38c8f8f4223f466125e508dcff966f`
+- No real or paper orders were transmitted. The validation used IBKR what-if
+  requests only.
+
+#### Verification
+
+- Focused tests:
+  `python -m pytest tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_whatif_check.py execution\tests\test_ibkr_broker.py -q`
+  passed: `56 passed`.
+- Broader paper/execution/risk suite:
+  `python -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py tests\test_paper_whatif_check.py execution\tests risk\tests -q`
+  passed: `209 passed`.
+- Focused ruff check over the touched paper-preflight files and tests passed.
+
+#### Status and next actions
+
+- The whole-share/tick-size Step 7.5 slice is complete.
+- The next decision is whether to run Step 7 with `--confirm YES` to submit the
+  validated paper orders. That must remain an explicit operator approval step.
+- Keep TWS/Gateway open on paper port `7497` for any submission attempt.
+
+---
+
+### Session 31 - IBKR Fractional Share What-If Validation
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** uncommitted Step 7.5 implementation
+
+---
+
+#### What was done
+
+Added and ran a Step 7.5 IBKR paper what-if validation slice to test whether
+the current fractional-share Step 6 blotter can be submitted through the TWS
+API without transmitting real paper orders.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/brokers/base.py` | Added default fail-closed `what_if_order()` broker contract |
+| `execution/brokers/ibkr.py` | Added IBKR `what_if_order()` using `IB.whatIfOrder()` and API error-event capture |
+| `scripts/paper_whatif_check.py` | New Step 7.5 command that validates a Step 6 blotter with paper what-if requests and writes a local artifact |
+| `tests/test_paper_whatif_check.py` | Unit tests for successful artifact creation, fractional quantities, broker rejects, environment gates, overwrite protection, and no submit/cancel/reconcile path |
+| `execution/tests/test_ibkr_broker.py` | Regression tests for IBKR what-if error-event capture and empty order-state fail-closed behavior |
+
+#### Live validation result
+
+Command:
+
+```powershell
+python -m scripts.paper_whatif_check --blotter .\local\paper_stage_blotter.json --output .\local\paper_whatif_validation.json --client-id 12 --overwrite
+```
+
+Result: **failed closed as intended**.
+
+- Artifact: `local/paper_whatif_validation.json`
+- Orders tested: `50`
+- Fractional quantity rows: `50`
+- Accepted by IBKR API what-if: `0`
+- Rejected by IBKR API what-if: `50`
+- IBKR error for every row: `10243` -
+  `Fractional-sized order cannot be placed via API. Please use desktop version to place this order.`
+
+#### Safety
+
+- The command connected only to paper TWS/Gateway on port `7497`.
+- It used IBKR what-if validation, not order transmission.
+- No `YES` was consumed.
+- No broker order IDs were created in the Step 6/7 workflow.
+- No fills, cancellations, or reconciliation were attempted.
+
+#### Status and next actions
+
+- Fractional-share submission via this TWS API path is blocked.
+- The next engineering slice should create a whole-share paper blotter path:
+  round each order to whole shares, leave residual cash, rerun Step 5/6, then
+  rerun Step 7.5 what-if validation.
+- Do not run Step 7 `--confirm YES` against the fractional Step 6 blotter.
+
+---
+
+### Session 30 - Paper Preflight Live Dry-Run Initiation
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** uncommitted operational log entry
+
+---
+
+#### What was done
+
+Initiated the next paper-trading priorities after completing Steps 1-8:
+
+1. Refreshed stale `v1_base_momentum` alpha scores through the latest available
+   `daily_prices` date.
+2. Ran the manual paper preflight chain through Step 7 dry-run and Step 8 audit.
+3. Performed an operator-review rehearsal summary over the generated blotter.
+
+#### Evidence
+
+- Before refresh: `daily_prices` latest date was `2026-06-18`, while
+  `v1_base_momentum` `alpha_scores` stopped at `2026-06-09`.
+- Refreshed `v1_base_momentum` scores for trading dates `2026-06-10`,
+  `2026-06-11`, `2026-06-12`, `2026-06-15`, `2026-06-16`, `2026-06-17`, and
+  `2026-06-18`.
+- Wrote `3,514` `factor_scores` rows and `3,514` `alpha_scores` rows using the
+  existing idempotent upsert path.
+- Verified Step 2:
+  `python -m scripts.paper_inputs_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum`
+  passed.
+- Verified Step 3:
+  `python -m scripts.paper_target_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum`
+  passed.
+- Verified Step 1 after supplying an ephemeral Bank of Canada FX override:
+  `IBKR_FX_RATE_USD_CAD=1.4171`, `IBKR_FX_RATE_USD_CAD_AS_OF=2026-06-19`.
+  TWS/Gateway paper socket was reachable on `127.0.0.1:7497`, broker connected
+  in paper mode, positions were empty, CAD NAV was `1,000,000.00`, and
+  USD-equivalent NAV was `705,666.50`.
+- Created local operator artifact `local/paper_portfolio_snapshot.json`
+  representing the empty paper account as all cash, with `as_of=2026-06-20`.
+- Step 4 order candidates passed: 50 BUY candidates from cash to target.
+- Step 5 risk/compliance passed: gross target weight `1.000000`, max target
+  position weight `0.020000`, turnover weight `1.000000`.
+- Step 6 wrote `local/paper_stage_blotter.json`, run id
+  `476df5d5-c467-49be-a965-835957c98a9f`, candidate rows checksum
+  `6faccf5594cc7fc067e44f13cb799dd895b8f892300c3669b0a4b64d203a965a`.
+- Step 7 dry-run passed with reviewed blotter file SHA-256
+  `073f35c9720992cc5c0c62681ee5575f61cd6efc7769936f3b03292f8b633588`.
+- Step 8 wrote `local/paper_run_audit.json`, run id
+  `d5f6bdbd-fa6e-4c9f-810f-c03fa11ac228`, status `DRY_RUN`, artifact checksum
+  `7c4ccd43467483ce509566a6e7b115ff50534a40ae65f4ad9c84f4d7613417a0`.
+
+#### Operator review rehearsal
+
+- The paper account had no existing positions, so the target transition is
+  100% cash to 50 long positions.
+- Blotter contains 50 BUY orders and no SELL orders.
+- Total estimated notional is `705,666.50` USD, with `14,113.33` USD per order.
+- Each target position is `2.00%`; no candidate exceeds the configured
+  `5.00%` position cap.
+- All 50 candidate quantities are fractional shares. This is acceptable only if
+  the IBKR paper account supports fractional US stock orders for this route and
+  order type; otherwise the blotter needs a whole-share sizing/rounding slice
+  before paper submission.
+- Lowest reference-price/highest-share examples: APA `427.288236` shares at
+  `33.03`, HAL `404.046092` shares at `34.93`, HPE `297.686775` shares at
+  `47.41`.
+- Highest reference-price/lowest-share examples: SNDK `6.459929` shares at
+  `2184.75`, FIX `7.173558` shares at `1967.41`, MU `12.445727` shares at
+  `1133.99`.
+
+#### Status and next actions
+
+- Priorities 1 and 2 are complete through the dry-run/audit boundary.
+- Priority 3 is initiated; final human approval is still required before any
+  Step 7 `--confirm YES`.
+- Do not submit until the operator explicitly accepts the reviewed blotter hash
+  and fractional-share behavior.
+- The manual FX override was not persisted to `.env`; future readiness checks
+  will need a fresh FX rate or a persisted same-day manual rate.
+
+---
+
+### Session 29 - Step 8 Paper Run Audit Record
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** this Step 8 commit
+
+---
+
+#### What was done
+
+Implemented Step 8 of the incremental paper-trading workflow: a final local
+audit/run record writer over existing Step 6 and optional Step 7 artifacts.
+
+Command, current blocked-state record:
+
+```powershell
+python -m scripts.paper_run_audit_check --blotter .\local\paper_stage_blotter.json --status BLOCKED --blocker "alpha_scores are stale for paper trading" --output .\local\paper_run_audit.json
+```
+
+Command, after a successful Step 7 paper submission/reconciliation:
+
+```powershell
+python -m scripts.paper_run_audit_check --blotter .\local\paper_stage_blotter.json --reconciliation .\local\paper_submit_reconciliation.json --status SUBMITTED --step1-status PASS --step2-status PASS --step3-status PASS --step4-status PASS --step5-status PASS --output .\local\paper_run_audit.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_run_audit_check.py` | New Step 8 command that validates existing paper artifacts and writes a separate audit/run record |
+| `tests/test_paper_run_audit_check.py` | Unit coverage for blocked and submitted records, reconciliation validation, status consistency, no-clobber writes, and source-level safety boundary |
+| `CLAUDE.md` | Added the Step 8 operator commands, artifact contract, read-only safety boundary, and stale-input live blocker |
+| `Worklog.md` | Recorded the Step 8 implementation and validation status |
+
+#### Safety behavior
+
+- Requires explicit `--blotter`, `--status`, and `--output`.
+- Validates the Step 6 blotter with the Step 7 blotter validator: schema,
+  `paper_only=true`, `stage_only=true`, pre-submission safety flags,
+  provenance checksums, candidate row checksum, and artifact checksum.
+- Validates a supplied Step 7 reconciliation artifact: schema,
+  `paper_only=true`, artifact checksum, source blotter file checksum, source
+  artifact checksum, source candidate checksum, and no cancel/circuit-breaker/live
+  safety flags.
+- Enforces status consistency: `SUBMITTED`/`COMPLETE` require a submitted
+  reconciliation artifact, `DRY_RUN` cannot include reconciliation, `FAILED`
+  with reconciliation requires failed reconciliation, and `COMPLETE` cannot
+  carry unresolved blockers.
+- Writes a separate local audit artifact with schema/version, run ID,
+  UTC timestamp, paper-only flag, operator-visible status, gate statuses,
+  artifact paths and hashes, git branch/commit/dirty flag, command/schema
+  versions, validation summary, unresolved blockers, safety assertions, and
+  next action.
+- Uses a no-clobber output write unless `--overwrite` is explicitly supplied.
+- Never connects to IBKR, submits/cancels/reconciles broker orders, mutates the
+  Step 6 blotter or Step 7 reconciliation artifact, resets/trips circuit
+  breakers, or asks for/consumes human `YES`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_run_audit_check.py -q`:
+  13 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_run_audit_check.py tests\test_paper_run_audit_check.py`:
+  passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py -q`:
+  101 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py execution\tests risk\tests -q`:
+  195 passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace. The combined paper/execution/risk run also emits
+an `eventkit` deprecation warning from imported IBKR plumbing.
+
+#### Adversarial review
+
+Attempted independent `codex review --uncommitted` in read-only mode. The local
+CLI could not reach the OpenAI API under sandboxed network restrictions.
+Escalation was requested only for the read-only review command, but was
+rejected because it would send the uncommitted private local diff to an
+external Codex/OpenAI review service. No workaround was attempted.
+
+Local adversarial review finding fixed:
+
+- The first Step 8 reconciliation validator checked source checksums and a few
+  no-live-action flags, but did not verify all Step 7 paper-safety metadata.
+  Fixed by requiring `live_port_supported=false`,
+  `safety.operator_confirmed_yes=true`, `safety.paper_env_required=true`,
+  `safety.ibkr_port=7497`, and `order_count == len(broker_responses)`. Added
+  regression tests for live-port metadata and order-count mismatch.
+
+Local adversarial review found no further required fixes: Step 8 delegates
+Step 6 validation to the existing Step 7 blotter validator, validates Step 7
+reconciliation linkage before recording submitted/complete statuses, refuses
+in-place output paths, uses atomic no-clobber writes, and contains no broker,
+OMS registration, cancel, circuit-breaker mutation, or confirmation path.
+
+Independent supervisor review finding fixed:
+
+- `FAILED` could previously be recorded without a Step 7 failure
+  reconciliation artifact, which made the default next action point at an
+  artifact that might not exist. Fixed by requiring a supplied Step 7
+  reconciliation with `status=FAILED`; pre-submission failures should be
+  recorded as `BLOCKED` with explicit blockers. Added regression tests for
+  missing and non-failed reconciliation artifacts.
+
+#### Status
+
+Step 8 code is implemented and locally validated. Live paper execution remains
+blocked until stale upstream `alpha_scores` are refreshed and a fresh Step 6
+blotter can be generated from current paper inputs.
+
+---
+
+### Session 28 - Step 7 Paper Submit/Reconcile Preflight
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `c48ae13`
+
+---
+
+#### What was done
+
+Implemented Step 7 of the incremental paper-trading workflow: a safety-first
+submit/reconcile preflight over the Step 6 stage-only blotter artifact.
+
+Command, dry-run/default:
+
+```powershell
+python -m scripts.paper_submit_reconcile_check --blotter .\local\paper_stage_blotter.json
+```
+
+Command, actual paper submission after operator review:
+
+```powershell
+$reviewed = (Get-FileHash .\local\paper_stage_blotter.json -Algorithm SHA256).Hash.ToLower()
+python -m scripts.paper_submit_reconcile_check --blotter .\local\paper_stage_blotter.json --confirm YES --reviewed-blotter-sha256 $reviewed --output .\local\paper_submit_reconciliation.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_submit_reconcile_check.py` | New Step 7 command that validates/displays Step 6 blotters by default and optionally submits paper orders through a mockable broker adapter |
+| `tests/test_paper_submit_reconcile_check.py` | Unit coverage for dry-run display, env gates, literal confirmation, immutable/separate output boundary, artifact validation failures, fake-broker submission, and non-paper broker rejection |
+| `CLAUDE.md` | Added the Step 7 operator commands, paper-only gates, confirmation boundary, artifact validation contract, and stale-input blocker |
+| `Worklog.md` | Recorded the Step 7 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `PAPER_TRADING=true`, `IBKR_PORT=7497`, and
+  `PAPER_RUN_CLEARED` unset or false even for dry-run validation/display.
+- Refuses live port `7496` completely; Step 7 has no live-order path.
+- Revalidates the Step 6 artifact before any broker attempt: schema/version,
+  `artifact_type`, `paper_only=true`, `stage_only=true`, pre-submission safety
+  flags, `source.step5_required=true`, candidate row checksum, artifact
+  checksum, strategy config checksum, portfolio input checksum, gate-input
+  checksum, operator review rows, and absence of broker IDs or
+  submitted/reconciled statuses.
+- Prints the full order list before any possible submission, satisfying the C1
+  display requirement in the command surface.
+- Defaults to dry-run and does not instantiate/connect a broker unless
+  `--confirm YES` is supplied.
+- Confirmed submission also requires `--reviewed-blotter-sha256` to match the
+  exact Step 6 blotter file displayed during dry-run.
+- Requires a separate `--output` reconciliation artifact for confirmed
+  submission and refuses to write over the Step 6 blotter path.
+- Writes a separate local reconciliation artifact with source blotter checksum,
+  broker response details, initial fill poll results, paper-only safety fields,
+  and artifact checksum.
+- Creates the reconciliation artifact before broker submission and updates it
+  after each accepted broker response, so partial failures still leave an audit
+  record with accepted broker IDs and error details.
+- Uses a no-clobber output write unless `--overwrite` is explicitly supplied.
+- Verifies the injected/default broker reports paper mode before and after
+  connection, and rejects unsafe adapter metadata when exposed.
+- Never modifies the Step 6 artifact in place, never cancels live orders, never
+  resets/trips circuit breakers, and never supports live orders.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_submit_reconcile_check.py -q`:
+  14 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_submit_reconcile_check.py tests\test_paper_submit_reconcile_check.py`:
+  passed after fixing import ordering during the implementation loop.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py -q`:
+  88 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_submit_reconcile_check.py execution\tests risk\tests -q`:
+  182 passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace. The combined paper/execution/risk run also emits
+an `eventkit` deprecation warning from imported IBKR plumbing. All collected
+tests passed.
+
+#### Adversarial review
+
+Attempted independent `codex review --uncommitted` in read-only mode. The local
+CLI could not reach the OpenAI API under sandboxed network restrictions.
+Escalation was requested only for the read-only review command, but was
+rejected because it would send the uncommitted local diff to an external
+Codex/OpenAI review service. No workaround was attempted.
+
+Local adversarial review finding fixed:
+
+- The first submission implementation checked the broker adapter's `is_paper`
+  flag only after `connect()`. That was safe for the default env-gated
+  `IBKRBroker`, but too weak for injected adapters. Fixed by checking
+  `broker.is_paper` before connection and again after connection, and tightened
+  the non-paper fake-broker test to prove `connect()` is never called.
+
+Local adversarial review found no further required fixes: Step 7 validates the
+Step 6 checksums/provenance before broker access, displays rows before any
+confirmed submission, rejects live-port/live-clearance env, refuses in-place
+blotter output, uses fake brokers in tests, and contains no cancel or circuit
+breaker reset path.
+
+Independent supervisor review findings fixed:
+
+- Partial paper submission could lose the reconciliation record if a later
+  order failed. Fixed by creating the reconciliation artifact before broker
+  submission, updating it after each accepted broker response, and recording
+  `FAILED`/partial state plus error details on exceptions.
+- Literal `YES` was not bound to a specific reviewed order list. Fixed by
+  printing the blotter SHA-256 in dry-run and requiring
+  `--reviewed-blotter-sha256` to match that exact file for confirmed
+  submission.
+- Adapter paper-mode validation was only semantic. Kept the pre/post
+  `is_paper` checks and added optional adapter metadata validation for exposed
+  paper port / connection mode.
+
+#### Status
+
+Step 7 code is implemented and locally validated. Live paper submission remains
+blocked until stale upstream `alpha_scores` are refreshed and a fresh Step 6
+blotter can be generated from current paper inputs.
+
+---
+
+### Session 27 - Step 6 Stage-Only Paper Blotter
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `51054e5`
+
+---
+
+#### What was done
+
+Implemented Step 6 of the incremental paper-trading workflow: a stage-only,
+local JSON blotter artifact for operator review.
+
+The command intentionally stays outside live OMS registration and broker
+boundaries. It reuses the Step 5 risk/compliance pass path, then writes a local
+artifact only after all reused target, candidate, risk, and compliance gates
+pass.
+
+Command:
+
+```powershell
+python -m scripts.paper_stage_blotter_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json --output .\local\paper_stage_blotter.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_stage_blotter_check.py` | New Step 6 command that creates a local stage-only JSON blotter artifact after Step 5 gates pass |
+| `tests/test_paper_stage_blotter_check.py` | Unit coverage for artifact schema/safety fields/checksum, overwrite protection, fail-before-write behavior, explicit strategy ID, and broker/OMS source boundary |
+| `CLAUDE.md` | Added the Step 6 operator command, artifact contract, safety boundary, overwrite behavior, and stale-input live blocker |
+| `Worklog.md` | Recorded the Step 6 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL`, explicit `--strategy-id`, explicit
+  `--portfolio-input`, and explicit `--output`.
+- Refuses to replace an existing artifact unless `--overwrite` is passed.
+- Reuses the Step 3/4/5 path, so stale strategy inputs, invalid local
+  snapshots, invalid candidate rows, and failed risk/compliance gates fail
+  closed before writing.
+- Writes a plain local JSON artifact with `schema_version`,
+  `artifact_type=paper_stage_only_order_blotter`, `run_id`,
+  `generated_at_utc`, source target/snapshot dates, candidate rows,
+  risk/compliance summary, `paper_only=true`, `stage_only=true`, explicit
+  broker/OMS safety flags, and `candidate_rows_sha256`.
+- Records `strategy_config_sha256`, `portfolio_input_sha256`, a gate-input
+  checksum, and an artifact-level checksum so Step 7 can revalidate provenance.
+- Uses an atomic no-clobber write when `--overwrite` is not supplied.
+- Candidate rows use `review_status=LOCAL_STAGE_ONLY` and do not include broker
+  IDs or submitted statuses.
+- Rejects `PAPER_RUN_CLEARED=true`, because that is a live-trading clearance
+  flag.
+- Never connects to IBKR, instantiates `OrderManager`, registers staged OMS
+  orders, submits/cancels/reconciles broker orders, resets/trips live circuit
+  breakers, or asks for/consumes human `YES`.
+- The only OMS `Order` DTOs involved are the transient Step 5 data-only
+  `ComplianceEngine.check()` adapters inherited from the risk/compliance
+  preflight; they are not written to the blotter and are never registered with
+  a live or in-memory `OrderManager`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_stage_blotter_check.py -q`:
+  8 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_stage_blotter_check.py tests\test_paper_stage_blotter_check.py`:
+  passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py -q`:
+  60 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py execution\tests risk\tests -q`:
+  168 passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace, but all collected tests passed.
+
+#### Adversarial review
+
+Attempted independent `codex exec review --uncommitted --ephemeral` in read-only
+mode. The local CLI could not reach the OpenAI API under the sandbox. Escalation
+was requested only for the read-only review command, but was rejected because it
+would export uncommitted private repo code/docs to an external API. No
+workaround was attempted.
+
+Local adversarial review findings fixed:
+
+- The source-boundary test initially rejected the literal string
+  `order_manager`, which incorrectly matched the artifact safety field
+  `order_manager_registered`. Fixed the test to look for imports,
+  `OrderManager(` construction, and `.stage(` calls instead.
+- The worklog still said adversarial review was pending after the external
+  subagent path was blocked. Fixed this entry to record the attempted subagent
+  review, the rejection reason, and the local fallback review outcome.
+
+Local adversarial review found no required code changes to the artifact writer:
+Step 5 gates run before artifact construction/write, the output path refuses
+overwrite unless `--overwrite` is passed, parent directory creation happens only
+after gates pass, candidate rows contain no broker IDs or submitted order
+statuses, and Step 6 imports no broker, `OrderManager`, or OMS `Order` DTOs.
+
+Independent supervisor review findings fixed:
+
+- Step 7 provenance was under-specified. Fixed by adding file hashes for the
+  strategy config and local portfolio input, a checksum over normalized gate
+  inputs, and an artifact-level checksum.
+- Non-overwrite protection was not atomic. Fixed by using hard-link finalization
+  for no-clobber writes and keeping `replace()` only for explicit overwrite.
+- The worklog overstated import boundaries by saying Step 6 imports no OMS
+  `Order` DTOs despite transitive Step 5 imports. Fixed wording to distinguish
+  direct Step 6 imports from inherited Step 5 transient DTO use.
+- Added a fail-closed guard for `PAPER_RUN_CLEARED=true`.
+
+#### Status
+
+Step 6 code is implemented and locally validated. Live stage-only blotter
+creation remains blocked until stale `alpha_scores` are refreshed, because the
+command intentionally fails closed through the reused Step 3/4/5 gates.
+
+---
+
+### Session 26 - Step 5 Paper Risk/Compliance Preflight
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `5c0de51`
+
+---
+
+#### What was done
+
+Implemented Step 5 of the incremental paper-trading workflow: a read-only risk
+and compliance preflight command over Step 4 order candidates.
+
+The command intentionally stays before OMS staging and broker boundaries. It
+reuses the Step 4 candidate path, validates the candidate rows, evaluates local
+risk limits, and runs an in-memory `ComplianceEngine` adapter with explicit
+local context.
+
+Command:
+
+```powershell
+python -m scripts.paper_risk_compliance_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_risk_compliance_check.py` | New read-only Step 5 command that evaluates schema, risk, and compliance gates over Step 4 candidates |
+| `tests/test_paper_risk_compliance_check.py` | Unit coverage for pass path, stale target blocking, required strategy ID, gross/concentration/turnover failures, invalid schema, short blocking, and sell-size blocking |
+| `CLAUDE.md` | Added the Step 5 operator command, safety boundary, local-only overrides, and stale-input/live-state blocker |
+| `Worklog.md` | Recorded the Step 5 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL`, explicit `--strategy-id`, and explicit
+  `--portfolio-input`.
+- Reuses the Step 3/4 target and candidate gates, so stale or invalid strategy
+  inputs still fail closed before risk/compliance reporting.
+- Reads current portfolio state only from the local JSON snapshot supplied by
+  the operator; it does not connect to IBKR or inspect broker state.
+- Validates candidate direction/schema, finite current/target/delta weights,
+  finite positive reference prices, estimated shares, and estimated notionals.
+- Defaults to long-only behavior: short target weights and SELL quantities above
+  local holdings fail unless the strategy config or `--allow-shorts`
+  explicitly allows shorts.
+- Enforces max single-name target weight from `portfolio.max_position_weight`
+  or `--max-position-weight`, max gross target weight, and optional
+  `--max-turnover-weight`.
+- Uses an in-memory `ComplianceEngine` data-only adapter with
+  `circuit_breaker_open=False`, local current weights, local NAV, and optional
+  `--min-order-notional`; live circuit-breaker state, wash-sale history, and
+  sector maps are not inspected by this slice.
+- Creates transient OMS `Order` DTOs only for in-memory
+  `ComplianceEngine.check()` calls; they are never registered with
+  `OrderManager.stage()`.
+- Never stages orders, submits/cancels/reconciles broker orders, resets/trips
+  live circuit breakers, or asks for/consumes human `YES`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_risk_compliance_check.py -q`:
+  14 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py -q`:
+  52 passed.
+- `.\.venv\Scripts\python.exe -m pytest execution\tests\test_oms.py risk\tests -q`:
+  74 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py execution\tests risk\tests -q`:
+  160 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_risk_compliance_check.py tests\test_paper_risk_compliance_check.py`:
+  passed.
+
+Pytest emitted cache-write warnings because `.pytest_cache` is permission
+restricted in this workspace, but all collected tests passed.
+
+#### Adversarial review
+
+Attempted independent `codex review --uncommitted` in read-only mode. The local
+CLI could not reach the OpenAI API under the sandbox. Escalation was requested
+only for `codex review`, but was rejected because it would export uncommitted
+repo code/docs to an external API. No workaround was attempted.
+
+Local adversarial review findings fixed:
+
+- `--max-gross-target-weight` incorrectly used a `(0, 1]` validator. Fixed so
+  gross target limits may be any finite positive value, while the default stays
+  `1.0`.
+- Short permission was CLI-only. Fixed so Step 5 also respects explicit
+  strategy config flags (`portfolio.allow_shorts: true` or
+  `portfolio.long_only: false`).
+- Invalid candidate rows could still be adapted into transient compliance
+  `Order` objects after schema failure. Fixed by running the
+  `ComplianceEngine` adapter only after candidate/target risk validation has
+  passed.
+
+Independent supervisor review findings fixed:
+
+- The success output and docs overstated the local `ComplianceEngine` adapter's
+  coverage. Fixed by reporting it as a data-only adapter and explicitly stating
+  that live circuit-breaker state, wash-sale history, and sector maps are not
+  inspected in this slice.
+- The docs did not say that transient OMS `Order` DTOs are created for
+  `ComplianceEngine.check()`. Fixed by documenting that they are never
+  registered with `OrderManager.stage()`.
+
+#### Status
+
+Step 5 code is implemented and locally validated. Live risk/compliance preflight
+remains blocked until stale `alpha_scores` are refreshed, because the command
+intentionally fails closed through the reused Step 3 target gate.
+
+---
+
+### Session 25 - Step 4 Paper Order Candidate Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `2d8f1a9`
+
+---
+
+#### What was done
+
+Implemented Step 4 of the incremental paper-trading workflow: a read-only,
+staging-free order candidate generation command.
+
+The command intentionally stops before OMS, compliance, risk, broker, and human
+approval boundaries. It reuses the Step 3 target construction path, reads
+current cash and positions from an explicit local JSON snapshot, computes
+current weights and target deltas, then prints candidate rows only.
+
+Command:
+
+```powershell
+python -m scripts.paper_order_candidates_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum --portfolio-input .\local\paper_portfolio_snapshot.json
+```
+
+Portfolio input shape:
+
+```json
+{
+  "as_of": "2026-06-20",
+  "cash": 1000.0,
+  "positions": [
+    {"ticker": "AAPL", "quantity": 5.0, "price": 200.0}
+  ]
+}
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_order_candidates_check.py` | New read-only/staging-free command that computes order candidate deltas from Step 3 targets and a local portfolio snapshot |
+| `tests/test_paper_order_candidates_check.py` | Unit coverage for successful candidates, no-op matches, invalid snapshots, explicit strategy ID, stale target blocking, and invalid thresholds |
+| `CLAUDE.md` | Added the Step 4 operator command, local JSON input shape, safety boundary, and live stale-score blocker |
+| `Worklog.md` | Recorded the Step 4 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL`, explicit `--strategy-id`, and explicit
+  `--portfolio-input`.
+- Reuses the Step 3 target gate, so stale or invalid strategy inputs still fail
+  closed before candidates are generated.
+- Reads current portfolio state only from a local JSON snapshot; it does not
+  connect to IBKR or inspect broker state.
+- Requires finite positive NAV and prices, non-negative cash and quantities,
+  unique tickers, a fresh non-future `as_of` date, and a finite non-negative
+  `--min-delta-weight`.
+- Computes current weights from local cash, quantities, and prices.
+- Uses existing `backtesting.engine.fill_simulator.compute_orders()` for
+  deterministic SELL-before-BUY weight deltas.
+- Prints candidate rows with direction, current/target/delta weights, reference
+  price, estimated shares, and estimated notional.
+- Generates no candidates when current weights already match targets within the
+  minimum delta threshold.
+- Never imports or instantiates `execution.oms.order.Order`, never stages
+  orders, never runs compliance/risk gates, never submits/cancels/reconciles
+  broker orders, and never asks for or consumes human `YES`.
+
+#### Adversarial review
+
+The worker attempted independent `codex review --uncommitted` in read-only mode.
+The CLI could not complete under the sandbox because external API/socket access
+was blocked, and escalation was rejected to avoid exporting uncommitted private
+repo data. The supervisor then ran an independent subagent review of the
+uncommitted Step 4 diff.
+
+Findings fixed:
+
+- Ruff flagged an unused import and import ordering in
+  `scripts/paper_order_candidates_check.py`; fixed with focused Ruff auto-fix.
+- The live Windows probe showed PowerShell-created UTF-8 BOM JSON snapshots were
+  rejected by the strict JSON loader before reaching the stale-score gate; fixed
+  by reading portfolio snapshots with `utf-8-sig` and adding regression coverage.
+- Independent review found that local portfolio snapshots had no freshness
+  guard. Fixed by requiring an `as_of` date, rejecting stale/future snapshots,
+  adding `--max-snapshot-age-days`, printing the snapshot date, and adding
+  regression coverage.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_order_candidates_check.py -q`:
+  13 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py -q`:
+  38 passed.
+- `.\.venv\Scripts\python.exe -m ruff check scripts\paper_order_candidates_check.py tests\test_paper_order_candidates_check.py`:
+  passed.
+- Live read-only command with `--strategy-id v1_base_momentum` and a temporary
+  local JSON snapshot:
+  failed as intended before candidate generation because `alpha_scores` stop at
+  2026-06-09, 11 calendar days before 2026-06-20.
+
+#### Status
+
+Step 4 code is implemented and locally validated. Live order-candidate
+generation remains blocked until the daily signal pipeline refreshes stale
+`alpha_scores`, because the command intentionally fails closed through the Step
+3 target gate.
+
+---
+
+### Session 24 - Step 3 Paper Target Portfolio Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `59cd709`
+
+---
+
+#### What was done
+
+Implemented Step 3 of the incremental paper-trading workflow: a read-only
+target-portfolio construction command.
+
+The command is intentionally narrower than order generation. It does not read
+broker positions, compute current-vs-target deltas, generate order candidates,
+stage orders, submit orders, cancel orders, or reconcile fills. It only builds
+the desired target weights from already-validated strategy inputs.
+
+Command:
+
+```powershell
+python -m scripts.paper_target_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_target_check.py` | New read-only target portfolio command for the current equal-weight strategy |
+| `tests/test_paper_target_check.py` | Unit coverage for target construction, cap-bound cash residual, stale input blocking, unsupported methods, and invalid caps |
+| `CLAUDE.md` | Added the Step 3 target command and safety boundary |
+| `Worklog.md` | Recorded the Step 3 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL` and explicit `--strategy-id`.
+- Reuses the Step 2 input gate before constructing target weights.
+- Fails if the latest alpha score date is newer than the latest price date.
+- Supports only `portfolio.method: equal_weight` for this first paper target
+  slice; unsupported methods fail closed.
+- Selects the top `portfolio.n_long` valid alpha scores.
+- Breaks equal-score ties deterministically by stored rank, then ticker.
+- Requires top target candidates to have valid latest prices through the Step 2
+  gate and a second construction-time check.
+- Applies `portfolio.max_position_weight`; any residual stays as cash.
+- Never imports or calls broker, OMS, risk, or execution modules.
+
+#### Adversarial review
+
+Independent subagent review found no blocking safety-boundary issues. It flagged
+two worthwhile correctness tightenings: equal-score tie behavior was implicit,
+and score dates could theoretically be newer than the latest price date. Fixed
+by sorting target candidates by alpha score descending, stored rank ascending,
+then ticker, and by failing closed if `alpha_scores.score_date` is newer than
+the latest `daily_prices.date`.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_target_check.py -q`:
+  10 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_target_check.py -q`:
+  25 passed.
+- `.\.venv\Scripts\python.exe -m pytest portfolio\tests tests\test_paper_inputs_check.py tests\test_paper_target_check.py -q`:
+  55 passed.
+- Live read-only command with `--strategy-id v1_base_momentum`:
+  failed as intended before target construction because `alpha_scores` stop at
+  2026-06-09, 11 calendar days before 2026-06-20.
+
+#### Status
+
+Step 3 code is implemented and locally validated. The live paper workflow is
+still blocked from producing target weights until the daily signal pipeline is
+refreshed.
+
+---
+
+### Session 23 - Step 2 Paper Input Readiness Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `e1c753e`
+
+---
+
+#### What was done
+
+Implemented Step 2 of the incremental paper-trading workflow: a read-only
+strategy-input preflight command.
+
+The command is intentionally narrower than portfolio construction. It does not
+connect to IBKR, optimize weights, create target positions, stage orders,
+submit orders, cancel orders, or reconcile fills. It only verifies that the
+selected strategy has usable current inputs before the next slice runs.
+
+Command:
+
+```powershell
+python -m scripts.paper_inputs_check --strategy-config config\strategy\v1_base_momentum.yaml --strategy-id v1_base_momentum
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_inputs_check.py` | New read-only input preflight for strategy config, prices, alpha scores, recency, finite values, and ticker overlap |
+| `tests/test_paper_inputs_check.py` | Unit coverage for successful loads, missing DB/config, strategy ID resolution, stale data, invalid values, and insufficient overlap |
+| `CLAUDE.md` | Added the Step 2 input command and current live-data blocker |
+| `Worklog.md` | Recorded the Step 2 implementation and validation status |
+
+#### Safety behavior
+
+- Requires `DATABASE_URL` before touching the database.
+- Loads only `daily_prices` and strategy-specific `alpha_scores`.
+- Treats `--strategy-id` as explicit operator input so display names and stored
+  score IDs cannot silently diverge.
+- Fails on stale prices or stale scores; default max age is 7 calendar days.
+- Fails on non-finite alpha scores, missing/invalid closes, or non-positive
+  closes.
+- Requires enough scored tickers with latest prices for `portfolio.n_long`
+  unless a smaller `--min-overlap` is supplied for smoke tests.
+- Requires the top `portfolio.n_long` scored tickers to have latest prices, so
+  lower-ranked overlap cannot mask unpriceable target candidates.
+- Never imports or calls broker, OMS, optimizer, or risk modules.
+
+#### Adversarial review
+
+Independent subagent review found one blocking correctness issue: total ticker
+overlap could pass even if the top `portfolio.n_long` scored candidates lacked
+latest prices. Fixed by requiring the top target-candidate set itself to have
+latest prices. The review also flagged explicit strategy ID handling and cheap
+edge-case coverage; fixed by requiring `--strategy-id` for paper input checks
+and adding regression tests for future dates, negative age limits, non-positive
+overlap, and top-candidate price gaps.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py -q`:
+  15 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_inputs_check.py tests\test_paper_readiness_check.py execution\tests\test_ibkr_broker.py -q`:
+  49 passed.
+- Full non-integration suite:
+  `.\.venv\Scripts\python.exe -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  585 passed, 10 warnings.
+- Live read-only command with `--strategy-id v1`:
+  failed as intended because `alpha_scores` stop at 2024-12-31.
+- Live read-only command with `--strategy-id v1_base_momentum`:
+  failed as intended because `alpha_scores` stop at 2026-06-09, 11 calendar
+  days before 2026-06-20.
+
+#### Status
+
+Step 2 code is implemented and locally validated. The live paper workflow is
+blocked from proceeding to Step 3 until the daily signal pipeline is refreshed
+so alpha scores are current.
+
+---
+
+### Session 22 - Step 1 Paper Readiness Command
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** `965d6e8`
+
+---
+
+#### What was done
+
+Implemented Step 1 of the incremental paper-trading workflow: a read-only
+paper-readiness preflight command.
+
+The command is intentionally narrower than a daily trading run. It does not
+load signals, construct portfolios, generate orders, stage orders, submit
+orders, cancel orders, or reconcile fills. It only verifies that the local
+machine can safely talk to the IBKR paper environment today.
+
+Command:
+
+```powershell
+python -m scripts.paper_readiness_check
+```
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `scripts/paper_readiness_check.py` | New read-only preflight command for IBKR paper readiness |
+| `tests/test_paper_readiness_check.py` | Unit coverage for env gates, socket gating, broker success/failure, NAV failure, and output formatting |
+| `execution/brokers/ibkr.py` | Hardened manual FX fallback parsing to reject non-finite rates |
+| `execution/tests/test_ibkr_broker.py` | Added non-finite manual FX fallback regression tests |
+| `CLAUDE.md` | Added the Step 1 readiness command and updated current paper-connection status |
+
+#### Safety behavior
+
+- Fails unless `PAPER_TRADING=true` is set explicitly.
+- Fails unless `IBKR_PORT=7497` is set explicitly.
+- Fails if `PAPER_RUN_CLEARED=true` is present, because that is a live-trading
+  clearance flag.
+- Checks the TWS/Gateway socket before constructing the broker.
+- Connects with `IBKRBroker`, confirms `is_paper=True`, reads positions, NAV by
+  currency, and finite positive USD-equivalent NAV.
+- Relies on the broker-level stale FX fallback guard from Session 21.
+- Never submits, stages, cancels, or reconciles orders.
+
+#### Validation
+
+- `pytest tests\test_paper_readiness_check.py execution\tests\test_ibkr_broker.py -q`:
+  34 passed.
+- `pytest portfolio\tests execution\tests risk\tests tests\test_paper_readiness_check.py -q`:
+  138 passed.
+- Full non-integration suite:
+  `python -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  570 passed, 10 warnings.
+- `python -m scripts.paper_readiness_check` against local TWS paper port `7497`:
+  passed, reporting empty positions, `{'CAD': 1000000.0}` NAV by currency, and
+  `740000.0` USD-equivalent NAV with a dated test CAD/USD fallback.
+
+#### Status
+
+Step 1 is implemented and locally validated. Next slice is Step 2: load today's
+strategy inputs without constructing a portfolio or generating orders.
+
+---
+
+## 2026-06-19
+
+### Session 21 - IBKR Paper Socket Connected + CAD/USD Account NAV Handling
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/linking-to-IBKR`
+**Commits:** pending
+
+---
+
+#### What was done
+
+Connected the local repo to the operator's IBKR TWS paper socket on
+`127.0.0.1:7497` and verified that `IBKRBroker.connect()` succeeds in paper
+mode.
+
+The first live account-value smoke test exposed a Canada-specific readiness
+gap: the paper account reports `NetLiquidation`, `AvailableFunds`, and
+`BuyingPower` in CAD, while the broker code assumed `NetLiquidation` would be
+available in USD. Returning zero or silently treating CAD as USD would corrupt
+portfolio weights, order sizing, and risk limits, so the broker now treats
+account NAV as currency-aware state.
+
+An independent adversarial review found a blocking edge case in the first
+implementation: a partial `$LEDGER-NetLiquidationByCurrency` row could override
+a full `NetLiquidation` summary and understate account NAV. The broker now uses
+ledger components only when multiple non-BASE currency components are present;
+otherwise it preserves the summary NAV. The review also removed the stale
+copy-paste FX-rate example from `.env.example` and tightened live FX market data
+requests to use the qualified IBKR contract.
+
+Manual FX fallback safety was then hardened from an operator warning to a
+code-level guard: setting `IBKR_FX_RATE_CAD_USD` now also requires
+`IBKR_FX_RATE_CAD_USD_AS_OF=YYYY-MM-DD`, and the broker rejects missing, future,
+or stale as-of dates before using the manual rate for USD-equivalent NAV.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `execution/brokers/ibkr.py` | Added per-currency `NetLiquidation` retrieval, USD-equivalent NAV conversion, explicit FX fallback handling, and partial-ledger protection |
+| `execution/brokers/base.py` | Preserved the USD `get_account_value()` contract used by execution and risk |
+| `execution/tests/test_ibkr_broker.py` | Added focused CAD/USD account-value, mixed-currency, FX fallback, and invalid currency tests |
+| `.env.example` | Documented optional `IBKR_FX_RATE_CAD_USD` plus required as-of date |
+| `CLAUDE.md` | Added the new IBKR FX fallback environment variables |
+
+#### Validation
+
+- `Test-NetConnection 127.0.0.1 -Port 7497`: TCP socket open.
+- `IBKRBroker.connect()`: succeeds against TWS paper port `7497`.
+- Live account values observed: `NetLiquidation=1000000.00 CAD`,
+  `AvailableFunds=1000000.00 CAD`, `BuyingPower=3333333.33 CAD`.
+- `get_account_values_by_currency()`: returns `{'CAD': 1000000.0}`.
+- `get_account_value_in_currency('CAD')`: returns `1000000.0`.
+- `get_account_value()` with explicit test `IBKR_FX_RATE_CAD_USD=0.74`: returns
+  `740000.0` USD-equivalent.
+- `pytest execution\tests\test_ibkr_broker.py execution\tests\test_oms.py -q`:
+  42 passed.
+- `pytest portfolio\tests execution\tests risk\tests -q`: 121 passed.
+- Full non-integration suite:
+  `python -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  553 passed, 10 warnings.
+
+#### Status
+
+The broker can connect to IBKR paper TWS and read the CAD account NAV. The
+current OMS and IBKR stock-order path are USD-denominated, so
+`get_account_value()` remains a USD-equivalent contract. In the current account,
+IBKR did not return usable CAD/USD market data during the smoke test, so
+USD-based order sizing requires an explicit `IBKR_FX_RATE_CAD_USD` fallback
+unless IBKR FX market data permissions are enabled later. Any manual fallback
+must include a fresh `IBKR_FX_RATE_CAD_USD_AS_OF` date or the broker rejects it.
+Explicit diagnostic calls such as `get_account_value_in_currency("CAD")` are
+supported, but the daily paper-trading path should use USD-equivalent NAV.
+
+---
+
+## 2026-06-17
+
+### Session 20 - Phase 4 Paper-Trading Readiness Handoff
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `main`
+**Commits:** documentation housekeeping only; no code commit yet
+
+---
+
+#### What was done
+
+Reviewed the current project state after Phase 4 PR #6 was merged into `main`.
+The repo orientation now reflects the live branch and the latest recorded
+validation count from Session 20.
+
+Phase 4 implementation remains complete. The next project step is not more
+optimizer, OMS, or risk-monitor implementation; it is starting the operational
+paper-trading gate.
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `CLAUDE.md` | Updated active branch from the old feature branch to `main`; replaced stale 79-test note with the latest recorded 536-test Session 20 validation |
+| `Worklog.md` | Added this paper-trading readiness handoff entry |
+
+#### Status
+
+Phase 4 repo-side readiness checks pass. Broker connectivity is still pending:
+IBKR TWS/Gateway has not yet been connected on paper port `7497`, and paper
+trading has not started yet.
+
+#### Next actions
+
+1. Operator starts IBKR TWS or Gateway in paper mode on port `7497`.
+2. Confirm `.env` has `IBKR_PORT=7497` and `PAPER_TRADING=true`.
+3. Run the first paper daily loop through `portfolio_construct`, `risk_check`,
+   and `execute_trade`.
+4. Monitor `RiskMonitor.snapshot()` output each session.
+5. Run the circuit-breaker fire drill and record the result.
+6. Begin the 4-week clean paper-trading clock after the first successful
+   end-to-end paper session and drill.
+
+#### Validation
+
+Paper-trading readiness smoke test started from this repository state:
+
+- `.env` has `IBKR_HOST=127.0.0.1`, `IBKR_PORT=7497`, and
+  `PAPER_TRADING=true`.
+- Installed missing pinned IBKR dependency `ib-insync==0.9.86` into the local
+  `.venv`.
+- `IBKRBroker()` instantiates in paper mode and reports `is_paper=True`.
+- Live-port guard works: `IBKRBroker(port=7496)` is blocked when
+  `PAPER_TRADING=true`.
+- Live-trading gate works: `PAPER_TRADING=false` with live port `7496` is
+  blocked unless `PAPER_RUN_CLEARED=true`.
+- `Test-NetConnection 127.0.0.1:7497` returned closed, as expected before IBKR
+  TWS/Gateway is running.
+- `pytest execution\tests risk\tests -q`: 74 passed.
+- `pytest tests\test_pin_snapshot.py tests\test_validate_signal_ic.py -q`: 8
+  passed.
+
+Portfolio optimizer tests could not run in the current `.venv` because
+`cvxpy==1.4.2` is not installed. Installing the pinned version on Python 3.12
+attempted a native build and failed because Microsoft C++ Build Tools are not
+installed. This is an environment readiness blocker for the full Phase 4 test
+slice, not a trading-account blocker.
+
+[RESOLVED] Python 3.12 CVXPY dependency blocker
+
+The original `cvxpy==1.4.2` pin was bumped during readiness work because it has
+no Windows Python 3.12 wheel and attempts a native build. `cvxpy==1.4.3`
+installed from a wheel, but its transitive OSQP solver stack crashed on Windows
+when imported after pandas. `cvxpy==1.7.1` was also tested and rejected because
+it pulled NumPy 2.x, conflicting with pandas, MLflow, pyarrow, scikit-learn, and
+statsmodels.
+
+Final tested dependency stack:
+
+- `cvxpy==1.6.5`
+- `clarabel==0.11.1`
+- `osqp==1.0.5`
+- existing `numpy==1.26.4`
+- existing `scipy==1.12.0`
+
+Validation after the dependency fix:
+
+- `pip check`: no broken requirements.
+- `PyPortfolioOpt==1.5.5` installed cleanly against the pinned portfolio stack.
+- `import pandas, cvxpy, osqp, pypfopt`: succeeds with pandas `2.2.0`,
+  cvxpy `1.6.5`, osqp `1.0.5`, and PyPortfolioOpt `1.5.5`.
+- Explicit OSQP solve smoke after importing pandas: optimal.
+- `pytest portfolio\tests -q`: 30 passed.
+- `pytest portfolio\tests execution\tests risk\tests -q`: 104 passed.
+- Full non-integration suite:
+  `python -m pytest --cov=data --cov=signals --cov=portfolio --cov=execution --cov=risk --cov=backtesting --cov-report=term-missing -m "not integration"`:
+  536 passed, 9 warnings.
+- `Test-NetConnection 127.0.0.1 -Port 7497`: TCP connection failed, confirming
+  that the broker listener is still pending until IBKR TWS/Gateway is running.
+
+An adversarial subagent review agreed that the dependency fix is reasonable and
+not obviously overfit, but recommended three tightening changes before commit:
+avoid claiming live paper-trading readiness before broker connection, pin the
+default CLARABEL solver version, and fix stale Session 19/102-test wording.
+Those corrections were applied.
+
+---
+
 ## 2026-06-15
 
 ### Session 19 — Phase 4: Third Adversarial Review + Final Fixes

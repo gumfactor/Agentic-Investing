@@ -27,7 +27,9 @@ scikit-learn==1.4.0
 lightgbm==4.3.0
 
 # ─── Portfolio construction ──────────────────────────────────────────────────
-cvxpy==1.4.2
+cvxpy==1.6.5
+clarabel==0.11.1
+osqp==1.0.5
 PyPortfolioOpt==1.5.5
 
 # ─── NLP / sentiment ─────────────────────────────────────────────────────────

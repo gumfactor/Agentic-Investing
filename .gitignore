@@ -68,6 +68,9 @@ mlruns/
 # Local market-data client cache
 .yfinance-cache/
 
+# Local operator/run artifacts
+local/
+
 # DVC
 .dvc/cache/
 .dvc/tmp/
