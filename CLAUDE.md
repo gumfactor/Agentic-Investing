@@ -416,7 +416,26 @@ reconciliation of the recorded broker order IDs before scaling paper allocation.
 Use `docs/runbooks/daily_paper_trading.md` as the operator checklist for the
 daily paper workflow. It covers data refresh, score refresh, readiness,
 portfolio snapshot, Steps 2-8, Step 7.5 what-if validation, tiny-probe versus
-full-allocation artifacts, and next-day durable reconciliation.
+full-allocation artifacts, next-day durable reconciliation, and the local
+append-only operational ledger/report command.
+
+## Phase 4 paper operational ledger command
+
+Run this after Step 8, and rerun it after durable reconciliation when the daily
+decision changes from submitted/monitoring to complete:
+
+```powershell
+python -m scripts.paper_operational_ledger_check --trading-date 2026-06-20 --decision SUBMITTED --decision-reason "paper orders submitted; durable reconciliation pending" --audit .\local\paper_run_audit.json --reconciliation .\local\paper_submit_reconciliation.json --ledger .\local\paper_operational_ledger.jsonl --output-report .\local\paper_operational_report.json
+```
+
+The command validates the supplied Step 8 audit, optional Step 7 reconciliation,
+and optional durable order reconciliation artifacts, then appends one
+checksum-bearing JSONL record to the local ledger. It never connects to IBKR,
+submits/cancels/reconciles broker orders, resets/trips circuit breakers, mutates
+prior artifacts, or consumes human `YES`. `COMPLETE` requires a clean durable
+order reconciliation artifact with status `RECONCILED`, exact Step 7 order
+coverage, all statuses found, and zero durable query errors; use `MONITOR` when
+broker order/fill uncertainty remains.
 
 ---
 

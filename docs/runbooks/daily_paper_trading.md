@@ -33,6 +33,8 @@ $WhatIfPath = ".\local\paper_whatif_validation_$RunStamp.json"
 $SubmitReconciliationPath = ".\local\paper_submit_reconciliation_$RunStamp.json"
 $OrderReconciliationPath = ".\local\paper_order_reconciliation_$RunStamp.json"
 $AuditPath = ".\local\paper_run_audit_$RunStamp.json"
+$LedgerPath = ".\local\paper_operational_ledger.jsonl"
+$ReportPath = ".\local\paper_operational_report_$RunStamp.json"
 ```
 
 The paths below separate the known 2026-06-20 tiny-probe artifacts from the
@@ -46,6 +48,8 @@ stamped variables used for new daily runs.
 | Step 7 submit/reconcile | `local/paper_submit_reconciliation_small.json` | `$SubmitReconciliationPath` |
 | Durable reconciliation | `local/paper_order_reconciliation_small.json` | `$OrderReconciliationPath` |
 | Step 8 audit | `local/paper_run_audit_small.json` | `$AuditPath` |
+| Daily operational ledger | `local/paper_operational_ledger.jsonl` | `$LedgerPath` |
+| Daily operational report | `local/paper_operational_report_small.json` | `$ReportPath` |
 
 Use the tiny probe artifacts when following up the APA/HAL/HPE probe or when the
 operator explicitly wants another minimal paper test. Use the full allocation
@@ -331,6 +335,45 @@ artifact but exits nonzero. Treat that as a stop condition: open TWS/Gateway
 paper, inspect the specific recorded order IDs manually, and do not scale beyond
 the tiny probe until the uncertainty is resolved and documented.
 
+## 10. Daily Operational Ledger
+
+| Owner | Action |
+|-------|--------|
+| Operator | Append one local ledger record for the daily decision and retained artifacts. |
+
+Blocked day:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.paper_operational_ledger_check --trading-date (Get-Date -Format yyyy-MM-dd) --decision BLOCKED --decision-reason "describe the blocker" --audit $AuditPath --ledger $LedgerPath --output-report $ReportPath
+```
+
+Dry-run day:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.paper_operational_ledger_check --trading-date (Get-Date -Format yyyy-MM-dd) --decision DRY_RUN --decision-reason "paper blotter reviewed but not submitted" --audit $AuditPath --ledger $LedgerPath --output-report $ReportPath
+```
+
+Submitted day that still needs durable reconciliation:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.paper_operational_ledger_check --trading-date (Get-Date -Format yyyy-MM-dd) --decision SUBMITTED --decision-reason "paper orders submitted; durable reconciliation pending" --audit $AuditPath --reconciliation $SubmitReconciliationPath --ledger $LedgerPath --output-report $ReportPath --circuit-breaker-event "no circuit breaker events observed"
+```
+
+Complete day after clean durable reconciliation:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.paper_operational_ledger_check --trading-date (Get-Date -Format yyyy-MM-dd) --decision COMPLETE --decision-reason "all recorded paper broker IDs reconciled" --audit $AuditPath --reconciliation $SubmitReconciliationPath --order-reconciliation $OrderReconciliationPath --ledger $LedgerPath --output-report $ReportPath
+```
+
+Expected: the command validates the supplied artifacts and appends one
+checksum-bearing JSONL record to `$LedgerPath`, including the daily decision,
+artifact hashes, submitted order records, reconciled fill records when
+available, and any circuit-breaker notes. The optional report is a compact JSON
+summary for quick review. The ledger command never connects to IBKR, submits or
+cancels orders, resets/trips circuit breakers, mutates prior artifacts, or
+consumes `YES`. Use `MONITOR` instead of `COMPLETE` when durable reconciliation
+is still `UNKNOWN` or `PARTIAL`.
+
 ## Completion Criteria
 
 | Status | Meaning | Next action |
@@ -339,4 +382,4 @@ the tiny probe until the uncertainty is resolved and documented.
 | `DRY_RUN` | Blotter was generated/reviewed but not submitted. | Preserve artifacts; decide whether to what-if/submit later. |
 | `SUBMITTED` | Paper orders were transmitted and a Step 7 artifact exists. | Run durable reconciliation before scaling. |
 | `FAILED` | Step 7 attempted submission and produced a failed reconciliation artifact. | Inspect TWS manually; do not retry blindly. |
-| `COMPLETE` | Operational label for a submitted run whose separate durable reconciliation artifact is clean. Step 8 does not prove this by itself. | Retain the Step 8 audit and durable reconciliation artifacts together for the four-week paper-trading phase gate. |
+| `COMPLETE` | Operational label for a submitted run whose separate durable reconciliation artifact is clean. Step 8 does not prove this by itself. | Retain the Step 8 audit, durable reconciliation, and ledger/report artifacts together for the four-week paper-trading phase gate. |

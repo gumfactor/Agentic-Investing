@@ -12,6 +12,63 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-21
+
+### Session 37 - Final Phase 4 Operational Ledger Plumbing
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/finalplumbing`
+**Commits:** final plumbing implementation slice
+
+---
+
+#### What was done
+
+Added the final local paper-trading operational state scaffold. The new
+`scripts.paper_operational_ledger_check` command validates existing Step 8 audit,
+Step 7 reconciliation, and durable order reconciliation artifacts, then appends
+one checksum-bearing JSONL record to a local operational ledger. It can also
+write a compact daily JSON report for quick review.
+
+#### Safety
+
+- No database migration was added; this is a reversible local artifact ledger.
+- The command is read-only with respect to broker and prior run artifacts.
+- It never connects to IBKR, submits or cancels orders, resets/trips circuit
+  breakers, mutates prior artifacts, or consumes human `YES`.
+- `COMPLETE` is rejected unless a durable order reconciliation artifact exists
+  and has status `RECONCILED`, exact Step 7 order coverage, all statuses found,
+  and zero durable query errors.
+- `MONITOR` remains available for submitted days with unresolved broker
+  order/fill uncertainty.
+- Ledger validation mirrors paper-safety metadata from the Step 7 and durable
+  reconciliation artifacts before accepting them as phase-gate evidence.
+
+#### Verification
+
+- Focused tests passed:
+  `python -m pytest tests\test_paper_operational_ledger_check.py tests\test_paper_run_audit_check.py tests\test_paper_order_reconcile_check.py -q`
+  passed: `39 passed`.
+- Full paper workflow command tests passed:
+  `python -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_whatif_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py tests\test_paper_order_reconcile_check.py tests\test_paper_operational_ledger_check.py -q`
+  passed: `142 passed`.
+- Focused lint passed:
+  `python -m ruff check reporting\audit\paper_operational_ledger.py scripts\paper_operational_ledger_check.py tests\test_paper_operational_ledger_check.py`.
+- Independent adversarial review found and fixed blockers around false
+  `COMPLETE` acceptance, missing safety metadata checks, `NO_TRADE` semantics,
+  report preflight ordering, and negative test coverage.
+
+#### Status and next actions
+
+- Daily paper runs can now retain Step 8 audit artifacts, durable
+  reconciliation artifacts, submitted order/fill records, circuit-breaker
+  notes, and the operator's daily decision in one append-only local ledger from
+  day one.
+- The next operational action remains durable reconciliation of the tiny
+  APA/HAL/HPE paper probe before any larger paper allocation.
+
+---
+
 ## 2026-06-20
 
 ### Session 36 - Daily Paper Trading Runbook
