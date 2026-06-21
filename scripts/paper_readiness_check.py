@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from execution.brokers.ibkr import IBKRBroker
 
-
 PAPER_PORT = 7497
 
 
