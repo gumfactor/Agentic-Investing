@@ -13,7 +13,7 @@ bulk order cancellation, or unattended submission.
 | Live clearance | Operator | `PAPER_RUN_CLEARED` must be unset or false for every step in this runbook. |
 | Human review | Operator | Review the full order list before Step 7. The literal `YES` is allowed only in the Step 7 submission command. |
 | Order safety | Operator | Do not cancel all orders from this runbook. Resolve order uncertainty manually in TWS/Gateway one order at a time. |
-| Capital safety | Operator | No live capital. The Phase 4 paper gate requires four clean paper-trading weeks before any live-capital discussion. |
+| Capital safety | Operator | No live capital. This runbook supports the 4-day supervised plumbing rehearsal only; live capital still requires a later 4-week automated paper-trading qualification. |
 
 Stop immediately if any command reports `FAIL`, `BLOCKED`, `UNKNOWN`, `PARTIAL`,
 stale inputs, missing broker status, live-mode config, open uncertainty in TWS, or
@@ -382,4 +382,4 @@ is still `UNKNOWN` or `PARTIAL`.
 | `DRY_RUN` | Blotter was generated/reviewed but not submitted. | Preserve artifacts; decide whether to what-if/submit later. |
 | `SUBMITTED` | Paper orders were transmitted and a Step 7 artifact exists. | Run durable reconciliation before scaling. |
 | `FAILED` | Step 7 attempted submission and produced a failed reconciliation artifact. | Inspect TWS manually; do not retry blindly. |
-| `COMPLETE` | Operational label for a submitted run whose separate durable reconciliation artifact is clean. Step 8 does not prove this by itself. | Retain the Step 8 audit, durable reconciliation, and ledger/report artifacts together for the four-week paper-trading phase gate. |
+| `COMPLETE` | Operational label for a submitted run whose separate durable reconciliation artifact is clean. Step 8 does not prove this by itself. | Retain the Step 8 audit, durable reconciliation, and ledger/report artifacts together for the 4-day supervised plumbing rehearsal. |

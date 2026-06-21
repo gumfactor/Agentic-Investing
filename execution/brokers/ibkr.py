@@ -6,8 +6,9 @@ Live trading:   IBKR_PORT=7496  (TWS Live or IB Gateway Live)
 Safety rules enforced here:
 - C1: order submission blocked unless caller has already obtained "YES"
       (enforced by OrderManager, not here - this class blindly submits)
-- C8: raises EnvironmentError if PAPER_TRADING=false and 4-week paper-run
-      gate has not been cleared (checked via env var PAPER_RUN_CLEARED)
+- C8: raises EnvironmentError if PAPER_TRADING=false and the 4-week automated
+      paper-trading qualification has not been cleared (checked via env var
+      PAPER_RUN_CLEARED)
 - C9: the live vs. paper switch is governed entirely by IBKR_PORT +
       PAPER_TRADING env vars; never hardcoded.
 """
@@ -77,7 +78,7 @@ class IBKRBroker(BaseBroker):
         self._validate_paper_trading_flag()
 
     def _validate_paper_trading_flag(self) -> None:
-        """Enforce C8/C9: live trading gate requires explicit opt-in + 4-week paper run.
+        """Enforce C8/C9: live trading gate requires explicit opt-in + paper qualification.
 
         Rules:
         - Port 7496 (live) requires PAPER_TRADING=false explicitly set.
@@ -104,7 +105,7 @@ class IBKRBroker(BaseBroker):
             if cleared != "true":
                 raise OSError(
                     "Live trading requires PAPER_RUN_CLEARED=true.  "
-                    "Confirm 4 consecutive weeks of clean paper trading before switching (C8)."
+                    "Confirm 4 consecutive weeks of clean automated paper trading before switching (C8)."
                 )
 
     # Connection

@@ -65,12 +65,18 @@ Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
 **Last recorded validation:** 675 local tests passed on 2026-06-20; the
 paper/execution/risk subset passed with 213 tests.
 
-Exit criterion for Phase 4: 4 consecutive weeks of paper trading with zero
-critical bugs; circuit breaker fire-drill test. A tiny IBKR paper submission
-probe has succeeded on port 7497, but the 4-week paper-trading phase gate is
-not complete. No real capital is at risk. The IBKR paper account connection
-(port 7497) has been smoke-tested, including a Canadian CAD NAV account with
-USD-equivalent NAV conversion.
+Exit criterion for the current supervised Phase 4 plumbing rehearsal: 4
+consecutive trading days of operator-run paper workflow with zero critical
+operational bugs, plus a circuit breaker fire-drill test. A tiny IBKR paper
+submission probe has succeeded on port 7497, but the 4-day supervised plumbing
+rehearsal is not complete. No real capital is at risk. The IBKR paper account
+connection (port 7497) has been smoke-tested, including a Canadian CAD NAV
+account with USD-equivalent NAV conversion.
+
+After the supervised plumbing rehearsal, the next major phase is strategy and
+automation: build automated trade/hold/reduce/increase decisioning, then run a
+separate 4-week automated paper-trading qualification before any live-capital
+discussion.
 
 ---
 
@@ -87,7 +93,7 @@ These are non-negotiable. If you are ever about to violate one, stop and ask the
 | C5 | Never put API keys, secrets, or passwords in source code, committed config files, or logs | Use `.env` (gitignored) or Vault. Reference `os.environ` in code. |
 | C6 | Never modify a strategy config YAML that has been used in a live session — create a new version | Create `v{N+1}_{description}.yaml`. |
 | C7 | Never run a backtest without recording the data snapshot version in MLflow | Pass `data_version` to the backtest call. |
-| C8 | Never switch from paper trading to live capital without a 4-week clean paper-trading run | This is a phase gate. Escalate to the operator. |
+| C8 | Never switch from paper trading to live capital without a 4-week clean automated paper-trading qualification | The 4-day supervised plumbing rehearsal is not enough for live capital. Escalate to the operator. |
 | C9 | Before any destructive infrastructure action (drop table, delete from object storage, cancel all orders, switch to live), display the action and require `"YES"` | Display → confirm → act. |
 
 ---

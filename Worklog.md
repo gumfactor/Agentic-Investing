@@ -14,6 +14,45 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-21
 
+### Session 38 - Phase Gate Duration Reframe
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/finalplumbing`
+**Commits:** phase gate duration reframe slice
+
+---
+
+#### What was decided
+
+[DECISION] Split the paper-trading validation into two distinct phases:
+
+- The current supervised plumbing rehearsal is now a 4-consecutive-trading-day
+  operator-run paper workflow check.
+- The later strategy/automation phase must include a separate 4-week automated
+  paper-trading qualification before any live-capital discussion.
+
+This reflects the operator's clarification that the current manual workflow is
+testing plumbing, not strategy quality or unattended trading behavior.
+
+#### What was updated
+
+- `PRD.md` now defines the Phase 4 exit criterion as 4 supervised trading days
+  without a critical operational bug, plus the circuit-breaker fire drill.
+- `PRD.md` now moves the 4-week requirement to a Phase 5 automated paper-trading
+  qualification before live capital.
+- `CLAUDE.md` and `docs/runbooks/daily_paper_trading.md` now use the same split.
+- `execution/brokers/ibkr.py` keeps the live-capital safety gate unchanged but
+  clarifies that `PAPER_RUN_CLEARED=true` represents the later 4-week automated
+  paper-trading qualification, not the 4-day supervised plumbing rehearsal.
+
+#### Status
+
+No trading behavior changed. The live broker gate remains closed unless
+`PAPER_TRADING=false`, live port `7496`, and `PAPER_RUN_CLEARED=true` are all
+explicitly set after the future automated qualification.
+
+---
+
 ### Session 37 - Final Phase 4 Operational Ledger Plumbing
 
 **Operator:** mshane@thecanadalist.ca
