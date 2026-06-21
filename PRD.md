@@ -655,25 +655,34 @@ ongoing research objective, not a prerequisite for beginning Phase 3.
 | M4.6 | Real-time risk monitor + alert system | Engineering | 25 |
 | M4.7 | Circuit breaker operational and tested | Engineering | 26 |
 
-**Exit criterion:** Paper trading loop runs for 4 consecutive weeks without a critical bug; circuit breaker successfully halts orders in a fire-drill test.
+**Exit criterion:** The supervised paper-trading plumbing rehearsal runs for 4
+consecutive trading days without a critical operational bug; circuit breaker
+successfully halts orders in a fire-drill test. This closes the manual plumbing
+phase only. Before live capital, the system must later complete a separate
+4-week automated paper-trading qualification period.
 
 ---
 
-### Phase 5 — Reporting & Live Trading (Weeks 27–36)
-**Goal:** Investor-ready reporting; live trading with real capital (small allocation).
+### Phase 5 — Automated Paper Trading, Reporting & Live Trading (Weeks 27–36)
+**Goal:** Automate daily paper-trading decisions, produce investor-ready
+reporting, and only then prepare live trading with real capital (small
+allocation).
 
 | # | Deliverable | Owner | Week |
 |---|------------|-------|------|
 | M5.1 | Streamlit dashboard with positions, risk, PnL | Engineering | 28 |
 | M5.2 | Daily and monthly tearsheet generation | Quant | 29 |
-| M5.3 | IBKR live trading integration | Engineering | 31 |
+| M5.3 | 4-week automated IBKR paper-trading qualification | Engineering | 31 |
 | M5.4 | Full Airflow DAG for daily operations | Engineering | 32 |
 | M5.5 | Security review of all live-trading code paths | Security | 33 |
 | M5.6 | Live trading go-live (small capital, tight limits) | All | 34 |
 | M5.7 | `monitor` and `report` skills operational | Engineering | 35 |
 | M5.8 | Post-launch stability review | All | 36 |
 
-**Exit criterion:** System operates live for 4 weeks; no critical incidents; all hard breach thresholds respected; tearsheets delivered on schedule.
+**Exit criterion:** The automated paper-trading system completes 4 weeks without
+critical operational incidents, live go-live receives explicit approval, and
+then the live system operates for 4 weeks with no critical incidents, all hard
+breach thresholds respected, and tearsheets delivered on schedule.
 
 ---
 
@@ -892,7 +901,10 @@ This section defines hard rules. Any proposed change that violates these rules r
 
 ### C8 — Paper Trading Before Live Capital (Phase Gate)
 
-**Rule:** No real capital may be deployed until the system has operated in paper trading mode for a minimum of 4 continuous weeks with zero critical incidents.
+**Rule:** No real capital may be deployed until the automated paper-trading
+system has operated for a minimum of 4 continuous weeks with zero critical
+incidents. The earlier 4-day supervised plumbing rehearsal does not satisfy
+this live-capital phase gate.
 
 **Critical incident definition:** Any of the following:
 - An order submitted without human confirmation

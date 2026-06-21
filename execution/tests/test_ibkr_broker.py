@@ -119,6 +119,56 @@ class FakeIBForWhatIf(FakeIB):
         )
 
 
+class FakeIBForOrderStatus(FakeIB):
+    def __init__(
+        self,
+        *,
+        trades=None,
+        open_trades=None,
+        completed_orders=None,
+        req_completed_orders=None,
+    ) -> None:
+        super().__init__([])
+        self._trades = trades or []
+        self._open_trades = open_trades or []
+        self._completed_orders = completed_orders
+        self._req_completed_orders = req_completed_orders
+        self.req_open_orders_called = False
+        self.req_completed_orders_called = False
+
+    def trades(self):
+        return self._trades
+
+    def openTrades(self):
+        return self._open_trades
+
+    def reqOpenOrders(self):
+        self.req_open_orders_called = True
+
+    def completedOrders(self):
+        if self._completed_orders is None:
+            raise AttributeError("completedOrders unavailable")
+        return self._completed_orders
+
+    def reqCompletedOrders(self, *, apiOnly: bool):
+        self.req_completed_orders_called = True
+        return self._req_completed_orders or []
+
+
+def _trade(order_id: int, status: str, filled: float, remaining: float, avg_price: float):
+    return SimpleNamespace(
+        order=SimpleNamespace(orderId=order_id),
+        orderStatus=SimpleNamespace(
+            status=status,
+            filled=filled,
+            remaining=remaining,
+            avgFillPrice=avg_price,
+            lastFillPrice=avg_price,
+            whyHeld="",
+        ),
+    )
+
+
 def _account_value(tag: str, value: str, currency: str):
     return SimpleNamespace(tag=tag, value=value, currency=currency)
 
@@ -334,3 +384,60 @@ def test_what_if_order_returns_margin_summary():
 
     assert broker.what_if_order(order)["status"] == "PreSubmitted"
     assert fake_ib.last_order.tif == "DAY"
+
+
+def test_get_order_status_reads_open_trade_by_broker_id():
+    broker = _broker([])
+    broker._submitted = {}
+    broker._ib = FakeIBForOrderStatus(open_trades=[_trade(3, "Submitted", 0.0, 1.0, 0.0)])
+
+    status = broker.get_order_status("3")
+
+    assert status == {
+        "broker_order_id": "3",
+        "status": "Submitted",
+        "filled_quantity": 0.0,
+        "remaining_quantity": 1.0,
+        "avg_price": 0.0,
+        "last_fill_price": 0.0,
+        "why_held": "",
+    }
+
+
+def test_get_order_status_requests_open_orders_before_returning_unknown():
+    broker = _broker([])
+    broker._submitted = {}
+    fake_ib = FakeIBForOrderStatus()
+    broker._ib = fake_ib
+
+    assert broker.get_order_status("999") is None
+    assert fake_ib.req_open_orders_called is True
+
+
+def test_get_order_status_reads_completed_order():
+    broker = _broker([])
+    broker._submitted = {}
+    broker._ib = FakeIBForOrderStatus(completed_orders=[_trade(4, "Filled", 1.0, 0.0, 33.03)])
+
+    assert broker.get_order_status("4") == {
+        "broker_order_id": "4",
+        "status": "Filled",
+        "filled_quantity": 1.0,
+        "remaining_quantity": 0.0,
+        "avg_price": 33.03,
+        "last_fill_price": 33.03,
+        "why_held": "",
+    }
+
+
+def test_get_order_status_still_handles_completed_bare_order():
+    broker = _broker([])
+    broker._submitted = {}
+    broker._ib = FakeIBForOrderStatus(completed_orders=[SimpleNamespace(orderId=5)])
+
+    assert broker.get_order_status("5") == {
+        "broker_order_id": "5",
+        "status": "Completed",
+        "filled_quantity": None,
+        "avg_price": None,
+    }

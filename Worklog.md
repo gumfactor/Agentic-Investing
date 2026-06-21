@@ -12,7 +12,259 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-21
+
+### Session 39 - PR Review Follow-up
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/finalplumbing`
+**Commits:** PR review follow-up slice
+
+---
+
+#### What was fixed
+
+[RESOLVED] Addressed Turing's PR review finding that durable order reconciliation
+could previously mark any returned broker status as reconciled. The durable
+paper order reconciliation now fails closed for unacceptable or unknown broker
+states, records `broker_status_clean` and `status_issue` per order, and writes
+aggregate clean/status-issue counts into the artifact.
+
+[RESOLVED] Addressed Turing's PR review finding that the runbook supported failed
+submission days but the operational ledger had no matching decision. `FAILED` is
+now a first-class ledger decision, and the runbook includes the matching failed
+submission ledger command.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_whatif_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py tests\test_paper_order_reconcile_check.py tests\test_paper_operational_ledger_check.py -q` passed: 146 tests.
+- `.\.venv\Scripts\python.exe -m ruff check ...` passed on the paper-trading script/test surface.
+- `git diff --check` passed.
+
+---
+
+### Session 38 - Phase Gate Duration Reframe
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/finalplumbing`
+**Commits:** phase gate duration reframe slice
+
+---
+
+#### What was decided
+
+[DECISION] Split the paper-trading validation into two distinct phases:
+
+- The current supervised plumbing rehearsal is now a 4-consecutive-trading-day
+  operator-run paper workflow check.
+- The later strategy/automation phase must include a separate 4-week automated
+  paper-trading qualification before any live-capital discussion.
+
+This reflects the operator's clarification that the current manual workflow is
+testing plumbing, not strategy quality or unattended trading behavior.
+
+#### What was updated
+
+- `PRD.md` now defines the Phase 4 exit criterion as 4 supervised trading days
+  without a critical operational bug, plus the circuit-breaker fire drill.
+- `PRD.md` now moves the 4-week requirement to a Phase 5 automated paper-trading
+  qualification before live capital.
+- `CLAUDE.md` and `docs/runbooks/daily_paper_trading.md` now use the same split.
+- `execution/brokers/ibkr.py` keeps the live-capital safety gate unchanged but
+  clarifies that `PAPER_RUN_CLEARED=true` represents the later 4-week automated
+  paper-trading qualification, not the 4-day supervised plumbing rehearsal.
+
+#### Status
+
+No trading behavior changed. The live broker gate remains closed unless
+`PAPER_TRADING=false`, live port `7496`, and `PAPER_RUN_CLEARED=true` are all
+explicitly set after the future automated qualification.
+
+---
+
+### Session 37 - Final Phase 4 Operational Ledger Plumbing
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/finalplumbing`
+**Commits:** final plumbing implementation slice
+
+---
+
+#### What was done
+
+Added the final local paper-trading operational state scaffold. The new
+`scripts.paper_operational_ledger_check` command validates existing Step 8 audit,
+Step 7 reconciliation, and durable order reconciliation artifacts, then appends
+one checksum-bearing JSONL record to a local operational ledger. It can also
+write a compact daily JSON report for quick review.
+
+#### Safety
+
+- No database migration was added; this is a reversible local artifact ledger.
+- The command is read-only with respect to broker and prior run artifacts.
+- It never connects to IBKR, submits or cancels orders, resets/trips circuit
+  breakers, mutates prior artifacts, or consumes human `YES`.
+- `COMPLETE` is rejected unless a durable order reconciliation artifact exists
+  and has status `RECONCILED`, exact Step 7 order coverage, all statuses found,
+  and zero durable query errors.
+- `MONITOR` remains available for submitted days with unresolved broker
+  order/fill uncertainty.
+- Ledger validation mirrors paper-safety metadata from the Step 7 and durable
+  reconciliation artifacts before accepting them as phase-gate evidence.
+
+#### Verification
+
+- Focused tests passed:
+  `python -m pytest tests\test_paper_operational_ledger_check.py tests\test_paper_run_audit_check.py tests\test_paper_order_reconcile_check.py -q`
+  passed: `39 passed`.
+- Full paper workflow command tests passed:
+  `python -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_whatif_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py tests\test_paper_order_reconcile_check.py tests\test_paper_operational_ledger_check.py -q`
+  passed: `142 passed`.
+- Focused lint passed:
+  `python -m ruff check reporting\audit\paper_operational_ledger.py scripts\paper_operational_ledger_check.py tests\test_paper_operational_ledger_check.py`.
+- Independent adversarial review found and fixed blockers around false
+  `COMPLETE` acceptance, missing safety metadata checks, `NO_TRADE` semantics,
+  report preflight ordering, and negative test coverage.
+
+#### Status and next actions
+
+- Daily paper runs can now retain Step 8 audit artifacts, durable
+  reconciliation artifacts, submitted order/fill records, circuit-breaker
+  notes, and the operator's daily decision in one append-only local ledger from
+  day one.
+- The next operational action remains durable reconciliation of the tiny
+  APA/HAL/HPE paper probe before any larger paper allocation.
+
+---
+
 ## 2026-06-20
+
+### Session 36 - Daily Paper Trading Runbook
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/IBKR-testing`
+**Commits:** daily paper-trading runbook slice
+
+---
+
+#### What was done
+
+Added `docs/runbooks/daily_paper_trading.md` as the P1 operator checklist for
+the daily IBKR paper-trading workflow. The runbook covers data refresh, score
+refresh, readiness, the operator-provided portfolio snapshot, Steps 2-6,
+Step 7.5 what-if validation, Step 7 display/submit/reconcile, Step 8 audit, and
+next-day durable order reconciliation.
+
+#### Safety
+
+- Keeps the workflow paper-only on port `7497`.
+- Requires `PAPER_RUN_CLEARED` to be absent or false.
+- Keeps literal `YES` isolated to the Step 7 submission command.
+- Separates tiny APA/HAL/HPE probe artifacts from full-allocation artifacts.
+- Documents that unresolved durable reconciliation statuses `UNKNOWN` and
+  `PARTIAL` write an artifact, exit nonzero, and require manual TWS/Gateway
+  follow-up before scaling paper allocation.
+- Adds a minimal `CLAUDE.md` pointer to the new runbook.
+
+#### Verification
+
+- Documentation-only slice. No IBKR connection or trading command was run.
+- Path existence checks passed for the new runbook, the existing fire-drill
+  runbook, the strategy config, and the durable reconciliation script.
+- Grep sanity checks covered paper safety terms, tiny/full artifact paths,
+  Step 7 `--confirm YES`, Step 7.5, Step 8, and durable reconciliation text.
+- Script help sanity checks passed for the paper readiness, stage blotter,
+  submit/reconcile, what-if, run audit, and durable reconciliation commands.
+- Independent adversarial review found and fixed three operator-readiness
+  blockers:
+  - The default readiness command no longer sets a placeholder manual FX rate;
+    manual CAD-to-USD fallback is now a separate optional numeric block.
+  - New daily runs now use `$RunStamp` artifact variables, and the portfolio
+    snapshot block fails if the target snapshot already exists.
+  - `COMPLETE` is now described as an operational label requiring a separate
+    clean durable reconciliation artifact; Step 8 no longer implies it proves
+    durable reconciliation by itself.
+- Post-review checks passed: targeted safety/path greps, ASCII check for the
+  new runbook, `git diff --check`, and `--help` for every `scripts.paper_*`
+  command referenced by the runbook.
+
+#### Status and next actions
+
+- The runbook is ready for review against the Phase 4 paper workflow.
+- The next operational action remains durable reconciliation of the tiny
+  APA/HAL/HPE paper probe before any larger paper allocation.
+
+---
+
+### Session 35 - Durable Paper Order Reconciliation Slice
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `main`
+**Commits:** uncommitted P1 implementation
+
+---
+
+#### What was done
+
+Added a read-only durable paper order reconciliation slice for post-Step 7
+paper submissions. The new command validates an existing Step 7
+`paper_submit_reconciliation` artifact, reconnects only to the IBKR paper
+socket, queries current broker order/fill status for each recorded
+`broker_order_id`, and writes a separate local
+`paper_order_reconciliation` artifact for phase-gate evidence.
+
+#### Safety
+
+- Requires `PAPER_TRADING=true` and `IBKR_PORT=7497`.
+- Rejects `PAPER_RUN_CLEARED=true`.
+- Verifies paper broker metadata before and after connection.
+- Never submits orders, cancels orders, resets/trips circuit breakers, mutates
+  prior artifacts, supports live port `7496`, or consumes human `YES`.
+- Per-order broker lookup failures are captured in the output artifact with
+  status `PARTIAL` instead of hiding the uncertainty; unresolved `PARTIAL` or
+  `UNKNOWN` reconciliation exits nonzero after writing the artifact.
+
+#### Verification
+
+- Focused reconciliation and IBKR broker tests:
+  `python -m pytest tests\test_paper_order_reconcile_check.py execution\tests\test_ibkr_broker.py -q`
+  passed: `41 passed`.
+
+#### Status and next actions
+
+- The next operator action for the tiny APA/HAL/HPE paper probe is to run the
+  durable reconciliation command against `local/paper_submit_reconciliation_small.json`
+  once TWS/Gateway paper is available, then retain the generated artifact with
+  the Step 8 audit record.
+
+---
+
+### Session 34 - P0 Paper Trading Orientation Cleanup
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `main`
+**Commits:** uncommitted documentation cleanup
+
+---
+
+#### What was done
+
+Updated the project orientation in `CLAUDE.md` after the successful tiny IBKR
+paper submission probe. The previous orientation still said Phase 4 paper
+trading had not begun, Step 7 was operationally blocked by stale
+`alpha_scores`, and the active branch was `local/linking-to-IBKR`.
+
+#### Current status
+
+- The implementation is merged on `main`.
+- The stale `alpha_scores` blocker was cleared for the 2026-06-20 paper
+  dry-run/submission rehearsal.
+- The full 50-order whole-share blotter passed IBKR paper what-if validation.
+- Only the deliberately tiny three-order paper probe was submitted.
+- Durable post-submission reconciliation of broker order IDs remains the next
+  P1 engineering slice before scaling paper allocation.
+
+---
 
 ### Session 33 - Tiny Step 7 Paper Submission Probe
 
