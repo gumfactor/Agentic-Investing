@@ -411,6 +411,13 @@ for the 50-order blotter and a `SUBMITTED` audit record for the tiny three-order
 paper probe. Next required operational step is durable post-submission
 reconciliation of the recorded broker order IDs before scaling paper allocation.
 
+## Phase 4 daily paper-trading runbook
+
+Use `docs/runbooks/daily_paper_trading.md` as the operator checklist for the
+daily paper workflow. It covers data refresh, score refresh, readiness,
+portfolio snapshot, Steps 2-8, Step 7.5 what-if validation, tiny-probe versus
+full-allocation artifacts, and next-day durable reconciliation.
+
 ---
 
 ## Conventions

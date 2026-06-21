@@ -14,6 +14,63 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-20
 
+### Session 36 - Daily Paper Trading Runbook
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/IBKR-testing`
+**Commits:** daily paper-trading runbook slice
+
+---
+
+#### What was done
+
+Added `docs/runbooks/daily_paper_trading.md` as the P1 operator checklist for
+the daily IBKR paper-trading workflow. The runbook covers data refresh, score
+refresh, readiness, the operator-provided portfolio snapshot, Steps 2-6,
+Step 7.5 what-if validation, Step 7 display/submit/reconcile, Step 8 audit, and
+next-day durable order reconciliation.
+
+#### Safety
+
+- Keeps the workflow paper-only on port `7497`.
+- Requires `PAPER_RUN_CLEARED` to be absent or false.
+- Keeps literal `YES` isolated to the Step 7 submission command.
+- Separates tiny APA/HAL/HPE probe artifacts from full-allocation artifacts.
+- Documents that unresolved durable reconciliation statuses `UNKNOWN` and
+  `PARTIAL` write an artifact, exit nonzero, and require manual TWS/Gateway
+  follow-up before scaling paper allocation.
+- Adds a minimal `CLAUDE.md` pointer to the new runbook.
+
+#### Verification
+
+- Documentation-only slice. No IBKR connection or trading command was run.
+- Path existence checks passed for the new runbook, the existing fire-drill
+  runbook, the strategy config, and the durable reconciliation script.
+- Grep sanity checks covered paper safety terms, tiny/full artifact paths,
+  Step 7 `--confirm YES`, Step 7.5, Step 8, and durable reconciliation text.
+- Script help sanity checks passed for the paper readiness, stage blotter,
+  submit/reconcile, what-if, run audit, and durable reconciliation commands.
+- Independent adversarial review found and fixed three operator-readiness
+  blockers:
+  - The default readiness command no longer sets a placeholder manual FX rate;
+    manual CAD-to-USD fallback is now a separate optional numeric block.
+  - New daily runs now use `$RunStamp` artifact variables, and the portfolio
+    snapshot block fails if the target snapshot already exists.
+  - `COMPLETE` is now described as an operational label requiring a separate
+    clean durable reconciliation artifact; Step 8 no longer implies it proves
+    durable reconciliation by itself.
+- Post-review checks passed: targeted safety/path greps, ASCII check for the
+  new runbook, `git diff --check`, and `--help` for every `scripts.paper_*`
+  command referenced by the runbook.
+
+#### Status and next actions
+
+- The runbook is ready for review against the Phase 4 paper workflow.
+- The next operational action remains durable reconciliation of the tiny
+  APA/HAL/HPE paper probe before any larger paper allocation.
+
+---
+
 ### Session 35 - Durable Paper Order Reconciliation Slice
 
 **Operator:** mshane@thecanadalist.ca
