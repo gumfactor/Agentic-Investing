@@ -70,6 +70,29 @@ def _write_blocked_audit(tmp_path: Path) -> Path:
     return audit_path
 
 
+def _write_failed_audit(tmp_path: Path) -> tuple[Path, Path, Path]:
+    blotter_path = _write_blotter(tmp_path)
+    reconciliation_path = _write_reconciliation(tmp_path, blotter_path, status="FAILED")
+    audit_path = tmp_path / "paper_run_audit_failed.json"
+    result = audit_check.run(
+        [
+            "--blotter",
+            str(blotter_path),
+            "--reconciliation",
+            str(reconciliation_path),
+            "--status",
+            "FAILED",
+            "--output",
+            str(audit_path),
+        ],
+        now_fn=lambda: datetime(2026, 6, 20, 16, 0, tzinfo=UTC),
+        run_id_factory=lambda: "step-8-failed",
+        git_metadata_factory=_git_metadata,
+    )
+    assert result == 0
+    return blotter_path, reconciliation_path, audit_path
+
+
 def _write_order_reconciliation(tmp_path: Path, reconciliation_path: Path, *, status: str = "RECONCILED") -> Path:
     reconciliation = json.loads(reconciliation_path.read_text(encoding="utf-8"))
     path = tmp_path / "paper_order_reconciliation.json"
@@ -83,6 +106,8 @@ def _write_order_reconciliation(tmp_path: Path, reconciliation_path: Path, *, st
             "broker_order_id": row["broker_order_id"],
             "query_ok": True,
             "status_found": status == "RECONCILED",
+            "broker_status_clean": status == "RECONCILED",
+            "status_issue": None if status == "RECONCILED" else "missing_broker_status",
             "broker_status": None
             if status != "RECONCILED"
             else {
@@ -115,6 +140,8 @@ def _write_order_reconciliation(tmp_path: Path, reconciliation_path: Path, *, st
         "order_count": len(results),
         "status_found_count": sum(1 for row in results if row["status_found"]),
         "query_error_count": 0,
+        "clean_broker_status_count": sum(1 for row in results if row["broker_status_clean"]),
+        "status_issue_count": sum(1 for row in results if row["status_issue"]),
         "results": results,
         "safety": {
             "paper_env_required": True,
@@ -332,6 +359,43 @@ def test_complete_rejects_incomplete_durable_reconciliation_counts(tmp_path, cap
     assert not ledger_path.exists()
 
 
+def test_complete_rejects_unclean_durable_broker_status(tmp_path, capsys):
+    _, reconciliation_path, audit_path = _write_submitted_audit(tmp_path)
+    order_reconciliation_path = _write_order_reconciliation(tmp_path, reconciliation_path)
+    artifact = json.loads(order_reconciliation_path.read_text(encoding="utf-8"))
+    artifact["results"][0]["broker_status"]["status"] = "Cancelled"
+    artifact["results"][0]["broker_status_clean"] = False
+    artifact["results"][0]["status_issue"] = "unacceptable_broker_status:Cancelled"
+    artifact["clean_broker_status_count"] = 0
+    artifact["status_issue_count"] = 1
+    _rewrite_artifact(order_reconciliation_path, artifact, order_reconcile._artifact_checksum)
+    ledger_path = tmp_path / "paper_operational_ledger.jsonl"
+
+    result = check.run(
+        [
+            "--trading-date",
+            "2026-06-21",
+            "--decision",
+            "COMPLETE",
+            "--decision-reason",
+            "operator marked complete",
+            "--audit",
+            str(audit_path),
+            "--reconciliation",
+            str(reconciliation_path),
+            "--order-reconciliation",
+            str(order_reconciliation_path),
+            "--ledger",
+            str(ledger_path),
+        ],
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "clean_broker_status_count must equal order_count" in out
+    assert not ledger_path.exists()
+
+
 def test_rejects_unsafe_step7_safety_metadata_even_when_checksum_matches(tmp_path, capsys):
     _, reconciliation_path, _audit_path = _write_submitted_audit(tmp_path)
     reconciliation = json.loads(reconciliation_path.read_text(encoding="utf-8"))
@@ -410,6 +474,63 @@ def test_blocked_record_does_not_require_submission_artifacts(tmp_path, capsys):
     assert record["decision"] == "BLOCKED"
     assert record["summary"]["unresolved_blocker_count"] == 1
     assert "reconciliation" not in record["artifact_paths"]
+
+
+def test_failed_record_requires_failed_audit_and_reconciliation(tmp_path, capsys):
+    _, reconciliation_path, audit_path = _write_failed_audit(tmp_path)
+    ledger_path = tmp_path / "paper_operational_ledger.jsonl"
+
+    result = check.run(
+        [
+            "--trading-date",
+            "2026-06-20",
+            "--decision",
+            "FAILED",
+            "--decision-reason",
+            "paper submission failed after broker attempt",
+            "--audit",
+            str(audit_path),
+            "--reconciliation",
+            str(reconciliation_path),
+            "--ledger",
+            str(ledger_path),
+        ],
+        run_id_factory=lambda: "failed-ledger-run",
+    )
+
+    assert result == 0
+    record = _read_jsonl(ledger_path)[0]
+    assert record["decision"] == "FAILED"
+    assert record["summary"]["audit_status"] == "FAILED"
+    assert record["summary"]["step7_status"] == "FAILED"
+    assert record["orders"][0]["broker_order_id"] == "paper-1"
+
+
+def test_failed_record_rejects_submitted_reconciliation(tmp_path, capsys):
+    _, reconciliation_path, audit_path = _write_submitted_audit(tmp_path)
+    ledger_path = tmp_path / "paper_operational_ledger.jsonl"
+
+    result = check.run(
+        [
+            "--trading-date",
+            "2026-06-20",
+            "--decision",
+            "FAILED",
+            "--decision-reason",
+            "incorrectly marked failed",
+            "--audit",
+            str(audit_path),
+            "--reconciliation",
+            str(reconciliation_path),
+            "--ledger",
+            str(ledger_path),
+        ],
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "FAILED ledger decision requires Step 8 status FAILED" in out
+    assert not ledger_path.exists()
 
 
 def test_no_trade_rejects_submission_artifacts(tmp_path, capsys):

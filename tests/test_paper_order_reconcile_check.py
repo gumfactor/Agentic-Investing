@@ -79,11 +79,13 @@ class FakeStatusBroker:
         port: int = 7497,
         fail_order_id: str | None = None,
         missing_order_id: str | None = None,
+        statuses_by_order_id: dict[str, str] | None = None,
     ) -> None:
         self._paper = paper
         self._port = port
         self.fail_order_id = fail_order_id
         self.missing_order_id = missing_order_id
+        self.statuses_by_order_id = statuses_by_order_id or {}
         self.connected = False
         self.disconnected = False
         self.queried: list[str] = []
@@ -106,9 +108,10 @@ class FakeStatusBroker:
             raise RuntimeError("simulated status lookup failure")
         if broker_order_id == self.missing_order_id:
             return None
+        broker_status = self.statuses_by_order_id.get(broker_order_id, "Submitted")
         return {
             "broker_order_id": broker_order_id,
-            "status": "Submitted",
+            "status": broker_status,
             "filled_quantity": 0.0,
             "remaining_quantity": 1.0,
             "avg_price": 0.0,
@@ -166,6 +169,10 @@ def test_reconciles_submitted_orders_and_writes_artifact(tmp_path, capsys):
     assert artifact["order_count"] == 2
     assert artifact["status_found_count"] == 2
     assert artifact["query_error_count"] == 0
+    assert artifact["clean_broker_status_count"] == 2
+    assert artifact["status_issue_count"] == 0
+    assert artifact["results"][0]["broker_status_clean"] is True
+    assert artifact["results"][0]["status_issue"] is None
     assert artifact["results"][0]["broker_status"]["status"] == "Submitted"
     assert artifact["results"][1]["status_found"] is True
     assert artifact["safety"] == {
@@ -347,6 +354,31 @@ def test_broker_query_failure_is_recorded_in_artifact(tmp_path, capsys):
     assert artifact["status"] == "PARTIAL"
     assert artifact["query_error_count"] == 1
     assert artifact["results"][1]["error"] == "simulated status lookup failure"
+
+
+def test_unacceptable_broker_status_writes_partial_artifact_and_fails_closed(tmp_path, capsys):
+    source = _write_step7_reconciliation(tmp_path)
+    output = tmp_path / "paper_order_reconciliation.json"
+    fake = FakeStatusBroker(statuses_by_order_id={"4": "Cancelled"})
+
+    result = check.run(
+        ["--reconciliation", str(source), "--output", str(output)],
+        env=_env(),
+        broker_factory=lambda client_id: fake,
+        run_id_factory=lambda: "cancelled-status-run",
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "Paper durable order reconciliation: PARTIAL" in out
+    assert output.exists()
+    artifact = json.loads(output.read_text(encoding="utf-8"))
+    assert artifact["status"] == "PARTIAL"
+    assert artifact["status_found_count"] == 2
+    assert artifact["clean_broker_status_count"] == 1
+    assert artifact["status_issue_count"] == 1
+    assert artifact["results"][1]["broker_status_clean"] is False
+    assert artifact["results"][1]["status_issue"] == "unacceptable_broker_status:Cancelled"
 
 
 def test_missing_broker_status_writes_unknown_artifact_and_fails_closed(tmp_path, capsys):

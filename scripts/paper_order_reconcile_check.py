@@ -38,6 +38,20 @@ from scripts.paper_submit_reconcile_check import (
 )
 
 ORDER_RECONCILE_SCHEMA_VERSION = "paper_order_reconcile.v1"
+ACCEPTABLE_BROKER_STATUSES = {
+    "FILLED",
+    "PARTIALLYFILLED",
+    "PENDING",
+    "PENDINGSUBMIT",
+    "PRESUBMITTED",
+    "SUBMITTED",
+}
+UNACCEPTABLE_BROKER_STATUSES = {
+    "APICANCELLED",
+    "CANCELLED",
+    "INACTIVE",
+    "REJECTED",
+}
 
 
 class OrderStatusBroker(Protocol):
@@ -206,6 +220,21 @@ def _status_summary(status: Mapping[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _normalize_broker_status(status: Any) -> str:
+    return str(status or "").replace(" ", "").replace("_", "").upper()
+
+
+def _broker_status_issue(status: Mapping[str, Any] | None) -> str | None:
+    if status is None:
+        return None
+    normalized = _normalize_broker_status(status.get("status"))
+    if normalized in UNACCEPTABLE_BROKER_STATUSES:
+        return f"unacceptable_broker_status:{status.get('status')}"
+    if normalized not in ACCEPTABLE_BROKER_STATUSES:
+        return f"unknown_broker_status:{status.get('status')}"
+    return None
+
+
 def _reconcile_orders(
     reconciliation: Mapping[str, Any],
     broker: OrderStatusBroker,
@@ -226,13 +255,18 @@ def _reconcile_orders(
             "broker_order_id": broker_order_id,
             "query_ok": False,
             "status_found": False,
+            "broker_status_clean": False,
+            "status_issue": None,
             "broker_status": None,
             "error": None,
         }
         try:
             status = broker.get_order_status(broker_order_id)
+            status_issue = _broker_status_issue(status)
             result["query_ok"] = True
             result["status_found"] = status is not None
+            result["broker_status_clean"] = status_issue is None
+            result["status_issue"] = status_issue
             result["broker_status"] = _status_summary(status)
         except Exception as exc:
             result["error"] = str(exc)
@@ -242,6 +276,8 @@ def _reconcile_orders(
 
 def _artifact_status(results: list[Mapping[str, Any]]) -> str:
     if any(row.get("error") for row in results):
+        return "PARTIAL"
+    if any(row.get("status_issue") for row in results):
         return "PARTIAL"
     if all(row.get("status_found") for row in results):
         return "RECONCILED"
@@ -258,6 +294,8 @@ def _build_artifact(
 ) -> dict[str, Any]:
     found_count = sum(1 for row in results if row["status_found"])
     error_count = sum(1 for row in results if row["error"])
+    clean_status_count = sum(1 for row in results if row["broker_status_clean"])
+    status_issue_count = sum(1 for row in results if row["status_issue"])
     artifact = {
         "schema_version": ORDER_RECONCILE_SCHEMA_VERSION,
         "artifact_type": "paper_order_reconciliation",
@@ -275,6 +313,8 @@ def _build_artifact(
         "order_count": len(results),
         "status_found_count": found_count,
         "query_error_count": error_count,
+        "clean_broker_status_count": clean_status_count,
+        "status_issue_count": status_issue_count,
         "results": results,
         "safety": {
             "paper_env_required": True,

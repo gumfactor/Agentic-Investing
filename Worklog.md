@@ -14,6 +14,35 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-21
 
+### Session 39 - PR Review Follow-up
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `local/finalplumbing`
+**Commits:** PR review follow-up slice
+
+---
+
+#### What was fixed
+
+[RESOLVED] Addressed Turing's PR review finding that durable order reconciliation
+could previously mark any returned broker status as reconciled. The durable
+paper order reconciliation now fails closed for unacceptable or unknown broker
+states, records `broker_status_clean` and `status_issue` per order, and writes
+aggregate clean/status-issue counts into the artifact.
+
+[RESOLVED] Addressed Turing's PR review finding that the runbook supported failed
+submission days but the operational ledger had no matching decision. `FAILED` is
+now a first-class ledger decision, and the runbook includes the matching failed
+submission ledger command.
+
+#### Validation
+
+- `.\.venv\Scripts\python.exe -m pytest tests\test_paper_readiness_check.py tests\test_paper_inputs_check.py tests\test_paper_target_check.py tests\test_paper_order_candidates_check.py tests\test_paper_risk_compliance_check.py tests\test_paper_stage_blotter_check.py tests\test_paper_whatif_check.py tests\test_paper_submit_reconcile_check.py tests\test_paper_run_audit_check.py tests\test_paper_order_reconcile_check.py tests\test_paper_operational_ledger_check.py -q` passed: 146 tests.
+- `.\.venv\Scripts\python.exe -m ruff check ...` passed on the paper-trading script/test surface.
+- `git diff --check` passed.
+
+---
+
 ### Session 38 - Phase Gate Duration Reframe
 
 **Operator:** mshane@thecanadalist.ca

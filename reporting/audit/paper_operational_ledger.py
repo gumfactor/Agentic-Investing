@@ -28,7 +28,7 @@ from scripts.paper_submit_reconcile_check import (
 LEDGER_SCHEMA_VERSION = "paper_operational_ledger.v1"
 LEDGER_RECORD_TYPE = "paper_daily_operational_record"
 REPORT_SCHEMA_VERSION = "paper_operational_report.v1"
-DECISIONS = {"BLOCKED", "DRY_RUN", "SUBMITTED", "MONITOR", "COMPLETE", "NO_TRADE"}
+DECISIONS = {"BLOCKED", "DRY_RUN", "SUBMITTED", "MONITOR", "COMPLETE", "NO_TRADE", "FAILED"}
 
 
 def _json_default(value: Any) -> str:
@@ -198,6 +198,10 @@ def _validate_cross_links(
             raise RuntimeError("Durable order reconciliation status_found_count must equal order_count")
         if order_reconciliation.get("query_error_count") != 0:
             raise RuntimeError("Durable order reconciliation query_error_count must be 0")
+        if order_reconciliation.get("clean_broker_status_count") != order_count:
+            raise RuntimeError("Durable order reconciliation clean_broker_status_count must equal order_count")
+        if order_reconciliation.get("status_issue_count") != 0:
+            raise RuntimeError("Durable order reconciliation status_issue_count must be 0")
     if str(audit_path) == str(reconciliation_path) or str(audit_path) == str(order_reconciliation_path):
         raise RuntimeError("Ledger source artifacts must be distinct files")
 
@@ -220,6 +224,13 @@ def _validate_decision(
         raise RuntimeError(f"{decision} ledger decision requires a Step 7 reconciliation artifact")
     if decision == "SUBMITTED" and audit_status != "SUBMITTED":
         raise RuntimeError("SUBMITTED ledger decision requires Step 8 status SUBMITTED")
+    if decision == "FAILED":
+        if audit_status != "FAILED":
+            raise RuntimeError("FAILED ledger decision requires Step 8 status FAILED")
+        if reconciliation is None:
+            raise RuntimeError("FAILED ledger decision requires a Step 7 reconciliation artifact")
+        if reconciliation.get("status") != "FAILED":
+            raise RuntimeError("FAILED ledger decision requires reconciliation status FAILED")
     if decision == "MONITOR":
         if audit_status != "SUBMITTED":
             raise RuntimeError("MONITOR ledger decision requires Step 8 status SUBMITTED")

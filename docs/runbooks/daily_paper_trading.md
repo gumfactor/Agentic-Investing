@@ -359,6 +359,12 @@ Submitted day that still needs durable reconciliation:
 .\.venv\Scripts\python.exe -m scripts.paper_operational_ledger_check --trading-date (Get-Date -Format yyyy-MM-dd) --decision SUBMITTED --decision-reason "paper orders submitted; durable reconciliation pending" --audit $AuditPath --reconciliation $SubmitReconciliationPath --ledger $LedgerPath --output-report $ReportPath --circuit-breaker-event "no circuit breaker events observed"
 ```
 
+Failed submission day:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.paper_operational_ledger_check --trading-date (Get-Date -Format yyyy-MM-dd) --decision FAILED --decision-reason "paper submission attempted and failed; inspect Step 7 reconciliation" --audit $AuditPath --reconciliation $SubmitReconciliationPath --ledger $LedgerPath --output-report $ReportPath
+```
+
 Complete day after clean durable reconciliation:
 
 ```powershell
