@@ -123,8 +123,8 @@ The system prioritizes:
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| Broker — IBKR | ib_insync | Async IBKR API wrapper |
-| Broker — Alpaca | alpaca-trade-api | REST + websocket; free paper trading |
+| Broker — IBKR | ib_insync | Async IBKR API wrapper — sole production broker (paper port 7497 / live port 7496) |
+| Broker — Alpaca | alpaca-trade-api | **Deferred** — dropped in Session 2; IBKR handles both paper and live |
 | Order management | Custom OMS (see features) | Full state machine; staged→pending→live→filled→cancelled |
 
 ### Infrastructure
@@ -349,7 +349,7 @@ rqis/
 
 #### F1.1 Market Data Ingestion
 - Pull OHLCV bars (daily) from yfinance (primary); Polygon.io deferred to Phase 2+ (see Session 2 decision)
-- Real-time quote stream via IBKR or Alpaca websocket
+- Real-time quote stream via IBKR websocket (Alpaca websocket deferred along with Alpaca broker)
 - Corporate actions: splits, dividends, spinoffs — applied retroactively with full audit log
 - **Point-in-time enforcement:** all historical joins use `as_of_date` parameter; no future data leaks
 
@@ -690,7 +690,7 @@ must precede the qualification run itself.
 | M5.1 | Strategy Registry — DB catalog of strategies with status (backtesting/paper/live/archived), config path, backtest metrics, and activation state | Engineering | 28 |
 | M5.2 | Unified trading journal — `execution/oms/trade_history.py` append-only fill store (P&L, timestamps, wash-sale history); feeds tearsheets and compliance | Engineering | 29 |
 | M5.3 | Daily and monthly tearsheet generation with charting output (backtest + paper performance unified; visual entry/exit charts so signals can be eyeballed against price) | Quant | 30 |
-| M5.4 | Full Airflow DAG for automated daily paper-trading operations (data refresh → scoring → target → candidates → risk/compliance → blotter → submit → reconcile → ledger) | Engineering | 32 |
+| M5.4 | Full Airflow DAG for automated daily paper-trading operations (data refresh → scoring → target → candidates → risk/compliance → blotter → operator blotter-review approval gate → submit → reconcile → ledger). C1 is satisfied at the daily-run level via the Airflow approval gate; no per-order YES required for paper. C1 remains in full force for all live submissions. | Engineering | 32 |
 | M5.5 | 4-week automated IBKR paper-trading qualification (no human per-trade intervention) | Engineering | 36 |
 | M5.6 | Additional strategy development — v3+ strategy configs + new signal modules (technical analysis signals, additional fundamental combos) | Quant | 37 |
 | M5.7 | Market regime detector — identify bull/bear/sideways/high-vol regimes; surface recommended strategy mix per regime | Quant | 38 |
@@ -834,8 +834,11 @@ This section defines hard rules. Any proposed change that violates these rules r
 - `execute_trade` skill displays: order list, estimated notional, net transaction cost estimate, pre-trade risk check results
 - Prompts: *"Confirm submission of [N] orders totaling [$X] notional? Type YES to proceed."*
 - Only the string `"YES"` (case-sensitive) triggers submission
-- This gate cannot be bypassed by any skill or automated process
+- This gate cannot be bypassed by any skill or automated process for **live** broker submissions
 - CI enforces: a unit test asserts that calling `OrderManager.submit()` without a `confirmation_token` raises `RequiresConfirmationError`
+
+**Paper-automation carve-out (Phase 5 Airflow DAG only):**
+The Phase 5 automated paper-trading qualification requires the DAG to run without a per-order YES prompt — that is the definition of unattended operation (C8). C1 is satisfied at the **daily-run level**: the operator authorises the day's paper run by approving the DAG trigger or the blotter-review step in Airflow. No individual order requires a separate YES. This carve-out applies strictly when `PAPER_TRADING=true` and `IBKR_PORT=7497`; any live-port (7496) code path retains the full per-submission C1 gate with no exceptions.
 
 **Why:** A submitted market order cannot be recalled once filled. Even a cancelled order may be partially filled. The cost of the confirmation prompt is seconds; the cost of an unintended order is potentially thousands of dollars and regulatory exposure.
 

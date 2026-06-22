@@ -86,8 +86,11 @@ sequence for Phase 5 is:
 3. **Tearsheets with charting output** — unified backtest + paper performance;
    visual entry/exit charts so signals can be eyeballed against price history.
 4. **Airflow DAG** — fully automated daily paper-trading pipeline (data refresh
-   → scoring → target → candidates → risk/compliance → blotter → submit →
-   reconcile → ledger). No human per-trade intervention.
+   → scoring → target → candidates → risk/compliance → blotter → operator
+   blotter-review approval gate → submit → reconcile → ledger). C1 is
+   satisfied at the daily-run level via the Airflow blotter-review approval
+   gate; no per-ORDER YES required for paper-only runs. C1 remains in full,
+   non-negotiable force for all live (port 7496) broker submissions.
 5. **4-week automated paper-trading qualification** — runs on top of the Airflow
    DAG; required before any live-capital discussion (C8).
 6. **Additional strategies** — new signal modules (technical analysis, additional
