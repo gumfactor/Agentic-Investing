@@ -64,7 +64,7 @@ The system prioritizes:
 - Daily and intraday (1-min bar) historical data
 - Factor-based signal library: value, momentum, quality, low-volatility, growth, sentiment
 - Mean-variance and risk-parity portfolio optimization
-- Paper trading and live trading via IBKR and Alpaca APIs
+- Paper trading and live trading via IBKR API (Alpaca deferred — IBKR only per Session 2 decision)
 - Event-driven backtesting engine with realistic fills and transaction costs
 - Real-time risk dashboard and breach alerting
 - Automated tearsheet generation (daily/weekly/monthly)
@@ -199,8 +199,9 @@ rqis/
 │   │   ├── momentum.py            # Price momentum, earnings momentum
 │   │   ├── quality.py             # ROE, ROIC, accruals, leverage
 │   │   ├── low_vol.py             # Beta, realized vol, idiosyncratic vol
-│   │   ├── growth.py              # Revenue/earnings growth, estimate revisions
-│   │   └── sentiment.py           # NLP scores, short interest, insider flow
+│   │   ├── growth.py              # Revenue/earnings growth, estimate revisions (Phase 5)
+│   │   ├── sentiment.py           # NLP scores, short interest, insider flow (Phase 5)
+│   │   └── technical.py           # MA crossovers, RSI, MACD, ATR, breakout (Phase 5)
 │   ├── research/
 │   │   ├── hypothesis_template.py # Standard research notebook template
 │   │   ├── statistical_tests.py   # IC, t-stats, multiple testing correction
@@ -228,11 +229,11 @@ rqis/
 │   ├── oms/
 │   │   ├── order.py               # Order dataclass + state machine
 │   │   ├── order_manager.py       # Staging, routing, cancellation
-│   │   └── compliance.py          # Pre-trade checks (wash sale, concentration)
+│   │   ├── compliance.py          # Pre-trade checks (wash sale, concentration)
+│   │   └── trade_history.py       # Append-only fill store for P&L + wash-sale history (Phase 5)
 │   ├── brokers/
 │   │   ├── base_broker.py         # Abstract interface
-│   │   ├── ibkr_broker.py
-│   │   └── alpaca_broker.py
+│   │   └── ibkr_broker.py         # sole production broker (Alpaca deferred)
 │   ├── algos/
 │   │   ├── twap.py
 │   │   ├── vwap.py
@@ -275,7 +276,8 @@ rqis/
 │   │   ├── performance.py         # Returns, Sharpe, drawdown, benchmark-rel
 │   │   └── factor_exposure.py     # What risks am I running?
 │   ├── audit/
-│   │   └── trade_log.py           # Signal → order → fill lineage
+│   │   ├── trade_log.py           # Signal → order → fill lineage
+│   │   └── paper_operational_ledger.py  # Append-only paper-run JSONL ledger
 │   ├── dashboards/
 │   │   ├── grafana/               # Dashboard JSON configs
 │   │   └── streamlit_app.py       # Internal stakeholder dashboard
@@ -305,8 +307,16 @@ rqis/
 ├── config/
 │   ├── settings.yaml              # Environment-specific config
 │   ├── universe.yaml              # Security eligibility rules
+│   ├── sector_map.yaml            # Ticker → GICS sector mapping (Phase 5)
 │   └── strategy/                  # Versioned strategy configs
-│       └── v1_base_momentum.yaml
+│       ├── v1_base_momentum.yaml
+│       └── v2_mvo_momentum.yaml
+│
+├── strategy_registry/             # Strategy catalog and activation management (Phase 5)
+│   ├── registry.py                # DB-backed catalog: id, status, config path, metrics
+│   ├── schema/
+│   │   └── strategy_registry.sql  # Alembic-managed table
+│   └── tests/
 │
 ├── notebooks/                     # Research notebooks (never run in prod)
 │   └── research/
@@ -338,7 +348,7 @@ rqis/
 ### F1 — Data Layer
 
 #### F1.1 Market Data Ingestion
-- Pull OHLCV bars (daily and 1-min) from Polygon.io (primary) and yfinance (fallback)
+- Pull OHLCV bars (daily) from yfinance (primary); Polygon.io deferred to Phase 2+ (see Session 2 decision)
 - Real-time quote stream via IBKR or Alpaca websocket
 - Corporate actions: splits, dividends, spinoffs — applied retroactively with full audit log
 - **Point-in-time enforcement:** all historical joins use `as_of_date` parameter; no future data leaks
@@ -375,6 +385,7 @@ Each factor produces a cross-sectional z-score (or rank percentile) per security
 | Low Volatility | 63-day realized vol, 1-year beta, idiosyncratic vol |
 | Growth | Revenue growth YoY, EPS growth YoY, EBITDA margin expansion |
 | Sentiment | Composite NLP score, short interest change, insider buy/sell ratio |
+| Technical Analysis | Moving average crossovers (SMA/EMA), RSI, MACD, Bollinger Bands, ATR, volume trends, breakout detection, relative strength vs. benchmark — all expressible as Python signal modules sharing the same factor infrastructure |
 
 #### F2.2 Signal Research Skill (`signal_research`)
 - Accepts hypothesis in natural language; Claude constructs data pull + validation plan
@@ -462,8 +473,8 @@ Run automatically before any order reaches `APPROVED`:
 
 #### F4.4 Broker Integration
 - Abstract `BaseBroker` interface; swap brokers via config only
-- IBKR: live trading (production)
-- Alpaca: paper trading and live trading (development / smaller accounts)
+- IBKR: paper trading (port 7497) and live trading (port 7496) — sole production broker
+- Alpaca: deferred (dropped in Session 2; re-evaluate if IBKR coverage gaps emerge)
 - Simulated broker: deterministic fill simulator for integration tests
 
 #### F4.5 Transaction Cost Model
@@ -650,7 +661,7 @@ ongoing research objective, not a prerequisite for beginning Phase 3.
 | M4.1 | MVO and risk-parity optimizers | Quant | 20 |
 | M4.2 | Constraint handler (position, sector, factor limits) | Quant | 21 |
 | M4.3 | OMS state machine + pre-trade compliance checks | Engineering | 22 |
-| M4.4 | Alpaca paper trading integration | Engineering | 23 |
+| M4.4 | IBKR paper trading integration — 8-step manual workflow (readiness → inputs → targets → candidates → risk/compliance → blotter → submit/reconcile → audit) | Engineering | 23 |
 | M4.5 | `portfolio_construct`, `risk_check`, `execute_trade` skills with approval gate | Engineering | 24 |
 | M4.6 | Real-time risk monitor + alert system | Engineering | 25 |
 | M4.7 | Circuit breaker operational and tested | Engineering | 26 |
@@ -663,25 +674,34 @@ phase only. Before live capital, the system must later complete a separate
 
 ---
 
-### Phase 5 — Automated Paper Trading, Reporting & Live Trading (Weeks 27–36)
-**Goal:** Automate daily paper-trading decisions, produce investor-ready
-reporting, and only then prepare live trading with real capital (small
-allocation).
+### Phase 5 — Strategy Library, Automated Paper Trading, Reporting & Live Trading (Weeks 27–42)
+**Goal:** Build the strategy management layer, automate daily paper-trading
+decisions, produce investor-ready reporting with visual output, add new
+strategies and a market regime detector, then prepare for live capital with a
+small allocation.
+
+Milestones are ordered by dependency. Strategy Registry must precede
+meaningful automation; tearsheets and trading journal must precede the
+4-week qualification so performance can be evaluated; Airflow automation
+must precede the qualification run itself.
 
 | # | Deliverable | Owner | Week |
 |---|------------|-------|------|
-| M5.1 | Streamlit dashboard with positions, risk, PnL | Engineering | 28 |
-| M5.2 | Daily and monthly tearsheet generation | Quant | 29 |
-| M5.3 | 4-week automated IBKR paper-trading qualification | Engineering | 31 |
-| M5.4 | Full Airflow DAG for daily operations | Engineering | 32 |
-| M5.5 | Security review of all live-trading code paths | Security | 33 |
-| M5.6 | Live trading go-live (small capital, tight limits) | All | 34 |
-| M5.7 | `monitor` and `report` skills operational | Engineering | 35 |
-| M5.8 | Post-launch stability review | All | 36 |
+| M5.1 | Strategy Registry — DB catalog of strategies with status (backtesting/paper/live/archived), config path, backtest metrics, and activation state | Engineering | 28 |
+| M5.2 | Unified trading journal — `execution/oms/trade_history.py` append-only fill store (P&L, timestamps, wash-sale history); feeds tearsheets and compliance | Engineering | 29 |
+| M5.3 | Daily and monthly tearsheet generation with charting output (backtest + paper performance unified; visual entry/exit charts so signals can be eyeballed against price) | Quant | 30 |
+| M5.4 | Full Airflow DAG for automated daily paper-trading operations (data refresh → scoring → target → candidates → risk/compliance → blotter → submit → reconcile → ledger) | Engineering | 32 |
+| M5.5 | 4-week automated IBKR paper-trading qualification (no human per-trade intervention) | Engineering | 36 |
+| M5.6 | Additional strategy development — v3+ strategy configs + new signal modules (technical analysis signals, additional fundamental combos) | Quant | 37 |
+| M5.7 | Market regime detector — identify bull/bear/sideways/high-vol regimes; surface recommended strategy mix per regime | Quant | 38 |
+| M5.8 | `monitor` and `report` skills operational; Streamlit dashboard with positions, risk, PnL | Engineering | 39 |
+| M5.9 | Security review of all live-trading code paths | Security | 40 |
+| M5.10 | Live trading go-live (small capital, tight limits) | All | 41 |
+| M5.11 | Post-launch stability review | All | 42 |
 
 **Exit criterion:** The automated paper-trading system completes 4 weeks without
-critical operational incidents, live go-live receives explicit approval, and
-then the live system operates for 4 weeks with no critical incidents, all hard
+critical operational incidents, live go-live receives explicit approval (C8 + C9),
+and then the live system operates for 4 weeks with no critical incidents, all hard
 breach thresholds respected, and tearsheets delivered on schedule.
 
 ---

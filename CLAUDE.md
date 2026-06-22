@@ -41,7 +41,7 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 2 | Signal Library | **Complete** | Week 12 |
 | 3 | Backtesting Engine | **Live validation complete** | Week 18 |
 | 4 | Portfolio + Paper Trading | **Implementation complete — tiny paper submission recorded** | Week 26 |
-| 5 | Reporting + Live Trading | Not started | Week 36 |
+| 5 | Strategy Library, Automated Paper Trading, Reporting & Live Trading | Not started | Week 42 |
 
 **Active branch:** `main`
 
@@ -73,10 +73,33 @@ rehearsal is not complete. No real capital is at risk. The IBKR paper account
 connection (port 7497) has been smoke-tested, including a Canadian CAD NAV
 account with USD-equivalent NAV conversion.
 
-After the supervised plumbing rehearsal, the next major phase is strategy and
-automation: build automated trade/hold/reduce/increase decisioning, then run a
-separate 4-week automated paper-trading qualification before any live-capital
-discussion.
+After the supervised plumbing rehearsal, Phase 5 begins. The confirmed priority
+sequence for Phase 5 is:
+
+1. **Strategy Registry** — a DB-backed catalog tracking each strategy's id,
+   config path, status (backtesting/paper/live/archived), and performance
+   metadata. Activation means passing `--strategy-config` for a registered
+   strategy; deactivation is a status update, not a code deletion.
+2. **Trading journal** (`execution/oms/trade_history.py`) — append-only fill
+   store with P&L and wash-sale history; this also unblocks live wash-sale
+   compliance checks (currently a dead letter).
+3. **Tearsheets with charting output** — unified backtest + paper performance;
+   visual entry/exit charts so signals can be eyeballed against price history.
+4. **Airflow DAG** — fully automated daily paper-trading pipeline (data refresh
+   → scoring → target → candidates → risk/compliance → blotter → submit →
+   reconcile → ledger). No human per-trade intervention.
+5. **4-week automated paper-trading qualification** — runs on top of the Airflow
+   DAG; required before any live-capital discussion (C8).
+6. **Additional strategies** — new signal modules (technical analysis, additional
+   fundamental combos) + new strategy YAML configs (v3+). Strategies are
+   config-driven, not independent codebases; new strategies share all
+   infrastructure and differ only in signal weights and portfolio parameters.
+7. **Market regime detector** — classify current regime (bull/bear/high-vol/
+   mean-reverting) and surface which strategy mix is best suited to each.
+8. **Streamlit dashboard + monitor/report skills** — real-time positions, risk,
+   PnL for live monitoring.
+9. **Security review**, then **live trading go-live** (small capital, tight
+   limits, C8 + C9 clearance required).
 
 ---
 
