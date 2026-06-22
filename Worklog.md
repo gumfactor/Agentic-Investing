@@ -12,6 +12,79 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-22
+
+### Session 40 — Phase 5 Architecture Alignment
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/ibkr-system-architecture-4t5toj`
+**Commits:** PRD + CLAUDE.md Phase 5 alignment
+
+---
+
+#### What was discussed and decided
+
+Operator and Claude reviewed the full project at a strategic level now that
+the IBKR paper-trading pipeline is confirmed working. The goal was to
+establish a unified forward-facing priority structure before Phase 5 begins,
+and to reconcile conflicts between the original PRD and decisions made during
+live sessions.
+
+[DECISION] Phase 5 priority sequence confirmed (master reference going
+forward):
+1. Strategy Registry
+2. Trading journal / fill history (`trade_history.py`)
+3. Tearsheets with charting output (unified backtest + paper)
+4. Airflow DAG (fully automated daily paper workflow)
+5. 4-week automated paper-trading qualification (C8 prerequisite)
+6. Additional strategies (v3+ — config + signal modules, not independent codebases)
+7. Market regime detector
+8. Streamlit dashboard + monitor/report skills
+9. Security review → live trading (C8 + C9)
+
+[DECISION] Strategies are config-driven, not independent codebases. A new
+strategy = a new YAML config + optionally a new `signals/factors/*.py` module.
+All strategies share the same execution, risk, and backtesting infrastructure.
+
+[DECISION] TradingView remains a human research/charting tool and is not
+integrated into the automated system. Chart-based signals (RSI, MACD, moving
+averages, breakout detection) are implemented as Python signal modules under
+`signals/factors/technical.py` and share the same factor infrastructure as
+fundamental signals.
+
+[DECISION] Technical Analysis is now a named factor group in the PRD factor
+library (F2.1), on equal footing with Value, Momentum, Quality, etc.
+
+#### What was changed
+
+- `PRD.md` Section 3: removed Alpaca as active broker; Alpaca is deferred.
+- `PRD.md` F1.1: corrected data source priority — yfinance is primary,
+  Polygon deferred to Phase 2+.
+- `PRD.md` F2.1: added Technical Analysis factor group.
+- `PRD.md` F4.4: updated broker table — IBKR only; Alpaca deferred.
+- `PRD.md` Phase 4 M4.4: updated to reflect actual IBKR 8-step paper workflow.
+- `PRD.md` Phase 5: complete milestone rewrite to match confirmed priority
+  sequence; extended to Week 42; renamed to reflect full scope.
+- `PRD.md` folder structure: removed `alpaca_broker.py`; added
+  `strategy_registry/`, `trade_history.py`, `sector_map.yaml`,
+  `technical.py`, and `paper_operational_ledger.py`.
+- `CLAUDE.md` phase table: updated Phase 5 name and target week.
+- `CLAUDE.md` Phase 5 priority sequence added inline after Phase 4 summary.
+
+#### What was not changed
+
+- All completed Phase 1–4 history is intact.
+- Safety rules C1–C9 unchanged.
+- All paper-trading workflow commands unchanged.
+- No code was modified in this session — documentation only.
+
+#### Next steps
+
+- Complete the 4-day supervised paper plumbing rehearsal (operational).
+- Begin Phase 5: Strategy Registry implementation.
+
+---
+
 ## 2026-06-21
 
 ### Session 39 - PR Review Follow-up
