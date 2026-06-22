@@ -572,6 +572,15 @@ Monthly stress runs with scenarios:
 - Includes: return attribution, risk summary, significant trades, outlook
 - Template customizable; data sourced automatically from audit trail
 
+#### F7.4 Blotter Approval UI (C1 gate — replaces CLI confirmation)
+- Integrated into the Streamlit dashboard; the universal approval interface for all broker submissions (paper and live)
+- Presents proposed orders as an editable grid: ticker, direction, quantity (editable inline), estimated notional, estimated cost, risk flag
+- Per-row checkboxes: operator selects exactly which orders proceed; not all-or-nothing
+- Unchecked rows are recorded in the audit log as operator-rejected with a timestamp
+- "Submit selected orders" button triggers a confirmation dialog (*"[N] orders / [$X] notional — this cannot be undone. Proceed?"*); operator must click YES to continue
+- Audit log records: orders presented, orders selected, any quantity edits, who confirmed, and timestamp
+- Applies identically to paper and live; the port and `PAPER_TRADING` flag are displayed prominently so the operator always knows which environment they are approving into
+
 ---
 
 ### F8 — Claude Code Skill Layer
@@ -690,11 +699,11 @@ must precede the qualification run itself.
 | M5.1 | Strategy Registry — DB catalog of strategies with status (backtesting/paper/live/archived), config path, backtest metrics, and activation state | Engineering | 28 |
 | M5.2 | Unified trading journal — `execution/oms/trade_history.py` append-only fill store (P&L, timestamps, wash-sale history); feeds tearsheets and compliance | Engineering | 29 |
 | M5.3 | Daily and monthly tearsheet generation with charting output (backtest + paper performance unified; visual entry/exit charts so signals can be eyeballed against price) | Quant | 30 |
-| M5.4 | Full Airflow DAG for automated daily paper-trading operations (data refresh → scoring → target → candidates → risk/compliance → blotter → operator blotter-review approval gate → submit → reconcile → ledger). C1 is satisfied at the daily-run level via the Airflow approval gate; no per-order YES required for paper. C1 remains in full force for all live submissions. | Engineering | 32 |
+| M5.4 | Full Airflow DAG for automated daily paper-trading operations (data refresh → scoring → target → candidates → risk/compliance → blotter → dashboard blotter-review approval gate → submit → reconcile → ledger). DAG pauses at the approval gate; operator reviews in the dashboard, selects orders (per-order checkboxes), and double-confirms before any broker submission. C1 satisfied via F7.4 dashboard UI. | Engineering | 32 |
 | M5.5 | 4-week automated IBKR paper-trading qualification (no human per-trade intervention) | Engineering | 36 |
 | M5.6 | Additional strategy development — v3+ strategy configs + new signal modules (technical analysis signals, additional fundamental combos) | Quant | 37 |
 | M5.7 | Market regime detector — identify bull/bear/sideways/high-vol regimes; surface recommended strategy mix per regime | Quant | 38 |
-| M5.8 | `monitor` and `report` skills operational; Streamlit dashboard with positions, risk, PnL | Engineering | 39 |
+| M5.8 | Streamlit dashboard: positions, risk, PnL; blotter approval UI with per-order selection and double confirmation (F7.4 — universal C1 gate for paper and live, replaces CLI confirmation); `monitor` and `report` skills operational | Engineering | 39 |
 | M5.9 | Security review of all live-trading code paths | Security | 40 |
 | M5.10 | Live trading go-live (small capital, tight limits) | All | 41 |
 | M5.11 | Post-launch stability review | All | 42 |
@@ -828,19 +837,24 @@ This section defines hard rules. Any proposed change that violates these rules r
 
 ### C1 — No Irreversible Market Actions Without Human Confirmation
 
-**Rule:** The `execute_trade` skill — and any code path that touches `BaseBroker.submit_order()` — must present a confirmation prompt to the operator and receive an affirmative response before submitting any order to a broker.
+**Rule:** No broker order may be submitted — paper or live — without the operator reviewing the proposed order list, selecting the specific orders they wish to submit, and explicitly confirming via the dashboard approval interface.
 
-**Implementation:**
-- `execute_trade` skill displays: order list, estimated notional, net transaction cost estimate, pre-trade risk check results
-- Prompts: *"Confirm submission of [N] orders totaling [$X] notional? Type YES to proceed."*
-- Only the string `"YES"` (case-sensitive) triggers submission
-- This gate cannot be bypassed by any skill or automated process for **live** broker submissions
+**Target implementation (Phase 5 dashboard — applies to all scenarios, paper and live):**
+- The pipeline (DAG or manual run) generates a blotter and pauses at the approval gate
+- Dashboard presents the proposed order grid: ticker, direction, quantity (editable), estimated notional, estimated cost, risk flags
+- Operator checks/unchecks individual rows — this is **not all-or-nothing**; the operator selects exactly which orders proceed; unchecked rows are recorded in the audit log as operator-rejected
+- "Submit selected orders" button opens a confirmation dialog: *"You are about to submit [N] orders totaling [$X]. This cannot be undone. Proceed?"*
+- Operator clicks YES in the dialog → only checked rows are submitted to the broker
+- This gate applies identically to paper (port 7497) and live (port 7496) submissions
 - CI enforces: a unit test asserts that calling `OrderManager.submit()` without a `confirmation_token` raises `RequiresConfirmationError`
 
-**Paper-automation carve-out (Phase 5 Airflow DAG only):**
-The Phase 5 automated paper-trading qualification requires the DAG to run without a per-order YES prompt — that is the definition of unattended operation (C8). C1 is satisfied at the **daily-run level**: the operator authorises the day's paper run by approving the DAG trigger or the blotter-review step in Airflow. No individual order requires a separate YES. This carve-out applies strictly when `PAPER_TRADING=true` and `IBKR_PORT=7497`; any live-port (7496) code path retains the full per-submission C1 gate with no exceptions.
+**Interim implementation (Phase 4 CLI workflow, until the dashboard is built):**
+- `paper_submit_reconcile_check` displays the full order list
+- Operator must pass `--confirm YES` and `--reviewed-blotter-sha256 <hash>` explicitly
+- Full blotter only — no per-order selection until the dashboard exists
+- This path is retired once the Phase 5 dashboard approval UI is live
 
-**Why:** A submitted market order cannot be recalled once filled. Even a cancelled order may be partially filled. The cost of the confirmation prompt is seconds; the cost of an unintended order is potentially thousands of dollars and regulatory exposure.
+**Why:** A submitted market order cannot be recalled once filled. Even a cancelled order may be partially filled. Per-order selection protects against accidentally submitting a position the operator has a specific view on; the double confirmation prevents misclicks.
 
 ---
 

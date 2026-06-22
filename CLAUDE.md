@@ -60,7 +60,7 @@ All three module trees (portfolio/, execution/, risk/) are now fully implemented
 - **risk/circuit_breaker.py**: CLOSED/OPEN state machine (C4-compliant)
 
 Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
-`execute_trade` (requires "YES" — C1).
+`execute_trade` (requires dashboard blotter approval with per-order selection and double confirmation — C1).
 
 **Last recorded validation:** 675 local tests passed on 2026-06-20; the
 paper/execution/risk subset passed with 213 tests.
@@ -86,11 +86,11 @@ sequence for Phase 5 is:
 3. **Tearsheets with charting output** — unified backtest + paper performance;
    visual entry/exit charts so signals can be eyeballed against price history.
 4. **Airflow DAG** — fully automated daily paper-trading pipeline (data refresh
-   → scoring → target → candidates → risk/compliance → blotter → operator
-   blotter-review approval gate → submit → reconcile → ledger). C1 is
-   satisfied at the daily-run level via the Airflow blotter-review approval
-   gate; no per-ORDER YES required for paper-only runs. C1 remains in full,
-   non-negotiable force for all live (port 7496) broker submissions.
+   → scoring → target → candidates → risk/compliance → blotter → dashboard
+   blotter-review approval gate → submit → reconcile → ledger). DAG pauses
+   at the approval gate; operator reviews the blotter in the dashboard,
+   selects which orders to submit (per-order checkboxes), and double-confirms.
+   C1 is satisfied via the F7.4 dashboard UI — same flow for paper and live.
 5. **4-week automated paper-trading qualification** — runs on top of the Airflow
    DAG; required before any live-capital discussion (C8).
 6. **Additional strategies** — new signal modules (technical analysis, additional
@@ -100,7 +100,8 @@ sequence for Phase 5 is:
 7. **Market regime detector** — classify current regime (bull/bear/high-vol/
    mean-reverting) and surface which strategy mix is best suited to each.
 8. **Streamlit dashboard + monitor/report skills** — real-time positions, risk,
-   PnL for live monitoring.
+   PnL; blotter approval UI with per-order selection and double confirmation
+   (F7.4 — universal C1 gate, replaces CLI confirmation for all scenarios).
 9. **Security review**, then **live trading go-live** (small capital, tight
    limits, C8 + C9 clearance required).
 
@@ -112,7 +113,7 @@ These are non-negotiable. If you are ever about to violate one, stop and ask the
 
 | # | Rule | What to do if you're about to violate it |
 |---|------|------------------------------------------|
-| C1 | Never submit a broker order without displaying the full order list and receiving a literal `"YES"` from the operator | Stop. Display the order list. Ask for confirmation. |
+| C1 | Never submit a broker order without the operator reviewing the blotter, selecting which orders to submit (per-order checkboxes), and double-confirming via the dashboard approval UI (F7.4). Interim path until dashboard exists: CLI `--confirm YES` + blotter hash. Applies to paper and live identically. | Stop. Display the order list. Ask for confirmation. |
 | C2 | Never run raw `ALTER TABLE` / `DROP TABLE` against a DB — always use Alembic migrations | Write a migration file instead. |
 | C3 | Never UPDATE or DELETE from audit log tables | Append a correction record with a `correction_of` foreign key instead. |
 | C4 | Never reset the circuit breaker automatically — only a human with a reason code may do it | Stop. Tell the operator the circuit breaker is open. Ask them to reset manually. |
