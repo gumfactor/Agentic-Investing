@@ -203,7 +203,9 @@ class TestRecordFill:
         assert rec1.cumulative_filled_quantity == pytest.approx(60.0)
         assert rec1.realized_pnl == pytest.approx(1200.0)            # (120-100)*60
 
-        # FILLED: 100 shares cumulative @ blended avg 118
+        # FILLED: 100 shares cumulative @ blended avg 118.
+        # Incremental 40 shares actually executed at 115:
+        #   (118*100 - 120*60) / 40 = (11800 - 7200) / 40 = 115.0
         sell_order.filled_quantity = 100.0
         sell_order.avg_fill_price = 118.0
         sell_order.status = OrderStatus.FILLED
@@ -212,12 +214,13 @@ class TestRecordFill:
 
         assert rec2.filled_quantity == pytest.approx(40.0)            # incremental (100-60)
         assert rec2.cumulative_filled_quantity == pytest.approx(100.0)
-        # P&L for incremental 40 shares @ 118, cost basis 100:
-        assert rec2.realized_pnl == pytest.approx(720.0)             # (118-100)*40
+        # Back-calculated incremental price = 115; P&L = (115-100)*40 = 600
+        assert rec2.avg_fill_price == pytest.approx(115.0)
+        assert rec2.realized_pnl == pytest.approx(600.0)
 
-        # Total P&L across both events = 1200 + 720 = 1920
+        # Total P&L across both events = 1200 + 600 = 1800
         summary = journal.realized_pnl_summary()
-        assert summary["AAPL"] == pytest.approx(1920.0)
+        assert summary["AAPL"] == pytest.approx(1800.0)
 
         # Open position should be zero (all 100 shares sold)
         open_pos = journal.open_position_cost_basis()

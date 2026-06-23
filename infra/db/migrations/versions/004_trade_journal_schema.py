@@ -95,21 +95,26 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("NOW()"),
         ),
-        sa.PrimaryKeyConstraint("fill_id"),
+        # TimescaleDB requires every unique index (including PRIMARY KEY) on a
+        # hypertable to include the partition column (fill_timestamp).  See
+        # 002_signal_schema.py docstring for the canonical project note on this.
+        sa.PrimaryKeyConstraint("fill_id", "fill_timestamp"),
         sa.CheckConstraint("side IN ('BUY', 'SELL')", name="ck_trade_fills_side"),
         sa.CheckConstraint("filled_quantity > 0", name="ck_trade_fills_qty_positive"),
         sa.CheckConstraint("avg_fill_price > 0", name="ck_trade_fills_price_positive"),
     )
 
-    # Dedup guard: one row per (order_id, cumulative_filled_quantity).
+    # Dedup guard: one row per (order_id, cumulative_filled_quantity, fill_timestamp).
     # Uses the cumulative quantity (not incremental) so that a PARTIALLY_FILLED
     # record (cumulative=60) and the subsequent FILLED record (cumulative=100)
     # are both allowed, while re-recording the same cumulative quantity is
-    # rejected as a duplicate.
+    # rejected as a duplicate.  fill_timestamp is required by TimescaleDB (every
+    # unique index must include the partition column); the Python-level
+    # incremental_qty check in record_fill() remains the primary dedup guard.
     op.create_unique_constraint(
         "uq_trade_fills_order_cumulative_qty",
         "trade_fills",
-        ["order_id", "cumulative_filled_quantity"],
+        ["order_id", "cumulative_filled_quantity", "fill_timestamp"],
     )
 
     # Ticker + time index for fill history queries and FIFO lot reconstruction.

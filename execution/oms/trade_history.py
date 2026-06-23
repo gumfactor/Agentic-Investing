@@ -195,18 +195,25 @@ class TradeJournal:
         now = datetime.now(timezone.utc)
 
         with self._engine.begin() as conn:
-            # Determine how much has already been recorded for this order.
-            prior_max_cumulative = float(
-                conn.execute(
-                    sa.select(
-                        sa.func.coalesce(
-                            sa.func.max(_trade_fills.c.cumulative_filled_quantity),
-                            sa.literal(0),
-                        )
-                    ).where(_trade_fills.c.order_id == order.order_id)
-                ).scalar()
-                or 0
-            )
+            # Fetch the most recent recorded row for this order (if any) so we
+            # can compute the incremental quantity and back-calculate the exact
+            # price for the incremental shares.
+            prior_row = conn.execute(
+                sa.select(
+                    _trade_fills.c.cumulative_filled_quantity,
+                    _trade_fills.c.avg_fill_price,
+                )
+                .where(_trade_fills.c.order_id == order.order_id)
+                .order_by(_trade_fills.c.cumulative_filled_quantity.desc())
+                .limit(1)
+            ).one_or_none()
+
+            if prior_row is not None:
+                prior_max_cumulative = float(prior_row.cumulative_filled_quantity)
+                prior_avg_fill_price = float(prior_row.avg_fill_price)
+            else:
+                prior_max_cumulative = 0.0
+                prior_avg_fill_price = 0.0
 
             incremental_qty = order.filled_quantity - prior_max_cumulative
             if incremental_qty <= 1e-9:
@@ -216,16 +223,31 @@ class TradeJournal:
                     f"journal already has {prior_max_cumulative:.4f} recorded"
                 )
 
+            # Derive the exact price for this specific fill event.  When prior
+            # fill records exist, the broker's avg_fill_price is a cumulative
+            # weighted average; back-calculating isolates the incremental price:
+            #   incremental_price = (new_cumul_avg × new_qty − old_cumul_avg × old_qty)
+            #                       / incremental_qty
+            # This prevents attributing the blended average to incremental shares
+            # when a partial fill and a final fill execute at different prices.
+            if prior_max_cumulative > 1e-9:
+                incremental_fill_price = (
+                    order.avg_fill_price * order.filled_quantity
+                    - prior_avg_fill_price * prior_max_cumulative
+                ) / incremental_qty
+            else:
+                incremental_fill_price = order.avg_fill_price
+
             realized_pnl: float | None = None
             cost_basis_per_share: float | None = None
             if order.side == OrderSide.SELL:
-                # P&L computed on incremental quantity only so that successive
-                # partial-fill records don't double-count prior lots.
+                # P&L computed on incremental quantity and exact incremental price
+                # so successive partial-fill records don't double-count prior lots.
                 cost_basis_per_share, realized_pnl = self._fifo_pnl(
                     order.ticker,
                     order.strategy_id,
                     incremental_qty,
-                    order.avg_fill_price,
+                    incremental_fill_price,
                 )
 
             fill_id = str(uuid.uuid4())
@@ -238,7 +260,8 @@ class TradeJournal:
                 "side": order.side.value,
                 "filled_quantity": incremental_qty,
                 "cumulative_filled_quantity": order.filled_quantity,
-                "avg_fill_price": order.avg_fill_price,
+                # Store the exact incremental price, not the cumulative average.
+                "avg_fill_price": incremental_fill_price,
                 "limit_price": order.limit_price,
                 "fill_timestamp": order.updated_at,
                 "order_status_at_record": order.status.value,
@@ -257,7 +280,7 @@ class TradeJournal:
             side=order.side.value,
             incremental_qty=incremental_qty,
             cumulative_qty=order.filled_quantity,
-            avg_fill_price=order.avg_fill_price,
+            incremental_fill_price=incremental_fill_price,
             realized_pnl=realized_pnl,
         )
 
@@ -270,7 +293,7 @@ class TradeJournal:
             side=order.side.value,
             filled_quantity=incremental_qty,
             cumulative_filled_quantity=order.filled_quantity,
-            avg_fill_price=order.avg_fill_price,
+            avg_fill_price=incremental_fill_price,
             limit_price=order.limit_price,
             fill_timestamp=order.updated_at,
             order_status_at_record=order.status.value,
