@@ -16,6 +16,7 @@ from strategy_registry.registry import (
     ConflictingActiveStrategyError,
     DefinitionNotFoundError,
     DuplicateVersionError,
+    InsufficientPaperQualificationError,
     InvalidTransitionError,
     MissingDataVersionError,
     MissingOperatorNotesError,
@@ -118,6 +119,20 @@ def test_validate_config_rejects_zero_weight() -> None:
                      "initial_capital": 1000.0, "benchmark": "SPY"},
     }
     with pytest.raises(ValueError, match="weights must sum"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_float_n_long() -> None:
+    """n_long: 10.5 must be rejected to prevent hash/metadata mismatch."""
+    config = {
+        "version": 1, "name": "x",
+        "universe": {}, "execution": {},
+        "factors": {"mom": {"weight": 1.0, "score_col": "x"}},
+        "portfolio": {"n_long": 10.5},
+        "backtest": {"start_date": "2022-01-01", "end_date": "2024-01-01",
+                     "initial_capital": 1000.0, "benchmark": "SPY"},
+    }
+    with pytest.raises(ValueError, match="n_long must be a positive integer"):
         validate_config(config)
 
 
@@ -249,11 +264,28 @@ def test_transition_to_live_rejects_whitespace_operator_notes(
         registry.transition("v1_test_strategy", StrategyStatus.LIVE, operator_notes="   ")
 
 
+def test_transition_to_live_requires_paper_run(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """C8: promote to live without any paper runs must be blocked."""
+    registry.register(str(cfg))
+    registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    with pytest.raises(InsufficientPaperQualificationError):
+        registry.transition(
+            "v1_test_strategy", StrategyStatus.LIVE, operator_notes="C8 clearance granted"
+        )
+
+
 def test_transition_paper_to_live_with_notes(
     registry: StrategyRegistry, cfg: Path
 ) -> None:
     registry.register(str(cfg))
     registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    s = registry.get("v1_test_strategy")
+    # Record a passed paper run to satisfy the C8 gate.
+    registry.record_run(
+        s.strategy_id, s.canonical_config_hash, "paper", "passed", metrics={}
+    )
     s = registry.transition(
         "v1_test_strategy", StrategyStatus.LIVE, operator_notes="C8 clearance granted"
     )
@@ -441,7 +473,7 @@ def test_record_run_signal_ic_no_data_version_required(
 def test_record_run_pre_registration(
     registry: StrategyRegistry, cfg: Path
 ) -> None:
-    """Runs can be recorded before formal register() is called."""
+    """Research-type runs (signal_ic, backtest) can be recorded before register()."""
     defn = registry.add_definition(str(cfg))
     run = registry.record_run(
         strategy_id=defn.strategy_id,
@@ -465,6 +497,24 @@ def test_record_run_paper_blocked_when_strategy_in_backtesting(
         )
 
 
+def test_record_run_paper_blocked_when_no_lifecycle_row(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Pre-registration paper runs must be blocked (no lifecycle row → can't qualify C8)."""
+    defn = registry.add_definition(str(cfg))
+    with pytest.raises(RunLifecycleMismatchError):
+        registry.record_run(defn.strategy_id, defn.config_hash, "paper", "passed")
+
+
+def test_record_run_live_blocked_when_no_lifecycle_row(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Pre-registration live runs must be blocked."""
+    defn = registry.add_definition(str(cfg))
+    with pytest.raises(RunLifecycleMismatchError):
+        registry.record_run(defn.strategy_id, defn.config_hash, "live", "passed")
+
+
 def test_record_run_paper_allowed_when_strategy_in_paper(
     registry: StrategyRegistry, cfg: Path
 ) -> None:
@@ -476,6 +526,59 @@ def test_record_run_paper_allowed_when_strategy_in_paper(
         metrics={"pnl": 0.0},
     )
     assert run.run_type == "paper"
+
+
+def test_record_run_live_blocked_when_strategy_in_paper(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Live run_type must be blocked when the strategy is in paper status."""
+    registry.register(str(cfg))
+    registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    s = registry.get("v1_test_strategy")
+    with pytest.raises(RunLifecycleMismatchError):
+        registry.record_run(
+            s.strategy_id, s.canonical_config_hash, "live", "passed",
+            metrics={"pnl": 0.0},
+        )
+
+
+def test_record_run_live_allowed_when_strategy_in_live(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    registry.register(str(cfg))
+    registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    s = registry.get("v1_test_strategy")
+    registry.record_run(s.strategy_id, s.canonical_config_hash, "paper", "passed")
+    registry.transition("v1_test_strategy", StrategyStatus.LIVE, operator_notes="C8 cleared")
+    run = registry.record_run(
+        s.strategy_id, s.canonical_config_hash, "live", "passed", metrics={"pnl": 0.01}
+    )
+    assert run.run_type == "live"
+
+
+def test_record_run_rejects_invalid_run_type(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="run_type must be one of"):
+        registry.record_run(s.strategy_id, s.canonical_config_hash, "invalid_type", "passed")
+
+
+def test_record_run_rejects_invalid_status(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="status must be one of"):
+        registry.record_run(s.strategy_id, s.canonical_config_hash, "signal_ic", "ok")
+
+
+def test_definition_runs_accessible_after_session_close(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """StrategyDefinition.runs must be loaded (not lazy) after session close."""
+    defn = registry.add_definition(str(cfg))
+    # New definition has no runs — should return an empty list, not raise.
+    assert defn.runs == []
 
 
 def test_status_history_accessible_after_session_close(

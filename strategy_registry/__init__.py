@@ -5,9 +5,10 @@ from strategy_registry.models import (
     StrategyStatusHistory,
 )
 from strategy_registry.registry import (
+    InsufficientPaperQualificationError,
+    RunLifecycleMismatchError,
     StrategyRegistry,
     StrategyStatus,
-    RunLifecycleMismatchError,
 )
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "StrategyStatusHistory",
     "StrategyRegistry",
     "StrategyStatus",
+    "InsufficientPaperQualificationError",
     "RunLifecycleMismatchError",
 ]

@@ -64,7 +64,7 @@ def fingerprint(
         n_long=int(portfolio["n_long"]) if portfolio.get("n_long") is not None else None,
         rebalance_frequency=_optional_str(portfolio.get("rebalance_frequency")),
         config=canonical,
-        source_path=_repo_relative(path),
+        source_path=str(path.resolve()),
     )
 
 
@@ -111,8 +111,12 @@ def validate_config(config: Mapping[str, Any]) -> None:
     portfolio = config["portfolio"]
     if not isinstance(portfolio, Mapping):
         raise ValueError("strategy config 'portfolio' must be a mapping")
-    if int(portfolio.get("n_long", 0)) <= 0:
-        raise ValueError("strategy config portfolio.n_long must be a positive integer")
+    n_long = portfolio.get("n_long", 0)
+    if not isinstance(n_long, int) or isinstance(n_long, bool) or n_long <= 0:
+        raise ValueError(
+            "strategy config portfolio.n_long must be a positive integer "
+            "(use 10, not 10.0 or '10')"
+        )
 
     backtest = config["backtest"]
     if not isinstance(backtest, Mapping):
@@ -171,11 +175,3 @@ def _slug(value: str) -> str:
     lowered = value.strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "_", lowered)
     return re.sub(r"_+", "_", slug).strip("_")
-
-
-def _repo_relative(path: Path) -> str:
-    """Return path relative to CWD (repo root) when possible; absolute otherwise."""
-    try:
-        return str(path.resolve().relative_to(Path.cwd().resolve()))
-    except ValueError:
-        return str(path.resolve())

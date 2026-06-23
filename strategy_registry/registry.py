@@ -58,6 +58,11 @@ class MissingOperatorNotesError(StrategyRegistryError):
     pass
 
 
+class InsufficientPaperQualificationError(StrategyRegistryError):
+    """Attempted live promotion without any passed paper runs (C8)."""
+    pass
+
+
 class ConfigDriftError(StrategyRegistryError):
     pass
 
@@ -95,12 +100,16 @@ _ALLOWED_TRANSITIONS: dict[StrategyStatus, set[StrategyStatus]] = {
 _SINGLE_ACTIVE = {StrategyStatus.PAPER, StrategyStatus.LIVE}
 _REQUIRE_DATA_VERSION = {"backtest", "walk_forward"}
 
-# run_type values that require the strategy lifecycle to be in a matching status.
-# If a lifecycle row exists, the strategy's status must be one of the allowed values.
+# Paper/live run_type requires the strategy lifecycle row to exist and be in
+# a matching active status. ARCHIVED is intentionally excluded: a terminal
+# strategy must not accumulate new qualification records.
 _RUN_TYPE_LIFECYCLE_GATE: dict[str, set[StrategyStatus]] = {
-    "paper": {StrategyStatus.PAPER, StrategyStatus.ARCHIVED},
-    "live": {StrategyStatus.LIVE, StrategyStatus.ARCHIVED},
+    "paper": {StrategyStatus.PAPER},
+    "live": {StrategyStatus.LIVE},
 }
+
+_VALID_RUN_TYPES = frozenset({"unit", "signal_ic", "backtest", "walk_forward", "paper", "live"})
+_VALID_RUN_STATUSES = frozenset({"running", "passed", "failed", "blocked"})
 
 
 # ── StrategyRegistry ──────────────────────────────────────────────────────────
@@ -193,7 +202,7 @@ class StrategyRegistry:
                 .options(selectinload(StrategyDefinition.runs))
             )
             log.info("definition_added", strategy_id=fp.strategy_id, config_hash=fp.config_hash[:8], version=fp.version)
-            return defn  # type: ignore[return-value]  # guaranteed non-None after INSERT
+            return defn  # type: ignore[return-value]
 
     def get_definition(
         self,
@@ -303,6 +312,20 @@ class StrategyRegistry:
             except IntegrityError as exc:
                 session.rollback()
                 exc_str = str(exc).lower()
+                # PK collision on strategies.strategy_id from a concurrent register().
+                if (
+                    "strategies.strategy_id" in exc_str
+                    or ("primary key" in exc_str and "strategies" in exc_str)
+                    or (
+                        "unique" in exc_str
+                        and "strategy_id" in exc_str
+                        and "version" not in exc_str
+                    )
+                ):
+                    raise StrategyAlreadyRegisteredError(
+                        f"'{fp.strategy_id}' was registered by a concurrent process. "
+                        f"strategy_id values are permanent — create v{{N+1}}_… instead."
+                    ) from exc
                 if "uq_strategy_definitions_version" in exc_str or (
                     "unique" in exc_str and "version" in exc_str
                 ):
@@ -346,6 +369,22 @@ class StrategyRegistry:
                     f"Cannot transition '{strategy_id}' from '{from_status}' to '{to_status}'. "
                     f"Allowed: {sorted(s.value for s in allowed) or 'none (terminal)'}."
                 )
+
+            # C8: require at least one passed paper run before live promotion.
+            if to_status == StrategyStatus.LIVE:
+                paper_run = session.scalar(
+                    select(StrategyRun).where(
+                        StrategyRun.strategy_id == strategy_id,
+                        StrategyRun.run_type == "paper",
+                        StrategyRun.status == "passed",
+                    )
+                )
+                if paper_run is None:
+                    raise InsufficientPaperQualificationError(
+                        f"Cannot promote '{strategy_id}' to live: no passed paper runs found. "
+                        f"C8 requires a 4-week automated paper-trading qualification. "
+                        f"Record paper runs via record_run(run_type='paper', status='passed') first."
+                    )
 
             if to_status in _SINGLE_ACTIVE:
                 conflict = session.scalar(
@@ -435,7 +474,12 @@ class StrategyRegistry:
                 StrategyDefinition,
                 (strategy_id, strategy.canonical_config_hash),
             )
-            if defn is None or not defn.source_path:
+            if defn is None:
+                raise DefinitionNotFoundError(
+                    f"No definition row found for '{strategy_id}' with its canonical config hash. "
+                    f"The definition may have been removed from the DB."
+                )
+            if not defn.source_path:
                 raise ConfigDriftError(
                     f"Cannot verify '{strategy_id}': source_path not recorded in definition."
                 )
@@ -468,6 +512,14 @@ class StrategyRegistry:
         Append a run record. data_version required for backtest/walk_forward (C7).
         The (strategy_id, config_hash) must exist in strategy_definitions.
         """
+        if run_type not in _VALID_RUN_TYPES:
+            raise ValueError(
+                f"run_type must be one of {sorted(_VALID_RUN_TYPES)}, got {run_type!r}"
+            )
+        if status not in _VALID_RUN_STATUSES:
+            raise ValueError(
+                f"status must be one of {sorted(_VALID_RUN_STATUSES)}, got {status!r}"
+            )
         if run_type in _REQUIRE_DATA_VERSION and not (data_version and data_version.strip()):
             raise MissingDataVersionError(
                 f"data_version is required for run_type='{run_type}' (C7). "
@@ -483,21 +535,28 @@ class StrategyRegistry:
                     f"Call add_definition() or register() first."
                 )
 
-            # Guard: paper/live run_type must match the lifecycle status when a
-            # strategy row exists. This prevents fabricated qualification records
-            # that would corrupt C8 four-week paper qualification tracking.
+            # Guard: paper/live run_type requires a registered lifecycle row in a
+            # matching active status. This prevents:
+            # (a) fabricated qualification records when no lifecycle row exists
+            # (b) runs inconsistent with the strategy's current status
+            # (c) new paper/live records on archived (terminal) strategies
             if run_type in _RUN_TYPE_LIFECYCLE_GATE:
                 lifecycle = session.get(Strategy, strategy_id)
-                if lifecycle is not None:
-                    current = StrategyStatus(lifecycle.status)
-                    allowed = _RUN_TYPE_LIFECYCLE_GATE[run_type]
-                    if current not in allowed:
-                        raise RunLifecycleMismatchError(
-                            f"Cannot record a '{run_type}' run for '{strategy_id}' "
-                            f"which is currently in '{current}' status. "
-                            f"Allowed statuses for '{run_type}' runs: "
-                            f"{sorted(s.value for s in allowed)}."
-                        )
+                if lifecycle is None:
+                    raise RunLifecycleMismatchError(
+                        f"Cannot record a '{run_type}' run for '{strategy_id}': "
+                        f"strategy is not registered. Call register() first, "
+                        f"then transition to the appropriate status."
+                    )
+                current = StrategyStatus(lifecycle.status)
+                allowed = _RUN_TYPE_LIFECYCLE_GATE[run_type]
+                if current not in allowed:
+                    raise RunLifecycleMismatchError(
+                        f"Cannot record a '{run_type}' run for '{strategy_id}' "
+                        f"which is currently in '{current}' status. "
+                        f"Allowed statuses for '{run_type}' runs: "
+                        f"{sorted(s.value for s in allowed)}."
+                    )
 
             run = StrategyRun(
                 strategy_id=strategy_id,

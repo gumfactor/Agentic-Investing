@@ -201,6 +201,10 @@ def upgrade() -> None:
             name="fk_strategy_status_history_strategy",
             ondelete="RESTRICT",
         ),
+        sa.CheckConstraint(
+            "to_status IN ('backtesting', 'paper', 'live', 'archived')",
+            name="ck_strategy_status_history_to_status",
+        ),
     )
     op.create_index(
         "ix_strategy_status_history_strategy_id",
