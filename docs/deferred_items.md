@@ -24,18 +24,14 @@ for Phase 5 enforcement.
 
 ---
 
-## Wash-Sale Compliance Check
+## ~~Wash-Sale Compliance Check~~ [RESOLVED — 2026-06-23, Session 41]
 
-`execution/oms/compliance.py::_check_wash_sale` is a working implementation
-but a dead letter: nothing in the system populates `ctx["recent_loss_buys"]`.
-
-The check requires a trade-history store that tracks realized-loss buy events
-per ticker per account.  This is Phase 5 scope (reporting / audit trail module).
-
-**Phase 5 action:** Build `execution/oms/trade_history.py` — an append-only
-store (Alembic migration + C3-safe) that records fills with P&L.
-`recent_loss_buys` is then populated from fills where realized_pnl < 0
-within the last 30 days.
+`execution/oms/trade_history.py` was built in Session 41 (branch
+`claude/trade-journal`, commits `708c35a`, `bf2098f`).  The
+`TradeJournal.wash_sale_context()` method now populates `ctx["recent_loss_buys"]`
+from real fill history, and `OrderManager.run_compliance()` auto-injects it when
+a `TradeJournal` is provided.  `_check_wash_sale` is no longer a dead letter.
+The Alembic migration is `infra/db/migrations/versions/004_trade_journal_schema.py`.
 
 ---
 
