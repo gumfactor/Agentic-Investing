@@ -48,7 +48,14 @@ _trade_fills = Table(
     Column("ticker", sa.Text(), nullable=False),
     Column("strategy_id", sa.Text(), nullable=False),
     Column("side", sa.Text(), nullable=False),
+    # filled_quantity is the INCREMENTAL quantity filled in this event (not cumulative).
+    # For the first fill of an order this equals order.filled_quantity; for subsequent
+    # events (PARTIALLY_FILLED → FILLED) it is the delta.  FIFO calculations use
+    # SUM(filled_quantity) which correctly totals incremental shares.
     Column("filled_quantity", sa.Numeric(18, 6), nullable=False),
+    # cumulative_filled_quantity mirrors order.filled_quantity at the time of recording.
+    # Used for dedup (unique with order_id) and for operator display / audit.
+    Column("cumulative_filled_quantity", sa.Numeric(18, 6), nullable=False),
     Column("avg_fill_price", sa.Numeric(18, 6), nullable=False),
     Column("limit_price", sa.Numeric(18, 6)),
     Column("fill_timestamp", sa.DateTime(timezone=True), nullable=False),
@@ -70,13 +77,14 @@ class FillRecord:
     broker_order_id: str | None
     ticker: str
     strategy_id: str
-    side: str                        # 'BUY' | 'SELL'
-    filled_quantity: float
+    side: str                              # 'BUY' | 'SELL'
+    filled_quantity: float                 # incremental shares in this event
+    cumulative_filled_quantity: float      # running total for this order
     avg_fill_price: float
     limit_price: float | None
     fill_timestamp: datetime
     order_status_at_record: str
-    realized_pnl: float | None       # None for BUYs; FIFO P&L for SELLs
+    realized_pnl: float | None             # None for BUYs; FIFO P&L for SELLs (incremental)
     cost_basis_per_share: float | None
     wash_sale_disallowed: bool
     notes: str
@@ -112,6 +120,7 @@ def _row_to_fill_record(row: sa.engine.Row) -> FillRecord:
         strategy_id=row.strategy_id,
         side=row.side,
         filled_quantity=float(row.filled_quantity),
+        cumulative_filled_quantity=float(row.cumulative_filled_quantity),
         avg_fill_price=float(row.avg_fill_price),
         limit_price=float(row.limit_price) if row.limit_price is not None else None,
         fill_timestamp=_coerce_datetime(row.fill_timestamp),  # type: ignore[arg-type]
@@ -152,15 +161,23 @@ class TradeJournal:
         """Persist a fill from an order that has transitioned to FILLED or
         PARTIALLY_FILLED.
 
-        For SELL orders, computes FIFO realized P&L against prior BUY fills
-        for the same (ticker, strategy_id).
+        Stores the INCREMENTAL quantity filled in this event (not cumulative) so
+        that FIFO lot reconstruction remains correct across PARTIALLY_FILLED→FILLED
+        progressions.  ``cumulative_filled_quantity`` preserves the running total
+        for display and audit.
+
+        For SELL orders, computes FIFO realized P&L on the incremental quantity
+        against prior BUY fills for the same (ticker, strategy_id).
 
         Raises
         ------
         ValueError
             - Order has no fill data (filled_quantity=0 or avg_fill_price=None).
-            - SELL quantity exceeds open long quantity (long-only violation).
-            - Duplicate: a fill for this (order_id, filled_quantity) already exists.
+            - Order is not in FILLED or PARTIALLY_FILLED state.
+            - No new incremental fill: order.filled_quantity <= previously recorded
+              cumulative (duplicate call or non-advancing fill).
+            - SELL incremental quantity exceeds open long quantity (long-only
+              violation).
         """
         if order.filled_quantity <= 0 or order.avg_fill_price is None:
             raise ValueError(
@@ -176,49 +193,61 @@ class TradeJournal:
             )
 
         now = datetime.now(timezone.utc)
-        realized_pnl: float | None = None
-        cost_basis_per_share: float | None = None
-
-        if order.side == OrderSide.SELL:
-            cost_basis_per_share, realized_pnl = self._fifo_pnl(
-                order.ticker,
-                order.strategy_id,
-                order.filled_quantity,
-                order.avg_fill_price,
-            )
-
-        fill_id = str(uuid.uuid4())
-        row = {
-            "fill_id": fill_id,
-            "order_id": order.order_id,
-            "broker_order_id": order.broker_order_id,
-            "ticker": order.ticker,
-            "strategy_id": order.strategy_id,
-            "side": order.side.value,
-            "filled_quantity": order.filled_quantity,
-            "avg_fill_price": order.avg_fill_price,
-            "limit_price": order.limit_price,
-            "fill_timestamp": order.updated_at,
-            "order_status_at_record": order.status.value,
-            "realized_pnl": realized_pnl,
-            "cost_basis_per_share": cost_basis_per_share,
-            "wash_sale_disallowed": False,
-            "notes": order.notes,
-            "ingested_at": now,
-        }
 
         with self._engine.begin() as conn:
-            existing = conn.execute(
-                sa.select(_trade_fills.c.fill_id).where(
-                    (_trade_fills.c.order_id == order.order_id)
-                    & (_trade_fills.c.filled_quantity == sa.literal(order.filled_quantity))
-                )
-            ).fetchone()
-            if existing is not None:
+            # Determine how much has already been recorded for this order.
+            prior_max_cumulative = float(
+                conn.execute(
+                    sa.select(
+                        sa.func.coalesce(
+                            sa.func.max(_trade_fills.c.cumulative_filled_quantity),
+                            sa.literal(0),
+                        )
+                    ).where(_trade_fills.c.order_id == order.order_id)
+                ).scalar()
+                or 0
+            )
+
+            incremental_qty = order.filled_quantity - prior_max_cumulative
+            if incremental_qty <= 1e-9:
                 raise ValueError(
-                    f"fill already recorded for order {order.order_id[:8]} "
-                    f"with filled_quantity={order.filled_quantity}"
+                    f"no new fill for order {order.order_id[:8]}: "
+                    f"order reports {order.filled_quantity} shares cumulative, "
+                    f"journal already has {prior_max_cumulative:.4f} recorded"
                 )
+
+            realized_pnl: float | None = None
+            cost_basis_per_share: float | None = None
+            if order.side == OrderSide.SELL:
+                # P&L computed on incremental quantity only so that successive
+                # partial-fill records don't double-count prior lots.
+                cost_basis_per_share, realized_pnl = self._fifo_pnl(
+                    order.ticker,
+                    order.strategy_id,
+                    incremental_qty,
+                    order.avg_fill_price,
+                )
+
+            fill_id = str(uuid.uuid4())
+            row = {
+                "fill_id": fill_id,
+                "order_id": order.order_id,
+                "broker_order_id": order.broker_order_id,
+                "ticker": order.ticker,
+                "strategy_id": order.strategy_id,
+                "side": order.side.value,
+                "filled_quantity": incremental_qty,
+                "cumulative_filled_quantity": order.filled_quantity,
+                "avg_fill_price": order.avg_fill_price,
+                "limit_price": order.limit_price,
+                "fill_timestamp": order.updated_at,
+                "order_status_at_record": order.status.value,
+                "realized_pnl": realized_pnl,
+                "cost_basis_per_share": cost_basis_per_share,
+                "wash_sale_disallowed": False,
+                "notes": order.notes,
+                "ingested_at": now,
+            }
             conn.execute(_trade_fills.insert().values(**row))
 
         logger.info(
@@ -226,7 +255,8 @@ class TradeJournal:
             order_id=order.order_id[:8],
             ticker=order.ticker,
             side=order.side.value,
-            filled_quantity=order.filled_quantity,
+            incremental_qty=incremental_qty,
+            cumulative_qty=order.filled_quantity,
             avg_fill_price=order.avg_fill_price,
             realized_pnl=realized_pnl,
         )
@@ -238,7 +268,8 @@ class TradeJournal:
             ticker=order.ticker,
             strategy_id=order.strategy_id,
             side=order.side.value,
-            filled_quantity=order.filled_quantity,
+            filled_quantity=incremental_qty,
+            cumulative_filled_quantity=order.filled_quantity,
             avg_fill_price=order.avg_fill_price,
             limit_price=order.limit_price,
             fill_timestamp=order.updated_at,
@@ -249,6 +280,41 @@ class TradeJournal:
             notes=order.notes,
             ingested_at=now,
         )
+
+    def recover_missed_fills(self, orders: list[Order]) -> list[FillRecord]:
+        """Replay record_fill() for FILLED/PARTIALLY_FILLED orders not yet in the journal.
+
+        Use this to recover from a DB connection failure that caused
+        _record_fill_to_journal() to swallow an exception during
+        reconcile_fills().  Safe to call with all orders — those already
+        recorded at their current cumulative quantity are skipped automatically
+        (the incremental-qty check treats them as no-ops).
+
+        Returns the list of newly recorded FillRecords.
+        """
+        recovered: list[FillRecord] = []
+        for order in orders:
+            if order.filled_quantity <= 0 or order.avg_fill_price is None:
+                continue
+            if order.status not in {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}:
+                continue
+            try:
+                rec = self.record_fill(order)
+                recovered.append(rec)
+                logger.info(
+                    "fill_recovered",
+                    order_id=order.order_id[:8],
+                    ticker=order.ticker,
+                    incremental_qty=rec.filled_quantity,
+                )
+            except ValueError as exc:
+                # No new fill for this order — already recorded or no fill data.
+                logger.debug(
+                    "fill_recovery_skipped",
+                    order_id=order.order_id[:8],
+                    reason=str(exc),
+                )
+        return recovered
 
     # ── Wash-sale context ─────────────────────────────────────────────────────
 

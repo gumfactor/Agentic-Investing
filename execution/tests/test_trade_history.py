@@ -60,7 +60,8 @@ class TestRecordFill:
         assert isinstance(rec, FillRecord)
         assert rec.ticker == "AAPL"
         assert rec.side == "BUY"
-        assert rec.filled_quantity == pytest.approx(100.0)
+        assert rec.filled_quantity == pytest.approx(100.0)            # incremental
+        assert rec.cumulative_filled_quantity == pytest.approx(100.0)  # same for first fill
         assert rec.avg_fill_price == pytest.approx(150.0)
         # BUYs have no realized P&L
         assert rec.realized_pnl is None
@@ -147,7 +148,7 @@ class TestRecordFill:
         order = _filled_order(side=OrderSide.BUY, quantity=100, avg_fill_price=150.0)
         journal.record_fill(order)
 
-        with pytest.raises(ValueError, match="already recorded"):
+        with pytest.raises(ValueError, match="no new fill"):
             journal.record_fill(order)
 
     def test_no_fill_data_raises(self, journal):
@@ -174,7 +175,60 @@ class TestRecordFill:
         order.filled_quantity = 60.0
         rec = journal.record_fill(order)
         assert rec.order_status_at_record == "PARTIALLY_FILLED"
-        assert rec.filled_quantity == pytest.approx(60.0)
+        assert rec.filled_quantity == pytest.approx(60.0)            # incremental
+        assert rec.cumulative_filled_quantity == pytest.approx(60.0)  # same as incremental (first fill)
+
+    def test_partial_to_full_fill_no_double_count(self, journal):
+        """Regression: PARTIALLY_FILLED→FILLED progression must not double-count
+        lots in FIFO or produce wrong P&L.  This was the bug caught in
+        adversarial review (BLOCKER #1)."""
+        # BUY 100 @ 100
+        buy = _filled_order(side=OrderSide.BUY, quantity=100, avg_fill_price=100.0)
+        journal.record_fill(buy)
+
+        # Same SELL order: partial fill at 60 shares, then full fill at 100 shares
+        sell_order = Order(
+            ticker="AAPL", side=OrderSide.SELL, quantity=100, limit_price=120.0,
+            strategy_id="strat1",
+        )
+
+        # PARTIALLY_FILLED: 60 shares @ 120
+        sell_order.filled_quantity = 60.0
+        sell_order.avg_fill_price = 120.0
+        sell_order.status = OrderStatus.PARTIALLY_FILLED
+        sell_order.updated_at = datetime.now(timezone.utc)
+        rec1 = journal.record_fill(sell_order)
+
+        assert rec1.filled_quantity == pytest.approx(60.0)           # incremental
+        assert rec1.cumulative_filled_quantity == pytest.approx(60.0)
+        assert rec1.realized_pnl == pytest.approx(1200.0)            # (120-100)*60
+
+        # FILLED: 100 shares cumulative @ blended avg 118
+        sell_order.filled_quantity = 100.0
+        sell_order.avg_fill_price = 118.0
+        sell_order.status = OrderStatus.FILLED
+        sell_order.updated_at = datetime.now(timezone.utc)
+        rec2 = journal.record_fill(sell_order)
+
+        assert rec2.filled_quantity == pytest.approx(40.0)            # incremental (100-60)
+        assert rec2.cumulative_filled_quantity == pytest.approx(100.0)
+        # P&L for incremental 40 shares @ 118, cost basis 100:
+        assert rec2.realized_pnl == pytest.approx(720.0)             # (118-100)*40
+
+        # Total P&L across both events = 1200 + 720 = 1920
+        summary = journal.realized_pnl_summary()
+        assert summary["AAPL"] == pytest.approx(1920.0)
+
+        # Open position should be zero (all 100 shares sold)
+        open_pos = journal.open_position_cost_basis()
+        assert "AAPL" not in open_pos
+
+        # No further sell should raise long-only violation (position is flat)
+        follow_sell = _filled_order(
+            side=OrderSide.SELL, quantity=10, avg_fill_price=115.0
+        )
+        with pytest.raises(ValueError, match="long-only violation"):
+            journal.record_fill(follow_sell)
 
 
 # ── wash_sale_context ─────────────────────────────────────────────────────────

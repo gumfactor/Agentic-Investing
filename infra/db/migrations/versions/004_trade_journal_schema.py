@@ -43,7 +43,18 @@ def upgrade() -> None:
             nullable=False,
             comment="BUY or SELL",
         ),
-        sa.Column("filled_quantity", sa.Numeric(18, 6), nullable=False),
+        sa.Column(
+            "filled_quantity",
+            sa.Numeric(18, 6),
+            nullable=False,
+            comment="Incremental shares filled in this event (not cumulative)",
+        ),
+        sa.Column(
+            "cumulative_filled_quantity",
+            sa.Numeric(18, 6),
+            nullable=False,
+            comment="Running total filled for this order at time of recording; used for dedup",
+        ),
         sa.Column("avg_fill_price", sa.Numeric(18, 6), nullable=False),
         sa.Column("limit_price", sa.Numeric(18, 6), nullable=True),
         sa.Column(
@@ -90,13 +101,15 @@ def upgrade() -> None:
         sa.CheckConstraint("avg_fill_price > 0", name="ck_trade_fills_price_positive"),
     )
 
-    # Dedup guard: one row per (order_id, filled_quantity) prevents re-recording
-    # the same fill event if reconcile_fills() is called twice before the order
-    # transitions to a terminal status.
+    # Dedup guard: one row per (order_id, cumulative_filled_quantity).
+    # Uses the cumulative quantity (not incremental) so that a PARTIALLY_FILLED
+    # record (cumulative=60) and the subsequent FILLED record (cumulative=100)
+    # are both allowed, while re-recording the same cumulative quantity is
+    # rejected as a duplicate.
     op.create_unique_constraint(
-        "uq_trade_fills_order_qty",
+        "uq_trade_fills_order_cumulative_qty",
         "trade_fills",
-        ["order_id", "filled_quantity"],
+        ["order_id", "cumulative_filled_quantity"],
     )
 
     # Ticker + time index for fill history queries and FIFO lot reconstruction.
@@ -129,4 +142,16 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # TimescaleDB hypertables must be detached before DROP TABLE; a plain
+    # DROP TABLE on a hypertable fails on PostgreSQL.  drop_hypertable() with
+    # cascade=TRUE also drops all chunks; if_exists=TRUE makes this safe if
+    # TimescaleDB is not installed (e.g., plain PostgreSQL) or the table was
+    # never converted.
+    try:
+        op.execute(
+            "SELECT drop_hypertable('trade_fills', cascade => TRUE, if_exists => TRUE)"
+        )
+    except Exception:
+        # Plain PostgreSQL without TimescaleDB — skip hypertable teardown.
+        pass
     op.drop_table("trade_fills")

@@ -343,10 +343,15 @@ class OrderManager:
     def _record_fill_to_journal(self, order: Order) -> None:
         """Attempt to persist a fill to the trade journal; log errors, never raise.
 
-        Swallowing the exception here is intentional: a journal persistence
-        failure should not abort the reconciliation loop or leave the in-memory
-        OMS state inconsistent.  The operator will see the error in the log and
-        can reprocess the fill manually.
+        Exceptions are swallowed so that a journal persistence failure does not
+        abort the reconciliation loop or leave in-memory OMS state inconsistent.
+        If this method logs an error, the OMS order will be in FILLED state but
+        the journal will be missing the fill.  To recover, call:
+
+            journal.recover_missed_fills(list(order_manager.all_orders()))
+
+        This replays fills for FILLED orders not yet recorded in the journal and
+        is safe to call multiple times (already-recorded fills are skipped).
         """
         if self._trade_journal is None:
             return
@@ -360,6 +365,7 @@ class OrderManager:
                 order_id=order.order_id[:8],
                 ticker=order.ticker,
                 error=str(exc),
+                recovery="call journal.recover_missed_fills(om.all_orders())",
             )
         except Exception as exc:
             logger.error(
@@ -367,6 +373,7 @@ class OrderManager:
                 order_id=order.order_id[:8],
                 ticker=order.ticker,
                 error=str(exc),
+                recovery="call journal.recover_missed_fills(om.all_orders()) once DB is back",
             )
 
     def cancel_order(self, order_id: str) -> bool:
