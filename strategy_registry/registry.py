@@ -286,7 +286,23 @@ class StrategyRegistry:
                     created_at=now,
                 )
                 session.add(defn)
-                session.flush()
+                # flush() must be wrapped: a pre-existing definition with the same
+                # strategy_id+version but different hash fires uq_strategy_definitions_version
+                # here, before the outer try/except commit block is reached.
+                try:
+                    session.flush()
+                except IntegrityError as exc:
+                    session.rollback()
+                    exc_str = str(exc).lower()
+                    if "uq_strategy_definitions_version" in exc_str or (
+                        "unique" in exc_str and "version" in exc_str
+                    ):
+                        raise DuplicateVersionError(
+                            f"Version {fp.version} is already registered for '{fp.strategy_id}' "
+                            f"with a different config hash. "
+                            f"Bump 'version' in the YAML to add a new config variant."
+                        ) from exc
+                    raise
 
             strategy = Strategy(
                 strategy_id=fp.strategy_id,

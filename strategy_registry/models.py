@@ -7,9 +7,9 @@ import sqlalchemy as sa
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
-    Date,
     ForeignKeyConstraint,
     Identity,
+    Index,
     Integer,
     Text,
     UniqueConstraint,
@@ -85,6 +85,22 @@ class Strategy(Base):
         CheckConstraint(
             "status IN ('backtesting', 'paper', 'live', 'archived')",
             name="ck_strategies_status",
+        ),
+        # Partial unique indexes: at most one strategy in paper, one in live.
+        # Defined here so Base.metadata.create_all() builds them (not just the migration).
+        Index(
+            "uix_strategies_one_paper",
+            "status",
+            unique=True,
+            postgresql_where=sa.text("status = 'paper'"),
+            sqlite_where=sa.text("status = 'paper'"),
+        ),
+        Index(
+            "uix_strategies_one_live",
+            "status",
+            unique=True,
+            postgresql_where=sa.text("status = 'live'"),
+            sqlite_where=sa.text("status = 'live'"),
         ),
     )
 
