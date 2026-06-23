@@ -71,6 +71,8 @@ Only one strategy per `(strategy_id)` may be in `paper` or `live` status at a ti
 | `version` | `INTEGER NOT NULL` | `version` field from YAML |
 | `name` | `TEXT NOT NULL` | `name` field from YAML (display name) |
 | `description` | `TEXT` | `description` field from YAML |
+| `strategy_family` | `TEXT` | Grouping label shared across versions of the same conceptual strategy, e.g. `"base_momentum"`. Set at registration time; nullable for one-off strategies. |
+| `supersedes_strategy_id` | `TEXT FK → strategies.strategy_id` | The strategy_id this version explicitly replaces, e.g. `v2_base_momentum.supersedes = "v1_base_momentum"`. Nullable; validates the predecessor exists. |
 | `portfolio_method` | `TEXT` | `portfolio.method` from YAML for quick filtering |
 | `n_long` | `INTEGER` | `portfolio.n_long` |
 | `rebalance_frequency` | `TEXT` | `portfolio.rebalance_frequency` |
@@ -162,6 +164,8 @@ class StrategyRegistry:
         self,
         strategy_id: str,
         config_path: str,
+        strategy_family: str | None = None,
+        supersedes_strategy_id: str | None = None,
         notes: str | None = None,
     ) -> Strategy:
         """
@@ -187,6 +191,7 @@ class StrategyRegistry:
     def list(
         self,
         status: StrategyStatus | None = None,
+        strategy_family: str | None = None,
     ) -> list[Strategy]: ...
 
     def record_performance(
@@ -209,13 +214,15 @@ class StrategyRegistry:
 ```
 python -m strategy_registry register   --strategy-id v1_base_momentum \
                                        --config-path config/strategy/v1_base_momentum.yaml \
+                                       [--family base_momentum] \
+                                       [--supersedes <predecessor_strategy_id>] \
                                        [--notes "Initial registration"]
 
 python -m strategy_registry status     --strategy-id v1_base_momentum
                                        --to paper
                                        [--notes "Moving to paper trading"]
 
-python -m strategy_registry list       [--status paper]
+python -m strategy_registry list       [--status paper] [--family base_momentum]
 
 python -m strategy_registry show       --strategy-id v1_base_momentum
 

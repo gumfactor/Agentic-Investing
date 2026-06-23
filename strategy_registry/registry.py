@@ -113,6 +113,8 @@ class StrategyRegistry:
         self,
         strategy_id: str,
         config_path: str,
+        strategy_family: Optional[str] = None,
+        supersedes_strategy_id: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> Strategy:
         """Register a new strategy from a YAML config file."""
@@ -129,6 +131,17 @@ class StrategyRegistry:
                     f"strategy_id values are permanent — create a new version (e.g. v2_...) instead."
                 )
 
+            if supersedes_strategy_id is not None:
+                predecessor = session.scalar(
+                    select(Strategy).where(
+                        Strategy.strategy_id == supersedes_strategy_id
+                    )
+                )
+                if predecessor is None:
+                    raise StrategyNotFoundError(
+                        f"supersedes_strategy_id '{supersedes_strategy_id}' not found in the registry."
+                    )
+
             strategy = Strategy(
                 strategy_id=cfg.strategy_id,
                 config_path=cfg.config_path,
@@ -137,6 +150,8 @@ class StrategyRegistry:
                 version=cfg.version,
                 name=cfg.name,
                 description=cfg.description,
+                strategy_family=strategy_family,
+                supersedes_strategy_id=supersedes_strategy_id,
                 portfolio_method=cfg.portfolio_method,
                 n_long=cfg.n_long,
                 rebalance_frequency=cfg.rebalance_frequency,
@@ -236,11 +251,14 @@ class StrategyRegistry:
     def list(
         self,
         status: Optional[StrategyStatus] = None,
+        strategy_family: Optional[str] = None,
     ) -> list[Strategy]:
         with Session(self._engine) as session:
             q = select(Strategy)
             if status is not None:
                 q = q.where(Strategy.status == status)
+            if strategy_family is not None:
+                q = q.where(Strategy.strategy_family == strategy_family)
             return list(session.scalars(q.order_by(Strategy.registered_at)))
 
     def record_performance(

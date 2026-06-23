@@ -28,6 +28,8 @@ def upgrade() -> None:
         sa.Column("version", sa.Integer(), nullable=False),
         sa.Column("name", sa.Text(), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("strategy_family", sa.Text(), nullable=True),
+        sa.Column("supersedes_strategy_id", sa.Text(), nullable=True),
         sa.Column("portfolio_method", sa.Text(), nullable=True),
         sa.Column("n_long", sa.Integer(), nullable=True),
         sa.Column("rebalance_frequency", sa.Text(), nullable=True),
@@ -47,8 +49,15 @@ def upgrade() -> None:
             "status IN ('backtesting', 'paper', 'live', 'archived')",
             name="ck_strategies_status",
         ),
+        sa.ForeignKeyConstraint(
+            ["supersedes_strategy_id"],
+            ["strategies.strategy_id"],
+            name="fk_strategies_supersedes",
+            ondelete="RESTRICT",
+        ),
     )
     op.create_index("ix_strategies_status", "strategies", ["status"])
+    op.create_index("ix_strategies_family", "strategies", ["strategy_family"])
 
     # Enforce at most one strategy in paper at a time.
     op.execute(
@@ -143,5 +152,6 @@ def downgrade() -> None:
     op.drop_table("strategy_status_history")
     op.drop_index("uix_strategies_one_live", table_name="strategies")
     op.drop_index("uix_strategies_one_paper", table_name="strategies")
+    op.drop_index("ix_strategies_family", table_name="strategies")
     op.drop_index("ix_strategies_status", table_name="strategies")
     op.drop_table("strategies")

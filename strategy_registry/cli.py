@@ -29,6 +29,8 @@ def cmd_register(args: argparse.Namespace) -> None:
     strategy = registry.register(
         strategy_id=args.strategy_id,
         config_path=args.config_path,
+        strategy_family=args.family,
+        supersedes_strategy_id=args.supersedes,
         notes=args.notes,
     )
     print(
@@ -53,7 +55,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     registry = _get_registry()
     status_filter = StrategyStatus(args.status) if args.status else None
-    strategies = registry.list(status=status_filter)
+    strategies = registry.list(status=status_filter, strategy_family=args.family)
     if not strategies:
         print("No strategies found.")
         return
@@ -73,6 +75,8 @@ def cmd_show(args: argparse.Namespace) -> None:
         "version": s.version,
         "name": s.name,
         "description": s.description,
+        "strategy_family": s.strategy_family,
+        "supersedes_strategy_id": s.supersedes_strategy_id,
         "config_path": s.config_path,
         "config_sha256": s.config_sha256,
         "portfolio_method": s.portfolio_method,
@@ -124,6 +128,8 @@ def main() -> None:
     p_reg = sub.add_parser("register", help="Register a new strategy")
     p_reg.add_argument("--strategy-id", required=True)
     p_reg.add_argument("--config-path", required=True)
+    p_reg.add_argument("--family", help="Strategy family name (e.g. 'base_momentum')")
+    p_reg.add_argument("--supersedes", help="strategy_id this version supersedes")
     p_reg.add_argument("--notes")
     p_reg.set_defaults(func=cmd_register)
 
@@ -145,6 +151,7 @@ def main() -> None:
         choices=[s.value for s in StrategyStatus],
         default=None,
     )
+    p_list.add_argument("--family", default=None, help="Filter by strategy family")
     p_list.set_defaults(func=cmd_list)
 
     # show

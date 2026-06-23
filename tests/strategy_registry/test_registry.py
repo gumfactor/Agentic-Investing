@@ -210,6 +210,62 @@ def test_record_performance_backtest_requires_data_version(
         registry.record_performance("v1_test", snap)
 
 
+# ── Family and lineage ────────────────────────────────────────────────────────
+
+
+def test_register_with_family(registry: StrategyRegistry, tmp_path: Path) -> None:
+    p = tmp_path / "v1.yaml"
+    p.write_text(yaml.dump({"version": 1, "name": "base_momentum", "portfolio": {"method": "equal_weight", "n_long": 10}}))
+    s = registry.register("v1_base_momentum", str(p), strategy_family="base_momentum")
+    assert s.strategy_family == "base_momentum"
+
+
+def test_register_supersedes_links_predecessor(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    p1 = tmp_path / "v1.yaml"
+    p2 = tmp_path / "v2.yaml"
+    p1.write_text(yaml.dump({"version": 1, "name": "base_momentum", "portfolio": {"method": "equal_weight", "n_long": 10}}))
+    p2.write_text(yaml.dump({"version": 2, "name": "base_momentum", "portfolio": {"method": "equal_weight", "n_long": 10}}))
+
+    registry.register("v1_base_momentum", str(p1), strategy_family="base_momentum")
+    s2 = registry.register(
+        "v2_base_momentum",
+        str(p2),
+        strategy_family="base_momentum",
+        supersedes_strategy_id="v1_base_momentum",
+    )
+    assert s2.supersedes_strategy_id == "v1_base_momentum"
+
+
+def test_register_supersedes_nonexistent_raises(
+    registry: StrategyRegistry, tmp_config: Path
+) -> None:
+    with pytest.raises(StrategyNotFoundError):
+        registry.register(
+            "v2_test",
+            str(tmp_config),
+            supersedes_strategy_id="v1_ghost",
+        )
+
+
+def test_list_filter_by_family(registry: StrategyRegistry, tmp_path: Path) -> None:
+    p1 = tmp_path / "v1.yaml"
+    p2 = tmp_path / "v2.yaml"
+    p3 = tmp_path / "v3.yaml"
+    p1.write_text(yaml.dump({"version": 1, "name": "base_momentum", "portfolio": {"method": "equal_weight", "n_long": 10}}))
+    p2.write_text(yaml.dump({"version": 2, "name": "base_momentum", "portfolio": {"method": "equal_weight", "n_long": 10}}))
+    p3.write_text(yaml.dump({"version": 1, "name": "mvo_momentum", "portfolio": {"method": "mvo", "n_long": 10}}))
+
+    registry.register("v1_base_momentum", str(p1), strategy_family="base_momentum")
+    registry.register("v2_base_momentum", str(p2), strategy_family="base_momentum")
+    registry.register("v1_mvo_momentum", str(p3), strategy_family="mvo_momentum")
+
+    base = registry.list(strategy_family="base_momentum")
+    assert len(base) == 2
+    assert all(s.strategy_family == "base_momentum" for s in base)
+
+
 # ── List and get ──────────────────────────────────────────────────────────────
 
 

@@ -39,6 +39,10 @@ class Strategy(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
+    strategy_family: Mapped[str | None] = mapped_column(Text)
+    supersedes_strategy_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("strategies.strategy_id", ondelete="RESTRICT")
+    )
     portfolio_method: Mapped[str | None] = mapped_column(Text)
     n_long: Mapped[int | None] = mapped_column(Integer)
     rebalance_frequency: Mapped[str | None] = mapped_column(Text)
@@ -50,6 +54,17 @@ class Strategy(Base):
     archived_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     notes: Mapped[str | None] = mapped_column(Text)
 
+    supersedes: Mapped[Strategy | None] = relationship(
+        "Strategy",
+        foreign_keys="[Strategy.supersedes_strategy_id]",
+        remote_side="Strategy.strategy_id",
+        back_populates="superseded_by",
+    )
+    superseded_by: Mapped[list[Strategy]] = relationship(
+        "Strategy",
+        foreign_keys="[Strategy.supersedes_strategy_id]",
+        back_populates="supersedes",
+    )
     status_history: Mapped[list[StrategyStatusHistory]] = relationship(
         "StrategyStatusHistory",
         back_populates="strategy",
