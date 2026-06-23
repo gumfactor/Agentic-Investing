@@ -230,7 +230,7 @@ rqis/
 │   │   ├── order.py               # Order dataclass + state machine
 │   │   ├── order_manager.py       # Staging, routing, cancellation
 │   │   ├── compliance.py          # Pre-trade checks (wash sale, concentration)
-│   │   └── trade_history.py       # Append-only fill store for P&L + wash-sale history (Phase 5)
+│   │   └── trade_history.py       # Append-only fill store for P&L + wash-sale history
 │   ├── brokers/
 │   │   ├── base_broker.py         # Abstract interface
 │   │   └── ibkr_broker.py         # sole production broker (Alpaca deferred)

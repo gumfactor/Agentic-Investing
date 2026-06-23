@@ -41,7 +41,7 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 2 | Signal Library | **Complete** | Week 12 |
 | 3 | Backtesting Engine | **Live validation complete** | Week 18 |
 | 4 | Portfolio + Paper Trading | **Implementation complete — tiny paper submission recorded** | Week 26 |
-| 5 | Strategy Library, Automated Paper Trading, Reporting & Live Trading | Not started | Week 42 |
+| 5 | Strategy Library, Automated Paper Trading, Reporting & Live Trading | **In progress — M5.2 complete** | Week 42 |
 
 **Active branch:** `main`
 
@@ -52,7 +52,7 @@ All three module trees (portfolio/, execution/, risk/) are now fully implemented
 - **portfolio/optimization/**: MVO (max-Sharpe/min-variance) + Risk-Parity (Spinu 2013)
 - **portfolio/risk_model/**: Ledoit-Wolf covariance + PortfolioConstraints
 - **portfolio/rebalancing/**: Calendar + drift trigger
-- **execution/oms/**: Order state machine (STAGED→FILLED) + ComplianceEngine
+- **execution/oms/**: Order state machine (STAGED→FILLED) + ComplianceEngine + TradeJournal (append-only fill store, FIFO P&L, wash-sale history)
 - **execution/brokers/**: IBKRBroker (paper port 7497 / live port 7496)
 - **execution/cost_model/**: Almgren-Chriss cost estimator
 - **risk/realtime/**: Historical/parametric VaR, CVaR, beta, RiskMonitor
@@ -62,8 +62,9 @@ All three module trees (portfolio/, execution/, risk/) are now fully implemented
 Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
 `execute_trade` (requires dashboard blotter approval with per-order selection and double confirmation — C1).
 
-**Last recorded validation:** 675 local tests passed on 2026-06-20; the
-paper/execution/risk subset passed with 213 tests.
+**Last recorded validation:** 675 local tests passed on 2026-06-20 (Phase 4
+baseline); 58/58 execution suite tests passed on 2026-06-23 after M5.2
+trade journal (+31 trade_history tests, +2 OMS integration tests).
 
 Exit criterion for the current supervised Phase 4 plumbing rehearsal: 4
 consecutive trading days of operator-run paper workflow with zero critical
@@ -80,9 +81,9 @@ sequence for Phase 5 is:
    config path, status (backtesting/paper/live/archived), and performance
    metadata. Activation means passing `--strategy-config` for a registered
    strategy; deactivation is a status update, not a code deletion.
-2. **Trading journal** (`execution/oms/trade_history.py`) — append-only fill
-   store with P&L and wash-sale history; this also unblocks live wash-sale
-   compliance checks (currently a dead letter).
+2. **Trading journal** (`execution/oms/trade_history.py`) — **COMPLETE (M5.2,
+   2026-06-23).** Append-only fill store with FIFO P&L and wash-sale history.
+   `_check_wash_sale` compliance rule is now live (no longer a dead letter).
 3. **Tearsheets with charting output** — unified backtest + paper performance;
    visual entry/exit charts so signals can be eyeballed against price history.
 4. **Airflow DAG** — fully automated daily paper-trading pipeline (data refresh
