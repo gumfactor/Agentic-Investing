@@ -14,6 +14,95 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-23
 
+### Session 42 — Phase 5 M5.3: Tearsheets with Charting Output
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/tearsheet-charting` (renamed from `claude/tearsheet-charting-ewunsn`)
+**Commits:** `dc67b29` (feat), `9e9f6ec` (fix — adversarial review)
+
+---
+
+#### What was done
+
+Built the tearsheet reporting module (Phase 5 priority sequence item 3) from scratch.
+
+**Files created:**
+
+- `reporting/tearsheets/metrics.py` — 17 pure-math performance metric functions:
+  CAGR, annualised Sharpe, Sortino (correct semi-deviation formula), max drawdown,
+  Calmar, information ratio, beta, Jensen's alpha, rolling Sharpe series,
+  monthly returns pivot (year × month), annual returns, and `compute_metrics()`
+  full-bundle wrapper.
+
+- `reporting/tearsheets/charts.py` — 9 matplotlib chart builders with dual `ax=`
+  API (standalone Figure for HTML embedding or draw-on-Axes for composite layouts):
+  equity curve (with nav_series support), drawdown, monthly returns heatmap
+  (seaborn, green/red diverging), rolling 252-day Sharpe, annual returns bar
+  (partial-year annotation), return distribution histogram + KDE, position
+  concentration stacked area, cumulative transaction costs, trade entry/exit
+  overlays.
+
+- `reporting/tearsheets/tearsheet.py` — `TearsheetGenerator` dataclass:
+  `from_backtest_result(BacktestResult)` factory; `render_html()` → self-contained
+  HTML with base64-embedded charts + KPI metric cards (16 metrics displayed);
+  `render_png_dir()` → per-chart PNG directory.
+
+- `reporting/tearsheets/__init__.py` — public API with `generate_tearsheet()`
+  convenience wrapper (auto-selects HTML or PNG dir from path extension).
+
+- `reporting/tests/test_tearsheets.py` — 94 tests, all passing.
+
+**Adversarial subagent review** surfaced 22 findings (P1–P5). All were addressed
+in the fix commit:
+
+- **P1.1 (Critical):** Sortino formula was wrong — replaced filter-negatives
+  approach with correct semi-deviation over all periods: `sqrt(mean(min(r-MAR,0)^2))`.
+- **P1.2/P1.3 (Critical):** Benchmark total return and equity curve were distorted
+  by `fillna(0)` for non-overlapping dates — switched to inner-align.
+- **P1.4:** Metrics cache sentinel `if not dict` → `if dict is None`.
+- **P2.1:** Explicit `len(r) < 2` guards in `information_ratio` and `beta`
+  (zero-overlap now returns NaN by design, not by accident).
+- **P2.2:** `from_backtest_result` now guards against non-dict `config` objects.
+- **P2.3:** `_build_charts` protected against missing `ticker` column and
+  all-NaN `notional` column in trades DataFrame.
+- **P2.4:** `generate_tearsheet()` directory path was a silent no-op — now
+  calls `render_png_dir()`.
+- **P3.1:** Sortino `risk_free_rate` now used as MAR threshold (part of P1.1 fix).
+- **P3.3:** Annual returns bar annotates partial first/last years with `*`.
+- **P4.1:** Replaced `matplotlib.use("Agg")` (called too late) with
+  `plt.switch_backend("Agg")` in `_build_charts`.
+- **P4.4:** `nav_series` was stored but never used — now passed to equity curve
+  chart for accurate day-0 NAV representation.
+- **P5.1–P5.5:** Added exact Sortino known-value test, zero-overlap NaN tests
+  for IR/beta, formula-verifying Calmar test, nav_series equity test,
+  disjoint-benchmark equity test, and directory output PNG existence assertions.
+
+[DECISION] Sortino uses full-period denominator (all days, only sub-MAR days
+contribute squared terms) — matches CFA/pyfolio/QuantStats convention. Prior
+filter-negatives approach would have understated the downside risk denominator
+and overstated the ratio.
+
+[DECISION] Information ratio uses `ddof=1` (sample tracking error). CFA/GIPS
+uses `ddof=0` but for backtesting samples `ddof=1` is the statistically
+unbiased estimator. Documented in docstring.
+
+[DECISION] Tearsheet entry point accepts `BacktestResult` directly. No database
+reads — works entirely from in-memory result objects. A separate `from_paper_run`
+factory is out of scope for this session; paper trading tearsheets can be
+constructed manually by passing the same data types.
+
+---
+
+#### Next steps
+
+- Wire `generate_tearsheet()` into `BacktestLogger.log_run()` so every MLflow
+  run automatically saves an HTML tearsheet as an artifact.
+- Implement `from_paper_run()` factory for post-paper-submission tearsheets
+  using `TradeJournal.fill_history()` + broker NAV series.
+- Proceed to Phase 5 priority item 4: Airflow DAG.
+
+---
+
 ### Session 41 — Phase 5 M5.2: Trade Journal (append-only fill store)
 
 **Operator:** mshane@thecanadalist.ca
