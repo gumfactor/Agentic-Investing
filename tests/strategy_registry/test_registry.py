@@ -19,6 +19,7 @@ from strategy_registry.registry import (
     InvalidTransitionError,
     MissingDataVersionError,
     MissingOperatorNotesError,
+    RunLifecycleMismatchError,
     StrategyAlreadyRegisteredError,
     StrategyNotFoundError,
     StrategyRegistry,
@@ -238,6 +239,16 @@ def test_transition_paper_to_live_requires_notes(
         registry.transition("v1_test_strategy", StrategyStatus.LIVE)
 
 
+def test_transition_to_live_rejects_whitespace_operator_notes(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Whitespace-only notes must not bypass the C8 documentation gate."""
+    registry.register(str(cfg))
+    registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    with pytest.raises(MissingOperatorNotesError):
+        registry.transition("v1_test_strategy", StrategyStatus.LIVE, operator_notes="   ")
+
+
 def test_transition_paper_to_live_with_notes(
     registry: StrategyRegistry, cfg: Path
 ) -> None:
@@ -378,6 +389,26 @@ def test_record_run_backtest_requires_data_version(
         registry.record_run(s.strategy_id, s.canonical_config_hash, "backtest", "passed")
 
 
+def test_record_run_walk_forward_requires_data_version(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """walk_forward must also enforce the C7 data_version requirement."""
+    s = registry.register(str(cfg))
+    with pytest.raises(MissingDataVersionError):
+        registry.record_run(s.strategy_id, s.canonical_config_hash, "walk_forward", "passed")
+
+
+def test_record_run_rejects_whitespace_data_version(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Whitespace-only data_version must not bypass the C7 gate."""
+    s = registry.register(str(cfg))
+    with pytest.raises(MissingDataVersionError):
+        registry.record_run(
+            s.strategy_id, s.canonical_config_hash, "backtest", "passed", data_version="   "
+        )
+
+
 def test_record_run_backtest_success(registry: StrategyRegistry, cfg: Path) -> None:
     s = registry.register(str(cfg))
     run = registry.record_run(
@@ -420,6 +451,42 @@ def test_record_run_pre_registration(
         metrics={"ic_mean": 0.04},
     )
     assert run.strategy_id == defn.strategy_id
+
+
+def test_record_run_paper_blocked_when_strategy_in_backtesting(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Paper run_type must be blocked when the strategy is in backtesting status."""
+    s = registry.register(str(cfg))
+    with pytest.raises(RunLifecycleMismatchError):
+        registry.record_run(
+            s.strategy_id, s.canonical_config_hash, "paper", "passed",
+            metrics={"pnl": 0.0},
+        )
+
+
+def test_record_run_paper_allowed_when_strategy_in_paper(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    registry.register(str(cfg))
+    registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    s = registry.get("v1_test_strategy")
+    run = registry.record_run(
+        s.strategy_id, s.canonical_config_hash, "paper", "passed",
+        metrics={"pnl": 0.0},
+    )
+    assert run.run_type == "paper"
+
+
+def test_status_history_accessible_after_session_close(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Returned Strategy objects must have status_history loaded (not lazy)."""
+    registry.register(str(cfg))
+    registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    s = registry.get("v1_test_strategy")
+    # Accessing status_history must not raise DetachedInstanceError.
+    assert len(s.status_history) == 2  # backtesting + paper
 
 
 def test_get_runs_filters(registry: StrategyRegistry, cfg: Path) -> None:

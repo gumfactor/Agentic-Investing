@@ -4,7 +4,11 @@ from strategy_registry.models import (
     StrategyRun,
     StrategyStatusHistory,
 )
-from strategy_registry.registry import StrategyRegistry, StrategyStatus
+from strategy_registry.registry import (
+    StrategyRegistry,
+    StrategyStatus,
+    RunLifecycleMismatchError,
+)
 
 __all__ = [
     "Strategy",
@@ -13,4 +17,5 @@ __all__ = [
     "StrategyStatusHistory",
     "StrategyRegistry",
     "StrategyStatus",
+    "RunLifecycleMismatchError",
 ]

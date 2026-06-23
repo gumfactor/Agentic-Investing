@@ -64,7 +64,7 @@ def fingerprint(
         n_long=int(portfolio["n_long"]) if portfolio.get("n_long") is not None else None,
         rebalance_frequency=_optional_str(portfolio.get("rebalance_frequency")),
         config=canonical,
-        source_path=str(path),
+        source_path=_repo_relative(path),
     )
 
 
@@ -171,3 +171,11 @@ def _slug(value: str) -> str:
     lowered = value.strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "_", lowered)
     return re.sub(r"_+", "_", slug).strip("_")
+
+
+def _repo_relative(path: Path) -> str:
+    """Return path relative to CWD (repo root) when possible; absolute otherwise."""
+    try:
+        return str(path.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return str(path.resolve())

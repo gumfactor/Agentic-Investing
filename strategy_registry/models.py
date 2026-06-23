@@ -158,6 +158,12 @@ class StrategyStatusHistory(Base):
     """Append-only audit trail of lifecycle transitions (C3)."""
 
     __tablename__ = "strategy_status_history"
+    __table_args__ = (
+        CheckConstraint(
+            "to_status IN ('backtesting', 'paper', 'live', 'archived')",
+            name="ck_strategy_status_history_to_status",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     strategy_id: Mapped[str] = mapped_column(

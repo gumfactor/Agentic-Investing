@@ -8,12 +8,12 @@ import os
 import sys
 
 from strategy_registry.registry import (
-    StrategyRegistry,
     StrategyStatus,
 )
 
 
-def _registry() -> StrategyRegistry:
+def _registry():
+    from strategy_registry.registry import StrategyRegistry
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         print("ERROR: DATABASE_URL environment variable is not set.", file=sys.stderr)
@@ -26,7 +26,6 @@ def _registry() -> StrategyRegistry:
 
 def cmd_fingerprint(args: argparse.Namespace) -> None:
     """Validate and display config fingerprint without writing to DB."""
-    reg = StrategyRegistry.__new__(StrategyRegistry)  # no DB needed
     from strategy_registry import fingerprint as fp_module
     fp = fp_module.fingerprint(args.config_path, args.strategy_id)
     print(json.dumps({

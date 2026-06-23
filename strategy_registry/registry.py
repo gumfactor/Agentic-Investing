@@ -7,7 +7,7 @@ from typing import Any, Optional
 import structlog
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from strategy_registry import fingerprint as fp_module
 from strategy_registry.fingerprint import StrategyFingerprint
@@ -66,6 +66,11 @@ class MissingDataVersionError(StrategyRegistryError):
     pass
 
 
+class RunLifecycleMismatchError(StrategyRegistryError):
+    """run_type is inconsistent with the strategy's current lifecycle status."""
+    pass
+
+
 # ── Status and transitions ────────────────────────────────────────────────────
 
 
@@ -89,6 +94,13 @@ _ALLOWED_TRANSITIONS: dict[StrategyStatus, set[StrategyStatus]] = {
 
 _SINGLE_ACTIVE = {StrategyStatus.PAPER, StrategyStatus.LIVE}
 _REQUIRE_DATA_VERSION = {"backtest", "walk_forward"}
+
+# run_type values that require the strategy lifecycle to be in a matching status.
+# If a lifecycle row exists, the strategy's status must be one of the allowed values.
+_RUN_TYPE_LIFECYCLE_GATE: dict[str, set[StrategyStatus]] = {
+    "paper": {StrategyStatus.PAPER, StrategyStatus.ARCHIVED},
+    "live": {StrategyStatus.LIVE, StrategyStatus.ARCHIVED},
+}
 
 
 # ── StrategyRegistry ──────────────────────────────────────────────────────────
@@ -129,7 +141,15 @@ class StrategyRegistry:
         now = datetime.now(tz=timezone.utc)
 
         with Session(self._engine) as session:
-            existing = session.get(StrategyDefinition, (fp.strategy_id, fp.config_hash))
+            # Eager-load runs so the returned object is usable after session close.
+            existing = session.scalar(
+                select(StrategyDefinition)
+                .where(
+                    StrategyDefinition.strategy_id == fp.strategy_id,
+                    StrategyDefinition.config_hash == fp.config_hash,
+                )
+                .options(selectinload(StrategyDefinition.runs))
+            )
             if existing is not None:
                 log.debug("definition_already_exists", strategy_id=fp.strategy_id, config_hash=fp.config_hash[:8])
                 return existing
@@ -152,16 +172,28 @@ class StrategyRegistry:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
-                if "uq_strategy_definitions_version" in str(exc) or "UNIQUE" in str(exc).upper():
+                exc_str = str(exc).lower()
+                if "uq_strategy_definitions_version" in exc_str or (
+                    "unique" in exc_str and "version" in exc_str
+                ):
                     raise DuplicateVersionError(
                         f"Version {fp.version} is already registered for "
                         f"'{fp.strategy_id}' with a different config hash. "
                         f"Bump 'version' in the YAML to add a new config variant."
                     ) from exc
                 raise
-            session.refresh(defn)
+
+            # Re-query with relationship loading before session closes.
+            defn = session.scalar(
+                select(StrategyDefinition)
+                .where(
+                    StrategyDefinition.strategy_id == fp.strategy_id,
+                    StrategyDefinition.config_hash == fp.config_hash,
+                )
+                .options(selectinload(StrategyDefinition.runs))
+            )
             log.info("definition_added", strategy_id=fp.strategy_id, config_hash=fp.config_hash[:8], version=fp.version)
-            return defn
+            return defn  # type: ignore[return-value]  # guaranteed non-None after INSERT
 
     def get_definition(
         self,
@@ -169,7 +201,14 @@ class StrategyRegistry:
         config_hash: str,
     ) -> StrategyDefinition:
         with Session(self._engine) as session:
-            defn = session.get(StrategyDefinition, (strategy_id, config_hash))
+            defn = session.scalar(
+                select(StrategyDefinition)
+                .where(
+                    StrategyDefinition.strategy_id == strategy_id,
+                    StrategyDefinition.config_hash == config_hash,
+                )
+                .options(selectinload(StrategyDefinition.runs))
+            )
             if defn is None:
                 raise DefinitionNotFoundError(
                     f"No definition found for ('{strategy_id}', '{config_hash[:8]}…'). "
@@ -183,6 +222,7 @@ class StrategyRegistry:
                 session.scalars(
                     select(StrategyDefinition)
                     .where(StrategyDefinition.strategy_id == strategy_id)
+                    .options(selectinload(StrategyDefinition.runs))
                     .order_by(StrategyDefinition.version)
                 )
             )
@@ -262,16 +302,24 @@ class StrategyRegistry:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
-                if "uq_strategy_definitions_version" in str(exc) or "UNIQUE" in str(exc).upper():
+                exc_str = str(exc).lower()
+                if "uq_strategy_definitions_version" in exc_str or (
+                    "unique" in exc_str and "version" in exc_str
+                ):
                     raise DuplicateVersionError(
                         f"Version {fp.version} is already registered for '{fp.strategy_id}' "
                         f"with a different config hash."
                     ) from exc
                 raise
 
-            session.refresh(strategy)
+            # Re-query with relationship loading before session closes.
+            strategy = session.scalar(
+                select(Strategy)
+                .where(Strategy.strategy_id == fp.strategy_id)
+                .options(selectinload(Strategy.status_history))
+            )
             log.info("strategy_registered", strategy_id=fp.strategy_id, config_hash=fp.config_hash[:8])
-            return strategy
+            return strategy  # type: ignore[return-value]
 
     def transition(
         self,
@@ -280,7 +328,7 @@ class StrategyRegistry:
         operator_notes: Optional[str] = None,
     ) -> Strategy:
         """Execute a lifecycle status transition with full guard checks."""
-        if to_status == StrategyStatus.LIVE and not operator_notes:
+        if to_status == StrategyStatus.LIVE and not (operator_notes and operator_notes.strip()):
             raise MissingOperatorNotesError(
                 "operator_notes is required when transitioning to 'live'. "
                 "Document the C8 clearance basis."
@@ -327,15 +375,41 @@ class StrategyRegistry:
                 transitioned_at=now,
                 operator_notes=operator_notes,
             ))
-            session.commit()
-            session.refresh(strategy)
 
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                # Partial-unique index on status fires when a concurrent process races us.
+                exc_str = str(exc).lower()
+                if "uix_strategies_one" in exc_str or (
+                    "unique" in exc_str and "status" in exc_str
+                ):
+                    raise ConflictingActiveStrategyError(
+                        f"A concurrent transition placed another strategy into '{to_status}' status. "
+                        f"Retry after resolving the conflict."
+                    ) from exc
+                raise
+
+            # Re-query with relationship loading before session closes.
+            strategy = session.scalar(
+                select(Strategy)
+                .where(Strategy.strategy_id == strategy_id)
+                .options(selectinload(Strategy.status_history))
+            )
             log.info("strategy_transition", strategy_id=strategy_id, from_status=from_status, to_status=to_status)
-            return strategy
+            return strategy  # type: ignore[return-value]
 
     def get(self, strategy_id: str) -> Strategy:
         with Session(self._engine) as session:
-            return self._get_or_raise(session, strategy_id)
+            strategy = session.scalar(
+                select(Strategy)
+                .where(Strategy.strategy_id == strategy_id)
+                .options(selectinload(Strategy.status_history))
+            )
+            if strategy is None:
+                raise StrategyNotFoundError(f"Strategy '{strategy_id}' not found in the registry.")
+            return strategy
 
     def list(
         self,
@@ -343,7 +417,7 @@ class StrategyRegistry:
         strategy_family: Optional[str] = None,
     ) -> list[Strategy]:
         with Session(self._engine) as session:
-            q = select(Strategy)
+            q = select(Strategy).options(selectinload(Strategy.status_history))
             if status is not None:
                 q = q.where(Strategy.status == status)
             if strategy_family is not None:
@@ -394,7 +468,7 @@ class StrategyRegistry:
         Append a run record. data_version required for backtest/walk_forward (C7).
         The (strategy_id, config_hash) must exist in strategy_definitions.
         """
-        if run_type in _REQUIRE_DATA_VERSION and not data_version:
+        if run_type in _REQUIRE_DATA_VERSION and not (data_version and data_version.strip()):
             raise MissingDataVersionError(
                 f"data_version is required for run_type='{run_type}' (C7). "
                 f"Pass the MLflow manifest path."
@@ -408,6 +482,22 @@ class StrategyRegistry:
                     f"No definition for ('{strategy_id}', '{config_hash[:8]}…'). "
                     f"Call add_definition() or register() first."
                 )
+
+            # Guard: paper/live run_type must match the lifecycle status when a
+            # strategy row exists. This prevents fabricated qualification records
+            # that would corrupt C8 four-week paper qualification tracking.
+            if run_type in _RUN_TYPE_LIFECYCLE_GATE:
+                lifecycle = session.get(Strategy, strategy_id)
+                if lifecycle is not None:
+                    current = StrategyStatus(lifecycle.status)
+                    allowed = _RUN_TYPE_LIFECYCLE_GATE[run_type]
+                    if current not in allowed:
+                        raise RunLifecycleMismatchError(
+                            f"Cannot record a '{run_type}' run for '{strategy_id}' "
+                            f"which is currently in '{current}' status. "
+                            f"Allowed statuses for '{run_type}' runs: "
+                            f"{sorted(s.value for s in allowed)}."
+                        )
 
             run = StrategyRun(
                 strategy_id=strategy_id,
