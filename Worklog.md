@@ -3269,3 +3269,53 @@ Rationale: Pinning a backtest to a specific dataset snapshot (C7 in PRD) require
 5. Write Alembic migration setup
 
 ---
+
+---
+
+## Session 2026-06-23 — Strategy Registry adversarial review fixes
+
+**Branch:** `claude/strategy-registry-spec-7elyui`  
+**Commits:** `37a5d70`  
+**Operator:** mshane@thecanadalist.ca
+
+### What was done
+
+- Launched an adversarial subagent to review the M5.1 strategy registry implementation to death (30 findings across CRITICAL/HIGH/MEDIUM/LOW).
+- Addressed all CRITICAL and HIGH findings; selected MEDIUM fixes.
+
+**Critical fixes applied:**
+
+- **C7 bypass (whitespace `data_version`):** Guard tightened from `not data_version` to `not (data_version and data_version.strip())`. A space character can no longer bypass the MLflow manifest requirement.
+- **Detached ORM objects:** All public methods (`get`, `list`, `get_definition`, `list_definitions`, `add_definition`, `register`, `transition`) now use `selectinload` so `status_history` and `runs` relationships are populated before the session closes. Previously, any caller accessing `strategy.status_history` after `registry.get()` would crash with `DetachedInstanceError`.
+- **TOCTOU race on `transition()` commit:** The `session.commit()` in `transition()` is now wrapped in `try/except IntegrityError`. The partial unique index violation (`uix_strategies_one_paper`, `uix_strategies_one_live`) that fires when two concurrent processes race to promote the same status now maps to `ConflictingActiveStrategyError` instead of a raw DB exception. This is critical for Airflow DAG safety.
+- **`cmd_fingerprint` `__new__` hack:** Removed the `StrategyRegistry.__new__(StrategyRegistry)` call that allocated an uninitialised object. The function now calls `fp_module.fingerprint()` directly.
+
+**High fixes applied:**
+
+- **C8 `operator_notes` whitespace bypass:** Same strip() tightening as C7.
+- **IntegrityError catch-all narrowed:** In `add_definition` and `register`, the catch now requires both "unique" AND "version" in the error string, not just any `UNIQUE`-containing error, preventing schema bugs from being misclassified as `DuplicateVersionError`.
+- **`record_run` paper/live lifecycle gate:** Added `_RUN_TYPE_LIFECYCLE_GATE` dict and a new `RunLifecycleMismatchError`. If a strategy lifecycle row exists and the `run_type` is `paper` or `live`, the strategy's current status must match. Prevents fabricated paper qualification records that would corrupt C8 four-week tracking.
+- **Missing tests added:** `walk_forward` C7 enforcement, whitespace `data_version`, whitespace `operator_notes`, lifecycle mismatch for paper runs, `status_history` accessibility after session close.
+
+**Medium fixes applied:**
+
+- **`source_path` repo-relative:** `fingerprint.py` now stores paths relative to `Path.cwd()` when the config is within the repo tree; falls back to absolute for paths outside (e.g. `tmp_path` in tests).
+- **`add_definition` early-return consistency:** The idempotent path now uses the same `selectinload` query as the new-row path, so both paths return equivalently populated objects.
+- **`strategy_status_history` CHECK constraint:** Added `ck_strategy_status_history_to_status` to the ORM model (pending migration update for production).
+
+**Test count:** 39 → 45 tests, all passing.
+
+### [DECISION] Lifecycle gate on `record_run` for paper/live run_type
+
+Rationale: Without this gate, a pipeline bug or operator error could write `run_type='paper'` records for a strategy that has never been promoted to paper status. The C8 four-week qualification window is computed from paper run history, so fabricated records directly undermine the safety gate for live capital deployment. The gate only fires when a lifecycle row exists — pre-registration research runs are unaffected.
+
+### [DECISION] `selectinload` rather than lazy + expunge
+
+Rationale: Making returned ORM objects safe to use after session close requires either eager loading or returning plain dataclasses. `selectinload` is the minimal change that keeps the existing public API intact while preventing `DetachedInstanceError` in calling code (dashboards, tearsheets) that traverses relationships. The alternative — returning `dict` or plain dataclass DTOs — would be cleaner but is a larger refactor deferred until Phase 5 dashboard integration.
+
+### Next steps
+
+1. Update `infra/db/migrations/versions/004_strategy_registry.py` to add the `ck_strategy_status_history_to_status` CHECK constraint.
+2. Begin Phase 5 items 2-onwards per CLAUDE.md priority sequence (trading journal, tearsheets, Airflow DAG).
+3. The 4-day supervised paper plumbing rehearsal is still not complete — see Phase 4 section in CLAUDE.md.
+

@@ -11,11 +11,11 @@ readme = "README.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["data*", "signals*", "portfolio*", "execution*", "risk*", "backtesting*", "reporting*", "mcp_servers*"]
+include = ["data*", "signals*", "portfolio*", "execution*", "risk*", "backtesting*", "reporting*", "mcp_servers*", "strategy_registry*"]
 
 # ─── Pytest ──────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
-testpaths = ["data/tests", "signals/tests", "portfolio/tests", "execution/tests", "risk/tests", "backtesting/tests", "reporting/tests", "tests"]
+testpaths = ["data/tests", "signals/tests", "portfolio/tests", "execution/tests", "risk/tests", "backtesting/tests", "reporting/tests", "tests", "tests/strategy_registry"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
@@ -34,7 +34,7 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]  # line length handled by formatter
 
 [tool.ruff.lint.isort]
-known-first-party = ["data", "signals", "portfolio", "execution", "risk", "backtesting", "reporting"]
+known-first-party = ["data", "signals", "portfolio", "execution", "risk", "backtesting", "reporting", "strategy_registry"]
 
 # ─── Mypy ────────────────────────────────────────────────────────────────────
 [tool.mypy]
