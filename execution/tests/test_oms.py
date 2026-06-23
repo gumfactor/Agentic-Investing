@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
+from unittest.mock import MagicMock
 
 import pytest
+import sqlalchemy as sa
 
 from execution.oms.compliance import ComplianceEngine
 from execution.oms.order import Order, OrderSide, OrderStatus
 from execution.oms.order_manager import OrderManager
+from execution.oms.trade_history import TradeJournal
 
 
 # ── Order state machine ───────────────────────────────────────────────────────
@@ -273,3 +276,84 @@ class TestOrderManager:
 
         with pytest.raises(RuntimeError, match="Circuit breaker"):
             om.submit_pending()
+
+
+# ── TradeJournal integration ──────────────────────────────────────────────────
+
+class TestOrderManagerJournalIntegration:
+    def _make_journal(self):
+        engine = sa.create_engine("sqlite:///:memory:", future=True)
+        TradeJournal.create_schema(engine)
+        return TradeJournal(engine)
+
+    def _fake_broker(self, filled_qty: float, avg_price: float):
+        broker = MagicMock()
+        broker.submit_order.return_value = "broker-001"
+        broker.get_fill.return_value = {
+            "filled_quantity": filled_qty,
+            "avg_price": avg_price,
+            "status": "FILLED",
+        }
+        return broker
+
+    def test_reconcile_records_fill_to_journal(self):
+        journal = self._make_journal()
+        broker = self._fake_broker(filled_qty=100.0, avg_price=150.0)
+
+        om = OrderManager(broker=broker, trade_journal=journal)
+        o = Order(ticker="AAPL", side=OrderSide.BUY, quantity=100, limit_price=150.0)
+        om.stage(o)
+        om.run_compliance({"circuit_breaker_open": False, "min_order_notional": 0.0})
+        om.submit_pending()
+        om.reconcile_fills()
+
+        fills = journal.fill_history(ticker="AAPL")
+        assert len(fills) == 1
+        assert fills[0].ticker == "AAPL"
+        assert fills[0].side == "BUY"
+        assert fills[0].filled_quantity == pytest.approx(100.0)
+
+    def test_compliance_wash_sale_populated_from_journal(self):
+        """Wash-sale context from a real journal unblocks _check_wash_sale."""
+        journal = self._make_journal()
+
+        # Record a loss-realizing SELL fill directly into the journal
+        buy_order = Order(
+            ticker="AAPL", side=OrderSide.BUY, quantity=100, limit_price=150.0,
+            strategy_id="s1",
+        )
+        buy_order.filled_quantity = 100.0
+        buy_order.avg_fill_price = 150.0
+        buy_order.status = OrderStatus.FILLED
+        buy_order.updated_at = datetime.now(timezone.utc)
+        journal.record_fill(buy_order)
+
+        sell_order = Order(
+            ticker="AAPL", side=OrderSide.SELL, quantity=100, limit_price=100.0,
+            strategy_id="s1",
+        )
+        sell_order.filled_quantity = 100.0
+        sell_order.avg_fill_price = 100.0  # below cost → loss
+        sell_order.status = OrderStatus.FILLED
+        sell_order.updated_at = datetime.now(timezone.utc)
+        journal.record_fill(sell_order)
+
+        # Now stage a new SELL for the same ticker and run compliance
+        om = OrderManager(trade_journal=journal)
+        new_sell = Order(
+            ticker="AAPL", side=OrderSide.SELL, quantity=50, limit_price=95.0,
+            strategy_id="s1",
+        )
+        om.stage(new_sell)
+
+        # Pass as_of_date so the wash-sale check has a reference date
+        ctx = {
+            "circuit_breaker_open": False,
+            "min_order_notional": 0.0,
+            "as_of_date": date.today(),
+        }
+        approved, rejected = om.run_compliance(ctx)
+
+        # The loss SELL is within 30 days → wash-sale check should block the new SELL
+        assert len(rejected) == 1
+        assert "wash-sale" in rejected[0].rejection_reason

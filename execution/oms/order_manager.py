@@ -21,6 +21,7 @@ from execution.oms.order import Order, OrderSide, OrderStatus
 
 if TYPE_CHECKING:
     from execution.brokers.base import BaseBroker
+    from execution.oms.trade_history import TradeJournal
     from risk.circuit_breaker import CircuitBreaker
 
 logger = structlog.get_logger(__name__)
@@ -47,10 +48,12 @@ class OrderManager:
         compliance: ComplianceEngine | None = None,
         broker: "BaseBroker | None" = None,
         circuit_breaker: "CircuitBreaker | None" = None,
+        trade_journal: "TradeJournal | None" = None,
     ) -> None:
         self._compliance = compliance or ComplianceEngine()
         self._broker = broker
         self._circuit_breaker = circuit_breaker
+        self._trade_journal = trade_journal
         self._orders: dict[str, Order] = {}
 
     # ── Staging ──────────────────────────────────────────────────────────────
@@ -93,6 +96,27 @@ class OrderManager:
             )
 
         staged = [o for o in self._orders.values() if o.status == OrderStatus.STAGED]
+
+        # Auto-inject wash-sale context from trade journal if available and not
+        # already provided by caller.  Populates ctx['recent_loss_buys'] so the
+        # previously-stubbed _check_wash_sale compliance check fires correctly.
+        if self._trade_journal is not None and "recent_loss_buys" not in context:
+            sell_tickers = [o.ticker for o in staged if o.side == OrderSide.SELL]
+            if sell_tickers:
+                as_of = context.get("as_of_date")
+                try:
+                    context = {
+                        **context,
+                        "recent_loss_buys": self._trade_journal.wash_sale_context(
+                            sell_tickers, as_of=as_of
+                        ),
+                    }
+                except Exception as exc:
+                    logger.error(
+                        "wash_sale_context_failed",
+                        error=str(exc),
+                        advice="Defaulting to empty wash-sale context; check trade journal DB connection.",
+                    )
         approved: list[Order] = []
         rejected: list[Order] = []
 
@@ -293,6 +317,7 @@ class OrderManager:
                 # Full fill
                 order.transition(OrderStatus.FILLED)
                 newly_filled.append(order)
+                self._record_fill_to_journal(order)
                 logger.info(
                     "order_filled",
                     order_id=order.order_id[:8],
@@ -303,6 +328,7 @@ class OrderManager:
             else:
                 # Partial fill — stay active, re-polled next cycle
                 order.transition(OrderStatus.PARTIALLY_FILLED)
+                self._record_fill_to_journal(order)
                 logger.warning(
                     "order_partially_filled",
                     order_id=order.order_id[:8],
@@ -313,6 +339,35 @@ class OrderManager:
                 )
 
         return newly_filled
+
+    def _record_fill_to_journal(self, order: Order) -> None:
+        """Attempt to persist a fill to the trade journal; log errors, never raise.
+
+        Swallowing the exception here is intentional: a journal persistence
+        failure should not abort the reconciliation loop or leave the in-memory
+        OMS state inconsistent.  The operator will see the error in the log and
+        can reprocess the fill manually.
+        """
+        if self._trade_journal is None:
+            return
+        try:
+            self._trade_journal.record_fill(order)
+        except ValueError as exc:
+            # Dedup guard or long-only violation — both indicate a programming
+            # error upstream; log at error level so they're not silently ignored.
+            logger.error(
+                "trade_journal_record_fill_rejected",
+                order_id=order.order_id[:8],
+                ticker=order.ticker,
+                error=str(exc),
+            )
+        except Exception as exc:
+            logger.error(
+                "trade_journal_record_fill_failed",
+                order_id=order.order_id[:8],
+                ticker=order.ticker,
+                error=str(exc),
+            )
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a STAGED or PENDING order.  Returns True if cancelled."""
