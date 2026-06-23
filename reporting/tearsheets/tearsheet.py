@@ -109,8 +109,8 @@ class TearsheetGenerator:
     prices: Optional[pd.DataFrame] = None  # for entry/exit charts (long-format)
     nav_series: Optional[pd.Series] = None  # if available, used for equity curve
 
-    # Lazily computed full metrics
-    _full_metrics: dict = field(default_factory=dict, init=False, repr=False)
+    # Lazily computed full metrics — None = not yet computed (use `is None` check)
+    _full_metrics: Optional[dict] = field(default=None, init=False, repr=False)
 
     # ------------------------------------------------------------------
     # Factory methods
@@ -123,9 +123,16 @@ class TearsheetGenerator:
         prices: Optional[pd.DataFrame] = None,
         title: str = "",
     ) -> "TearsheetGenerator":
-        """Build from a ``BacktestResult`` dataclass."""
-        config = getattr(result, "config", {})
-        initial_capital = config.get("backtest", {}).get("initial_capital", 1_000_000.0)
+        """Build from a ``BacktestResult`` dataclass.
+
+        Accepts any object whose attributes match BacktestResult.  ``config``
+        must have a ``.get()`` method (plain dict or dict-like); if it does
+        not, it is treated as an empty dict.
+        """
+        raw_config = getattr(result, "config", {})
+        config: dict = raw_config if hasattr(raw_config, "get") else {}
+        backtest_cfg = config.get("backtest", {}) or {}
+        initial_capital = backtest_cfg.get("initial_capital", 1_000_000.0)
         if not title:
             title = config.get("name", "Tearsheet")
         return cls(
@@ -147,7 +154,7 @@ class TearsheetGenerator:
 
     def full_metrics(self) -> dict:
         """Compute (or return cached) full metrics dictionary."""
-        if not self._full_metrics:
+        if self._full_metrics is None:
             self._full_metrics = compute_metrics(
                 self.returns,
                 self.benchmark_returns,
@@ -169,17 +176,20 @@ class TearsheetGenerator:
     # ------------------------------------------------------------------
 
     def _build_charts(self) -> dict[str, plt.Figure]:
-        """Generate all chart figures with Agg backend (non-interactive)."""
-        matplotlib.use("Agg")
+        """Generate all chart figures, switching to Agg for file rendering."""
+        # switch_backend is safe to call after pyplot is imported; use("Agg")
+        # is not (it must be called before pyplot import).
+        plt.switch_backend("Agg")
         m = self.full_metrics()
         ic = self.initial_capital
 
         fig_map: dict[str, plt.Figure] = {}
 
-        # 1. Equity curve
+        # 1. Equity curve — use nav_series when available for accurate day-0 value
         fig_map["equity_curve"] = charts.equity_curve(
             self.returns, self.benchmark_returns,
-            title="Cumulative Return (indexed to 100)"
+            nav_series=self.nav_series,
+            title="Cumulative Return (indexed to 100)",
         )
 
         # 2. Drawdown
@@ -215,15 +225,22 @@ class TearsheetGenerator:
         )
 
         # 9. Entry/exit for the most-traded ticker (when prices available)
-        if self.prices is not None and not self.trades.empty:
-            top_ticker = (
-                self.trades.groupby("ticker")["notional"].sum().idxmax()
-                if "notional" in self.trades.columns
-                else self.trades["ticker"].value_counts().idxmax()
-            )
-            fig_map["trade_entry_exit"] = charts.trade_entry_exit(
-                top_ticker, self.prices, self.trades
-            )
+        if (self.prices is not None
+                and not self.trades.empty
+                and "ticker" in self.trades.columns):
+            try:
+                if "notional" in self.trades.columns:
+                    by_notional = self.trades.groupby("ticker")["notional"].sum().dropna()
+                    top_ticker: Optional[str] = by_notional.idxmax() if not by_notional.empty else None
+                else:
+                    counts = self.trades["ticker"].value_counts()
+                    top_ticker = counts.index[0] if not counts.empty else None
+                if top_ticker is not None:
+                    fig_map["trade_entry_exit"] = charts.trade_entry_exit(
+                        top_ticker, self.prices, self.trades
+                    )
+            except (KeyError, ValueError):
+                pass  # skip entry/exit chart on malformed trade data
 
         return fig_map
 

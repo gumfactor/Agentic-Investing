@@ -78,24 +78,51 @@ def _maybe_return(fig: Optional[plt.Figure], ax: Optional[plt.Axes]) -> Optional
 def equity_curve(
     returns: pd.Series,
     benchmark_returns: pd.Series,
+    nav_series: Optional[pd.Series] = None,
     ax: Optional[plt.Axes] = None,
     figsize: tuple[float, float] = (10, 4),
     title: str = "Cumulative Return (indexed to 100)",
 ) -> Optional[plt.Figure]:
-    """Strategy vs benchmark cumulative return."""
+    """Strategy vs benchmark cumulative return.
+
+    When ``nav_series`` is supplied (e.g. from BacktestResult), the strategy
+    curve is derived from it directly (indexed to 100 at start), giving an
+    accurate picture including the very first trading day's NAV.  Falls back
+    to ``(1 + returns).cumprod()`` when nav_series is None.
+
+    The benchmark is inner-aligned to the strategy date range so that missing
+    benchmark dates never inject spurious 0%-return days.
+    """
     fig: Optional[plt.Figure] = None
     if ax is None:
         fig, ax = _new_fig(figsize)
     else:
         _style()
 
-    strat_cum = 100.0 * (1 + returns).cumprod()
-    bm_aligned = benchmark_returns.reindex(returns.index).fillna(0.0)
-    bm_cum = 100.0 * (1 + bm_aligned).cumprod()
+    # Strategy cumulative curve
+    if nav_series is not None and not nav_series.empty:
+        first_val = float(nav_series.iloc[0])
+        strat_cum = (100.0 / first_val) * nav_series if first_val != 0 else 100.0 * (1 + returns).cumprod()
+    else:
+        strat_cum = 100.0 * (1 + returns).cumprod()
+
+    # Benchmark: inner-align, then index so both start at 100 on first shared date
+    bm_r, _ = benchmark_returns.align(returns, join="inner")
+    if not bm_r.empty:
+        bm_cum_inner = 100.0 * (1 + bm_r).cumprod()
+        # Re-base benchmark to match strategy level on first shared date
+        first_shared = bm_r.index[0]
+        if first_shared in strat_cum.index:
+            bm_cum_inner = bm_cum_inner / bm_cum_inner.iloc[0] * float(strat_cum.loc[first_shared])
+    else:
+        bm_cum_inner = pd.Series(dtype=float)
 
     dates = pd.to_datetime(strat_cum.index)
     ax.plot(dates, strat_cum.values, color=_C["strategy"], lw=1.5, label="Strategy")
-    ax.plot(dates, bm_cum.values, color=_C["benchmark"], lw=1.2, ls="--", label="Benchmark")
+    if not bm_cum_inner.empty:
+        bm_dates = pd.to_datetime(bm_cum_inner.index)
+        ax.plot(bm_dates, bm_cum_inner.values, color=_C["benchmark"], lw=1.2,
+                ls="--", label="Benchmark")
     ax.axhline(100, color=_C["neutral"], lw=0.7, ls=":")
 
     ax.set_title(title, fontsize=10, fontweight="bold")
@@ -166,10 +193,10 @@ def monthly_returns_heatmap(
             pivot[label] = np.nan
     pivot = pivot[_MONTH_LABELS]
 
-    # Append YTD column
+    # Append YTD column (use integer year as index to align with pivot)
     s_dt = _to_dt(returns)
     ytd = (1 + s_dt).resample("YE").prod() - 1
-    ytd.index = ytd.index.year
+    ytd.index = ytd.index.year.astype(int)
     pivot["YTD"] = ytd * 100.0
 
     # Auto-scale colour range
@@ -268,6 +295,29 @@ def annual_returns_bar(
         ax.set_title(title, fontsize=10, fontweight="bold")
         return _maybe_return(fig, ax)
 
+    # Detect partial years (first/last years that don't span the full calendar year)
+    s_dt = _to_dt(returns)
+    first_date = s_dt.index[0]
+    last_date = s_dt.index[-1]
+    first_year = int(first_date.year)
+    last_year = int(last_date.year)
+    has_partial = False
+
+    def _is_partial(y: int) -> bool:
+        if y == first_year and first_date.month > 1:
+            return True
+        if y == last_year and last_date.month < 12:
+            return True
+        return False
+
+    year_labels = []
+    for y in years:
+        if _is_partial(y):
+            year_labels.append(f"{y}*")
+            has_partial = True
+        else:
+            year_labels.append(str(y))
+
     x = np.arange(len(years))
     w = 0.38
     strat_vals = [strat_by_year.get(y, np.nan) for y in years]
@@ -280,11 +330,14 @@ def annual_returns_bar(
 
     ax.axhline(0, color="black", lw=0.7)
     ax.set_xticks(x)
-    ax.set_xticklabels(years, rotation=45, ha="right", fontsize=8)
+    ax.set_xticklabels(year_labels, rotation=45, ha="right", fontsize=8)
     ax.set_title(title, fontsize=10, fontweight="bold")
     ax.set_ylabel("Return (%)")
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.0f}%"))
     ax.legend(fontsize=8)
+    if has_partial:
+        ax.text(0.01, 0.02, "* Partial year", transform=ax.transAxes,
+                fontsize=7, color=_C["neutral"], va="bottom")
 
     return _maybe_return(fig, ax)
 

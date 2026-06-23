@@ -57,10 +57,22 @@ def sharpe_ratio(returns: pd.Series, risk_free_rate: float = 0.0) -> float:
 
 
 def sortino_ratio(returns: pd.Series, risk_free_rate: float = 0.0) -> float:
-    downside = returns[returns < 0]
-    if len(downside) < 2:
+    """Sortino ratio using semi-deviation (downside deviation).
+
+    Downside deviation is computed over ALL periods using minimum acceptable
+    return (MAR = daily risk_free_rate):
+      dd_vol = sqrt(mean(min(r_i - MAR, 0)^2)) * sqrt(252)
+
+    This differs from filtering only negative returns: all days count in the
+    denominator, only sub-MAR days contribute to the numerator.
+    ``risk_free_rate`` must be an annualised decimal rate (e.g. 0.05 = 5%).
+    """
+    if len(returns) < 2:
         return float("nan")
-    downside_vol = float(downside.std(ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR))
+    daily_rf = risk_free_rate / _TRADING_DAYS_PER_YEAR
+    excess = returns - daily_rf
+    downside_sq = np.where(excess < 0.0, excess ** 2, 0.0)
+    downside_vol = float(np.sqrt(np.mean(downside_sq)) * np.sqrt(_TRADING_DAYS_PER_YEAR))
     if not downside_vol:
         return float("nan")
     return float((annualized_return(returns) - risk_free_rate) / downside_vol)
@@ -84,18 +96,30 @@ def calmar_ratio(returns: pd.Series) -> float:
 
 
 def information_ratio(returns: pd.Series, benchmark_returns: pd.Series) -> float:
+    """Information ratio: active return / tracking error × sqrt(252).
+
+    Uses ddof=1 (sample tracking error).  Returns NaN when the date overlap
+    between the two series is fewer than 2 observations.
+    """
     r, b = returns.align(benchmark_returns, join="inner")
-    active = r - b
-    if len(active) < 2 or active.std(ddof=1) == 0:
+    if len(r) < 2:
         return float("nan")
-    return float(active.mean() / active.std(ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR))
+    active = r - b
+    tracking_error = active.std(ddof=1)
+    if not tracking_error or np.isnan(tracking_error):
+        return float("nan")
+    return float(active.mean() / tracking_error * np.sqrt(_TRADING_DAYS_PER_YEAR))
 
 
 def beta(returns: pd.Series, benchmark_returns: pd.Series) -> float:
+    """Market beta via OLS.  Returns NaN when overlap < 2 or benchmark is constant."""
     r, b = returns.align(benchmark_returns, join="inner")
-    if len(r) < 2 or b.var(ddof=1) == 0:
+    if len(r) < 2:
         return float("nan")
-    return float(r.cov(b) / b.var(ddof=1))
+    b_var = b.var(ddof=1)
+    if not b_var or np.isnan(b_var):
+        return float("nan")
+    return float(r.cov(b) / b_var)
 
 
 def alpha(
@@ -187,11 +211,13 @@ def compute_metrics(
     m: dict = dict(base_metrics or {})
 
     b_val = beta(returns, benchmark_returns)
-    aligned_bm = benchmark_returns.reindex(returns.index).fillna(0.0)
+    # Inner-align benchmark so total return is not distorted by fillna(0) padding
+    _, bm_inner = returns.align(benchmark_returns, join="inner")
+    bm_total = float((1 + bm_inner).prod() - 1) if len(bm_inner) >= 1 else float("nan")
 
     m.update({
         "total_return": float((1 + returns).prod() - 1),
-        "benchmark_total_return": float((1 + aligned_bm).prod() - 1),
+        "benchmark_total_return": bm_total,
         "cagr": annualized_return(returns),
         "annualized_volatility": annualized_volatility(returns),
         "sharpe": sharpe_ratio(returns),

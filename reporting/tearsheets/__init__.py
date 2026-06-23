@@ -34,4 +34,6 @@ def generate_tearsheet(
     p = Path(output_path)
     if p.suffix.lower() == ".html":
         return gen.render_html(p)
-    return p  # for directory output callers should use render_png_dir directly
+    # Directory output: render all charts as individual PNGs
+    gen.render_png_dir(p)
+    return p

@@ -195,15 +195,37 @@ class TestSharpeRatio:
 class TestSortinoRatio:
     def test_only_positive_returns(self):
         r = pd.Series([0.001] * 252)
-        # No negative returns → downside vol = 0 → nan
+        # No sub-zero returns → downside vol = 0 → nan
         assert math.isnan(sortino_ratio(r))
 
-    def test_mixed_returns(self):
+    def test_mixed_returns_not_nan(self):
         r = _RETURNS
         result = sortino_ratio(r)
         assert not math.isnan(result)
-        # Sortino >= Sharpe when distribution is not perfectly symmetric
-        assert result >= sharpe_ratio(r) * 0.5  # loose bound
+
+    def test_known_value(self):
+        # Hand-compute: r = [+0.01, -0.01] × 3, rf = 0
+        # downside_sq over all 6 periods: [0, 0.0001, 0, 0.0001, 0, 0.0001]
+        # mean(downside_sq) = 0.0001/2 = 0.00005
+        # downside_vol = sqrt(0.00005) * sqrt(252)
+        r = pd.Series([0.01, -0.01, 0.01, -0.01, 0.01, -0.01])
+        expected_dd_vol = float(np.sqrt(np.mean([0.0, 1e-4, 0.0, 1e-4, 0.0, 1e-4]))
+                                * np.sqrt(252))
+        expected = annualized_return(r) / expected_dd_vol
+        assert sortino_ratio(r) == pytest.approx(expected, rel=1e-9)
+
+    def test_uses_all_periods_not_just_negative(self):
+        # Two series with the same negative days but different total lengths:
+        # longer series has more zero-contribution days → smaller downside vol
+        # → higher Sortino than the short series.
+        neg_days = pd.Series([-0.01] * 10)
+        padded = pd.Series([0.001] * 100 + [-0.01] * 10)
+        s_short = sortino_ratio(neg_days)
+        s_long = sortino_ratio(padded)
+        assert not math.isnan(s_short)
+        assert not math.isnan(s_long)
+        # Padded series has same losses but more non-loss days → larger Sortino
+        assert s_long > s_short
 
 
 class TestMaxDrawdown:
@@ -227,11 +249,19 @@ class TestMaxDrawdown:
 
 
 class TestCalmarRatio:
-    def test_positive_cagr_negative_dd(self):
-        r = _RETURNS
+    def test_calmar_matches_formula(self):
+        # Series with a deliberate drawdown so Calmar is well-defined
+        r = pd.Series([0.002] * 100 + [-0.05] + [0.002] * 100)
         c = calmar_ratio(r)
         if not math.isnan(c):
-            assert c > 0 or calmar_ratio(r) != 0
+            expected = annualized_return(r) / abs(max_drawdown(r))
+            assert c == pytest.approx(expected, rel=1e-9)
+
+    def test_positive_when_cagr_positive(self):
+        r = pd.Series([0.002] * 100 + [-0.05] + [0.002] * 100)
+        c = calmar_ratio(r)
+        if not math.isnan(c):
+            assert c > 0
 
     def test_zero_dd_is_nan(self):
         r = pd.Series([0.001] * 252)
@@ -249,6 +279,16 @@ class TestInformationRatio:
         if not math.isnan(ir):
             assert -10 < ir < 10
 
+    def test_zero_overlap_returns_nan(self):
+        r = pd.Series([0.01, 0.02], index=[date(2020, 1, 2), date(2020, 1, 3)])
+        b = pd.Series([0.01, 0.02], index=[date(2025, 1, 2), date(2025, 1, 3)])
+        assert math.isnan(information_ratio(r, b))
+
+    def test_single_overlap_returns_nan(self):
+        r = pd.Series([0.01, 0.02], index=[date(2020, 1, 2), date(2020, 1, 3)])
+        b = pd.Series([0.01], index=[date(2020, 1, 2)])
+        assert math.isnan(information_ratio(r, b))
+
 
 class TestBetaAlpha:
     def test_beta_to_itself_is_one(self):
@@ -265,6 +305,16 @@ class TestBetaAlpha:
         b_val = beta(r, r)
         a = compute_alpha(r, r, beta_val=b_val)
         assert a == pytest.approx(0.0, abs=1e-6)
+
+    def test_zero_overlap_beta_is_nan(self):
+        r = pd.Series([0.01, 0.02], index=[date(2020, 1, 2), date(2020, 1, 3)])
+        b = pd.Series([0.01, 0.02], index=[date(2025, 1, 2), date(2025, 1, 3)])
+        assert math.isnan(beta(r, b))
+
+    def test_single_overlap_beta_is_nan(self):
+        r = pd.Series([0.01, 0.02], index=[date(2020, 1, 2), date(2020, 1, 3)])
+        b = pd.Series([0.01], index=[date(2020, 1, 2)])
+        assert math.isnan(beta(r, b))
 
 
 class TestDrawdownSeries:
@@ -373,6 +423,20 @@ class TestEquityCurve:
         r = _RETURNS.iloc[:10]
         b = _BM_RETURNS.iloc[:10]
         fig = charts.equity_curve(r, b)
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_with_nav_series(self):
+        nav = 500_000.0 * (1 + _RETURNS).cumprod()
+        fig = charts.equity_curve(_RETURNS, _BM_RETURNS, nav_series=nav)
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_disjoint_benchmark_dates(self):
+        # Benchmark with dates 5 years in the future — should still render
+        bm_future = _BM_RETURNS.copy()
+        bm_future.index = [date(d.year + 5, d.month, d.day) for d in bm_future.index]
+        fig = charts.equity_curve(_RETURNS, bm_future)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
 
@@ -693,7 +757,16 @@ class TestGenerateTearsheet:
         html = dest.read_text(encoding="utf-8")
         assert "Wrapper Test" in html
 
-    def test_non_html_path_returns_path(self, fake_result, tmp_path):
+    def test_directory_output_generates_pngs(self, fake_result, tmp_path):
         dest = tmp_path / "charts"
         result = generate_tearsheet(fake_result, dest)
-        assert result == dest  # directory path returned as-is
+        assert result == dest
+        assert dest.exists()
+        # Equity curve PNG must be present
+        assert (dest / "equity_curve.png").exists()
+
+    def test_directory_output_creates_multiple_charts(self, fake_result, tmp_path):
+        dest = tmp_path / "charts"
+        generate_tearsheet(fake_result, dest)
+        pngs = list(dest.glob("*.png"))
+        assert len(pngs) >= 5  # at minimum: equity, drawdown, monthly, rolling, annual
