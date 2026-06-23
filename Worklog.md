@@ -12,6 +12,118 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-23
+
+### Session 41 — Phase 5 M5.2: Trade Journal (append-only fill store)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trade-journal`
+**Commits:** `708c35a` (feat), `bf2098f` (fix)
+
+---
+
+#### What was done
+
+Built the trade journal as specified in the Phase 5 priority sequence (item 2).
+The implementation covers the full M5.2 scope: durable fill store, FIFO realized
+P&L, and wash-sale history that unblocks the previously dead-letter
+`_check_wash_sale` compliance rule.
+
+**New files:**
+- `infra/db/migrations/versions/004_trade_journal_schema.py` — Alembic migration
+  creating the `trade_fills` table (PostgreSQL + TimescaleDB hypertable).
+  Columns: `fill_id` (PK), `order_id`, `broker_order_id`, `ticker`,
+  `strategy_id`, `side` (CHECK BUY/SELL), `filled_quantity` (incremental),
+  `cumulative_filled_quantity` (dedup key), `avg_fill_price`, `limit_price`,
+  `fill_timestamp` (hypertable partition key), `order_status_at_record`,
+  `realized_pnl` (NULL for BUYs), `cost_basis_per_share` (NULL for BUYs),
+  `wash_sale_disallowed`, `notes`, `ingested_at`.
+  Unique constraint: `(order_id, cumulative_filled_quantity)`.
+  Indexes: `ix_trade_fills_ticker_time`, `ix_trade_fills_strategy_time`,
+  `ix_trade_fills_wash_sale` (partial: `side='SELL' AND realized_pnl<0`).
+
+- `execution/oms/trade_history.py` — `TradeJournal` class with:
+  - `record_fill(order)`: incremental fill logic; queries prior cumulative qty,
+    stores only the new delta as `filled_quantity`; computes FIFO P&L on
+    incremental quantity for SELL fills.
+  - `recover_missed_fills(orders)`: replay path for OMS/journal divergence
+    recovery; safe to call multiple times (already-recorded fills are skipped).
+  - `wash_sale_context(tickers, window_days=30, as_of=None)`: returns
+    `{ticker: last_loss_sell_date}` for tickers with loss SELLs within the
+    lookback window; feeds `ctx["recent_loss_buys"]` in `run_compliance()`.
+  - `fill_history()`, `realized_pnl_summary()`, `open_position_cost_basis()`:
+    query helpers.
+  - `_fifo_pnl()`: FIFO lot consumption for SELL P&L; raises long-only
+    violation if sell exceeds open lots.
+  - Uses `sa.String(36)` and `sa.DateTime(timezone=True)` throughout for
+    cross-DB compatibility (SQLite in tests, PostgreSQL in production).
+
+**Modified files:**
+- `execution/oms/order_manager.py`: injected `TradeJournal` as optional
+  constructor parameter; `run_compliance()` auto-populates `recent_loss_buys`
+  from journal when not supplied by caller; `reconcile_fills()` calls
+  `_record_fill_to_journal()` after each fill transition.
+- `execution/oms/__init__.py`: exported `FillRecord`, `TradeJournal`.
+- `execution/tests/test_oms.py`: added `TestOrderManagerJournalIntegration`
+  (2 tests covering fill recording and wash-sale compliance end-to-end).
+- `execution/tests/test_trade_history.py`: 31 new tests covering all
+  `TradeJournal` methods.
+
+**Adversarial subagent review run** before final commit. Two BLOCKER findings
+fixed in `bf2098f`:
+
+[RESOLVED] BLOCKER #1 — FIFO double-count on PARTIALLY_FILLED→FILLED.
+Old dedup key `(order_id, filled_quantity)` allowed two rows for the same
+order (e.g. cumulative=60 and cumulative=100 both store filled_quantity=the
+same incremental value when the second fill is computed incorrectly). Fixed by
+storing only the incremental quantity in `filled_quantity`, adding
+`cumulative_filled_quantity` for dedup, and computing P&L on the incremental
+quantity only. The unique constraint is now `(order_id, cumulative_filled_quantity)`.
+
+[RESOLVED] BLOCKER #2 — No recovery path for silent OMS/journal divergence.
+Fixed by adding `recover_missed_fills()` and documenting it in the
+`_record_fill_to_journal()` error log with exact call syntax.
+
+Other fixes in `bf2098f`:
+- Migration `downgrade()` used plain `DROP TABLE` which fails on TimescaleDB
+  hypertables. Fixed with `drop_hypertable(..., cascade=TRUE, if_exists=TRUE)`
+  wrapped in try/except for plain PostgreSQL.
+- Added regression test `test_partial_to_full_fill_no_double_count` to pin the
+  BLOCKER #1 fix.
+- Updated `test_duplicate_fill_raises` match string after error message change.
+
+[SAFETY] `record_fill()` raises `ValueError("long-only violation")` if a SELL
+fill exceeds open BUY lots. This enforces the system's long-only assumption and
+should be investigated immediately if it fires in production — it indicates
+either a data integrity issue or a short position that was not expected.
+
+[SAFETY] `_record_fill_to_journal()` in `OrderManager` swallows exceptions so
+that a journal persistence failure does not abort reconciliation or leave OMS
+state inconsistent. If it logs an error, the OMS order will be in FILLED state
+but the journal will be missing the fill. Recovery: call
+`journal.recover_missed_fills(list(order_manager.all_orders()))`.
+
+[DECISION] Used SQLAlchemy Core (`Table` / `select`) rather than ORM for
+`TradeJournal` to preserve cross-dialect compatibility (SQLite for tests,
+PostgreSQL + TimescaleDB for production). The Alembic migration uses
+PostgreSQL-native types (`UUID`, `TIMESTAMPTZ`, `NUMERIC`); the Python Table
+object uses `String(36)` and `DateTime(timezone=True)` which SQLite handles.
+
+[DECISION] `avg_fill_price` on a partial→full fill is the blended cumulative
+average (set by the broker), not the exact price for the incremental shares.
+The FIFO P&L on the incremental portion uses this blended average as an
+approximation. Acceptable for Phase 5; exact lot-level prices would require
+the broker to report per-lot fills separately.
+
+#### Next steps
+
+- Wash-sale compliance check is now live (no longer a dead letter). Verify it
+  fires correctly in the next paper-trading workflow run.
+- Deferred items doc updated: wash-sale item marked `[RESOLVED]`.
+- M5.2 complete. Next Phase 5 priority: tearsheets with charting output (M5.3).
+
+---
+
 ## 2026-06-22
 
 ### Session 40 — Phase 5 Architecture Alignment
