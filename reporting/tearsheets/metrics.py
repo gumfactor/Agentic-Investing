@@ -37,6 +37,8 @@ def annualized_return(returns: pd.Series) -> float:
     if len(returns) < 2:
         return float("nan")
     n_years = len(returns) / _TRADING_DAYS_PER_YEAR
+    if n_years < 5.0 / _TRADING_DAYS_PER_YEAR:
+        return float("nan")
     total = float((1 + returns).prod())
     if total <= 0 or n_years <= 0:
         return float("nan")
@@ -73,7 +75,7 @@ def sortino_ratio(returns: pd.Series, risk_free_rate: float = 0.0) -> float:
     excess = returns - daily_rf
     downside_sq = np.where(excess < 0.0, excess ** 2, 0.0)
     downside_vol = float(np.sqrt(np.mean(downside_sq)) * np.sqrt(_TRADING_DAYS_PER_YEAR))
-    if not downside_vol:
+    if not downside_vol or np.isnan(downside_vol):
         return float("nan")
     return float((annualized_return(returns) - risk_free_rate) / downside_vol)
 
@@ -127,12 +129,19 @@ def alpha(
     benchmark_returns: pd.Series,
     beta_val: Optional[float] = None,
 ) -> float:
-    """Jensen's alpha (annualised, risk-free = 0)."""
+    """Jensen's alpha (annualised, risk-free = 0).
+
+    Uses the inner-aligned overlap period for both strategy and benchmark CAGR
+    so that mismatched date ranges don't distort the benchmark annualised return.
+    """
     if beta_val is None:
         beta_val = beta(returns, benchmark_returns)
     if np.isnan(beta_val):
         return float("nan")
-    return float(annualized_return(returns) - beta_val * annualized_return(benchmark_returns))
+    r_aligned, bm_aligned = returns.align(benchmark_returns, join="inner")
+    if len(r_aligned) < 2:
+        return float("nan")
+    return float(annualized_return(r_aligned) - beta_val * annualized_return(bm_aligned))
 
 
 # ---------------------------------------------------------------------------

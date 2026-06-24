@@ -637,6 +637,30 @@ class TestTearsheetGeneratorFactory:
         gen = TearsheetGenerator.from_backtest_result(fake_result)
         pd.testing.assert_series_equal(gen.returns, _RETURNS)
 
+    def test_backtest_none_in_config_does_not_crash(self, fake_result, tmp_path):
+        """GAP-1: config['backtest'] = None must not crash render_html."""
+        fake_result.config["backtest"] = None
+        gen = TearsheetGenerator.from_backtest_result(fake_result)
+        dest = tmp_path / "tearsheet.html"
+        gen.render_html(dest)
+        assert dest.exists()
+
+    def test_missing_nav_series_attribute(self, tmp_path):
+        """GAP-2: result without nav_series attribute must not crash."""
+        class MinimalResult:
+            returns = _RETURNS
+            benchmark_returns = _BM_RETURNS
+            positions = _POSITIONS
+            trades = _TRADES
+            metrics = {}
+            config = {"name": "minimal"}
+            # deliberately omitting nav_series
+
+        gen = TearsheetGenerator.from_backtest_result(MinimalResult())
+        dest = tmp_path / "tearsheet.html"
+        gen.render_html(dest)
+        assert dest.exists()
+
 
 class TestFullMetrics:
     def test_all_required_keys(self, generator):
@@ -718,6 +742,31 @@ class TestRenderHtml:
         html = dest.read_text(encoding="utf-8")
         # Our formatters should convert NaN to "—", not the string "nan"
         assert "nan" not in html.lower().split("</html>")[0].split("data:image")[0]
+
+    def test_render_html_empty_positions(self, tmp_path):
+        """GAP-4: empty positions DataFrame must not crash render_html."""
+        gen = TearsheetGenerator(
+            returns=_RETURNS,
+            benchmark_returns=_BM_RETURNS,
+            positions=pd.DataFrame(),
+            trades=_TRADES,
+            metrics={},
+            config={},
+        )
+        dest = tmp_path / "tearsheet.html"
+        gen.render_html(dest)
+        assert dest.exists()
+
+    def test_render_html_then_render_png_dir(self, generator, tmp_path):
+        """GAP-5: calling render_html then render_png_dir on same generator must both succeed."""
+        html_path = tmp_path / "report.html"
+        generator.render_html(html_path)
+        assert html_path.exists()
+        png_dir = tmp_path / "charts"
+        paths = generator.render_png_dir(png_dir)
+        assert len(paths) > 0
+        for p in paths:
+            assert p.exists() and p.suffix == ".png"
 
 
 class TestRenderPngDir:

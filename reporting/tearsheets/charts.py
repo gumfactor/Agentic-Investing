@@ -104,7 +104,10 @@ def equity_curve(
         first_val = float(nav_series.iloc[0])
         strat_cum = (100.0 / first_val) * nav_series if first_val != 0 else 100.0 * (1 + returns).cumprod()
     else:
-        strat_cum = 100.0 * (1 + returns).cumprod()
+        cum = 100.0 * (1 + returns).cumprod()
+        # Prepend a synthetic day-0 anchor so the curve originates at exactly 100
+        idx0 = pd.Timestamp(cum.index[0]) - pd.Timedelta(days=1)
+        strat_cum = pd.concat([pd.Series([100.0], index=[idx0]), cum])
 
     # Benchmark: inner-align, then index so both start at 100 on first shared date
     bm_r, _ = benchmark_returns.align(returns, join="inner")
@@ -283,8 +286,8 @@ def annual_returns_bar(
         _style()
 
     ann = annual_returns(returns) * 100.0
-    bm_aligned = benchmark_returns.reindex(returns.index).fillna(0.0)
-    bm_ann = annual_returns(bm_aligned) * 100.0
+    bm_r, _ = benchmark_returns.align(returns, join="inner")
+    bm_ann = annual_returns(bm_r) * 100.0
 
     strat_by_year = {int(dt.year): float(v) for dt, v in zip(pd.to_datetime(ann.index), ann.values)}
     bm_by_year = {int(dt.year): float(v) for dt, v in zip(pd.to_datetime(bm_ann.index), bm_ann.values)}

@@ -145,7 +145,7 @@ class TearsheetGenerator:
             initial_capital=float(initial_capital),
             title=title,
             prices=prices,
-            nav_series=result.nav_series,
+            nav_series=getattr(result, "nav_series", None),
         )
 
     # ------------------------------------------------------------------
@@ -359,7 +359,7 @@ def _build_html(
 ) -> str:
     strategy_name = config.get("name", title)
     data_version  = config.get("data_version", "—")
-    benchmark     = config.get("backtest", {}).get("benchmark", "—")
+    benchmark     = (config.get("backtest") or {}).get("benchmark", "—")
 
     chart_sections = "\n".join(
         f'<div class="chart-block">'
