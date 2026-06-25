@@ -12,6 +12,131 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-25
+
+### Session 42 — Phase 5 M5.4: Airflow daily_paper_trading DAG
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/airflow-dag-spec-brqadk` (remote alias: `claude/airflow-dag`)
+**Commits:** `ca62608` (feat: implement M5.4)
+
+---
+
+#### What was done
+
+1. **Spec** (`docs/airflow_paper_dag_spec.md`, 848 lines) — full design spec for the
+   `daily_paper_trading` DAG written earlier in the session (commit `549a757`).
+
+2. **DAG** (`airflow/dags/daily_paper_trading.py`):
+   - 13-task pipeline: `wait_for_signal_pipeline` → `verify_inputs` →
+     `construct_target` → `fetch_ibkr_snapshot` → `gen_candidates` →
+     `risk_compliance_gate` → `build_blotter` → `whatif_validate` →
+     `wait_approval` → `submit_orders` → `wait_for_fills` →
+     `durable_reconcile` → `write_ledger`
+   - Schedule `0 23 * * 1-5` (23:00 ET weekdays), `catchup=False`,
+     `max_active_runs=1`
+   - `_require_paper_env()` guards against `PAPER_TRADING!=true`,
+     `IBKR_PORT!=7497`, and `PAPER_RUN_CLEARED=true` at every entry point
+   - `_fetch_ibkr_snapshot()` replaces manual `local/paper_portfolio_snapshot.json`
+     with a live read from the IBKR paper account
+   - All artifacts written to per-run subdirectory of `RQIS_PAPER_ARTIFACT_DIR`
+     (default `/opt/airflow/rqis_paper/`) with XCom for artifact paths
+
+3. **C1 approval gate** (`airflow/plugins/blotter_approval_sensor.py`):
+   - `BlotterApprovalSensor(BaseSensorOperator)` polls `blotter_approvals` table
+   - SHA-256 tamper detection: raises `AirflowException` on mismatch between
+     XCom-stored hash and DB-recorded `confirmed_blotter_sha256`
+   - Pushes `selected_order_ids`, `approved_by`, `approved_at_utc` to XCom on success
+
+4. **CLI approval bridge** (`scripts/paper_approve_blotter.py`):
+   - Interim operator tool until Streamlit dashboard (M5.8)
+   - Validates blotter schema, displays candidates, prompts `YES`, inserts row
+     into `blotter_approvals` with both `blotter_sha256` and
+     `confirmed_blotter_sha256` set to the same computed value
+
+5. **DB migration** (`infra/db/migrations/versions/005_blotter_approvals.py`):
+   - `blotter_approvals` table with UUID PK, JSONB `selected_order_ids`,
+     SHA-256 length check, and `confirmed_sha256 = sha256` check constraint
+   - Chains onto `down_revision="004"` (two pre-existing 004 revisions remain
+     a known conflict; documented but not fixed here)
+
+6. **IBKRBroker additions** (`execution/brokers/ibkr.py`):
+   - `get_cash_balance_usd()`: totals `TotalCashValue` across all currencies,
+     converting non-USD amounts via `_get_fx_rate()`
+   - `_account_values_for_tag()`: prefers per-currency `$LEDGER-*` entries
+     over simple totals when multiple currencies are present
+
+7. **Airflow stubs** for local testing without `apache-airflow` installed:
+   - `airflow/__init__.py`: `DAG` with thread-local context stack for task
+     registration during `with DAG(...) as dag:` blocks
+   - `airflow/exceptions.py`: `AirflowException`
+   - `airflow/operators/python.py`: `PythonOperator`
+   - `airflow/sensors/base.py`: `BaseSensorOperator` with structlog `self.log`
+   - `airflow/sensors/external_task.py`: `ExternalTaskSensor`
+   - `airflow/sensors/time_delta.py`: `TimeDeltaSensor`
+   - `airflow/utils/context.py`: `Context = dict[str, Any]`
+
+8. **Tests** — 42 new passing:
+   - `tests/test_ibkr_cash_balance.py` (9): `_account_values_for_tag` and
+     `get_cash_balance_usd` with ledger/simple/multi-currency/BASE-skip logic
+   - `tests/test_blotter_approval_sensor.py` (6): False-when-no-row,
+     True+XCom-when-approved, SHA-256 mismatch raises, missing run_id raises,
+     missing DATABASE_URL raises, default sha256_task_id
+   - `tests/test_paper_approve_blotter.py` (13): dry-run, schema validation,
+     `_resolve_selected_ids`, happy-path DB insertion, non-YES rejection,
+     missing DATABASE_URL, subset order-ids
+   - `tests/test_daily_paper_trading_dag.py` (14): DAG structure (task IDs,
+     dag_id, catchup, max_active_runs), `_require_paper_env`, `_safe_run_id`,
+     `_fetch_ibkr_snapshot` with mocked broker+DB
+
+#### Decisions
+
+[DECISION] Artifact storage uses local filesystem (`RQIS_PAPER_ARTIFACT_DIR`),
+not MinIO as the spec originally suggested. Rationale: single-machine Docker
+Compose deployment means all tasks share the same volume; MinIO adds complexity
+with no benefit at this stage. The spec noted MinIO as preferred for multi-node;
+this can be changed when infrastructure scales.
+
+[DECISION] `create_engine`/`text`/`IBKRBroker` moved from lazy per-function
+imports to module-level imports in `daily_paper_trading.py` and
+`blotter_approval_sensor.py`. This enables `unittest.mock.patch()` to intercept
+at the module namespace, which is required by the test suite.
+
+[DECISION] Minimal Airflow stubs created in the project's own `airflow/`
+package directory rather than installing `apache-airflow`. This keeps the CI
+environment lightweight and avoids the ~200MB airflow dependency chain. The
+stubs expose exactly what RQIS needs (DAG, PythonOperator, BaseSensorOperator,
+ExternalTaskSensor, TimeDeltaSensor, AirflowException, Context).
+
+[DECISION] `_require_paper_env()` is called at every task entry point that
+touches IBKR or submits orders, not just at DAG startup. Belt-and-suspenders:
+even if someone manually triggers a single task, the guard fires.
+
+#### Safety notes
+
+[SAFETY] C1 gate is enforced via `BlotterApprovalSensor` polling
+`blotter_approvals` table. SHA-256 tamper detection prevents submitting a
+modified blotter. The SHA-256 is of the blotter file bytes, computed
+independently by both the CLI (insert) and sensor (verify XCom value).
+
+[SAFETY] The `submit_orders` task reads `selected_order_ids` from XCom (pushed
+by the sensor on approval). Only the approved subset is submitted; remaining
+candidates are silently skipped. This is the per-order selection required by C1.
+
+[SAFETY] `PAPER_RUN_CLEARED=true` is checked and rejected at:
+- `_require_paper_env()` (called from `verify_inputs`, `fetch_ibkr_snapshot`,
+  `submit_orders`)
+- `paper_approve_blotter.py` is read-only to the clearance flag
+
+#### Next steps
+
+- Adversarial review of M5.4 implementation (in progress — subagent running)
+- Address any findings from adversarial review
+- Begin M5.5 (tearsheets with charting output) or M5.6 (4-week paper
+  qualification on the DAG), per operator priority decision
+
+---
+
 ## 2026-06-24
 
 ### Session 43 — Phase 5 M5.3: Tearsheets — second adversarial review fixes
