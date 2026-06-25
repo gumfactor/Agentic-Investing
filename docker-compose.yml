@@ -29,6 +29,12 @@ x-airflow-common: &airflow-common
     - ./data:/opt/airflow/rqis/data:ro
     - ./signals:/opt/airflow/rqis/signals:ro
     - ./config:/opt/airflow/rqis/config:ro
+    - ./scripts:/opt/airflow/rqis/scripts:ro
+    - ./execution:/opt/airflow/rqis/execution:ro
+    - ./risk:/opt/airflow/rqis/risk:ro
+    - ./portfolio:/opt/airflow/rqis/portfolio:ro
+    - ./reporting:/opt/airflow/rqis/reporting:ro
+    - ./backtesting:/opt/airflow/rqis/backtesting:ro
     - airflow_logs:/opt/airflow/logs
   depends_on:
     timescaledb:

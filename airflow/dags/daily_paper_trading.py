@@ -612,6 +612,17 @@ def _submit_orders(**context: Any) -> None:
     blotter_path = _Path(blotter_path_str)
     artifact = validate_blotter(blotter_path)
 
+    # C1: verify the file on disk still matches the hash the operator approved.
+    # This catches any race between wait_approval succeeding and this task running.
+    from scripts.paper_submit_reconcile_check import _file_sha256 as _fsha
+    current_sha = _fsha(blotter_path)
+    if current_sha != blotter_sha256:
+        raise AirflowException(
+            f"Blotter artifact was modified after operator approval. "
+            f"Approved SHA-256: {blotter_sha256!r}, current on disk: {current_sha!r}. "
+            "This is a C1 safety violation — do not retry without a fresh approval."
+        )
+
     # Filter to approved candidates only (C1: per-order selection is mandatory)
     all_rows = artifact["candidate_rows"]
     if isinstance(selected_order_ids, str):
@@ -671,7 +682,12 @@ def _submit_orders(**context: Any) -> None:
     if not rows_to_submit:
         # All orders were submitted in a prior attempt; load the partial artifact
         # and mark as SUBMITTED.
+        from datetime import UTC, datetime as _datetime
         existing = json.loads(reconciliation_path.read_text(encoding="utf-8"))
+        # Recover the original submission timestamp so wait_for_fills can anchor
+        # its fill window correctly on retry (it raises if submitted_at_utc is missing).
+        submitted_at = existing.get("generated_at_utc") or _datetime.now(UTC).isoformat()
+        ti.xcom_push(key="submitted_at_utc", value=submitted_at)
         ti.xcom_push(key="reconciliation_path", value=str(reconciliation_path))
         ti.xcom_push(key="submitted_count", value=len(existing.get("broker_responses", [])))
         ti.xcom_push(key="initial_filled_count", value=0)
@@ -720,8 +736,6 @@ def _submit_orders(**context: Any) -> None:
         now_fn=lambda: datetime.now(UTC),
         on_progress=_on_progress,
     )
-
-    from scripts.paper_submit_reconcile_check import _file_sha256 as _fsha
 
     all_responses = previous_responses + broker_responses
     final_artifact = _build_reconciliation_artifact(
@@ -953,12 +967,16 @@ with DAG(
     )
 
     # ── C1 approval gate ────────────────────────────────────────────────────
-    # Import sensor inline to avoid issues if the plugins/ directory is not
-    # yet on the Airflow plugin path during DAG file parsing.
+    # Airflow adds /opt/airflow/plugins directly to sys.path, so the plugin is
+    # importable as a top-level module (not under airflow.plugins.*).
+    # Fallbacks cover unit tests and alternate plugin packaging arrangements.
     try:
-        from airflow.plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
+        from blotter_approval_sensor import BlotterApprovalSensor  # Airflow plugin sys.path
     except ImportError:
-        from airflow_plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
+        try:
+            from airflow.plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
+        except ImportError:
+            from airflow_plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
 
     t_approval = BlotterApprovalSensor(
         task_id="wait_approval",

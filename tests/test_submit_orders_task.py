@@ -148,6 +148,33 @@ class TestSubmitOrdersHappyPath:
         assert pushed["initial_filled_count"] == 1
 
 
+class TestSubmitOrdersBlotterHashCheck:
+    def test_raises_on_hash_mismatch(self, tmp_path, monkeypatch):
+        """_submit_orders raises before any broker call if blotter file changed after approval."""
+        monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
+        blotter_path = _make_blotter_file(tmp_path)
+        artifact = {
+            "candidate_rows": [
+                {"sequence": 1, "ticker": "AAPL", "direction": "BUY",
+                 "estimated_shares": 5.0, "reference_price": 200.0},
+            ],
+        }
+        submit_mod = _make_submit_module(artifact, [])
+        # Return a different hash than what XCom reports as approved
+        submit_mod._file_sha256.return_value = "b" * 64  # disk hash differs from approved "a"*64
+
+        ctx = _make_context(tmp_path, blotter_path)  # xcom blotter_sha256 = "a"*64
+
+        import airflow.dags.daily_paper_trading as dag_mod
+        from airflow.exceptions import AirflowException
+        with patch.dict(sys.modules, {"scripts.paper_submit_reconcile_check": submit_mod}):
+            with pytest.raises(AirflowException, match="modified after operator approval"):
+                dag_mod._submit_orders(**ctx)
+
+        # Broker must not have been called
+        submit_mod._submit_orders.assert_not_called()
+
+
 class TestSubmitOrdersC1Guard:
     def test_raises_on_none_selected_order_ids(self, tmp_path, monkeypatch):
         monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
@@ -318,3 +345,6 @@ class TestSubmitOrdersPartialRetry:
         ti = ctx["ti"]
         pushed = {call[1]["key"]: call[1]["value"] for call in ti.xcom_push.call_args_list}
         assert pushed["submitted_count"] == 1  # from the partial artifact
+        # submitted_at_utc must be pushed so wait_for_fills can anchor the fill window
+        assert "submitted_at_utc" in pushed
+        assert pushed["submitted_at_utc"]  # non-empty timestamp string
