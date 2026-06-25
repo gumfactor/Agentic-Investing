@@ -12,7 +12,178 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-24
+
+### Session 43 — Phase 5 M5.3: Tearsheets — second adversarial review fixes
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/tearsheet-charting`
+**Commits:** (this session)
+
+---
+
+#### What was done
+
+Applied all findings from the second adversarial review of the tearsheet module
+(7 findings: 2 critical crashes, 3 medium correctness issues, 2 gaps).
+
+**Fixes applied:**
+
+- **BUG-1 (Critical crash):** `_build_html` called `config.get("backtest", {}).get(...)`
+  which crashed when `config["backtest"] = None`. Fixed to `(config.get("backtest") or {}).get(...)`.
+
+- **BUG-2 (Critical crash):** `from_backtest_result` accessed `result.nav_series` directly,
+  crashing if the attribute is absent. Fixed to `getattr(result, "nav_series", None)`.
+
+- **BUG-3 (Visual correctness):** Equity curve without nav_series started at
+  `100*(1+r[0])` rather than 100. Fixed by prepending a synthetic day-0 anchor
+  at index `first_date - 1 day` with value 100.0 via `pd.concat`.
+
+- **BUG-4 (Edge case correctness):** `sortino_ratio` used `if not downside_vol`
+  which passes silently when `downside_vol = float('nan')`. Fixed to
+  `if not downside_vol or np.isnan(downside_vol)`.
+
+- **MISS-2 (Correctness):** `alpha()` used `annualized_return(benchmark_returns)`
+  on the full benchmark series, distorting alpha when benchmark dates extend
+  beyond the strategy range. Fixed to inner-align first, then compute both
+  strategy and benchmark CAGR over the overlap period only.
+
+- **MISS-3 (Correctness):** `annualized_return()` produced astronomically large
+  CAGR values (e.g. 10^6%) for sub-5-day series. Added a guard:
+  `if n_years < 5.0 / _TRADING_DAYS_PER_YEAR: return float("nan")`.
+
+- **MISS-4 (Correctness):** `annual_returns_bar` used `reindex().fillna(0.0)` for
+  the benchmark, injecting spurious zero-return days. Fixed to inner-align
+  (`benchmark_returns.align(returns, join="inner")`), consistent with equity
+  curve and other chart builders.
+
+**New tests added (4 gap-coverage tests):**
+
+- GAP-1: `test_backtest_none_in_config_does_not_crash` — verifies BUG-1 fix.
+- GAP-2: `test_missing_nav_series_attribute` — verifies BUG-2 fix; uses a
+  `MinimalResult` class without `nav_series` attribute.
+- GAP-4: `test_render_html_empty_positions` — verifies empty positions DataFrame
+  skips the concentration chart without crashing.
+- GAP-5: `test_render_html_then_render_png_dir` — verifies that calling both
+  render methods sequentially on the same generator succeeds.
+
+**Final test count:** 98 tests, all passing.
+
+[DECISION] Equity curve BUG-3 fix uses a `pd.concat` prepend of a synthetic
+`first_date - 1 day` anchor at 100.0 only for the non-nav_series path.
+The nav_series path already starts at exactly 100 (scaled from first NAV value)
+so no prepend is needed there. This keeps the two paths symmetric in visual
+appearance without changing benchmark re-basing logic.
+
+[DECISION] `alpha()` MISS-2 fix changes alpha semantics slightly: alpha is now
+computed over the inner-aligned overlap period for both strategy and benchmark
+CAGR. Previously, a strategy run over 2022-2024 with a benchmark series
+covering 2020-2025 would use the benchmark's full 5-year CAGR (distorted by
+years outside the strategy window). The correct approach matches the overlap
+period used by beta and information_ratio.
+
+---
+
+#### Next steps
+
+- Wire `generate_tearsheet()` into `BacktestLogger.log_run()` so every MLflow
+  run automatically saves an HTML tearsheet as an artifact.
+- Implement `from_paper_run()` factory for post-paper-submission tearsheets
+  using `TradeJournal.fill_history()` + broker NAV series.
+- Proceed to Phase 5 priority item 4: Airflow DAG.
+
+---
+
 ## 2026-06-23
+
+### Session 42 — Phase 5 M5.3: Tearsheets with Charting Output
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/tearsheet-charting` (renamed from `claude/tearsheet-charting-ewunsn`)
+**Commits:** `dc67b29` (feat), `9e9f6ec` (fix — adversarial review)
+
+---
+
+#### What was done
+
+Built the tearsheet reporting module (Phase 5 priority sequence item 3) from scratch.
+
+**Files created:**
+
+- `reporting/tearsheets/metrics.py` — 17 pure-math performance metric functions:
+  CAGR, annualised Sharpe, Sortino (correct semi-deviation formula), max drawdown,
+  Calmar, information ratio, beta, Jensen's alpha, rolling Sharpe series,
+  monthly returns pivot (year × month), annual returns, and `compute_metrics()`
+  full-bundle wrapper.
+
+- `reporting/tearsheets/charts.py` — 9 matplotlib chart builders with dual `ax=`
+  API (standalone Figure for HTML embedding or draw-on-Axes for composite layouts):
+  equity curve (with nav_series support), drawdown, monthly returns heatmap
+  (seaborn, green/red diverging), rolling 252-day Sharpe, annual returns bar
+  (partial-year annotation), return distribution histogram + KDE, position
+  concentration stacked area, cumulative transaction costs, trade entry/exit
+  overlays.
+
+- `reporting/tearsheets/tearsheet.py` — `TearsheetGenerator` dataclass:
+  `from_backtest_result(BacktestResult)` factory; `render_html()` → self-contained
+  HTML with base64-embedded charts + KPI metric cards (16 metrics displayed);
+  `render_png_dir()` → per-chart PNG directory.
+
+- `reporting/tearsheets/__init__.py` — public API with `generate_tearsheet()`
+  convenience wrapper (auto-selects HTML or PNG dir from path extension).
+
+- `reporting/tests/test_tearsheets.py` — 94 tests, all passing.
+
+**Adversarial subagent review** surfaced 22 findings (P1–P5). All were addressed
+in the fix commit:
+
+- **P1.1 (Critical):** Sortino formula was wrong — replaced filter-negatives
+  approach with correct semi-deviation over all periods: `sqrt(mean(min(r-MAR,0)^2))`.
+- **P1.2/P1.3 (Critical):** Benchmark total return and equity curve were distorted
+  by `fillna(0)` for non-overlapping dates — switched to inner-align.
+- **P1.4:** Metrics cache sentinel `if not dict` → `if dict is None`.
+- **P2.1:** Explicit `len(r) < 2` guards in `information_ratio` and `beta`
+  (zero-overlap now returns NaN by design, not by accident).
+- **P2.2:** `from_backtest_result` now guards against non-dict `config` objects.
+- **P2.3:** `_build_charts` protected against missing `ticker` column and
+  all-NaN `notional` column in trades DataFrame.
+- **P2.4:** `generate_tearsheet()` directory path was a silent no-op — now
+  calls `render_png_dir()`.
+- **P3.1:** Sortino `risk_free_rate` now used as MAR threshold (part of P1.1 fix).
+- **P3.3:** Annual returns bar annotates partial first/last years with `*`.
+- **P4.1:** Replaced `matplotlib.use("Agg")` (called too late) with
+  `plt.switch_backend("Agg")` in `_build_charts`.
+- **P4.4:** `nav_series` was stored but never used — now passed to equity curve
+  chart for accurate day-0 NAV representation.
+- **P5.1–P5.5:** Added exact Sortino known-value test, zero-overlap NaN tests
+  for IR/beta, formula-verifying Calmar test, nav_series equity test,
+  disjoint-benchmark equity test, and directory output PNG existence assertions.
+
+[DECISION] Sortino uses full-period denominator (all days, only sub-MAR days
+contribute squared terms) — matches CFA/pyfolio/QuantStats convention. Prior
+filter-negatives approach would have understated the downside risk denominator
+and overstated the ratio.
+
+[DECISION] Information ratio uses `ddof=1` (sample tracking error). CFA/GIPS
+uses `ddof=0` but for backtesting samples `ddof=1` is the statistically
+unbiased estimator. Documented in docstring.
+
+[DECISION] Tearsheet entry point accepts `BacktestResult` directly. No database
+reads — works entirely from in-memory result objects. A separate `from_paper_run`
+factory is out of scope for this session; paper trading tearsheets can be
+constructed manually by passing the same data types.
+
+---
+
+#### Next steps
+
+- Wire `generate_tearsheet()` into `BacktestLogger.log_run()` so every MLflow
+  run automatically saves an HTML tearsheet as an artifact.
+- Implement `from_paper_run()` factory for post-paper-submission tearsheets
+  using `TradeJournal.fill_history()` + broker NAV series.
+- Proceed to Phase 5 priority item 4: Airflow DAG.
+
+---
 
 ### Session 41 — Phase 5 M5.2: Trade Journal (append-only fill store)
 
