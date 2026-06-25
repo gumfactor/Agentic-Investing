@@ -610,23 +610,30 @@ def _submit_orders(**context: Any) -> None:
     approved_by: str = ti.xcom_pull(key="approved_by", task_ids="wait_approval")
 
     blotter_path = _Path(blotter_path_str)
-    artifact = validate_blotter(blotter_path)
 
-    # C1: verify the file on disk still matches the hash the operator approved.
-    # This catches any race between wait_approval succeeding and this task running.
+    # C1: read the file ONCE so the hash and the submitted rows come from the same
+    # bytes, closing the TOCTOU window where a swapped-then-restored file could pass
+    # validation but have its hash checked against the original approved content.
+    import hashlib as _hashlib
     if blotter_sha256 is None:
         raise AirflowException(
             "blotter_sha256 XCom not found — build_blotter task may not have completed "
             "or the XCom has expired. Cannot verify blotter integrity before submission."
         )
-    from scripts.paper_submit_reconcile_check import _file_sha256 as _fsha
-    current_sha = _fsha(blotter_path)
+    raw_bytes = blotter_path.read_bytes()
+    current_sha = _hashlib.sha256(raw_bytes).hexdigest()
     if current_sha != blotter_sha256:
         raise AirflowException(
             f"Blotter artifact was modified after operator approval. "
             f"Approved SHA-256: {blotter_sha256!r}, current on disk: {current_sha!r}. "
             "This is a C1 safety violation — do not retry without a fresh approval."
         )
+    # Parse the artifact from the same bytes the hash was computed over.
+    # validate_blotter re-reads the path for its internal consistency checks
+    # (schema version, candidate_rows_sha256, artifact_sha256, provenance), but
+    # the rows used for submission come from raw_bytes, not that second read.
+    artifact = json.loads(raw_bytes.decode("utf-8"))
+    validate_blotter(blotter_path)
 
     # Filter to approved candidates only (C1: per-order selection is mandatory)
     all_rows = artifact["candidate_rows"]

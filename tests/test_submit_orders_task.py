@@ -64,13 +64,19 @@ def _make_submit_module(blotter_artifact: dict, broker_responses: list) -> Modul
     return mod
 
 
+def _real_sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _make_context(tmp_path: Path, blotter_path: Path, run_id: str = "test-run-1") -> dict:
+    sha256 = _real_sha256(blotter_path)
     ti = MagicMock()
     def xcom_pull(key: str, task_ids: str) -> str | list | None:
         if key == "blotter_path":
             return str(blotter_path)
         if key == "blotter_sha256":
-            return "a" * 64
+            return sha256
         if key == "selected_order_ids":
             return ["ALL"]
         if key == "approved_by":
@@ -150,7 +156,11 @@ class TestSubmitOrdersHappyPath:
 
 class TestSubmitOrdersBlotterHashCheck:
     def test_raises_on_hash_mismatch(self, tmp_path, monkeypatch):
-        """_submit_orders raises before any broker call if blotter file changed after approval."""
+        """_submit_orders raises before any broker call if blotter file changed after approval.
+
+        The hash now uses hashlib directly on raw_bytes (single read), so we patch
+        Path.read_bytes to return bytes whose SHA-256 differs from the approved XCom value.
+        """
         monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
         blotter_path = _make_blotter_file(tmp_path)
         artifact = {
@@ -160,16 +170,15 @@ class TestSubmitOrdersBlotterHashCheck:
             ],
         }
         submit_mod = _make_submit_module(artifact, [])
-        # Return a different hash than what XCom reports as approved
-        submit_mod._file_sha256.return_value = "b" * 64  # disk hash differs from approved "a"*64
-
         ctx = _make_context(tmp_path, blotter_path)  # xcom blotter_sha256 = "a"*64
 
         import airflow.dags.daily_paper_trading as dag_mod
         from airflow.exceptions import AirflowException
+        # Patch read_bytes to return content whose SHA-256 != "a"*64
         with patch.dict(sys.modules, {"scripts.paper_submit_reconcile_check": submit_mod}):
-            with pytest.raises(AirflowException, match="modified after operator approval"):
-                dag_mod._submit_orders(**ctx)
+            with patch("pathlib.Path.read_bytes", return_value=b"tampered content"):
+                with pytest.raises(AirflowException, match="modified after operator approval"):
+                    dag_mod._submit_orders(**ctx)
 
         # Broker must not have been called
         submit_mod._submit_orders.assert_not_called()
@@ -216,7 +225,9 @@ class TestSubmitOrdersC1Guard:
                 return str(blotter_path)
             if key == "selected_order_ids":
                 return None  # falsy — must raise
-            return "a" * 64
+            if key == "blotter_sha256":
+                return _real_sha256(blotter_path)
+            return None
         ti.xcom_pull.side_effect = xcom_pull
         ctx = {"ti": ti, "run_id": "test-run-c1", "params": {}}
         submit_mod = _make_submit_module(artifact, [])
@@ -242,7 +253,9 @@ class TestSubmitOrdersC1Guard:
                 return str(blotter_path)
             if key == "selected_order_ids":
                 return []  # empty list — must raise
-            return "a" * 64
+            if key == "blotter_sha256":
+                return _real_sha256(blotter_path)
+            return None
         ti.xcom_pull.side_effect = xcom_pull
         ctx = {"ti": ti, "run_id": "test-run-c1b", "params": {}}
         submit_mod = _make_submit_module(artifact, [])
@@ -277,7 +290,9 @@ class TestSubmitOrdersC1Guard:
                 return str(blotter_path)
             if key == "selected_order_ids":
                 return [1, 3]  # only sequences 1 and 3
-            return "a" * 64
+            if key == "blotter_sha256":
+                return _real_sha256(blotter_path)
+            return None
         ti.xcom_pull.side_effect = xcom_pull
         ctx = {"ti": ti, "run_id": "test-run-subset", "params": {}}
 
