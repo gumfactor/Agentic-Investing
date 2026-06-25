@@ -1,7 +1,7 @@
 """blotter_approvals: operator approval gate for paper-trading blotter artifacts.
 
 Revision ID: 005
-Revises: 004
+Revises: 004b (trade_journal_schema)
 Create Date: 2026-06-25
 
 Implements the approval gate table consumed by the daily_paper_trading Airflow
@@ -22,7 +22,7 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 revision: str = "005"
-down_revision: str = "004"
+down_revision: str = "004b"
 branch_labels = None
 depends_on = None
 

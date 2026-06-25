@@ -252,8 +252,13 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
         raise AirflowException(f"IBKR paper NAV is not a finite positive number: {nav_usd}")
 
     # Fetch latest close prices for held positions from daily_prices.
-    # Using the DB (same source as the rest of the pipeline) rather than live quotes.
+    # These EOD prices become the limit-order reference prices for order candidates.
+    # This is intentional: the snapshot is taken at 23:00 ET after market close,
+    # so the most recent daily_prices row IS today's close. Stale prices (older
+    # than 3 calendar days) raise an error rather than submitting at a bad price.
+    _MAX_PRICE_AGE_DAYS = 3
     position_list: list[dict[str, Any]] = []
+    price_close_date: str | None = None
     if positions_raw:
         tickers = list(positions_raw.keys())
         engine = create_engine(database_url)
@@ -261,7 +266,8 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
             with engine.connect() as conn:
                 rows = conn.execute(
                     text(
-                        "SELECT DISTINCT ON (ticker) ticker, close::float AS close "
+                        "SELECT DISTINCT ON (ticker) ticker, close::float AS close, "
+                        "date::text AS price_date "
                         "FROM daily_prices "
                         "WHERE ticker = ANY(:tickers) "
                         "ORDER BY ticker, date DESC"
@@ -271,23 +277,43 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
         finally:
             engine.dispose()
 
-        price_map: dict[str, float] = {r.ticker: float(r.close) for r in rows}
+        price_map: dict[str, tuple[float, str]] = {
+            r.ticker: (float(r.close), r.price_date) for r in rows
+        }
         for ticker, qty in positions_raw.items():
-            price = price_map.get(ticker)
-            if price is None:
+            entry = price_map.get(ticker)
+            if entry is None:
                 raise AirflowException(
                     f"No price found in daily_prices for held position {ticker!r}. "
                     "Refresh daily data before running the paper pipeline."
                 )
+            price, close_date_str = entry
+            # Track the oldest price date across all positions
+            if price_close_date is None or close_date_str < price_close_date:
+                price_close_date = close_date_str
             position_list.append({
                 "ticker": ticker,
                 "quantity": qty,
                 "price": price,
+                "price_date": close_date_str,
             })
+
+        # Fail if the reference prices are too stale to use as limit price anchors
+        if price_close_date is not None:
+            from datetime import date as _date
+            price_age = (trading_date - _date.fromisoformat(price_close_date)).days
+            if price_age > _MAX_PRICE_AGE_DAYS:
+                raise AirflowException(
+                    f"Position reference prices are {price_age} calendar days old "
+                    f"(oldest close date: {price_close_date}). "
+                    f"Prices older than {_MAX_PRICE_AGE_DAYS} days are too stale "
+                    "to use as limit-order price anchors. Refresh daily_prices first."
+                )
 
     snapshot = {
         "schema_version": "paper_portfolio_snapshot.v1",
         "as_of": str(trading_date),
+        "price_close_date": price_close_date,
         "cash": round(cash_usd, 2),
         "nav_usd": round(nav_usd, 2),
         "positions": position_list,
