@@ -358,6 +358,43 @@ class IBKRBroker(BaseBroker):
             "Position data may not have arrived yet; retry after a short delay."
         )
 
+    def get_cash_balance_usd(self) -> float:
+        """Return total cash balance across all currencies, converted to USD."""
+        values = self._account_values_for_tag("TotalCashValue", "$LEDGER-CashBalance")
+        if not values:
+            raise RuntimeError(
+                "TotalCashValue not found in IBKR account values for any currency. "
+                "Account data may not have arrived yet; retry after a short delay."
+            )
+        total = 0.0
+        for source_currency, value in values.items():
+            if source_currency == "USD":
+                total += value
+            else:
+                total += value * self._get_fx_rate(source_currency, "USD")
+        return total
+
+    def _account_values_for_tag(self, tag: str, ledger_tag: str) -> dict[str, float]:
+        """Return {currency: value} for an account value tag, preferring per-currency ledger."""
+        self._ib.sleep(0)
+        simple: dict[str, float] = {}
+        ledger: dict[str, float] = {}
+        for av in self._ib.accountValues():
+            cur = self._normalize_currency(av.currency)
+            if not cur or cur == "BASE":
+                continue
+            if av.tag == tag:
+                simple[cur] = float(av.value)
+            elif av.tag == ledger_tag:
+                ledger[cur] = float(av.value)
+        if len(ledger) > 1:
+            return ledger
+        if simple:
+            return simple
+        if ledger:
+            return ledger
+        return {}
+
     @property
     def is_paper(self) -> bool:
         return self._port == 7497
