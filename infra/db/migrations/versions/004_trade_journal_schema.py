@@ -1,7 +1,7 @@
 """Trade journal schema: trade_fills append-only fill store.
 
-Revision ID: 004
-Revises: 003
+Revision ID: 004b
+Revises: 004 (strategy_registry)
 Create Date: 2026-06-23
 
 Implements Phase 5, M5.2 — the durable fill store required to:
@@ -20,8 +20,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID
 
-revision: str = "004"
-down_revision: str = "003"
+revision: str = "004b"
+down_revision: str = "004"
 branch_labels = None
 depends_on = None
 

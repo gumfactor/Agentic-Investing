@@ -150,10 +150,12 @@ class TestFetchIbkrSnapshot:
         mock_row_aapl = MagicMock()
         mock_row_aapl.ticker = "AAPL"
         mock_row_aapl.close = 200.0
+        mock_row_aapl.price_date = "2026-06-25"
 
         mock_row_msft = MagicMock()
         mock_row_msft.ticker = "MSFT"
         mock_row_msft.close = 450.0
+        mock_row_msft.price_date = "2026-06-25"
 
         mock_conn = MagicMock()
         mock_conn.execute.return_value.fetchall.return_value = [mock_row_aapl, mock_row_msft]
