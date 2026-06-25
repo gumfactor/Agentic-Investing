@@ -99,6 +99,13 @@ def equity_curve(
     else:
         _style()
 
+    # Guard: nothing to plot if both returns and nav_series are empty
+    if returns.empty and (nav_series is None or nav_series.empty):
+        ax.text(0.5, 0.5, "No return data", ha="center", va="center",
+                transform=ax.transAxes)
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        return _maybe_return(fig, ax)
+
     # Strategy cumulative curve
     if nav_series is not None and not nav_series.empty:
         first_val = float(nav_series.iloc[0])
@@ -421,9 +428,14 @@ def position_concentration(
     ax.stackplot(dates, [pos_top[t].values for t in top_tickers],
                  labels=top_tickers, colors=colors, alpha=0.8)
 
-    # Show residual cash only if non-trivial
-    total_invested = pos_top.sum(axis=1)
-    cash_frac = (1.0 - total_invested).clip(0.0, 1.0)
+    # Distinguish non-top-N holdings ("Other") from genuine unallocated cash
+    total_all = positions.fillna(0.0).sum(axis=1)
+    total_top = pos_top.sum(axis=1)
+    other_frac = (total_all - total_top).clip(0.0, 1.0)
+    cash_frac = (1.0 - total_all).clip(0.0, 1.0)
+    if (other_frac > 0.01).any():
+        ax.stackplot(dates, [other_frac.values], labels=["Other"],
+                     colors=[_C["benchmark"]], alpha=0.4)
     if (cash_frac > 0.01).any():
         ax.stackplot(dates, [cash_frac.values], labels=["Cash"],
                      colors=[_C["neutral"]], alpha=0.4)

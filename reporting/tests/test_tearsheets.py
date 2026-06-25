@@ -453,6 +453,12 @@ class TestEquityCurve:
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
 
+    def test_empty_returns_no_nav_series_does_not_crash(self):
+        """Codex thread 3: empty returns + no nav_series raised IndexError on cum.index[0]."""
+        fig = charts.equity_curve(pd.Series([], dtype=float), pd.Series([], dtype=float))
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
     def test_benchmark_starts_at_100_no_nav_series(self):
         """WEAK: benchmark must originate at 100 on its first plotted point."""
         fig = charts.equity_curve(_RETURNS.iloc[:100], _BM_RETURNS.iloc[:100])
@@ -555,6 +561,22 @@ class TestPositionConcentration:
         # 5 tickers, request top_n=20 — should not crash
         fig = charts.position_concentration(_POSITIONS, top_n=20)
         assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_other_bucket_not_labelled_cash(self):
+        """Codex thread 2: non-top-N holdings must appear as 'Other', not 'Cash'."""
+        # Build fully-invested 6-ticker positions; request only top_n=2
+        rng = np.random.default_rng(55)
+        n = 50
+        tickers6 = ["A", "B", "C", "D", "E", "F"]
+        weights = rng.dirichlet(np.ones(6), size=n)  # rows sum to 1 — fully invested
+        dates6 = list(_POSITIONS.index[:n])
+        pos6 = pd.DataFrame(weights, index=dates6, columns=tickers6)
+        fig = charts.position_concentration(pos6, top_n=2)
+        ax = fig.get_axes()[0]
+        labels = [p.get_label() for p in ax.collections]
+        assert "Other" in labels, "Non-top-N holdings should be labelled 'Other'"
+        assert "Cash" not in labels, "Fully-invested portfolio should not show 'Cash'"
         plt.close(fig)
 
 
