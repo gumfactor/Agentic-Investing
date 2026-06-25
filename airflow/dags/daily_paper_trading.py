@@ -74,19 +74,6 @@ _DEFAULT_MIN_DELTA_WEIGHT = 0.005
 _DEFAULT_WHATIF_ENABLED = True
 _DEFAULT_APPROVAL_TIMEOUT_HOURS = 8.0
 
-# ── Default task args ──────────────────────────────────────────────────────────
-
-_default_args: dict[str, Any] = {
-    "owner": "rqis",
-    "depends_on_past": False,
-    "retries": 3,
-    "retry_delay": timedelta(minutes=5),
-    "retry_exponential_backoff": True,
-    "max_retry_delay": timedelta(minutes=30),
-    "on_failure_callback": "_alert_operator",  # resolved at runtime
-}
-
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _safe_run_id(run_id: str) -> str:
@@ -129,6 +116,19 @@ def _alert_operator(context: Any) -> None:
     )
 
 
+# ── Default task args (defined after _alert_operator to allow callable ref) ───
+
+_default_args: dict[str, Any] = {
+    "owner": "rqis",
+    "depends_on_past": False,
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=30),
+    "on_failure_callback": _alert_operator,
+}
+
+
 # ── Task: verify_inputs (Step 2) ───────────────────────────────────────────────
 
 def _verify_inputs(**context: Any) -> None:
@@ -168,6 +168,7 @@ def _construct_target(**context: Any) -> None:
     import sys
     from pathlib import Path as _Path
 
+    _require_paper_env(dict(os.environ))
     sys.path.insert(0, str(_Path(__file__).parent.parent.parent))
 
     from scripts.paper_inputs_check import CheckRecorder, load_strategy_config
@@ -308,6 +309,7 @@ def _gen_candidates(**context: Any) -> None:
     import sys
     from pathlib import Path as _Path
 
+    _require_paper_env(dict(os.environ))
     sys.path.insert(0, str(_Path(__file__).parent.parent.parent))
 
     from scripts.paper_order_candidates_check import run as candidates_run
@@ -399,6 +401,7 @@ def _risk_compliance_gate(**context: Any) -> None:
     import sys
     from pathlib import Path as _Path
 
+    _require_paper_env(dict(os.environ))
     sys.path.insert(0, str(_Path(__file__).parent.parent.parent))
 
     from scripts.paper_risk_compliance_check import run as risk_run
@@ -434,6 +437,7 @@ def _build_blotter(**context: Any) -> None:
     import sys
     from pathlib import Path as _Path
 
+    _require_paper_env(dict(os.environ))
     sys.path.insert(0, str(_Path(__file__).parent.parent.parent))
 
     from scripts.paper_stage_blotter_check import run as blotter_run
@@ -582,16 +586,23 @@ def _submit_orders(**context: Any) -> None:
     blotter_path = _Path(blotter_path_str)
     artifact = validate_blotter(blotter_path)
 
-    # Filter to approved candidates only
+    # Filter to approved candidates only (C1: per-order selection is mandatory)
     all_rows = artifact["candidate_rows"]
     if isinstance(selected_order_ids, str):
         selected_order_ids = json.loads(selected_order_ids)
 
-    if selected_order_ids and selected_order_ids != ["ALL"] and selected_order_ids != []:
+    if not selected_order_ids and selected_order_ids != ["ALL"]:
+        raise AirflowException(
+            "selected_order_ids from wait_approval XCom is empty or None. "
+            "The approval sensor must push a non-empty list or [\"ALL\"]. "
+            "This is a C1 safety guard — no orders will be submitted."
+        )
+
+    if selected_order_ids == ["ALL"]:
+        rows_to_submit = all_rows
+    else:
         approved_seqs = set(int(x) for x in selected_order_ids)
         rows_to_submit = [r for r in all_rows if int(r["sequence"]) in approved_seqs]
-    else:
-        rows_to_submit = all_rows
 
     if not rows_to_submit:
         raise AirflowException(
@@ -614,8 +625,13 @@ def _submit_orders(**context: Any) -> None:
             for resp in partial.get("broker_responses", []):
                 if resp.get("broker_order_id"):
                     already_submitted_seqs.add(int(resp["sequence"]))
-        except Exception:
-            pass  # corrupt partial artifact; re-submit all
+        except Exception as _exc:
+            import structlog as _structlog
+            _structlog.get_logger("rqis.airflow").warning(
+                "partial_artifact_corrupt_resubmitting_all",
+                path=str(reconciliation_path),
+                error=str(_exc),
+            )
 
     if already_submitted_seqs:
         rows_to_submit = [
@@ -700,9 +716,41 @@ def _submit_orders(**context: Any) -> None:
         if r.get("initial_fill_poll") and r["initial_fill_poll"].get("status") == "Filled"
     )
 
+    from datetime import UTC, datetime as _datetime
+    ti.xcom_push(key="submitted_at_utc", value=_datetime.now(UTC).isoformat())
     ti.xcom_push(key="reconciliation_path", value=str(reconciliation_path))
     ti.xcom_push(key="submitted_count", value=len(all_responses))
     ti.xcom_push(key="initial_filled_count", value=filled)
+
+
+# ── Task: wait_for_fills ──────────────────────────────────────────────────────
+
+def _wait_for_fills(**context: Any) -> None:
+    """Sleep until 30 minutes have elapsed since submit_orders completed.
+
+    Uses wall-clock time from the submitted_at_utc XCom pushed by submit_orders,
+    not the DAG execution_date, so the wait is anchored to actual submission time.
+    """
+    import time
+    from datetime import UTC, datetime as _datetime, timedelta as _timedelta
+
+    ti = context["ti"]
+    submitted_at_str: str | None = ti.xcom_pull(
+        key="submitted_at_utc", task_ids="submit_orders"
+    )
+    if not submitted_at_str:
+        raise AirflowException(
+            "submitted_at_utc XCom not found — submit_orders may have failed."
+        )
+    submitted_at = _datetime.fromisoformat(submitted_at_str)
+    target = submitted_at + _timedelta(minutes=30)
+    remaining = (target - _datetime.now(UTC)).total_seconds()
+    if remaining > 0:
+        import structlog as _sl
+        _sl.get_logger("rqis.airflow").info(
+            "wait_for_fills_sleeping", seconds=int(remaining)
+        )
+        time.sleep(remaining)
 
 
 # ── Task: durable_reconcile (Step 8) ──────────────────────────────────────────
@@ -743,6 +791,7 @@ def _write_ledger(**context: Any) -> None:
     import sys
     from pathlib import Path as _Path
 
+    _require_paper_env(dict(os.environ))
     sys.path.insert(0, str(_Path(__file__).parent.parent.parent))
 
     from scripts.paper_run_audit_check import run as audit_run
@@ -904,12 +953,14 @@ with DAG(
         execution_timeout=timedelta(minutes=10),
     )
 
-    # Wait 30 minutes for limit orders to fill before polling status
-    t_wait_fills = TimeDeltaSensor(
+    # Wait 30 minutes from submission time for limit orders to fill
+    # Uses wall-clock elapsed time (XCom-anchored) rather than execution_date
+    # so the wait is always 30 minutes from actual broker submission.
+    t_wait_fills = PythonOperator(
         task_id="wait_for_fills",
-        delta=timedelta(minutes=30),
-        mode="reschedule",
+        python_callable=_wait_for_fills,
         retries=0,
+        execution_timeout=timedelta(minutes=45),
     )
 
     t_reconcile = PythonOperator(

@@ -76,7 +76,12 @@ def upgrade() -> None:
             "confirmed_blotter_sha256",
             sa.Text(),
             nullable=False,
-            comment="Must match blotter_sha256; verified by sensor before permitting submission.",
+            comment=(
+                "SHA-256 computed by the operator/dashboard at review time. "
+                "The sensor verifies this matches blotter_sha256 in Python before "
+                "permitting submission. Kept as independent fields to support the "
+                "future Streamlit dashboard (M5.8) which may set them independently."
+            ),
         ),
         sa.Column(
             "dashboard_session_id",
@@ -96,8 +101,8 @@ def upgrade() -> None:
             name="ck_blotter_approvals_sha256_len",
         ),
         sa.CheckConstraint(
-            "confirmed_blotter_sha256 = blotter_sha256",
-            name="ck_blotter_approvals_sha256_match",
+            "length(confirmed_blotter_sha256) = 64",
+            name="ck_blotter_approvals_confirmed_sha256_len",
         ),
     )
 
