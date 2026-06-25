@@ -64,13 +64,19 @@ def _make_submit_module(blotter_artifact: dict, broker_responses: list) -> Modul
     return mod
 
 
+def _real_sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _make_context(tmp_path: Path, blotter_path: Path, run_id: str = "test-run-1") -> dict:
+    sha256 = _real_sha256(blotter_path)
     ti = MagicMock()
     def xcom_pull(key: str, task_ids: str) -> str | list | None:
         if key == "blotter_path":
             return str(blotter_path)
         if key == "blotter_sha256":
-            return "a" * 64
+            return sha256
         if key == "selected_order_ids":
             return ["ALL"]
         if key == "approved_by":
@@ -148,6 +154,61 @@ class TestSubmitOrdersHappyPath:
         assert pushed["initial_filled_count"] == 1
 
 
+class TestSubmitOrdersBlotterHashCheck:
+    def test_raises_on_hash_mismatch(self, tmp_path, monkeypatch):
+        """_submit_orders raises before any broker call if blotter file changed after approval.
+
+        The hash now uses hashlib directly on raw_bytes (single read), so we patch
+        Path.read_bytes to return bytes whose SHA-256 differs from the approved XCom value.
+        """
+        monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
+        blotter_path = _make_blotter_file(tmp_path)
+        artifact = {
+            "candidate_rows": [
+                {"sequence": 1, "ticker": "AAPL", "direction": "BUY",
+                 "estimated_shares": 5.0, "reference_price": 200.0},
+            ],
+        }
+        submit_mod = _make_submit_module(artifact, [])
+        ctx = _make_context(tmp_path, blotter_path)  # xcom blotter_sha256 = "a"*64
+
+        import airflow.dags.daily_paper_trading as dag_mod
+        from airflow.exceptions import AirflowException
+        # Patch read_bytes to return content whose SHA-256 != "a"*64
+        with patch.dict(sys.modules, {"scripts.paper_submit_reconcile_check": submit_mod}):
+            with patch("pathlib.Path.read_bytes", return_value=b"tampered content"):
+                with pytest.raises(AirflowException, match="modified after operator approval"):
+                    dag_mod._submit_orders(**ctx)
+
+        # Broker must not have been called
+        submit_mod._submit_orders.assert_not_called()
+
+    def test_raises_with_clear_message_when_blotter_sha256_xcom_missing(self, tmp_path, monkeypatch):
+        """When blotter_sha256 XCom is None (missing/expired), error is clear — not 'modified'."""
+        monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
+        blotter_path = _make_blotter_file(tmp_path)
+        artifact = {"candidate_rows": []}
+        submit_mod = _make_submit_module(artifact, [])
+
+        ti = MagicMock()
+        def xcom_pull(key: str, task_ids: str) -> str | list | None:
+            if key == "blotter_path":
+                return str(blotter_path)
+            if key == "blotter_sha256":
+                return None  # XCom missing
+            if key == "selected_order_ids":
+                return ["ALL"]
+            return None
+        ti.xcom_pull.side_effect = xcom_pull
+        ctx = {"ti": ti, "run_id": "test-sha-none", "params": {}}
+
+        import airflow.dags.daily_paper_trading as dag_mod
+        from airflow.exceptions import AirflowException
+        with patch.dict(sys.modules, {"scripts.paper_submit_reconcile_check": submit_mod}):
+            with pytest.raises(AirflowException, match="blotter_sha256 XCom not found"):
+                dag_mod._submit_orders(**ctx)
+
+
 class TestSubmitOrdersC1Guard:
     def test_raises_on_none_selected_order_ids(self, tmp_path, monkeypatch):
         monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
@@ -164,7 +225,9 @@ class TestSubmitOrdersC1Guard:
                 return str(blotter_path)
             if key == "selected_order_ids":
                 return None  # falsy — must raise
-            return "a" * 64
+            if key == "blotter_sha256":
+                return _real_sha256(blotter_path)
+            return None
         ti.xcom_pull.side_effect = xcom_pull
         ctx = {"ti": ti, "run_id": "test-run-c1", "params": {}}
         submit_mod = _make_submit_module(artifact, [])
@@ -190,7 +253,9 @@ class TestSubmitOrdersC1Guard:
                 return str(blotter_path)
             if key == "selected_order_ids":
                 return []  # empty list — must raise
-            return "a" * 64
+            if key == "blotter_sha256":
+                return _real_sha256(blotter_path)
+            return None
         ti.xcom_pull.side_effect = xcom_pull
         ctx = {"ti": ti, "run_id": "test-run-c1b", "params": {}}
         submit_mod = _make_submit_module(artifact, [])
@@ -225,7 +290,9 @@ class TestSubmitOrdersC1Guard:
                 return str(blotter_path)
             if key == "selected_order_ids":
                 return [1, 3]  # only sequences 1 and 3
-            return "a" * 64
+            if key == "blotter_sha256":
+                return _real_sha256(blotter_path)
+            return None
         ti.xcom_pull.side_effect = xcom_pull
         ctx = {"ti": ti, "run_id": "test-run-subset", "params": {}}
 
@@ -318,3 +385,45 @@ class TestSubmitOrdersPartialRetry:
         ti = ctx["ti"]
         pushed = {call[1]["key"]: call[1]["value"] for call in ti.xcom_push.call_args_list}
         assert pushed["submitted_count"] == 1  # from the partial artifact
+        # submitted_at_utc must be pushed so wait_for_fills can anchor the fill window
+        assert "submitted_at_utc" in pushed
+        assert pushed["submitted_at_utc"]  # non-empty timestamp string
+
+    def test_fill_count_recovered_from_existing_artifact_not_hardcoded_zero(self, tmp_path, monkeypatch):
+        """On idempotent retry, initial_filled_count reflects actual fills in the partial artifact."""
+        monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
+        blotter_path = _make_blotter_file(tmp_path, n_rows=2)
+        artifact = {
+            "candidate_rows": [
+                {"sequence": 1, "ticker": "AAPL", "direction": "BUY",
+                 "estimated_shares": 5.0, "reference_price": 200.0},
+                {"sequence": 2, "ticker": "MSFT", "direction": "BUY",
+                 "estimated_shares": 3.0, "reference_price": 450.0},
+            ]
+        }
+        run_dir = tmp_path / "test-run-fill-count"
+        run_dir.mkdir()
+        partial = {
+            "generated_at_utc": "2026-06-25T10:00:00+00:00",
+            "broker_responses": [
+                {"sequence": 1, "broker_order_id": "O1", "status": "SUBMITTED",
+                 "initial_fill_poll": {"status": "Filled", "fill_price": 200.0}},
+                {"sequence": 2, "broker_order_id": "O2", "status": "SUBMITTED",
+                 "initial_fill_poll": {"status": "Submitted"}},
+            ],
+        }
+        (run_dir / "submit_reconciliation.json").write_text(json.dumps(partial), encoding="utf-8")
+
+        submit_mod = _make_submit_module(artifact, [])
+        ctx = _make_context(tmp_path, blotter_path, run_id="test-run-fill-count")
+
+        import airflow.dags.daily_paper_trading as dag_mod
+        with patch.dict(sys.modules, {"scripts.paper_submit_reconcile_check": submit_mod}):
+            with patch.object(dag_mod, "IBKRBroker", return_value=MagicMock()):
+                dag_mod._submit_orders(**ctx)
+
+        ti = ctx["ti"]
+        pushed = {call[1]["key"]: call[1]["value"] for call in ti.xcom_push.call_args_list}
+        assert pushed["submitted_count"] == 2
+        assert pushed["initial_filled_count"] == 1  # only sequence 1 was Filled
+        assert pushed["submitted_at_utc"] == "2026-06-25T10:00:00+00:00"  # from artifact

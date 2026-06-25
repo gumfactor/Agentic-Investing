@@ -610,7 +610,30 @@ def _submit_orders(**context: Any) -> None:
     approved_by: str = ti.xcom_pull(key="approved_by", task_ids="wait_approval")
 
     blotter_path = _Path(blotter_path_str)
-    artifact = validate_blotter(blotter_path)
+
+    # C1: read the file ONCE so the hash and the submitted rows come from the same
+    # bytes, closing the TOCTOU window where a swapped-then-restored file could pass
+    # validation but have its hash checked against the original approved content.
+    import hashlib as _hashlib
+    if blotter_sha256 is None:
+        raise AirflowException(
+            "blotter_sha256 XCom not found — build_blotter task may not have completed "
+            "or the XCom has expired. Cannot verify blotter integrity before submission."
+        )
+    raw_bytes = blotter_path.read_bytes()
+    current_sha = _hashlib.sha256(raw_bytes).hexdigest()
+    if current_sha != blotter_sha256:
+        raise AirflowException(
+            f"Blotter artifact was modified after operator approval. "
+            f"Approved SHA-256: {blotter_sha256!r}, current on disk: {current_sha!r}. "
+            "This is a C1 safety violation — do not retry without a fresh approval."
+        )
+    # Parse the artifact from the same bytes the hash was computed over.
+    # validate_blotter re-reads the path for its internal consistency checks
+    # (schema version, candidate_rows_sha256, artifact_sha256, provenance), but
+    # the rows used for submission come from raw_bytes, not that second read.
+    artifact = json.loads(raw_bytes.decode("utf-8"))
+    validate_blotter(blotter_path)
 
     # Filter to approved candidates only (C1: per-order selection is mandatory)
     all_rows = artifact["candidate_rows"]
@@ -671,10 +694,21 @@ def _submit_orders(**context: Any) -> None:
     if not rows_to_submit:
         # All orders were submitted in a prior attempt; load the partial artifact
         # and mark as SUBMITTED.
+        from datetime import UTC, datetime as _datetime
         existing = json.loads(reconciliation_path.read_text(encoding="utf-8"))
+        existing_responses = existing.get("broker_responses", [])
+        # Recover the original submission timestamp so wait_for_fills can anchor
+        # its fill window correctly on retry (it raises if submitted_at_utc is missing).
+        submitted_at = existing.get("generated_at_utc") or _datetime.now(UTC).isoformat()
+        # Re-count actual fills from the existing artifact rather than hardcoding 0.
+        existing_filled = sum(
+            1 for r in existing_responses
+            if r.get("initial_fill_poll") and r["initial_fill_poll"].get("status") == "Filled"
+        )
+        ti.xcom_push(key="submitted_at_utc", value=submitted_at)
         ti.xcom_push(key="reconciliation_path", value=str(reconciliation_path))
-        ti.xcom_push(key="submitted_count", value=len(existing.get("broker_responses", [])))
-        ti.xcom_push(key="initial_filled_count", value=0)
+        ti.xcom_push(key="submitted_count", value=len(existing_responses))
+        ti.xcom_push(key="initial_filled_count", value=existing_filled)
         return
 
     filtered_artifact = copy.deepcopy(dict(artifact))
@@ -720,8 +754,6 @@ def _submit_orders(**context: Any) -> None:
         now_fn=lambda: datetime.now(UTC),
         on_progress=_on_progress,
     )
-
-    from scripts.paper_submit_reconcile_check import _file_sha256 as _fsha
 
     all_responses = previous_responses + broker_responses
     final_artifact = _build_reconciliation_artifact(
@@ -953,12 +985,22 @@ with DAG(
     )
 
     # ── C1 approval gate ────────────────────────────────────────────────────
-    # Import sensor inline to avoid issues if the plugins/ directory is not
-    # yet on the Airflow plugin path during DAG file parsing.
+    # Airflow adds /opt/airflow/plugins directly to sys.path, so the plugin is
+    # importable as a top-level module (not under airflow.plugins.*).
+    # Flat fallback chain using a sentinel: each except only catches ImportError
+    # from its own try-block, so a body-level error (AttributeError, SyntaxError)
+    # in a candidate module propagates immediately rather than falling through.
+    _BlotterApprovalSensor = None
     try:
-        from airflow.plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
+        from blotter_approval_sensor import BlotterApprovalSensor as _BlotterApprovalSensor  # type: ignore[assignment]
     except ImportError:
-        from airflow_plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
+        pass
+    if _BlotterApprovalSensor is None:
+        try:
+            from airflow.plugins.blotter_approval_sensor import BlotterApprovalSensor as _BlotterApprovalSensor  # type: ignore[assignment,import]
+        except ImportError:
+            from airflow_plugins.blotter_approval_sensor import BlotterApprovalSensor as _BlotterApprovalSensor  # type: ignore[assignment,import]
+    BlotterApprovalSensor = _BlotterApprovalSensor
 
     t_approval = BlotterApprovalSensor(
         task_id="wait_approval",
