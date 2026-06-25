@@ -614,6 +614,11 @@ def _submit_orders(**context: Any) -> None:
 
     # C1: verify the file on disk still matches the hash the operator approved.
     # This catches any race between wait_approval succeeding and this task running.
+    if blotter_sha256 is None:
+        raise AirflowException(
+            "blotter_sha256 XCom not found — build_blotter task may not have completed "
+            "or the XCom has expired. Cannot verify blotter integrity before submission."
+        )
     from scripts.paper_submit_reconcile_check import _file_sha256 as _fsha
     current_sha = _fsha(blotter_path)
     if current_sha != blotter_sha256:
@@ -684,13 +689,19 @@ def _submit_orders(**context: Any) -> None:
         # and mark as SUBMITTED.
         from datetime import UTC, datetime as _datetime
         existing = json.loads(reconciliation_path.read_text(encoding="utf-8"))
+        existing_responses = existing.get("broker_responses", [])
         # Recover the original submission timestamp so wait_for_fills can anchor
         # its fill window correctly on retry (it raises if submitted_at_utc is missing).
         submitted_at = existing.get("generated_at_utc") or _datetime.now(UTC).isoformat()
+        # Re-count actual fills from the existing artifact rather than hardcoding 0.
+        existing_filled = sum(
+            1 for r in existing_responses
+            if r.get("initial_fill_poll") and r["initial_fill_poll"].get("status") == "Filled"
+        )
         ti.xcom_push(key="submitted_at_utc", value=submitted_at)
         ti.xcom_push(key="reconciliation_path", value=str(reconciliation_path))
-        ti.xcom_push(key="submitted_count", value=len(existing.get("broker_responses", [])))
-        ti.xcom_push(key="initial_filled_count", value=0)
+        ti.xcom_push(key="submitted_count", value=len(existing_responses))
+        ti.xcom_push(key="initial_filled_count", value=existing_filled)
         return
 
     filtered_artifact = copy.deepcopy(dict(artifact))
@@ -969,14 +980,20 @@ with DAG(
     # ── C1 approval gate ────────────────────────────────────────────────────
     # Airflow adds /opt/airflow/plugins directly to sys.path, so the plugin is
     # importable as a top-level module (not under airflow.plugins.*).
-    # Fallbacks cover unit tests and alternate plugin packaging arrangements.
+    # Flat fallback chain using a sentinel: each except only catches ImportError
+    # from its own try-block, so a body-level error (AttributeError, SyntaxError)
+    # in a candidate module propagates immediately rather than falling through.
+    _BlotterApprovalSensor = None
     try:
-        from blotter_approval_sensor import BlotterApprovalSensor  # Airflow plugin sys.path
+        from blotter_approval_sensor import BlotterApprovalSensor as _BlotterApprovalSensor  # type: ignore[assignment]
     except ImportError:
+        pass
+    if _BlotterApprovalSensor is None:
         try:
-            from airflow.plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
+            from airflow.plugins.blotter_approval_sensor import BlotterApprovalSensor as _BlotterApprovalSensor  # type: ignore[assignment,import]
         except ImportError:
-            from airflow_plugins.blotter_approval_sensor import BlotterApprovalSensor  # type: ignore[import]
+            from airflow_plugins.blotter_approval_sensor import BlotterApprovalSensor as _BlotterApprovalSensor  # type: ignore[assignment,import]
+    BlotterApprovalSensor = _BlotterApprovalSensor
 
     t_approval = BlotterApprovalSensor(
         task_id="wait_approval",
