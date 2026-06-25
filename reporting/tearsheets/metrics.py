@@ -101,10 +101,11 @@ def information_ratio(returns: pd.Series, benchmark_returns: pd.Series) -> float
     """Information ratio: active return / tracking error × sqrt(252).
 
     Uses ddof=1 (sample tracking error).  Returns NaN when the date overlap
-    between the two series is fewer than 2 observations.
+    between the two series is fewer than 20 observations (fewer than that
+    makes the tracking-error estimate statistically unreliable).
     """
     r, b = returns.align(benchmark_returns, join="inner")
-    if len(r) < 2:
+    if len(r) < 20:
         return float("nan")
     active = r - b
     tracking_error = active.std(ddof=1)
@@ -225,7 +226,7 @@ def compute_metrics(
     bm_total = float((1 + bm_inner).prod() - 1) if len(bm_inner) >= 1 else float("nan")
 
     m.update({
-        "total_return": float((1 + returns).prod() - 1),
+        "total_return": float((1 + returns).prod() - 1) if not returns.empty else float("nan"),
         "benchmark_total_return": bm_total,
         "cagr": annualized_return(returns),
         "annualized_volatility": annualized_volatility(returns),
@@ -251,7 +252,7 @@ def compute_metrics(
     if not trades.empty:
         m["n_trades"] = int(len(trades))
         if "total_cost" in trades.columns:
-            m["total_transaction_cost"] = float(trades["total_cost"].sum())
+            m["total_transaction_cost"] = float(trades["total_cost"].sum(min_count=1))
         if "notional" in trades.columns and "total_cost" in trades.columns:
             denom = trades["notional"].replace(0, np.nan)
             m["avg_trade_cost_bps"] = float(

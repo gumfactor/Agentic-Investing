@@ -399,6 +399,19 @@ class TestComputeMetrics:
                             base_metrics={"custom_key": 42})
         assert m["custom_key"] == 42
 
+    def test_empty_returns_total_return_is_nan(self):
+        """WEAK: empty returns series must yield NaN total_return, not 0.0."""
+        empty = pd.Series([], dtype=float)
+        m = compute_metrics(empty, empty, pd.DataFrame(), 1e6)
+        assert math.isnan(m["total_return"])
+
+    def test_all_nan_total_cost_is_nan(self):
+        """WEAK: NaN total_cost values must yield NaN, not 0.0."""
+        trades_nan_cost = _TRADES.copy()
+        trades_nan_cost["total_cost"] = float("nan")
+        m = compute_metrics(_RETURNS, _BM_RETURNS, trades_nan_cost, 1_000_000.0)
+        assert math.isnan(m["total_transaction_cost"])
+
 
 # ---------------------------------------------------------------------------
 # charts.py tests
@@ -438,6 +451,15 @@ class TestEquityCurve:
         bm_future.index = [date(d.year + 5, d.month, d.day) for d in bm_future.index]
         fig = charts.equity_curve(_RETURNS, bm_future)
         assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_benchmark_starts_at_100_no_nav_series(self):
+        """WEAK: benchmark must originate at 100 on its first plotted point."""
+        fig = charts.equity_curve(_RETURNS.iloc[:100], _BM_RETURNS.iloc[:100])
+        ax = fig.get_axes()[0]
+        bm_lines = [l for l in ax.get_lines() if l.get_label() == "Benchmark"]
+        assert bm_lines, "Benchmark line not found"
+        assert bm_lines[0].get_ydata()[0] == pytest.approx(100.0, rel=1e-6)
         plt.close(fig)
 
 
@@ -577,6 +599,13 @@ class TestTradeEntryExit:
     def test_empty_trades(self):
         empty = pd.DataFrame(columns=["date", "ticker", "direction", "fill_price"])
         fig = charts.trade_entry_exit("AAPL", _PRICES, empty)
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_missing_direction_column_does_not_crash(self):
+        """CRASH: trades without 'direction' column must not raise KeyError."""
+        trades_no_dir = _TRADES.drop(columns=["direction"])
+        fig = charts.trade_entry_exit("AAPL", _PRICES, trades_no_dir)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
 
@@ -767,6 +796,32 @@ class TestRenderHtml:
         assert len(paths) > 0
         for p in paths:
             assert p.exists() and p.suffix == ".png"
+
+    def test_no_figure_leak_after_render_html(self, generator, tmp_path):
+        """EDGE: render_html must close all figures it opens."""
+        plt.close("all")
+        before = len(plt.get_fignums())
+        generator.render_html(tmp_path / "tearsheet.html")
+        after = len(plt.get_fignums())
+        assert after == before
+
+    def test_html_injection_escaped(self, tmp_path):
+        """EDGE: XSS vectors in title/config must be escaped in HTML output."""
+        gen = TearsheetGenerator(
+            returns=_RETURNS,
+            benchmark_returns=_BM_RETURNS,
+            positions=_POSITIONS,
+            trades=_TRADES,
+            metrics={},
+            config={"name": "<script>alert(1)</script>", "backtest": {"benchmark": "<img>"}},
+            title="<b>hack</b>",
+        )
+        dest = tmp_path / "tearsheet.html"
+        gen.render_html(dest)
+        content = dest.read_text(encoding="utf-8")
+        assert "<script>alert" not in content
+        assert "<b>hack</b>" not in content
+        assert "&lt;script&gt;" in content or "alert(1)" not in content
 
 
 class TestRenderPngDir:

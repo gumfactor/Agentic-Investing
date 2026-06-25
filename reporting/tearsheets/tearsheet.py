@@ -24,6 +24,7 @@ For paper/live trading, construct directly::
 from __future__ import annotations
 
 import base64
+import html as _html
 import io
 import math
 from dataclasses import dataclass, field
@@ -45,9 +46,11 @@ from reporting.tearsheets.metrics import compute_metrics
 def _fig_to_b64(fig: plt.Figure, dpi: int = 150) -> str:
     """Encode a matplotlib Figure as a base64 PNG string."""
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
-                facecolor="white", edgecolor="none")
-    plt.close(fig)
+    try:
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                    facecolor="white", edgecolor="none")
+    finally:
+        plt.close(fig)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("utf-8")
 
@@ -288,9 +291,11 @@ class TearsheetGenerator:
         paths: list[Path] = []
         for name, fig in fig_map.items():
             dest = output_dir / f"{name}.png"
-            fig.savefig(dest, dpi=150, bbox_inches="tight",
-                        facecolor="white", edgecolor="none")
-            plt.close(fig)
+            try:
+                fig.savefig(dest, dpi=150, bbox_inches="tight",
+                            facecolor="white", edgecolor="none")
+            finally:
+                plt.close(fig)
             paths.append(dest)
 
         return paths
@@ -357,9 +362,10 @@ def _build_html(
     metrics: dict,
     b64_charts: dict[str, str],
 ) -> str:
-    strategy_name = config.get("name", title)
-    data_version  = config.get("data_version", "—")
-    benchmark     = (config.get("backtest") or {}).get("benchmark", "—")
+    strategy_name = _html.escape(str(config.get("name", title) or ""))
+    data_version  = _html.escape(str(config.get("data_version", "—") or "—"))
+    benchmark     = _html.escape(str((config.get("backtest") or {}).get("benchmark", "—") or "—"))
+    title         = _html.escape(str(title or ""))
 
     chart_sections = "\n".join(
         f'<div class="chart-block">'

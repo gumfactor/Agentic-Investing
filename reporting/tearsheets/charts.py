@@ -109,14 +109,12 @@ def equity_curve(
         idx0 = pd.Timestamp(cum.index[0]) - pd.Timedelta(days=1)
         strat_cum = pd.concat([pd.Series([100.0], index=[idx0]), cum])
 
-    # Benchmark: inner-align, then index so both start at 100 on first shared date
+    # Benchmark: inner-align, then normalise to 100 at the first shared date so
+    # both curves share the same inception level regardless of the strategy path.
     bm_r, _ = benchmark_returns.align(returns, join="inner")
     if not bm_r.empty:
         bm_cum_inner = 100.0 * (1 + bm_r).cumprod()
-        # Re-base benchmark to match strategy level on first shared date
-        first_shared = bm_r.index[0]
-        if first_shared in strat_cum.index:
-            bm_cum_inner = bm_cum_inner / bm_cum_inner.iloc[0] * float(strat_cum.loc[first_shared])
+        bm_cum_inner = bm_cum_inner / bm_cum_inner.iloc[0] * 100.0
     else:
         bm_cum_inner = pd.Series(dtype=float)
 
@@ -537,7 +535,7 @@ def trade_entry_exit(
     p.index = pd.to_datetime(p.index)
     ax.plot(p.index, p.values, color=_C["neutral"], lw=1.0, zorder=1, label="Price")
 
-    if not trades.empty:
+    if not trades.empty and "direction" in trades.columns:
         t = trades[trades["ticker"] == ticker].copy()
         t["date"] = pd.to_datetime(t["date"])
         buys = t[t["direction"] == "BUY"]
