@@ -8,6 +8,7 @@ import pandas as pd
 
 
 _REQUIRED_OHLC_COLS = {"date", "ticker", "open", "high", "low", "close"}
+_REQUIRED_OHLCV_COLS = _REQUIRED_OHLC_COLS | {"volume"}
 
 
 def validate_ohlc(ohlc: pd.DataFrame) -> None:
@@ -16,6 +17,14 @@ def validate_ohlc(ohlc: pd.DataFrame) -> None:
         raise ValueError(f"ohlc DataFrame missing required columns: {missing}")
     if ohlc.empty:
         raise ValueError("ohlc DataFrame is empty")
+
+
+def validate_ohlcv(ohlcv: pd.DataFrame) -> None:
+    missing = _REQUIRED_OHLCV_COLS - set(ohlcv.columns)
+    if missing:
+        raise ValueError(f"ohlcv DataFrame missing required columns: {missing}")
+    if ohlcv.empty:
+        raise ValueError("ohlcv DataFrame is empty")
 
 
 def ohlc_wide(ohlc: pd.DataFrame, col: str) -> pd.DataFrame:
