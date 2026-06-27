@@ -14,7 +14,7 @@ import yaml
 
 _RUNTIME_KEYS: frozenset[str] = frozenset({"data_version"})
 _REQUIRED_TOP_LEVEL: frozenset[str] = frozenset(
-    {"version", "name", "universe", "factors", "portfolio", "execution", "backtest"}
+    {"version", "name", "universe", "indicators", "portfolio", "execution", "backtest"}
 )
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,99}$")
 
@@ -93,20 +93,20 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("strategy config 'name' must be a non-empty string")
 
-    factors = config["factors"]
-    if not isinstance(factors, Mapping) or not factors:
-        raise ValueError("strategy config 'factors' must be a non-empty mapping")
+    indicators = config["indicators"]
+    if not isinstance(indicators, Mapping) or not indicators:
+        raise ValueError("strategy config 'indicators' must be a non-empty mapping")
     total_weight = 0.0
-    for factor_name, factor_cfg in factors.items():
-        if not isinstance(factor_name, str) or not factor_name.strip():
-            raise ValueError("every factor name must be a non-empty string")
-        if not isinstance(factor_cfg, Mapping):
-            raise ValueError(f"factor {factor_name!r} must be a mapping")
-        if "weight" not in factor_cfg:
-            raise ValueError(f"factor {factor_name!r} is missing required key 'weight'")
-        total_weight += float(factor_cfg["weight"])
+    for indicator_name, indicator_cfg in indicators.items():
+        if not isinstance(indicator_name, str) or not indicator_name.strip():
+            raise ValueError("every indicator name must be a non-empty string")
+        if not isinstance(indicator_cfg, Mapping):
+            raise ValueError(f"indicator {indicator_name!r} must be a mapping")
+        if "weight" not in indicator_cfg:
+            raise ValueError(f"indicator {indicator_name!r} is missing required key 'weight'")
+        total_weight += float(indicator_cfg["weight"])
     if total_weight <= 0:
-        raise ValueError("strategy factor weights must sum to a positive value")
+        raise ValueError("strategy indicator weights must sum to a positive value")
 
     portfolio = config["portfolio"]
     if not isinstance(portfolio, Mapping):

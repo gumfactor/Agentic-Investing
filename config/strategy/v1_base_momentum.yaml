@@ -11,7 +11,7 @@ universe:
   min_market_cap_usd: 500000000
   min_adv_usd: 1000000
 
-factors:
+indicators:
   momentum:
     weight: 1.0
     score_col: momentum_score

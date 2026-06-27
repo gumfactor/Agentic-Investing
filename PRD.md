@@ -194,12 +194,12 @@ rqis/
 │   └── tests/
 │
 ├── signals/                       # Signal generation layer
-│   ├── factors/
-│   │   ├── value.py               # P/E, P/B, EV/EBITDA, etc.
-│   │   ├── momentum.py            # Price momentum, earnings momentum
-│   │   ├── quality.py             # ROE, ROIC, accruals, leverage
+│   ├── indicators/
+│   │   ├── value/                 # P/E, P/B, EV/EBITDA, etc.
+│   │   ├── momentum/              # Price momentum, earnings momentum
+│   │   ├── quality/               # ROE, ROIC, accruals, leverage
 │   │   ├── low_vol.py             # Beta, realized vol, idiosyncratic vol
-│   │   ├── growth.py              # Revenue/earnings growth, estimate revisions (Phase 5)
+│   │   ├── growth/                # Revenue/earnings growth, estimate revisions (Phase 5)
 │   │   ├── sentiment.py           # NLP scores, short interest, insider flow (Phase 5)
 │   │   └── technical.py           # MA crossovers, RSI, MACD, ATR, breakout (Phase 5)
 │   ├── research/
