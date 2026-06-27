@@ -83,6 +83,89 @@ def _latest_scores(result: pd.DataFrame, score_col: str) -> pd.Series:
     return result[result["date"] == latest_date].set_index("ticker")[score_col]
 
 
+def make_ohlc(
+    tickers: list[str] | None = None,
+    n_days: int = 300,
+    start: str = "2020-01-01",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """OHLC DataFrame in long format [date, ticker, open, high, low, close].
+
+    close is NOT forced to be the midpoint of high/low so CLV-based factors
+    (Chaikin, A/D line, MFI) produce non-zero values.
+    """
+    tickers = tickers or _DEFAULT_TICKERS
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start, periods=n_days)
+    rows: list[dict] = []
+    for i, ticker in enumerate(tickers):
+        base = 50.0 + i * 20.0
+        price = base
+        for d in dates:
+            day_ret = rng.normal(0.0, 0.01)
+            open_ = price * (1 + rng.normal(0.0, 0.003))
+            close = max(open_ * (1 + day_ret), 0.01)
+            intraday = abs(rng.normal(0.0, 0.005)) * price
+            high = max(open_, close) + intraday
+            low  = max(min(open_, close) - intraday, 0.01)
+            rows.append({
+                "date": d, "ticker": ticker,
+                "open": float(open_), "high": float(high),
+                "low": float(low), "close": float(close),
+            })
+            price = close
+    return pd.DataFrame(rows)
+
+
+def make_ohlcv(
+    tickers: list[str] | None = None,
+    n_days: int = 300,
+    start: str = "2020-01-01",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """OHLCV DataFrame in long format [date, ticker, open, high, low, close, volume]."""
+    tickers = tickers or _DEFAULT_TICKERS
+    rng = np.random.default_rng(seed)
+    ohlc = make_ohlc(tickers=tickers, n_days=n_days, start=start, seed=seed)
+    dates = sorted(ohlc["date"].unique())
+    vol_rows = []
+    for ticker in tickers:
+        for d in dates:
+            vol_rows.append({"date": d, "ticker": ticker,
+                             "volume": float(abs(rng.normal(1_000_000, 200_000)) + 10_000)})
+    vol_df = pd.DataFrame(vol_rows)
+    return ohlc.merge(vol_df, on=["date", "ticker"])
+
+
+def make_volumes(
+    tickers: list[str] | None = None,
+    n_days: int = 300,
+    start: str = "2020-01-01",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Volume DataFrame in long format [date, ticker, volume]."""
+    tickers = tickers or _DEFAULT_TICKERS
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range(start, periods=n_days)
+    rows: list[dict] = []
+    for ticker in tickers:
+        vols = np.maximum(rng.normal(1_000_000, 200_000, n_days), 10_000)
+        for d, v in zip(dates, vols):
+            rows.append({"date": d, "ticker": ticker, "volume": float(v)})
+    return pd.DataFrame(rows)
+
+
+def make_prices_with_spy(
+    tickers: list[str] | None = None,
+    n_days: int = 400,
+    start: str = "2020-01-01",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Prices including SPY — required for beta and relative-strength factors."""
+    tickers = list(tickers or _DEFAULT_TICKERS) + ["SPY"]
+    return make_prices(tickers=tickers, n_days=n_days, start=start, seed=seed)
+
+
 # ─── Pytest fixtures ──────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -98,3 +181,38 @@ def prices_400d() -> pd.DataFrame:
 @pytest.fixture
 def prices_810d() -> pd.DataFrame:
     return make_prices(n_days=810)
+
+
+@pytest.fixture
+def ohlc_300d() -> pd.DataFrame:
+    return make_ohlc(n_days=300)
+
+
+@pytest.fixture
+def ohlcv_300d() -> pd.DataFrame:
+    return make_ohlcv(n_days=300)
+
+
+@pytest.fixture
+def ohlcv_400d() -> pd.DataFrame:
+    return make_ohlcv(n_days=400)
+
+
+@pytest.fixture
+def volumes_300d() -> pd.DataFrame:
+    return make_volumes(n_days=300)
+
+
+@pytest.fixture
+def volumes_400d() -> pd.DataFrame:
+    return make_volumes(n_days=400)
+
+
+@pytest.fixture
+def prices_with_spy_400d() -> pd.DataFrame:
+    return make_prices_with_spy(n_days=400)
+
+
+@pytest.fixture
+def prices_with_spy_810d() -> pd.DataFrame:
+    return make_prices_with_spy(n_days=810)
