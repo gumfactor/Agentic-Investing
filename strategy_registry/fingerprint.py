@@ -14,8 +14,12 @@ import yaml
 
 _RUNTIME_KEYS: frozenset[str] = frozenset({"data_version"})
 _REQUIRED_TOP_LEVEL: frozenset[str] = frozenset(
-    {"version", "name", "universe", "indicators", "portfolio", "execution", "backtest"}
+    {"version", "name", "universe", "portfolio", "execution", "backtest"}
 )
+# Accept both the legacy "factors" key and the current "indicators" key.
+# Configs registered before this rename used "factors"; their stored hashes
+# must not change, so we read whichever key is present without normalising.
+_INDICATORS_KEY_ALIASES: tuple[str, ...] = ("indicators", "factors")
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,99}$")
 
 
@@ -85,6 +89,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if missing:
         raise ValueError(f"Strategy config missing required keys: {sorted(missing)}")
 
+    indicators_key = next((k for k in _INDICATORS_KEY_ALIASES if k in config), None)
+    if indicators_key is None:
+        raise ValueError("strategy config must have an 'indicators' (or legacy 'factors') key")
+
     version = config["version"]
     if not isinstance(version, int) or version <= 0:
         raise ValueError("strategy config 'version' must be a positive integer")
@@ -93,7 +101,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("strategy config 'name' must be a non-empty string")
 
-    indicators = config["indicators"]
+    indicators = config[indicators_key]
     if not isinstance(indicators, Mapping) or not indicators:
         raise ValueError("strategy config 'indicators' must be a non-empty mapping")
     total_weight = 0.0
