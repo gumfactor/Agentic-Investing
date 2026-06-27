@@ -3727,3 +3727,63 @@ Rationale: Making returned ORM objects safe to use after session close requires 
 2. Begin Phase 5 items 2-onwards per CLAUDE.md priority sequence (trading journal, tearsheets, Airflow DAG).
 3. The 4-day supervised paper plumbing rehearsal is still not complete — see Phase 4 section in CLAUDE.md.
 
+
+---
+
+## Session 2026-06-27 — Signal architecture decision: 2-tier indicators + composites
+
+**Branch:** `claude/trading-strategies-indicators-krxubp`
+**Operator:** mshane@thecanadalist.ca
+
+### What was done
+
+- Reviewed the existing signal architecture (3-tier: individual indicators → composite factor
+  scores → alpha score) and evaluated whether the intermediate composite layer added value or
+  unnecessary rigidity.
+- Decided to flatten to a 2-tier architecture. Updated PRD.md and CLAUDE.md accordingly.
+  No code was changed this session — documentation only.
+
+### [DECISION] Flatten signal architecture to 2-tier: indicators + composites → alpha score
+
+**Previous design:** Three mandatory tiers — individual indicators feed into intermediate
+composite factor scores (e.g., `momentum_score` aggregates mom_1m/3m/6m/12m), which then
+feed into the strategy-weighted alpha score. Strategies could only reference composites,
+not individual indicators directly.
+
+**New design:** Two tiers. `signals/indicators/` holds atomic signals organized by category.
+`signals/composites/` holds named composite signals — pre-built blends of two or more
+indicators. Both are first-class named signals. Strategy YAML configs reference either type
+(or a mix) by name, and the scorer weights them identically. No mandatory intermediate layer.
+
+**Rationale:**
+
+1. The mandatory intermediate tier was artificial. A strategy that wants to overweight
+   `mom_12m` specifically (the most empirically studied window) was forced to go through
+   an equal-weight composite that diluted the signal.
+
+2. Composites still exist and are still useful — they're reusable pre-built blends that
+   save strategy authors from re-specifying sub-indicator weights every time. But their
+   use is optional, not mandatory.
+
+3. Composites may combine indicators from a single category (e.g., four momentum windows)
+   or across multiple categories (e.g., PE ratio + price momentum). The original design
+   would have required cross-category composites to live awkwardly inside one category's
+   folder. The new flat `composites/` folder solves this cleanly.
+
+4. Composite organization within `signals/composites/` starts flat. Subfolders are added
+   only when natural clusters emerge from actual built composites — not designed upfront.
+
+5. The scorer gains one new responsibility: validate that a strategy does not reference
+   both a composite and any of its constituent indicators simultaneously (silent
+   double-counting guard).
+
+**Files changed:** `PRD.md` (Section 5 folder tree, F2.1, F2.3), `CLAUDE.md` (repo layout
+note, Phase 5 item 6).
+
+### Next steps
+
+1. Physically move `signals/indicators/low_vol.py` and existing composite logic (currently
+   embedded in category `__init__.py` files) to `signals/composites/` to match the new layout.
+2. Build `growth_score` composite (the most significant current gap — 18 growth indicators
+   exist but no composite aggregates them).
+3. Begin v3+ strategy YAML development once composites are populated.

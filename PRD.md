@@ -194,21 +194,32 @@ rqis/
 │   └── tests/
 │
 ├── signals/                       # Signal generation layer
-│   ├── indicators/
-│   │   ├── value/                 # P/E, P/B, EV/EBITDA, etc.
-│   │   ├── momentum/              # Price momentum, earnings momentum
-│   │   ├── quality/               # ROE, ROIC, accruals, leverage
-│   │   ├── low_vol.py             # Beta, realized vol, idiosyncratic vol
-│   │   ├── growth/                # Revenue/earnings growth, estimate revisions (Phase 5)
-│   │   ├── sentiment.py           # NLP scores, short interest, insider flow (Phase 5)
-│   │   └── technical.py           # MA crossovers, RSI, MACD, ATR, breakout (Phase 5)
+│   ├── indicators/                # Atomic signals, organized by category
+│   │   ├── momentum/              # Price momentum, trend, breakout, reversals
+│   │   ├── value/                 # P/E, P/B, EV/EBITDA, FCF yield, etc.
+│   │   ├── quality/               # ROE, ROIC, accruals, leverage, Piotroski
+│   │   ├── growth/                # Revenue/earnings/FCF growth, margin expansion
+│   │   ├── volatility/            # Realized vol, beta, downside risk, regime
+│   │   ├── volume/                # Accumulation, price-volume, volume trend
+│   │   ├── moving_averages/       # SMA/EMA crossovers, price-vs-MA, slopes
+│   │   ├── oscillators/           # RSI, MACD, Bollinger, stochastic, mean reversion
+│   │   ├── size/                  # Market cap, enterprise value, operating scale
+│   │   └── sentiment/             # NLP scores, short interest, insider flow (Phase 5+)
+│   ├── composites/                # Named composite signals; treated as first-class signals
+│   │   │                          # alongside indicators. Strategies reference composites
+│   │   │                          # and indicators identically by name. May blend signals
+│   │   │                          # within a single category or across multiple categories.
+│   │   │                          # Start flat; add subfolders when clusters become obvious.
+│   │   ├── momentum_score.py      # Equal-weight blend of momentum return windows
+│   │   ├── value_score.py         # Earnings yield + book-to-market + FCF yield
+│   │   ├── quality_score.py       # ROE + gross profitability + accruals (negated)
+│   │   └── low_vol_score.py       # Vol 21d/63d/252d + beta (all negated; low vol = positive)
 │   ├── research/
 │   │   ├── hypothesis_template.py # Standard research notebook template
 │   │   ├── statistical_tests.py   # IC, t-stats, multiple testing correction
 │   │   └── decay_analysis.py      # Signal half-life measurement
 │   ├── scoring/
-│   │   ├── normalizer.py          # Cross-sectional z-score, rank normalization
-│   │   ├── combiner.py            # Composite score construction
+│   │   ├── scorer.py              # Strategy-weighted alpha score from any named signals
 │   │   └── universe.py            # Security eligibility filters
 │   └── tests/
 │
@@ -374,18 +385,29 @@ rqis/
 
 ### F2 — Signal Generation
 
-#### F2.1 Factor Library
-Each factor produces a cross-sectional z-score (or rank percentile) per security per date.
+#### F2.1 Signal Library
+Each signal (whether an individual indicator or a composite) produces a cross-sectional
+z-score (or rank percentile) per security per date, and is referenced by name in strategy configs.
 
-| Factor Group | Signals |
+**Individual indicator categories:**
+
+| Category | Examples |
 |---|---|
-| Value | Forward P/E, EV/EBITDA, P/B, FCF yield |
-| Momentum | 12-1 month price return, earnings momentum (SUE), estimate revision trend |
-| Quality | ROIC, gross margin stability, Piotroski F-score, accruals ratio |
-| Low Volatility | 63-day realized vol, 1-year beta, idiosyncratic vol |
-| Growth | Revenue growth YoY, EPS growth YoY, EBITDA margin expansion |
-| Sentiment | Composite NLP score, short interest change, insider buy/sell ratio |
-| Technical Analysis | Moving average crossovers (SMA/EMA), RSI, MACD, Bollinger Bands, ATR, volume trends, breakout detection, relative strength vs. benchmark — all expressible as Python signal modules sharing the same factor infrastructure |
+| Value | Forward P/E, EV/EBITDA, P/B, FCF yield, shareholder yield |
+| Momentum | 1m/3m/6m/12m price return, breakout vs. 52w high/low, relative strength vs. SPY |
+| Quality | ROE, ROIC, Piotroski F-score, accruals ratio, leverage, earnings stability |
+| Growth | Revenue/EPS/FCF growth YoY and CAGR, margin expansion, ROIC improvement |
+| Volatility | Realized vol (10d–252d), beta, Sharpe, Sortino, max drawdown, vol regime |
+| Volume | OBV momentum, Chaikin money flow, volume trend slope, up/down volume ratio |
+| Moving Averages | SMA/EMA crossovers (5/20, 20/50, 50/200), price-vs-MA, MA slope |
+| Oscillators | RSI, MACD, Bollinger %B, stochastic, CCI, VWAP deviation |
+| Size | Log market cap, log enterprise value, log revenue TTM |
+| Sentiment | Composite NLP score, short interest change, insider buy/sell ratio (Phase 5+) |
+
+**Composite signals** (`signals/composites/`) are pre-built named blends of two or more individual
+indicators. They may combine indicators within a single category or across multiple categories
+(e.g., a PE-ratio + momentum composite). Composites are treated identically to individual
+indicators by strategies — referenced by name, weighted, z-scored the same way. See F2.3.
 
 #### F2.2 Signal Research Skill (`signal_research`)
 - Accepts hypothesis in natural language; Claude constructs data pull + validation plan
@@ -393,10 +415,19 @@ Each factor produces a cross-sectional z-score (or rank percentile) per security
 - Applies Bonferroni / BHY multiple-testing correction before declaring a signal valid
 - Outputs a standardized research report stored in MLflow
 
-#### F2.3 Composite Score (`score`)
-- Normalizes individual factor scores cross-sectionally
-- Combines via configurable weights (equal-weight default; regression-fit optional)
+#### F2.3 Alpha Score (`score`)
+The signal architecture is two-tier: individual indicators and composite signals are
+both first-class named signals; the scorer blends any named signals into an alpha score.
+There is no mandatory intermediate layer.
+
+- Strategy configs declare which signals to use and at what weight; signals may be
+  individual indicators, pre-built composites, or a mix of both
+- The scorer cross-sectionally z-scores each named signal, then computes the
+  strategy-weighted sum; missing signals are excluded and remaining weights renormalized
 - Outputs a single `alpha_score` per security per date, stored in TimescaleDB
+- **Overlap guard:** the scorer warns (or errors, configurable) if a strategy references
+  both a composite and any of its constituent indicators simultaneously, preventing
+  silent double-counting
 
 #### F2.4 Signal Decay Analysis
 - Measures IC decay over 1-, 5-, 10-, 21-, 63-day horizons

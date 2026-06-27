@@ -94,10 +94,13 @@ sequence for Phase 5 is:
    C1 is satisfied via the F7.4 dashboard UI — same flow for paper and live.
 5. **4-week automated paper-trading qualification** — runs on top of the Airflow
    DAG; required before any live-capital discussion (C8).
-6. **Additional strategies** — new signal modules (technical analysis, additional
-   fundamental combos) + new strategy YAML configs (v3+). Strategies are
-   config-driven, not independent codebases; new strategies share all
-   infrastructure and differ only in signal weights and portfolio parameters.
+6. **Additional strategies** — new individual indicators and composite signals
+   (`signals/indicators/`, `signals/composites/`) + new strategy YAML configs (v3+).
+   Strategies are config-driven: a strategy YAML declares which named signals (individual
+   indicators, composites, or a mix) to use and at what weights, plus portfolio construction
+   parameters. New strategies share all infrastructure and differ only in those declarations.
+   Composites may combine signals within a single category or across categories (e.g.,
+   a growth + momentum composite) and are referenced by strategies exactly like any other signal.
 7. **Market regime detector** — classify current regime (bull/bear/high-vol/
    mean-reverting) and surface which strategy mix is best suited to each.
 8. **Streamlit dashboard + monitor/report skills** — real-time positions, risk,
@@ -132,7 +135,7 @@ These are non-negotiable. If you are ever about to violate one, stop and ask the
 rqis/
 ├── .claude/skills/        ← Claude Code skill definitions (11 skills)
 ├── data/                  ← Data ingestion, normalization, storage
-├── signals/               ← Factor library, signal research, scoring
+├── signals/               ← Signal library: indicators/, composites/, scoring/, research/
 ├── portfolio/             ← Optimization, risk model, rebalancing
 ├── execution/             ← OMS, brokers, algos, transaction costs
 ├── risk/                  ← Real-time risk, alerts, circuit breaker
@@ -148,6 +151,15 @@ rqis/
 ```
 
 Full directory tree with file-level detail: `PRD.md` Section 5.
+
+**Signal architecture (2-tier):** `signals/indicators/` contains atomic signals organized
+by category (momentum, value, quality, growth, volatility, volume, moving_averages,
+oscillators, size, sentiment). `signals/composites/` contains named composite signals —
+pre-built blends of two or more indicators, which may span categories (e.g., PE ratio +
+momentum). Both individual indicators and composites are first-class signals: strategies
+reference them identically by name in YAML config, and the scorer weights them the same way.
+There is no mandatory intermediate composite layer. The scorer validates that a strategy
+does not reference both a composite and any of its constituent indicators simultaneously.
 
 ---
 
