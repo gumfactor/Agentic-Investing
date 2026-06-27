@@ -16,7 +16,7 @@ universe:
     min_price_usd: 5.00
     allowed_security_types: [CS, ADR]
 
-factors:
+indicators:
   momentum:
     weight: 0.50
     score_col: momentum_score

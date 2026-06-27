@@ -20,10 +20,10 @@ the composite.
 
 1. Load daily prices from `daily_prices` for the trailing 3 years (or since `since`).
 2. Compute factor scores using the appropriate function:
-   - `momentum` → `signals.factors.momentum.compute_momentum_scores`
-   - `lowvol` → `signals.factors.low_vol.compute_lowvol_scores`
-   - `value` → `signals.factors.value.compute_value_scores` (requires fundamentals)
-   - `quality` → `signals.factors.quality.compute_quality_scores` (requires fundamentals)
+   - `momentum` → `signals.indicators.momentum.compute_momentum_scores`
+   - `lowvol` → `signals.indicators.low_vol.compute_lowvol_scores`
+   - `value` → `signals.indicators.value.compute_value_scores` (requires fundamentals)
+   - `quality` → `signals.indicators.quality.compute_quality_scores` (requires fundamentals)
 3. Run `signals.research.ic.compute_ic_series` to get per-date IC at each horizon.
 4. Run `signals.research.ic.summarize_ic` to compute mean IC, IC-IR, t-stat, and p-value.
 5. Run `signals.research.ic.rolling_ic_summary` (trailing_dates=252) to show walk-forward stability.

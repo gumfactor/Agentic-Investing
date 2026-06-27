@@ -1,4 +1,4 @@
-"""Tests for signals/factors/momentum.py.
+"""Tests for signals/indicators/momentum.py.
 
 All tests use synthetic price data — no DB or network access required.
 """
@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.factors.momentum import compute_momentum_scores, rank_by_momentum
+from signals.indicators.momentum import compute_momentum_scores, rank_by_momentum
 
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────

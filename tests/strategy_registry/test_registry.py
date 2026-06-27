@@ -38,7 +38,7 @@ def _write_config(path: Path, *, version: int = 1, name: str = "test_strategy", 
         "name": name,
         "description": f"Test strategy v{version}",
         "universe": {"source": "sp500"},
-        "factors": {"momentum": {"weight": weight, "score_col": "momentum_score"}},
+        "indicators": {"momentum": {"weight": weight, "score_col": "momentum_score"}},
         "portfolio": {"method": "equal_weight", "n_long": 10, "max_position_weight": 0.1},
         "execution": {"fill_model": "perfect"},
         "backtest": {
@@ -113,7 +113,7 @@ def test_validate_config_rejects_zero_weight() -> None:
     config = {
         "version": 1, "name": "x",
         "universe": {}, "execution": {},
-        "factors": {"mom": {"weight": 0.0, "score_col": "x"}},
+        "indicators": {"mom": {"weight": 0.0, "score_col": "x"}},
         "portfolio": {"n_long": 5},
         "backtest": {"start_date": "2022-01-01", "end_date": "2024-01-01",
                      "initial_capital": 1000.0, "benchmark": "SPY"},
@@ -127,7 +127,7 @@ def test_validate_config_rejects_float_n_long() -> None:
     config = {
         "version": 1, "name": "x",
         "universe": {}, "execution": {},
-        "factors": {"mom": {"weight": 1.0, "score_col": "x"}},
+        "indicators": {"mom": {"weight": 1.0, "score_col": "x"}},
         "portfolio": {"n_long": 10.5},
         "backtest": {"start_date": "2022-01-01", "end_date": "2024-01-01",
                      "initial_capital": 1000.0, "benchmark": "SPY"},
@@ -140,7 +140,7 @@ def test_validate_config_rejects_inverted_dates() -> None:
     config = {
         "version": 1, "name": "x",
         "universe": {}, "execution": {},
-        "factors": {"mom": {"weight": 1.0, "score_col": "x"}},
+        "indicators": {"mom": {"weight": 1.0, "score_col": "x"}},
         "portfolio": {"n_long": 5},
         "backtest": {"start_date": "2024-01-01", "end_date": "2022-01-01",
                      "initial_capital": 1000.0, "benchmark": "SPY"},
@@ -350,7 +350,7 @@ def test_verify_config_integrity_logic_change_raises(
     registry.register(str(cfg))
     # Mutate strategy logic (weight change → new canonical hash)
     raw = yaml.safe_load(cfg.read_text())
-    raw["factors"]["momentum"]["weight"] = 0.5
+    raw["indicators"]["momentum"]["weight"] = 0.5
     cfg.write_text(yaml.dump(raw))
     with pytest.raises(ConfigDriftError):
         registry.verify_config_integrity("v1_test_strategy")
