@@ -451,13 +451,13 @@ forward):
 9. Security review → live trading (C8 + C9)
 
 [DECISION] Strategies are config-driven, not independent codebases. A new
-strategy = a new YAML config + optionally a new `signals/factors/*.py` module.
+strategy = a new YAML config + optionally a new `signals/indicators/*.py` module.
 All strategies share the same execution, risk, and backtesting infrastructure.
 
 [DECISION] TradingView remains a human research/charting tool and is not
 integrated into the automated system. Chart-based signals (RSI, MACD, moving
 averages, breakout detection) are implemented as Python signal modules under
-`signals/factors/technical.py` and share the same factor infrastructure as
+`signals/indicators/technical.py` and share the same factor infrastructure as
 fundamental signals.
 
 [DECISION] Technical Analysis is now a named factor group in the PRD factor
@@ -2886,13 +2886,13 @@ Created:
 
 **Step 6 — Value and quality factors**
 
-Created `signals/factors/value.py`:
+Created `signals/indicators/value.py`:
 - Sub-factors: earnings_yield (E/P), book_to_market (B/P), fcf_yield (FCF/P)
 - Market cap via shares × close price on score date
 - `_pit_latest_fundamentals()`: `release_date ≤ as_of_date` filter, sort by (release_date, period_end_date) ascending then `.last()` per ticker
 - Cross-sectional z-score per date; equal-weight composite `value_score`
 
-Created `signals/factors/quality.py`:
+Created `signals/indicators/quality.py`:
 - Sub-factors: roe (net_income / total_equity), gross_profitability (gross_profit / total_assets), accruals
 - Hribar & Collins (2002) cash-flow accruals: `(net_income - operating_cash_flow) / total_assets`
 - Accruals negated before z-scoring (low accruals = high quality = high positive score)
@@ -2938,8 +2938,8 @@ Created `airflow/dags/daily_signal_pipeline.py`:
 | `signals/research/ic.py` IC engine | ✅ 40 tests |
 | EDGAR vs SimFin decision | ✅ EDGAR selected |
 | `data/ingestion/fundamentals/edgar_client.py` | ✅ 29 tests |
-| `signals/factors/value.py` | ✅ |
-| `signals/factors/quality.py` | ✅ 22 tests (value+quality combined) |
+| `signals/indicators/value.py` | ✅ |
+| `signals/indicators/quality.py` | ✅ 22 tests (value+quality combined) |
 | `signals/scoring/scorer.py` | ✅ 14 tests |
 | `airflow/dags/daily_signal_pipeline.py` | ✅ |
 | Fundamentals backfill CLI | ⏳ not yet built |
@@ -2967,7 +2967,7 @@ Created `airflow/dags/daily_signal_pipeline.py`:
 
 #### Stretch goals
 
-- **Sentiment factor**: `signals/factors/sentiment.py` using earnings call transcript tone or short-interest ratios (deferred per original plan — no high-quality free source identified)
+- **Sentiment factor**: `signals/indicators/sentiment.py` using earnings call transcript tone or short-interest ratios (deferred per original plan — no high-quality free source identified)
 - **Analyst revision factor**: change in consensus EPS estimates (requires IBES/Refinitiv — deferred, not free)
 - **Factor turnover analysis**: measure how stable each factor's ranks are across months (low turnover = lower transaction costs when used in portfolio construction)
 - **Walk-forward IC stability**: split IC computation by sub-period to detect factor decay or regime changes
@@ -3007,7 +3007,7 @@ body: Host not in allowlist
 
 **Part 3 — Low-volatility factor (Phase 2)**
 
-Built `signals/factors/low_vol.py`:
+Built `signals/indicators/low_vol.py`:
 - Realized volatility at 21 / 63 / 252-day windows (annualised log-return std × √252)
 - Optional rolling 252-day beta vs a market reference series (computed via rolling Cov/Var)
 - Composite `lowvol_score` = negated + re-standardised mean of vol z-scores (lower vol → higher positive score, consistent with momentum sign convention)
@@ -3077,10 +3077,10 @@ Created `release/phase-1` branch (cherry-pick of all Phase 0 + Phase 1 commits, 
 
 | Deliverable | Status |
 |-------------|--------|
-| `signals/factors/momentum.py` | ✅ 19 tests |
-| `signals/factors/low_vol.py` | ✅ 16 tests |
-| `signals/factors/quality.py` | ⏳ requires fundamentals ingestion |
-| `signals/factors/value.py` | ⏳ requires fundamentals ingestion |
+| `signals/indicators/momentum.py` | ✅ 19 tests |
+| `signals/indicators/low_vol.py` | ✅ 16 tests |
+| `signals/indicators/quality.py` | ⏳ requires fundamentals ingestion |
+| `signals/indicators/value.py` | ⏳ requires fundamentals ingestion |
 | `signals/scoring/scorer.py` | ⏳ defer until ≥3 factors exist |
 | Fundamentals ingestion | ⏳ next major workstream |
 
@@ -3161,7 +3161,7 @@ resumability check means only un-fetched tickers will be attempted.
 
 **Part 3 — Phase 2 momentum factor**
 
-Built `signals/factors/momentum.py` — the first Phase 2 deliverable.
+Built `signals/indicators/momentum.py` — the first Phase 2 deliverable.
 
 Design:
 - Four lookback windows: 1 M, 3 M, 6 M, 12 M (skipping the final month per
@@ -3177,7 +3177,7 @@ Design:
 #### Next steps
 - Wait for Yahoo rate limit to clear, then run `make backfill`
 - After data is populated: validate momentum signals against the live DB
-- Begin `signals/factors/quality.py` (ROE, ROIC, accruals) — requires
+- Begin `signals/indicators/quality.py` (ROE, ROIC, accruals) — requires
   fundamentals data, so deferred until fundamentals ingestion is built
 
 ---

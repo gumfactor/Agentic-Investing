@@ -46,10 +46,10 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-from signals.factors.low_vol import compute_lowvol_scores
-from signals.factors.momentum import compute_momentum_scores
-from signals.factors.quality import compute_quality_scores
-from signals.factors.value import compute_value_scores
+from signals.indicators.low_vol import compute_lowvol_scores
+from signals.indicators.momentum import compute_momentum_scores
+from signals.indicators.quality import compute_quality_scores
+from signals.indicators.value import compute_value_scores
 from signals.research.ic import (
     compute_factor_turnover,
     compute_ic_series,

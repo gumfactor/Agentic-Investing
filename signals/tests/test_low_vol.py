@@ -1,4 +1,4 @@
-"""Tests for signals/factors/low_vol.py.
+"""Tests for signals/indicators/low_vol.py.
 
 All tests use synthetic price data — no DB or network access required.
 """
@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.factors.low_vol import compute_lowvol_scores
+from signals.indicators.low_vol import compute_lowvol_scores
 
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
