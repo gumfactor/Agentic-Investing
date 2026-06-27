@@ -4,10 +4,10 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from signals.factors.size.market_cap.log_market_cap import compute_log_market_cap_scores
-from signals.factors.size.market_cap.log_enterprise_value import compute_log_enterprise_value_scores
-from signals.factors.size.operating_scale.log_total_assets import compute_log_total_assets_scores
-from signals.factors.size.operating_scale.log_revenue_ttm import compute_log_revenue_ttm_scores
+from signals.indicators.size.market_cap.log_market_cap import compute_log_market_cap_scores
+from signals.indicators.size.market_cap.log_enterprise_value import compute_log_enterprise_value_scores
+from signals.indicators.size.operating_scale.log_total_assets import compute_log_total_assets_scores
+from signals.indicators.size.operating_scale.log_revenue_ttm import compute_log_revenue_ttm_scores
 
 from signals.tests.factors.conftest import make_fixed_prices, make_fundamentals, _latest_scores
 

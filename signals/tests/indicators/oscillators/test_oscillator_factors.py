@@ -4,25 +4,25 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from signals.factors.oscillators.bollinger.bb_pct_b_20 import compute_bb_pct_b_20_scores
-from signals.factors.oscillators.bollinger.bb_width_20 import compute_bb_width_20_scores
-from signals.factors.oscillators.bollinger.bb_z_score_20 import compute_bb_z_score_20_scores
-from signals.factors.oscillators.macd.macd_histogram_12_26_9 import compute_macd_histogram_12_26_9_scores
-from signals.factors.oscillators.macd.macd_signal_line_12_26_9 import compute_macd_signal_line_12_26_9_scores
-from signals.factors.oscillators.macd.ppo_12_26 import compute_ppo_12_26_scores
-from signals.factors.oscillators.macd.dpo_20 import compute_dpo_20_scores
-from signals.factors.oscillators.mean_reversion.rolling_zscore_63d import compute_rolling_zscore_63d_scores
-from signals.factors.oscillators.mean_reversion.rolling_zscore_252d import compute_rolling_zscore_252d_scores
-from signals.factors.oscillators.mean_reversion.price_vs_vwap_21d import compute_price_vs_vwap_21d_scores
-from signals.factors.oscillators.momentum.rsi_14 import compute_rsi_14_scores
-from signals.factors.oscillators.momentum.rsi_28 import compute_rsi_28_scores
-from signals.factors.oscillators.momentum.roc_10 import compute_roc_10_scores
-from signals.factors.oscillators.momentum.roc_21 import compute_roc_21_scores
-from signals.factors.oscillators.momentum.cci_20 import compute_cci_20_scores
-from signals.factors.oscillators.momentum.stoch_k_14 import compute_stoch_k_14_scores
-from signals.factors.oscillators.momentum.stoch_d_14 import compute_stoch_d_14_scores
-from signals.factors.oscillators.momentum.stoch_rsi_14 import compute_stoch_rsi_14_scores
-from signals.factors.oscillators.momentum.williams_r_14 import compute_williams_r_14_scores
+from signals.indicators.oscillators.bollinger.bb_pct_b_20 import compute_bb_pct_b_20_scores
+from signals.indicators.oscillators.bollinger.bb_width_20 import compute_bb_width_20_scores
+from signals.indicators.oscillators.bollinger.bb_z_score_20 import compute_bb_z_score_20_scores
+from signals.indicators.oscillators.macd.macd_histogram_12_26_9 import compute_macd_histogram_12_26_9_scores
+from signals.indicators.oscillators.macd.macd_signal_line_12_26_9 import compute_macd_signal_line_12_26_9_scores
+from signals.indicators.oscillators.macd.ppo_12_26 import compute_ppo_12_26_scores
+from signals.indicators.oscillators.macd.dpo_20 import compute_dpo_20_scores
+from signals.indicators.oscillators.mean_reversion.rolling_zscore_63d import compute_rolling_zscore_63d_scores
+from signals.indicators.oscillators.mean_reversion.rolling_zscore_252d import compute_rolling_zscore_252d_scores
+from signals.indicators.oscillators.mean_reversion.price_vs_vwap_21d import compute_price_vs_vwap_21d_scores
+from signals.indicators.oscillators.momentum.rsi_14 import compute_rsi_14_scores
+from signals.indicators.oscillators.momentum.rsi_28 import compute_rsi_28_scores
+from signals.indicators.oscillators.momentum.roc_10 import compute_roc_10_scores
+from signals.indicators.oscillators.momentum.roc_21 import compute_roc_21_scores
+from signals.indicators.oscillators.momentum.cci_20 import compute_cci_20_scores
+from signals.indicators.oscillators.momentum.stoch_k_14 import compute_stoch_k_14_scores
+from signals.indicators.oscillators.momentum.stoch_d_14 import compute_stoch_d_14_scores
+from signals.indicators.oscillators.momentum.stoch_rsi_14 import compute_stoch_rsi_14_scores
+from signals.indicators.oscillators.momentum.williams_r_14 import compute_williams_r_14_scores
 
 from signals.tests.factors.conftest import make_prices, make_volumes, make_ohlc, _latest_scores
 

@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.factors._fundamentals_utils import (
+from signals.indicators._fundamentals_utils import (
     align_fundamentals,
     compute_ev_wide,
     fund_to_wide,
@@ -149,7 +149,7 @@ def test_compute_ev_wide_formula():
     fund = pd.DataFrame([{"date": pd.Timestamp("2019-01-01"), "ticker": "X",
                           "shares_outstanding": shares, "total_debt": debt, "cash": cash}])
 
-    from signals.factors._price_utils import to_wide
+    from signals.indicators._price_utils import to_wide
     price_wide = to_wide(prices)
     ev_wide = compute_ev_wide(price_wide, fund)
 
@@ -162,7 +162,7 @@ def test_compute_ev_wide_negative_ev_is_possible():
     fund = pd.DataFrame([{"date": pd.Timestamp("2019-01-01"), "ticker": "X",
                           "shares_outstanding": 1.0, "total_debt": 0.0, "cash": 1000.0}])
 
-    from signals.factors._price_utils import to_wide
+    from signals.indicators._price_utils import to_wide
     price_wide = to_wide(prices)
     ev_wide = compute_ev_wide(price_wide, fund)
     # EV = 10*1 + 0 - 1000 = -990

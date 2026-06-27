@@ -4,22 +4,22 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from signals.factors.value.earnings.earnings_yield_ttm import compute_earnings_yield_ttm_scores
-from signals.factors.value.earnings.earnings_yield_normalized import compute_earnings_yield_normalized_scores
-from signals.factors.value.earnings.forward_earnings_yield import compute_forward_earnings_yield_scores
-from signals.factors.value.earnings.peg_inverse import compute_peg_inverse_scores
-from signals.factors.value.book_value.book_to_market import compute_book_to_market_scores
-from signals.factors.value.book_value.tangible_book_to_price import compute_tangible_book_to_price_scores
-from signals.factors.value.sales.sales_to_price import compute_sales_to_price_scores
-from signals.factors.value.sales.ev_to_sales_inverse import compute_ev_to_sales_inverse_scores
-from signals.factors.value.cash_flow.fcf_yield import compute_fcf_yield_scores
-from signals.factors.value.cash_flow.operating_cf_yield import compute_operating_cf_yield_scores
-from signals.factors.value.cash_flow.ev_to_fcf_inverse import compute_ev_to_fcf_inverse_scores
-from signals.factors.value.ev_multiples.ebitda_to_ev import compute_ebitda_to_ev_scores
-from signals.factors.value.ev_multiples.ebit_to_ev import compute_ebit_to_ev_scores
-from signals.factors.value.shareholder_yield.dividend_yield import compute_dividend_yield_scores
-from signals.factors.value.shareholder_yield.buyback_yield import compute_buyback_yield_scores
-from signals.factors.value.shareholder_yield.shareholder_yield import compute_shareholder_yield_scores
+from signals.indicators.value.earnings.earnings_yield_ttm import compute_earnings_yield_ttm_scores
+from signals.indicators.value.earnings.earnings_yield_normalized import compute_earnings_yield_normalized_scores
+from signals.indicators.value.earnings.forward_earnings_yield import compute_forward_earnings_yield_scores
+from signals.indicators.value.earnings.peg_inverse import compute_peg_inverse_scores
+from signals.indicators.value.book_value.book_to_market import compute_book_to_market_scores
+from signals.indicators.value.book_value.tangible_book_to_price import compute_tangible_book_to_price_scores
+from signals.indicators.value.sales.sales_to_price import compute_sales_to_price_scores
+from signals.indicators.value.sales.ev_to_sales_inverse import compute_ev_to_sales_inverse_scores
+from signals.indicators.value.cash_flow.fcf_yield import compute_fcf_yield_scores
+from signals.indicators.value.cash_flow.operating_cf_yield import compute_operating_cf_yield_scores
+from signals.indicators.value.cash_flow.ev_to_fcf_inverse import compute_ev_to_fcf_inverse_scores
+from signals.indicators.value.ev_multiples.ebitda_to_ev import compute_ebitda_to_ev_scores
+from signals.indicators.value.ev_multiples.ebit_to_ev import compute_ebit_to_ev_scores
+from signals.indicators.value.shareholder_yield.dividend_yield import compute_dividend_yield_scores
+from signals.indicators.value.shareholder_yield.buyback_yield import compute_buyback_yield_scores
+from signals.indicators.value.shareholder_yield.shareholder_yield import compute_shareholder_yield_scores
 
 from signals.tests.factors.conftest import make_fixed_prices, make_fundamentals, _latest_scores
 

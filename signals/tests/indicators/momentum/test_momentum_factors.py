@@ -5,29 +5,29 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.factors.momentum.returns.mom_1w import compute_mom_1w_scores
-from signals.factors.momentum.returns.mom_2w import compute_mom_2w_scores
-from signals.factors.momentum.returns.mom_1m import compute_mom_1m_scores
-from signals.factors.momentum.returns.mom_3m import compute_mom_3m_scores
-from signals.factors.momentum.returns.mom_6m import compute_mom_6m_scores
-from signals.factors.momentum.returns.mom_12m import compute_mom_12m_scores
-from signals.factors.momentum.returns.mom_24m import compute_mom_24m_scores
-from signals.factors.momentum.returns.mom_36m import compute_mom_36m_scores
-from signals.factors.momentum.breakout.price_vs_52w_high import compute_price_vs_52w_high_scores
-from signals.factors.momentum.breakout.price_vs_52w_low import compute_price_vs_52w_low_scores
-from signals.factors.momentum.breakout.price_vs_4w_high import compute_price_vs_4w_high_scores
-from signals.factors.momentum.breakout.price_vs_4w_low import compute_price_vs_4w_low_scores
-from signals.factors.momentum.breakout.donchian_pct import compute_donchian_pct_scores
-from signals.factors.momentum.relative_strength.rel_strength_vs_spy_12m import compute_rel_strength_vs_spy_12m_scores
-from signals.factors.momentum.relative_strength.rel_strength_vs_spy_3m import compute_rel_strength_vs_spy_3m_scores
-from signals.factors.momentum.reversals.reversal_1w import compute_reversal_1w_scores
-from signals.factors.momentum.reversals.reversal_1m import compute_reversal_1m_scores
-from signals.factors.momentum.reversals.reversal_36m import compute_reversal_36m_scores
-from signals.factors.momentum.trend_quality.drawdown_from_peak_63d import compute_drawdown_from_peak_63d_scores
-from signals.factors.momentum.trend_quality.drawdown_from_peak_252d import compute_drawdown_from_peak_252d_scores
-from signals.factors.momentum.trend_quality.trend_consistency_21d import compute_trend_consistency_21d_scores
-from signals.factors.momentum.trend_quality.trend_consistency_63d import compute_trend_consistency_63d_scores
-from signals.factors.momentum.trend_quality.trend_r2_50d import compute_trend_r2_50d_scores
+from signals.indicators.momentum.returns.mom_1w import compute_mom_1w_scores
+from signals.indicators.momentum.returns.mom_2w import compute_mom_2w_scores
+from signals.indicators.momentum.returns.mom_1m import compute_mom_1m_scores
+from signals.indicators.momentum.returns.mom_3m import compute_mom_3m_scores
+from signals.indicators.momentum.returns.mom_6m import compute_mom_6m_scores
+from signals.indicators.momentum.returns.mom_12m import compute_mom_12m_scores
+from signals.indicators.momentum.returns.mom_24m import compute_mom_24m_scores
+from signals.indicators.momentum.returns.mom_36m import compute_mom_36m_scores
+from signals.indicators.momentum.breakout.price_vs_52w_high import compute_price_vs_52w_high_scores
+from signals.indicators.momentum.breakout.price_vs_52w_low import compute_price_vs_52w_low_scores
+from signals.indicators.momentum.breakout.price_vs_4w_high import compute_price_vs_4w_high_scores
+from signals.indicators.momentum.breakout.price_vs_4w_low import compute_price_vs_4w_low_scores
+from signals.indicators.momentum.breakout.donchian_pct import compute_donchian_pct_scores
+from signals.indicators.momentum.relative_strength.rel_strength_vs_spy_12m import compute_rel_strength_vs_spy_12m_scores
+from signals.indicators.momentum.relative_strength.rel_strength_vs_spy_3m import compute_rel_strength_vs_spy_3m_scores
+from signals.indicators.momentum.reversals.reversal_1w import compute_reversal_1w_scores
+from signals.indicators.momentum.reversals.reversal_1m import compute_reversal_1m_scores
+from signals.indicators.momentum.reversals.reversal_36m import compute_reversal_36m_scores
+from signals.indicators.momentum.trend_quality.drawdown_from_peak_63d import compute_drawdown_from_peak_63d_scores
+from signals.indicators.momentum.trend_quality.drawdown_from_peak_252d import compute_drawdown_from_peak_252d_scores
+from signals.indicators.momentum.trend_quality.trend_consistency_21d import compute_trend_consistency_21d_scores
+from signals.indicators.momentum.trend_quality.trend_consistency_63d import compute_trend_consistency_63d_scores
+from signals.indicators.momentum.trend_quality.trend_r2_50d import compute_trend_r2_50d_scores
 
 from signals.tests.factors.conftest import make_prices, make_prices_with_spy, _latest_scores
 
