@@ -125,7 +125,7 @@ def make_ohlcv(
 ) -> pd.DataFrame:
     """OHLCV DataFrame in long format [date, ticker, open, high, low, close, volume]."""
     tickers = tickers or _DEFAULT_TICKERS
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed + 1000)
     ohlc = make_ohlc(tickers=tickers, n_days=n_days, start=start, seed=seed)
     dates = sorted(ohlc["date"].unique())
     vol_rows = []

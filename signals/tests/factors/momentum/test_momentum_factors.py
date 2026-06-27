@@ -119,21 +119,23 @@ def test_rel_strength_vs_spy_12m_smoke(prices_with_spy_400d):
     result = compute_rel_strength_vs_spy_12m_scores(prices_with_spy_400d)
     assert {"date", "ticker", "rel_strength_vs_spy_12m_score"} <= set(result.columns)
     assert "SPY" not in result["ticker"].values
+    assert len(result) > 0
 
 
 def test_rel_strength_vs_spy_3m_smoke(prices_with_spy_400d):
     result = compute_rel_strength_vs_spy_3m_scores(prices_with_spy_400d)
     assert {"date", "ticker", "rel_strength_vs_spy_3m_score"} <= set(result.columns)
     assert "SPY" not in result["ticker"].values
+    assert len(result) > 0
 
 
 # ─── Behavioral tests ────────────────────────────────────────────────────────
 
 def test_mom_12m_rising_stock_scores_higher():
     """A stock with a strong positive trend should score higher than a flat stock."""
-    dates = pd.bdate_range("2020-01-01", periods=300)
+    dates = pd.bdate_range("2020-01-01", periods=400)
     rows = []
-    for d, i in zip(dates, range(300)):
+    for d, i in zip(dates, range(400)):
         rows.append({"date": d, "ticker": "RISER", "close": 100.0 + i * 0.5})
         rows.append({"date": d, "ticker": "FLAT",  "close": 100.0})
     prices = pd.DataFrame(rows)
@@ -174,3 +176,40 @@ def test_rel_strength_missing_spy_raises():
 def test_momentum_empty_prices_raises():
     with pytest.raises(ValueError):
         compute_mom_12m_scores(pd.DataFrame(columns=["date", "ticker", "close"]))
+
+
+def test_mom_6m_rising_stock_scores_higher():
+    """Stock with a strong 6-month return should outscore a declining one."""
+    dates = pd.bdate_range("2020-01-01", periods=200)
+    rows = []
+    for d, i in zip(dates, range(200)):
+        rows.append({"date": d, "ticker": "UP",   "close": 100.0 + i * 0.4})
+        rows.append({"date": d, "ticker": "DOWN", "close": 100.0 - i * 0.2})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_mom_6m_scores(prices), "mom_6m_score")
+    assert scores["UP"] > scores["DOWN"]
+
+
+def test_trend_consistency_21d_consistent_up_scores_higher():
+    """Stock with more positive-return days in the past 21 days scores higher."""
+    dates = pd.bdate_range("2020-01-01", periods=60)
+    rows = []
+    for d, i in zip(dates, range(60)):
+        rows.append({"date": d, "ticker": "UP",   "close": 100.0 + i * 0.2})
+        rows.append({"date": d, "ticker": "DOWN", "close": 100.0 - i * 0.2})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_trend_consistency_21d_scores(prices), "trend_consistency_21d_score")
+    assert scores["UP"] > scores["DOWN"]
+
+
+def test_drawdown_from_peak_63d_at_peak_scores_higher():
+    """Stock trading at its 63-day high scores higher than one far below its peak."""
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    rows = []
+    for d, i in zip(dates, range(100)):
+        rows.append({"date": d, "ticker": "PEAK",   "close": 100.0})
+        fallen = 60.0 if i >= 80 else 100.0
+        rows.append({"date": d, "ticker": "FALLEN", "close": float(fallen)})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_drawdown_from_peak_63d_scores(prices), "drawdown_from_peak_63d_score")
+    assert scores["PEAK"] > scores["FALLEN"]

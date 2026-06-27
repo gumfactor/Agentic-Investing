@@ -61,8 +61,9 @@ def test_rolling_zscore_252d_smoke(prices_400d):
     assert len(result) > 0
 
 
-def test_cci_20_smoke(ohlc_300d):
-    result = compute_cci_20_scores(ohlc_300d)
+def test_cci_20_smoke(prices_300d):
+    # Implementation uses close-only (standard deviation-of-mean variant), not typical price
+    result = compute_cci_20_scores(prices_300d)
     assert {"date", "ticker", "cci_20_score"} <= set(result.columns)
     assert len(result) > 0
 
@@ -139,3 +140,47 @@ def test_price_vs_vwap_21d_empty_volumes_raises(prices_300d):
 def test_oscillator_empty_prices_raises():
     with pytest.raises(ValueError):
         compute_rsi_14_scores(pd.DataFrame(columns=["date", "ticker", "close"]))
+
+
+def test_bb_pct_b_above_upper_band_scores_higher():
+    """Price recently pushed above BB upper band should score higher than one at the lower band."""
+    import numpy as np
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    rows = []
+    for d, i in zip(dates, range(100)):
+        above = 100.0 + rng.normal(0, 0.5) + (8.0 if i >= 85 else 0.0)
+        below = 100.0 + rng.normal(0, 0.5) - (8.0 if i >= 85 else 0.0)
+        rows.append({"date": d, "ticker": "ABOVE", "close": float(above)})
+        rows.append({"date": d, "ticker": "BELOW", "close": float(below)})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_bb_pct_b_20_scores(prices), "bb_pct_b_20_score")
+    assert scores["ABOVE"] > scores["BELOW"]
+
+
+def test_macd_histogram_acceleration_scores_higher():
+    """Price that recently started trending up generates positive MACD histogram vs decelerating price."""
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    rows = []
+    for d, i in zip(dates, range(100)):
+        # ACCEL: flat for 85 days then rises sharply — fast EMA reacts before slow EMA
+        accel = 100.0 if i < 85 else 100.0 + (i - 85) * 1.5
+        # DECEL: rises for 85 days then flattens — both EMAs converge toward flat value
+        decel = 100.0 + i * 0.5 if i < 85 else 100.0 + 85 * 0.5
+        rows.append({"date": d, "ticker": "ACCEL", "close": float(accel)})
+        rows.append({"date": d, "ticker": "DECEL", "close": float(decel)})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_macd_histogram_12_26_9_scores(prices), "macd_histogram_12_26_9_score")
+    assert scores["ACCEL"] > scores["DECEL"]
+
+
+def test_roc_10_rising_stock_scores_higher():
+    """A stock with a positive 10-day return should score higher than a declining one."""
+    dates = pd.bdate_range("2020-01-01", periods=60)
+    rows = []
+    for d, i in zip(dates, range(60)):
+        rows.append({"date": d, "ticker": "UP",   "close": 100.0 + i * 0.3})
+        rows.append({"date": d, "ticker": "DOWN", "close": 100.0 - i * 0.3})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_roc_10_scores(prices), "roc_10_score")
+    assert scores["UP"] > scores["DOWN"]

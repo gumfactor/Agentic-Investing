@@ -99,3 +99,43 @@ def test_ma_slope_200_rising_trend_scores_higher():
 def test_moving_average_empty_prices_raises():
     with pytest.raises(ValueError):
         compute_price_vs_sma_200_scores(pd.DataFrame(columns=["date", "ticker", "close"]))
+
+
+def test_ma_cross_5_20_golden_cross_scores_higher():
+    """A stock in a golden cross (5-day MA > 20-day MA) should score higher."""
+    dates = pd.bdate_range("2020-01-01", periods=80)
+    rows = []
+    for d, i in zip(dates, range(80)):
+        rows.append({"date": d, "ticker": "GOLD",  "close": 100.0 + i * 0.2})
+        rows.append({"date": d, "ticker": "DEATH", "close": 100.0 - i * 0.1})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_ma_cross_5_20_scores(prices), "ma_cross_5_20_score")
+    assert scores["GOLD"] > scores["DEATH"]
+
+
+def test_price_vs_sma_50_above_ma_scores_higher():
+    """Stock that recently spiked above its 50-day SMA scores higher than one that fell below it."""
+    dates = pd.bdate_range("2020-01-01", periods=200)
+    rows = []
+    for d, i in zip(dates, range(200)):
+        # ABOVE: was at 80 for 190 days, jumped to 120 in last 10 days → trades above 50-SMA
+        above_close = 120.0 if i >= 190 else 80.0
+        # BELOW: was at 120 for 190 days, dropped to 80 in last 10 days → trades below 50-SMA
+        below_close = 80.0 if i >= 190 else 120.0
+        rows.append({"date": d, "ticker": "ABOVE", "close": float(above_close)})
+        rows.append({"date": d, "ticker": "BELOW", "close": float(below_close)})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_price_vs_sma_50_scores(prices), "price_vs_sma_50_score")
+    assert scores["ABOVE"] > scores["BELOW"]
+
+
+def test_ma_slope_50_rising_scores_higher():
+    """A consistently rising 50-day MA should score higher than a flat one."""
+    dates = pd.bdate_range("2020-01-01", periods=200)
+    rows = []
+    for d, i in zip(dates, range(200)):
+        rows.append({"date": d, "ticker": "RISING", "close": 100.0 + i * 0.3})
+        rows.append({"date": d, "ticker": "FLAT",   "close": 100.0})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_ma_slope_50_scores(prices), "ma_slope_50_score")
+    assert scores["RISING"] > scores["FLAT"]

@@ -109,9 +109,9 @@ def test_obv_momentum_21d_accumulation_scores_higher():
 
 def test_volume_weighted_momentum_up_on_volume_scores_higher():
     """Price rising on high-volume days should outscore flat price."""
-    dates = pd.bdate_range("2020-01-01", periods=60)
+    dates = pd.bdate_range("2020-01-01", periods=150)
     price_rows, vol_rows = [], []
-    for d, i in zip(dates, range(60)):
+    for d, i in zip(dates, range(150)):
         price_rows.append({"date": d, "ticker": "STRONG", "close": 100.0 + i * 0.5})
         price_rows.append({"date": d, "ticker": "WEAK",   "close": 100.0})
         vol_rows.append({"date": d, "ticker": "STRONG", "volume": 2_000_000.0})
@@ -135,3 +135,47 @@ def test_ohlcv_missing_volume_column_raises():
         compute_chaikin_money_flow_21d_scores(
             pd.DataFrame(columns=["date", "ticker", "open", "high", "low", "close"])
         )
+
+
+def test_volume_roc_21d_rising_volume_scores_higher():
+    """Ticker with steadily rising volume over 21 days scores higher than flat volume."""
+    dates = pd.bdate_range("2020-01-01", periods=80)
+    rows = []
+    for d, i in zip(dates, range(80)):
+        rows.append({"date": d, "ticker": "RISING", "volume": 1_000_000.0 + i * 20_000.0})
+        rows.append({"date": d, "ticker": "FLAT",   "volume": 1_000_000.0})
+    volumes = pd.DataFrame(rows)
+    scores = _latest_scores(compute_volume_roc_21d_scores(volumes), "volume_roc_21d_score")
+    assert scores["RISING"] > scores["FLAT"]
+
+
+def test_chaikin_money_flow_21d_buying_pressure_scores_higher():
+    """Net buying pressure (close near high) scores higher than selling pressure (close near low)."""
+    dates = pd.bdate_range("2020-01-01", periods=40)
+    rows = []
+    for d in dates:
+        vol = 1_000_000.0
+        rows.append({"date": d, "ticker": "BUY",  "open": 100.0, "high": 102.0,
+                     "low": 98.0, "close": 101.5, "volume": vol})
+        rows.append({"date": d, "ticker": "SELL", "open": 100.0, "high": 102.0,
+                     "low": 98.0, "close": 98.5,  "volume": vol})
+    ohlcv = pd.DataFrame(rows)
+    scores = _latest_scores(compute_chaikin_money_flow_21d_scores(ohlcv), "chaikin_money_flow_21d_score")
+    assert scores["BUY"] > scores["SELL"]
+
+
+def test_price_volume_trend_21d_uptrend_scores_higher():
+    """Rising price with consistent volume generates higher PVT trend than declining price."""
+    dates = pd.bdate_range("2020-01-01", periods=120)
+    price_rows, vol_rows = [], []
+    for d, i in zip(dates, range(120)):
+        price_rows.append({"date": d, "ticker": "UP",   "close": 100.0 + i * 0.3})
+        price_rows.append({"date": d, "ticker": "DOWN", "close": 100.0 - i * 0.2})
+        vol_rows.append({"date": d, "ticker": "UP",   "volume": 1_000_000.0})
+        vol_rows.append({"date": d, "ticker": "DOWN", "volume": 1_000_000.0})
+    prices  = pd.DataFrame(price_rows)
+    volumes = pd.DataFrame(vol_rows)
+    scores = _latest_scores(
+        compute_price_volume_trend_21d_scores(prices, volumes), "price_volume_trend_21d_score"
+    )
+    assert scores["UP"] > scores["DOWN"]
