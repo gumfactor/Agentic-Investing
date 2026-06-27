@@ -52,7 +52,7 @@ _VALUE_CASES = [
 
 @pytest.mark.parametrize("fn,fund_kwargs,score_col", _VALUE_CASES, ids=[c[2] for c in _VALUE_CASES])
 def test_value_factor_smoke(fn, fund_kwargs, score_col, prices_300d):
-    """Every value factor runs without error and produces correct output schema."""
+    """Every value indicator runs without error and produces correct output schema."""
     fund = make_fundamentals(n_quarters=16, **fund_kwargs)
     result = fn(prices_300d, fund)
     assert {"date", "ticker", score_col} <= set(result.columns)
@@ -202,7 +202,7 @@ def test_ev_factors_negative_ev_ticker_excluded():
 
 
 def test_earnings_yield_negative_eps_valid_scores_lower():
-    """Negative EPS is valid — the factor just returns a low (negative) ratio, not NaN."""
+    """Negative EPS is valid — the indicator just returns a low (negative) ratio, not NaN."""
     prices = make_fixed_prices(["POS", "NEG"], close=100.0)
     fund = make_fundamentals(["POS", "NEG"], eps_ttm=[5.0, -3.0])
     result = compute_earnings_yield_ttm_scores(prices, fund)

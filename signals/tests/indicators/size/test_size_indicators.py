@@ -31,7 +31,7 @@ _SIZE_CASES = [
 
 @pytest.mark.parametrize("fn,fund_kwargs,score_col", _SIZE_CASES, ids=[c[2] for c in _SIZE_CASES])
 def test_size_factor_smoke(fn, fund_kwargs, score_col, prices_300d):
-    """Every size factor runs without error and produces correct output schema."""
+    """Every size indicator runs without error and produces correct output schema."""
     fund = make_fundamentals(n_quarters=16, **fund_kwargs)
     result = fn(prices_300d, fund)
     assert {"date", "ticker", score_col} <= set(result.columns)

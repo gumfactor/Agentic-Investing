@@ -81,7 +81,7 @@ _QUALITY_CASES_400D = [
 
 @pytest.mark.parametrize("fn,fund_kwargs,score_col", _QUALITY_CASES_300D, ids=[c[2] for c in _QUALITY_CASES_300D])
 def test_quality_factor_smoke_300d(fn, fund_kwargs, score_col, prices_300d):
-    """Every quality factor runs without error and produces correct output schema."""
+    """Every quality indicator runs without error and produces correct output schema."""
     fund = make_fundamentals(n_quarters=16, **fund_kwargs)
     result = fn(prices_300d, fund)
     assert {"date", "ticker", score_col} <= set(result.columns)
@@ -205,7 +205,7 @@ def test_net_debt_to_ebitda_lower_leverage_scores_higher():
 
 
 def test_debt_to_equity_less_debt_scores_higher():
-    """Lower debt / equity → higher score (negated factor)."""
+    """Lower debt / equity → higher score (negated indicator)."""
     prices = make_fixed_prices(["LOW", "HIGH"], close=100.0)
     fund = make_fundamentals(["LOW", "HIGH"],
                               total_debt=[50.0, 800.0],

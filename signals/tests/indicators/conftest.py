@@ -1,4 +1,4 @@
-"""Shared fixtures and helpers for factor unit tests."""
+"""Shared fixtures and helpers for indicator unit tests."""
 from __future__ import annotations
 
 import numpy as np

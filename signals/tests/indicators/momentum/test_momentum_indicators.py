@@ -144,7 +144,7 @@ def test_mom_12m_rising_stock_scores_higher():
 
 
 def test_reversal_1m_underperformer_scores_higher():
-    """A stock that fell last month should score higher on the reversal factor."""
+    """A stock that fell last month should score higher on the reversal indicator."""
     dates = pd.bdate_range("2020-01-01", periods=100)
     rows = []
     for d, i in zip(dates, range(100)):
