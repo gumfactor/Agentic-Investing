@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/growth/* factors."""
+"""Unit tests for signals/indicators/growth/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -25,7 +25,7 @@ from signals.indicators.growth.profitability_improvement.roic_improvement_yoy im
 from signals.indicators.growth.profitability_improvement.roe_improvement_yoy import compute_roe_improvement_yoy_scores
 from signals.indicators.growth.book_value_growth.book_value_per_share_growth_yoy import compute_book_value_per_share_growth_yoy_scores
 
-from signals.tests.factors.conftest import make_prices, make_fixed_prices, make_fundamentals, _latest_scores
+from signals.tests.indicators.conftest import make_prices, make_fixed_prices, make_fundamentals, _latest_scores
 
 # ─── Smoke tests ──────────────────────────────────────────────────────────────
 

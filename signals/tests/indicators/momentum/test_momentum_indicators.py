@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/momentum/* factors."""
+"""Unit tests for signals/indicators/momentum/* factors."""
 from __future__ import annotations
 
 import numpy as np
@@ -29,7 +29,7 @@ from signals.indicators.momentum.trend_quality.trend_consistency_21d import comp
 from signals.indicators.momentum.trend_quality.trend_consistency_63d import compute_trend_consistency_63d_scores
 from signals.indicators.momentum.trend_quality.trend_r2_50d import compute_trend_r2_50d_scores
 
-from signals.tests.factors.conftest import make_prices, make_prices_with_spy, _latest_scores
+from signals.tests.indicators.conftest import make_prices, make_prices_with_spy, _latest_scores
 
 # ─── Smoke tests ─────────────────────────────────────────────────────────────
 

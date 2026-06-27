@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/oscillators/* factors."""
+"""Unit tests for signals/indicators/oscillators/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -24,7 +24,7 @@ from signals.indicators.oscillators.momentum.stoch_d_14 import compute_stoch_d_1
 from signals.indicators.oscillators.momentum.stoch_rsi_14 import compute_stoch_rsi_14_scores
 from signals.indicators.oscillators.momentum.williams_r_14 import compute_williams_r_14_scores
 
-from signals.tests.factors.conftest import make_prices, make_volumes, make_ohlc, _latest_scores
+from signals.tests.indicators.conftest import make_prices, make_volumes, make_ohlc, _latest_scores
 
 # ─── Smoke tests ─────────────────────────────────────────────────────────────
 

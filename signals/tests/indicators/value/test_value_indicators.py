@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/value/* factors."""
+"""Unit tests for signals/indicators/value/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -21,7 +21,7 @@ from signals.indicators.value.shareholder_yield.dividend_yield import compute_di
 from signals.indicators.value.shareholder_yield.buyback_yield import compute_buyback_yield_scores
 from signals.indicators.value.shareholder_yield.shareholder_yield import compute_shareholder_yield_scores
 
-from signals.tests.factors.conftest import make_fixed_prices, make_fundamentals, _latest_scores
+from signals.tests.indicators.conftest import make_fixed_prices, make_fundamentals, _latest_scores
 
 # EV baseline: realistic positive-EV balance sheet used by EV-based factors
 _EV = dict(shares_outstanding=(1000.0, 50.0), total_debt=(200.0, 20.0), cash=(50.0, 5.0))

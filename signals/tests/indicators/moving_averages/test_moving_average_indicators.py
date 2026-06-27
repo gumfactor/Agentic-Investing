@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/moving_averages/* factors."""
+"""Unit tests for signals/indicators/moving_averages/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -19,7 +19,7 @@ from signals.indicators.moving_averages.price_vs_ma.price_vs_ema_200 import comp
 from signals.indicators.moving_averages.slopes.ma_slope_50 import compute_ma_slope_50_scores
 from signals.indicators.moving_averages.slopes.ma_slope_200 import compute_ma_slope_200_scores
 
-from signals.tests.factors.conftest import _latest_scores
+from signals.tests.indicators.conftest import _latest_scores
 
 # ─── Smoke tests ─────────────────────────────────────────────────────────────
 

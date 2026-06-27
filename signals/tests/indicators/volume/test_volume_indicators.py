@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/volume/* factors."""
+"""Unit tests for signals/indicators/volume/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -21,7 +21,7 @@ from signals.indicators.volume.accumulation.ad_line_momentum_21d import compute_
 from signals.indicators.volume.accumulation.ease_of_movement_14d import compute_ease_of_movement_14d_scores
 from signals.indicators.volume.accumulation.money_flow_index_14d import compute_money_flow_index_14d_scores
 
-from signals.tests.factors.conftest import make_prices, make_volumes, _latest_scores
+from signals.tests.indicators.conftest import make_prices, make_volumes, _latest_scores
 
 # ─── Smoke tests ─────────────────────────────────────────────────────────────
 

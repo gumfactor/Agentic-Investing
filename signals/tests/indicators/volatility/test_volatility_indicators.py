@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/volatility/* factors."""
+"""Unit tests for signals/indicators/volatility/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -33,7 +33,7 @@ from signals.indicators.volatility.systematic.beta_252d import compute_beta_252d
 from signals.indicators.volatility.systematic.beta_stability_63d import compute_beta_stability_63d_scores
 from signals.indicators.volatility.systematic.idiosyncratic_vol_63d import compute_idiosyncratic_vol_63d_scores
 
-from signals.tests.factors.conftest import make_prices, make_ohlc, _latest_scores
+from signals.tests.indicators.conftest import make_prices, make_ohlc, _latest_scores
 
 # ─── Smoke tests ─────────────────────────────────────────────────────────────
 

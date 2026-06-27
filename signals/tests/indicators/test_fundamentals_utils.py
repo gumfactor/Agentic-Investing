@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/_fundamentals_utils.py."""
+"""Unit tests for signals/indicators/_fundamentals_utils.py."""
 from __future__ import annotations
 
 import numpy as np
@@ -11,7 +11,7 @@ from signals.indicators._fundamentals_utils import (
     fund_to_wide,
     validate_fundamentals,
 )
-from signals.tests.factors.conftest import make_fixed_prices, make_fundamentals
+from signals.tests.indicators.conftest import make_fixed_prices, make_fundamentals
 
 
 # ─── validate_fundamentals ────────────────────────────────────────────────────

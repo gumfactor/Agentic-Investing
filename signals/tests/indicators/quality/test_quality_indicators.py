@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/quality/* factors."""
+"""Unit tests for signals/indicators/quality/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -27,7 +27,7 @@ from signals.indicators.quality.earnings_stability.revenue_stability import comp
 from signals.indicators.quality.earnings_stability.earnings_consistency import compute_earnings_consistency_scores
 from signals.indicators.quality.composite.piotroski_f_score import compute_piotroski_f_score_scores
 
-from signals.tests.factors.conftest import make_fixed_prices, make_fundamentals, _latest_scores
+from signals.tests.indicators.conftest import make_fixed_prices, make_fundamentals, _latest_scores
 
 # Piotroski requires 9 columns; use tuple specs so cross-sectional variation produces valid z-scores.
 _PIOTROSKI_KWARGS = dict(

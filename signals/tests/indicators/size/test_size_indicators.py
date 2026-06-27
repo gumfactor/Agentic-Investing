@@ -1,4 +1,4 @@
-"""Unit tests for signals/factors/size/* factors."""
+"""Unit tests for signals/indicators/size/* factors."""
 from __future__ import annotations
 
 import pandas as pd
@@ -9,7 +9,7 @@ from signals.indicators.size.market_cap.log_enterprise_value import compute_log_
 from signals.indicators.size.operating_scale.log_total_assets import compute_log_total_assets_scores
 from signals.indicators.size.operating_scale.log_revenue_ttm import compute_log_revenue_ttm_scores
 
-from signals.tests.factors.conftest import make_fixed_prices, make_fundamentals, _latest_scores
+from signals.tests.indicators.conftest import make_fixed_prices, make_fundamentals, _latest_scores
 
 # ─── Smoke tests: all 4 size factors ──────────────────────────────────────────
 
