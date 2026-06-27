@@ -1,7 +1,11 @@
-"""Piotroski F-Score factor (Piotroski 2000).
+"""Piotroski F-Score composite signal (Piotroski 2000).
 
 Sum of 9 binary quality signals (0–9). Each signal scores 1 if the condition
-is met, 0 otherwise (missing data treated conservatively as 0).
+is met, 0 otherwise (missing data treated conservatively as 0). The raw sum
+is then cross-sectionally z-scored so it's on the same scale as other signals.
+
+This is a cross-category composite: it blends profitability, leverage/liquidity,
+dilution, and operating-efficiency signals into a single quality screen.
 
 Profitability (4 signals):
   F1  ROA > 0
@@ -21,7 +25,7 @@ Operating Efficiency (2 signals):
 YoY change approximated by a 252-trading-day shift on the daily-aligned series.
 Higher total score = stronger overall financial condition.
 
-Requires fundamentals columns:
+Required fundamentals columns:
   net_income_ttm, operating_cf_ttm, total_assets, long_term_debt,
   current_assets, current_liabilities, shares_outstanding,
   gross_profit_ttm, revenue_ttm

@@ -864,7 +864,7 @@ def test_audit_structural_pass(tmp_path):
 def test_audit_empirical_clean(tmp_path):
     """Empirical audit reports zero violations on correctly computed scores."""
     import importlib
-    from signals.indicators.momentum import compute_momentum_scores
+    from signals.composites.momentum_score import compute_momentum_scores
 
     audit = importlib.import_module("scripts.audit_pit_safety")
 
@@ -888,7 +888,7 @@ def test_audit_empirical_accepts_momentum_only_alpha_scores():
     """Pinned v1 alpha scores can be audited when factor scores are absent."""
     import importlib
 
-    from signals.indicators.momentum import compute_momentum_scores
+    from signals.composites.momentum_score import compute_momentum_scores
 
     audit = importlib.import_module("scripts.audit_pit_safety")
     prices_df = _make_audit_prices()
@@ -944,7 +944,7 @@ def test_audit_snapshot_falls_back_to_v1_alpha_scores(monkeypatch):
 def test_audit_empirical_detects_corrupted_scores(tmp_path):
     """Empirical audit reports violations when stored scores are wrong."""
     import importlib
-    from signals.indicators.momentum import compute_momentum_scores
+    from signals.composites.momentum_score import compute_momentum_scores
 
     audit = importlib.import_module("scripts.audit_pit_safety")
 

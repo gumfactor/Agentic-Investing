@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.indicators.low_vol import compute_lowvol_scores
+from signals.composites.low_vol_score import compute_lowvol_scores
 
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────

@@ -88,7 +88,7 @@ def _load_prices(**context: Any) -> None:
 
 def _compute_momentum(**context: Any) -> None:
     import pandas as pd
-    from signals.indicators.momentum import compute_momentum_scores
+    from signals.composites.momentum_score import compute_momentum_scores
 
     prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
@@ -103,7 +103,7 @@ def _compute_momentum(**context: Any) -> None:
 
 def _compute_lowvol(**context: Any) -> None:
     import pandas as pd
-    from signals.indicators.low_vol import compute_lowvol_scores
+    from signals.composites.low_vol_score import compute_lowvol_scores
 
     prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
@@ -121,7 +121,7 @@ def _compute_value(**context: Any) -> None:
     import pandas as pd
     from sqlalchemy import create_engine, text
     import os
-    from signals.indicators.value import compute_value_scores
+    from signals.composites.value_score import compute_value_scores
 
     score_date_str: str = context["ti"].xcom_pull(key="score_date", task_ids="load_prices")
     score_date = date.fromisoformat(score_date_str)
@@ -167,7 +167,7 @@ def _compute_quality(**context: Any) -> None:
     import pandas as pd
     from sqlalchemy import create_engine, text
     import os
-    from signals.indicators.quality import compute_quality_scores
+    from signals.composites.quality_score import compute_quality_scores
 
     score_date_str: str = context["ti"].xcom_pull(key="score_date", task_ids="load_prices")
     score_date = date.fromisoformat(score_date_str)
