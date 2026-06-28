@@ -13,6 +13,62 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-28
 
+### Session 46 — Implementation: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** `0f31d04`
+
+---
+
+#### What was done
+
+Implemented all three components of M5.65 and wired them into the existing
+infrastructure. 62 tests passing.
+
+**`backtesting/validation/bootstrap_stress.py`**
+- `bootstrap_stress(oos_returns, n_reshuffles=500, seed)` function
+- Reshuffles the OOS daily return sequence N times using `np.random.default_rng`
+- Reports 5th/50th/95th percentile annualised Sharpe and worst-case max drawdown
+  across reshuffles
+- Flags strategy as `"solid"` or `"fragile"` based on worst-case drawdown vs
+  configurable threshold (default -35%)
+- 17 tests
+
+**`backtesting/validation/survival_funnel.py`**
+- `SurvivalFunnel` class with six configurable gates:
+  1. OOS Sharpe >= min (default 0.5)
+  2. OOS max drawdown >= floor (default -35%)
+  3. OOS Sharpe < ceiling to exclude lucky artifacts (default 2.5)
+  4. IS/OOS Sharpe relative gap <= tolerance (default 30%) — catches both
+     overfit (IS >> OOS) and lucky-OOS (OOS >> IS) in one check
+  5. OOS trade count >= minimum (default 30)
+  6. Average IS Sharpe > 0
+- `avg_is_sharpe_from_wf(wf_result)` and `oos_trade_count_from_wf(wf_result)`
+  convenience helpers for extracting inputs from `WalkForwardResult`
+- 30 tests
+
+**`backtesting/validation/parameter_sensitivity.py`**
+- `ParameterSweeper.sweep(base_config, param_grid, data_handler)` — runs
+  the full `WalkForwardValidator` across the Cartesian product of all
+  dot-path parameter overrides (e.g. `{"portfolio.n_long": [30, 50, 75]}`)
+- Reports mean, std, and positive-fraction of OOS Sharpe across variants
+- Flags `"curve_fit"` when positive_fraction < 0.5 or std > 0.5 (both
+  configurable); `"robust"` otherwise
+- Failed variants are logged as warnings and recorded with NaN Sharpe; they
+  do not abort the sweep
+- 15 tests
+
+**`backtesting/experiment_tracking/mlflow_logger.py`**
+- `BacktestLogger.log_run()` gains optional `funnel_result: SurvivalFunnelResult`
+- When supplied, logs `survival_funnel.passed`, `survival_funnel.verdict`, and
+  per-gate `gate.<name>: PASS/FAIL` as MLflow tags alongside run metrics
+
+**`backtesting/validation/__init__.py`**
+- Exposes all new public classes and helpers via `__all__`
+
+---
+
 ### Session 45 — Roadmap: M5.65 Backtesting Validation Suite
 
 **Operator:** mshane@thecanadalist.ca

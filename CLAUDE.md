@@ -73,12 +73,16 @@ Phase 5 milestones completed as of 2026-06-28:
 - **M5.4 Airflow DAG** — **COMPLETE (2026-06-25).** `airflow/dags/daily_paper_trading.py`
   — 13-task automated paper pipeline; `BlotterApprovalSensor` (C1 gate with SHA-256
   tamper detection); CLI approval bridge; `blotter_approvals` migration. 42 tests passing.
-- **M5.6 Additional signal library** — **IN PROGRESS (branch: `claude/trading-strategies-indicators-krxubp`).**
+- **M5.6 Additional signal library** — **COMPLETE (2026-06-28, merged via PR #22).**
   21 composite signals across 8 thematic groups built and tested. 753 signal tests passing.
+- **M5.65 Backtesting validation suite** — **COMPLETE (2026-06-28).**
+  `backtesting/validation/bootstrap_stress.py`, `survival_funnel.py`,
+  `parameter_sensitivity.py`. 62 tests passing. `BacktestLogger.log_run()`
+  accepts optional `funnel_result` to record gate verdicts as MLflow tags.
 
 **Last recorded validation:** 675 local tests passed on 2026-06-20 (Phase 4
-baseline). Signals suite: 753 tests as of 2026-06-28 (branch). Tearsheets: 98
-tests. Airflow DAG: 42 tests.
+baseline). Signals suite: 753 tests (M5.6, merged). Tearsheets: 98 tests.
+Airflow DAG: 42 tests. M5.65 validation suite: 62 tests (2026-06-28).
 
 Exit criterion for the current supervised Phase 4 plumbing rehearsal: 4
 consecutive trading days of operator-run paper workflow with zero critical
