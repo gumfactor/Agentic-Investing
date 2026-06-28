@@ -13,6 +13,78 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-28
 
+### Session 47 — Adversarial Review Fixes: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** `ec0b2d2`
+
+---
+
+#### What was done
+
+Applied all fixes from a single-agent adversarial review of the M5.65 validation
+suite. 67 tests now pass (up from 62).
+
+**Critical bugs fixed:**
+
+1. **`bootstrap_stress.py`: Sharpe percentiles are permutation-invariant (Bug #3)**
+   — Sharpe = mean/std × √252. Because permutation does not change mean or std,
+   every reshuffle produces identical Sharpe. Removed `sharpe_p5/p50/p95` fields
+   from `BootstrapStressResult` entirely. Replaced with `drawdown_p5/p50/p95`
+   (max drawdown IS path-dependent and varies across reshuffles). Module docstring
+   updated to explain permutation vs bootstrap distinction.
+
+2. **`parameter_sensitivity.py`: misspelled terminal key silently runs wrong config (Bug #2 extension)**
+   — `_set_nested` only checked intermediate path segments; a misspelled final key
+   like `"portfolio.n_longg"` silently created a new config key, leaving `n_long`
+   unchanged and producing misleading NaN-free results. Fixed: `_set_nested` now
+   checks that the terminal key exists in the final sub-dict before assigning.
+
+3. **`parameter_sensitivity.py`: broad `except Exception` swallowed config errors**
+   — Already moved `_apply_params` outside the try block in the previous session;
+   this session verified the terminal-key check makes that protection effective.
+   Exception catch remains narrowed to `(ValueError, RuntimeError)`.
+
+4. **`survival_funnel.py`: dead zone inconsistency between gates 4 and 6 (Bug #1)**
+   — `_gate_is_oos_consistency` uses `abs(is_sharpe) > 1e-6` as denominator guard;
+   `_gate_positive_is_sharpe` used `is_sharpe > 0.0`. A strategy with IS Sharpe in
+   `(0, 1e-6]` would pass gate 6 but produce a NaN gap in gate 4 — silently failing
+   with no diagnostic. Threshold aligned to `1e-6` in both gates.
+
+**New features added:**
+
+- `ParameterSensitivityResult.to_dataframe()` — returns per-variant results as a
+  DataFrame sorted by OOS Sharpe descending, for notebook/reporting use.
+- `BacktestLogger.log_walk_forward_run()` — logs `WalkForwardResult` OOS metrics,
+  per-fold IS Sharpes, optional `SurvivalFunnelResult` gate verdicts, and optional
+  `BootstrapStressResult` drawdown distribution to MLflow (C7 enforced via
+  `config["data_version"]`).
+
+**Deduplication:**
+
+- Removed duplicate `_oos_trade_count` from `parameter_sensitivity.py`; now
+  imports `oos_trade_count_from_wf` from `survival_funnel.py`.
+
+**Test improvements (67 total):**
+
+- `test_bootstrap_stress`: replaced stale `sharpe_p50` references with `drawdown_p50`;
+  added `test_drawdown_percentile_ordering`, `test_drawdown_percentiles_are_nonpositive`,
+  `test_drawdown_varies_across_reshuffles` (verifies path-dependence).
+- `test_survival_funnel`: added `test_dead_zone_is_sharpe_fails_both_gates`
+  (IS Sharpe = 5e-7 fails gates 4 and 6 consistently).
+- `test_parameter_sensitivity`: added `test_bad_param_grid_key_raises_key_error`
+  (misspelled `portfolio.n_longg` raises `KeyError`, not silent NaN) and
+  `test_to_dataframe_columns_and_row_count`.
+
+[DECISION] Extended `_set_nested` to require the terminal key to exist in the
+config before overwriting. Rationale: all `param_grid` keys are overrides of
+existing config values — creating new keys from typos is always a bug, never
+intentional, and should fail loudly. If a strategy genuinely needs to add new
+config keys dynamically, that is a different operation that should be explicit.
+
+---
+
 ### Session 46 — Implementation: M5.65 Backtesting Validation Suite
 
 **Operator:** mshane@thecanadalist.ca
