@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.indicators.momentum import compute_momentum_scores, rank_by_momentum
+from signals.composites.momentum_score import compute_momentum_scores, rank_by_momentum
 
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────

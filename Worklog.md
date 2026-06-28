@@ -8,6 +8,97 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 - Decision records are prefixed `[DECISION]`.
 - Risk / safety notes are prefixed `[SAFETY]`.
 - Blockers are prefixed `[BLOCKER]`.
+
+---
+
+## 2026-06-28
+
+### Session 44 — Phase 5 M5.6: Composite Signal Library (Groups 4–8)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-strategies-indicators-krxubp`
+**Commits:** `2ff2d90`, `3a75a68`, `c32f2e3`, `9887035`, `681da98`
+
+---
+
+#### What was done
+
+Completed the composite signal library as part of M5.6 (additional strategies).
+Built 21 composite signals across 8 thematic groups, each with a full test suite.
+All composites use the shared `signals/composites/_blend.py` utility for per-row
+weight renormalization and cross-sectional z-scoring per date.
+
+**Group 4 — Contrarian / Mean-Reversion (commit `2ff2d90`):**
+- New raw oscillator indicators (skip cross-sectional z-score to preserve absolute
+  levels for contrarian strategies):
+  - `signals/indicators/oscillators/momentum/rsi_14_raw.py` — RSI(14), 0–100 scale.
+    Fixed pure-uptrend edge case (avg_loss=0 → NaN cascade → ticker dropped).
+  - `signals/indicators/oscillators/bollinger/bb_pct_b_20_raw.py` — %B(20), 0–1 scale.
+  - `signals/indicators/oscillators/mean_reversion/rolling_zscore_252d_raw.py` —
+    time-series z-score vs own 252-day history (not cross-sectional).
+- New composites:
+  - `quality_dip`: quality (50%) + inverted RSI (30%) + inverted rolling z-score (20%).
+  - `deep_value_oversold`: value (50%) + inverted RSI (30%) + inverted %B (20%).
+
+**Group 5 — Risk-Adjusted (commit `3a75a68`):**
+- `low_vol_momentum`: vol-adj momentum (50%) + inverted realized vol (30%) + Sortino (20%).
+- `defensive_quality`: quality (50%) + inverted beta (25%) + up/down vol ratio (25%).
+- `risk_adjusted_value`: value (50%) + Sharpe (30%) + inverted max drawdown (20%).
+
+**Group 6 — Growth-Centric (commit `c32f2e3`):**
+- `growth_score`: revenue growth (25%) + EPS growth (25%) + FCF growth (20%) +
+  margin expansion (15%) + EPS acceleration (15%). Foundational growth aggregate,
+  parallel to pre-existing `quality_score` and `value_score`.
+- `sustainable_growth`: growth (50%) + quality (30%) + ROIC improvement (20%).
+- `growth_momentum`: growth (50%) + vol-adj momentum (30%) + EPS acceleration (20%).
+
+**Group 7 — Momentum Variants (commit `9887035`):**
+- `breakout_momentum`: 52-week high proximity (40%) + Donchian % (35%) + MA cross (25%).
+- `relative_strength`: RS vs SPY 12m (50%) + RS vs SPY 3m (30%) + MA slope (20%).
+- `short_term_reversal`: reversal 1m (50%) + reversal 1w (30%) + inverted BB z-score (20%).
+  Note: `reversal_1m_score` and `reversal_1w_score` are pre-negated at the indicator level.
+
+**Group 8 — Size & Income (commit `681da98`):**
+- `small_cap_quality`: log market cap (50%) + quality (30%) + inverted realized vol (20%).
+  Note: `log_market_cap_score` is pre-negated at the indicator level (higher = smaller cap).
+- `small_cap_momentum`: log market cap (50%) + vol-adj momentum 12m (30%) + RS vs SPY 12m (20%).
+- `income_yield`: shareholder yield (40%) + dividend yield (35%) + buyback yield (25%).
+
+**Internal negation pattern:** For signals where higher = worse, composites create
+`_prefixed` temp columns (e.g., `_low_vol = -realized_vol_21d_score`), pass them to
+`blend_scores`, then drop before returning. Original raw values are preserved in output.
+
+**Test coverage:** 43 tests per group average; 753 signal tests total, all passing.
+
+**CLAUDE.md updated:** Phase table, Phase 5 priority list, MCP server status,
+and Claude skills table all brought current to reflect M5.1–M5.4 completion and
+M5.6 in-progress state.
+
+#### Decisions
+
+[DECISION] `growth_score` composite created as a new foundational aggregate parallel
+to `quality_score` and `value_score`. The 18 existing growth indicators had no
+category-level aggregate. Without it, growth-centric composites (`sustainable_growth`,
+`growth_momentum`) would have had to reference 5+ raw indicators directly.
+
+[DECISION] Raw oscillator variants (`rsi_14_raw`, `bb_pct_b_20_raw`,
+`rolling_zscore_252d_raw`) bypass cross-sectional z-scoring. Contrarian composites
+need absolute price levels (RSI = 20 is oversold; RSI = 80 is overbought) — a
+cross-sectional z-score would destroy this information by converting absolute levels
+to relative ranks within the universe on that date.
+
+[DECISION] Strategy YAML configs (v3+) deferred. Building YAMLs now would be
+premature — the new composites haven't been backtested or validated. YAML configs
+should follow after signal validation.
+
+#### Next steps
+
+- Merge `claude/trading-strategies-indicators-krxubp` to `main` when operator approves.
+- Continue M5.6: unused indicators audit (volatility regime, accumulation/volume signals)
+  may warrant additional composites after review.
+- M5.5: 4-week automated paper-trading qualification (requires Airflow DAG operational).
+- M5.7: Market regime detector.
+- M5.8: Streamlit dashboard + remaining 3 Claude skills (`data_fetch`, `monitor`, `report`).
 - Resolved items are prefixed `[RESOLVED]`.
 
 ---
@@ -3727,3 +3818,63 @@ Rationale: Making returned ORM objects safe to use after session close requires 
 2. Begin Phase 5 items 2-onwards per CLAUDE.md priority sequence (trading journal, tearsheets, Airflow DAG).
 3. The 4-day supervised paper plumbing rehearsal is still not complete — see Phase 4 section in CLAUDE.md.
 
+
+---
+
+## Session 2026-06-27 — Signal architecture decision: 2-tier indicators + composites
+
+**Branch:** `claude/trading-strategies-indicators-krxubp`
+**Operator:** mshane@thecanadalist.ca
+
+### What was done
+
+- Reviewed the existing signal architecture (3-tier: individual indicators → composite factor
+  scores → alpha score) and evaluated whether the intermediate composite layer added value or
+  unnecessary rigidity.
+- Decided to flatten to a 2-tier architecture. Updated PRD.md and CLAUDE.md accordingly.
+  No code was changed this session — documentation only.
+
+### [DECISION] Flatten signal architecture to 2-tier: indicators + composites → alpha score
+
+**Previous design:** Three mandatory tiers — individual indicators feed into intermediate
+composite factor scores (e.g., `momentum_score` aggregates mom_1m/3m/6m/12m), which then
+feed into the strategy-weighted alpha score. Strategies could only reference composites,
+not individual indicators directly.
+
+**New design:** Two tiers. `signals/indicators/` holds atomic signals organized by category.
+`signals/composites/` holds named composite signals — pre-built blends of two or more
+indicators. Both are first-class named signals. Strategy YAML configs reference either type
+(or a mix) by name, and the scorer weights them identically. No mandatory intermediate layer.
+
+**Rationale:**
+
+1. The mandatory intermediate tier was artificial. A strategy that wants to overweight
+   `mom_12m` specifically (the most empirically studied window) was forced to go through
+   an equal-weight composite that diluted the signal.
+
+2. Composites still exist and are still useful — they're reusable pre-built blends that
+   save strategy authors from re-specifying sub-indicator weights every time. But their
+   use is optional, not mandatory.
+
+3. Composites may combine indicators from a single category (e.g., four momentum windows)
+   or across multiple categories (e.g., PE ratio + price momentum). The original design
+   would have required cross-category composites to live awkwardly inside one category's
+   folder. The new flat `composites/` folder solves this cleanly.
+
+4. Composite organization within `signals/composites/` starts flat. Subfolders are added
+   only when natural clusters emerge from actual built composites — not designed upfront.
+
+5. The scorer gains one new responsibility: validate that a strategy does not reference
+   both a composite and any of its constituent indicators simultaneously (silent
+   double-counting guard).
+
+**Files changed:** `PRD.md` (Section 5 folder tree, F2.1, F2.3), `CLAUDE.md` (repo layout
+note, Phase 5 item 6).
+
+### Next steps
+
+1. Physically move `signals/indicators/low_vol.py` and existing composite logic (currently
+   embedded in category `__init__.py` files) to `signals/composites/` to match the new layout.
+2. Build `growth_score` composite (the most significant current gap — 18 growth indicators
+   exist but no composite aggregates them).
+3. Begin v3+ strategy YAML development once composites are populated.

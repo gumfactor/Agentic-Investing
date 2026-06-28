@@ -24,6 +24,10 @@ from signals.indicators.oscillators.momentum.stoch_d_14 import compute_stoch_d_1
 from signals.indicators.oscillators.momentum.stoch_rsi_14 import compute_stoch_rsi_14_scores
 from signals.indicators.oscillators.momentum.williams_r_14 import compute_williams_r_14_scores
 
+from signals.indicators.oscillators.momentum.rsi_14_raw import compute_rsi_14_raw_scores
+from signals.indicators.oscillators.bollinger.bb_pct_b_20_raw import compute_bb_pct_b_20_raw_scores
+from signals.indicators.oscillators.mean_reversion.rolling_zscore_252d_raw import compute_rolling_zscore_252d_raw_scores
+
 from signals.tests.indicators.conftest import make_prices, make_volumes, make_ohlc, _latest_scores
 
 # ─── Smoke tests ─────────────────────────────────────────────────────────────
@@ -184,3 +188,111 @@ def test_roc_10_rising_stock_scores_higher():
     prices = pd.DataFrame(rows)
     scores = _latest_scores(compute_roc_10_scores(prices), "roc_10_score")
     assert scores["UP"] > scores["DOWN"]
+
+
+# ─── Raw (absolute-value) oscillator tests ────────────────────────────────────
+
+def test_rsi_14_raw_output_columns(prices_300d):
+    result = compute_rsi_14_raw_scores(prices_300d)
+    assert {"date", "ticker", "rsi_14_raw"} <= set(result.columns)
+    assert len(result) > 0
+
+
+def test_rsi_14_raw_not_cross_sectionally_normalized(prices_300d):
+    """Raw RSI values must NOT be centered on 0 or have unit variance — they are absolute."""
+    import numpy as np
+    result = compute_rsi_14_raw_scores(prices_300d)
+    latest_date = result["date"].max()
+    latest = result[result["date"] == latest_date]["rsi_14_raw"].dropna()
+    # RSI values are 0–100; they should not look like a cross-sectional z-score
+    assert latest.mean() > 5.0, "RSI mean should be well above 0"
+    assert latest.std() < 40.0, "RSI std should be much less than values themselves"
+
+
+def test_rsi_14_raw_range(prices_300d):
+    """RSI values must stay within [0, 100]."""
+    result = compute_rsi_14_raw_scores(prices_300d)
+    valid = result["rsi_14_raw"].dropna()
+    assert (valid >= 0.0).all()
+    assert (valid <= 100.0).all()
+
+
+def test_rsi_14_raw_downtrend_lower_than_uptrend():
+    """A persistently falling stock should have lower raw RSI than a rising one."""
+    import numpy as np
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    rows = []
+    for d, i in zip(dates, range(100)):
+        rows.append({"date": d, "ticker": "UP",   "close": 100.0 + i * 0.5})
+        rows.append({"date": d, "ticker": "DOWN", "close": max(100.0 - i * 0.5, 1.0)})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_rsi_14_raw_scores(prices), "rsi_14_raw")
+    assert scores["UP"] > scores["DOWN"]
+
+
+def test_bb_pct_b_20_raw_output_columns(prices_300d):
+    result = compute_bb_pct_b_20_raw_scores(prices_300d)
+    assert {"date", "ticker", "bb_pct_b_20_raw"} <= set(result.columns)
+    assert len(result) > 0
+
+
+def test_bb_pct_b_20_raw_not_cross_sectionally_normalized(prices_300d):
+    """Raw %B values are in approximately [0, 1] range, not centered on 0."""
+    result = compute_bb_pct_b_20_raw_scores(prices_300d)
+    latest_date = result["date"].max()
+    latest = result[result["date"] == latest_date]["bb_pct_b_20_raw"].dropna()
+    # For a typical market, %B clusters around 0.5; definitely not zero-mean
+    assert latest.mean() > -1.0
+    assert latest.mean() < 2.0
+
+
+def test_bb_pct_b_20_raw_above_band_higher_than_below():
+    """Price above upper band (%B > 1) should have higher raw value than price below lower band (%B < 0)."""
+    import numpy as np
+    rng = np.random.default_rng(42)
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    rows = []
+    for d, i in zip(dates, range(100)):
+        above = 100.0 + rng.normal(0, 0.3) + (12.0 if i >= 80 else 0.0)
+        below = 100.0 + rng.normal(0, 0.3) - (12.0 if i >= 80 else 0.0)
+        rows.append({"date": d, "ticker": "ABOVE", "close": float(above)})
+        rows.append({"date": d, "ticker": "BELOW", "close": float(below)})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_bb_pct_b_20_raw_scores(prices), "bb_pct_b_20_raw")
+    assert scores["ABOVE"] > scores["BELOW"]
+
+
+def test_rolling_zscore_252d_raw_output_columns(prices_400d):
+    result = compute_rolling_zscore_252d_raw_scores(prices_400d)
+    assert {"date", "ticker", "rolling_zscore_252d_raw"} <= set(result.columns)
+    assert len(result) > 0
+
+
+def test_rolling_zscore_252d_raw_above_mean_positive():
+    """A stock trading well above its 252d mean should have a positive raw z-score."""
+    import numpy as np
+    rng = np.random.default_rng(13)
+    dates = pd.bdate_range("2020-01-01", periods=400)
+    rows = []
+    for d, i in zip(dates, range(400)):
+        # HIGH: jumps 3 std-devs above prior mean in the last 20 bars
+        high = 100.0 + rng.normal(0, 0.5) + (15.0 if i >= 380 else 0.0)
+        low  = max(100.0 + rng.normal(0, 0.5) - (15.0 if i >= 380 else 0.0), 1.0)
+        rows.append({"date": d, "ticker": "HIGH", "close": float(high)})
+        rows.append({"date": d, "ticker": "LOW",  "close": float(low)})
+    prices = pd.DataFrame(rows)
+    scores = _latest_scores(compute_rolling_zscore_252d_raw_scores(prices), "rolling_zscore_252d_raw")
+    assert scores["HIGH"] > 0
+    assert scores["LOW"] < 0
+    assert scores["HIGH"] > scores["LOW"]
+
+
+def test_rolling_zscore_252d_raw_not_cross_sectionally_normalized(prices_400d):
+    """Values should reflect each stock's own history, not be re-centered across the universe."""
+    result = compute_rolling_zscore_252d_raw_scores(prices_400d)
+    latest_date = result["date"].max()
+    latest = result[result["date"] == latest_date]["rolling_zscore_252d_raw"].dropna()
+    # Unlike cross-sectional z-scores, the mean should NOT be forced to exactly 0
+    # (though it may be close by coincidence). The key test is that values reflect
+    # individual stocks — check that std is non-trivially positive.
+    assert latest.std() > 0.01

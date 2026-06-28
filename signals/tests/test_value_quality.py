@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.indicators.value import compute_value_scores
-from signals.indicators.quality import compute_quality_scores
+from signals.composites.value_score import compute_value_scores
+from signals.composites.quality_score import compute_quality_scores
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

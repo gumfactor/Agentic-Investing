@@ -1,34 +1,19 @@
-"""Value factor: earnings yield, book-to-market, FCF yield.
+"""Value indicator utilities: point-in-time fundamental data access helpers.
 
-All three ratios use market capitalisation (price × shares_outstanding) as
-the denominator.  Prices come from daily_prices; fundamentals from
-financial_statements via pit_latest().
+These helpers are used by signals/composites/value_score.py and
+signals/composites/quality_score.py to retrieve PIT-correct fundamental values.
+The value_score composite itself lives in signals/composites/value_score.py.
 
 Point-in-time correctness
 -------------------------
 Flow items use the latest four distinct quarterly observations known on the
 score date, with the latest annual observation as a fallback. Balance-sheet
-items and shares are selected at or before the flow period end. This prevents
-mixing one quarter of earnings with a full market capitalisation or pairing
-fundamentals from incompatible fiscal periods.
-
-Survivorship bias note
-----------------------
-Same as momentum: current-membership S&P 500 universe in Phase 1.
-Results labelled provisional until PIT constituent history is in place.
-
-Output sign convention
------------------------
-All three factors are defined so that HIGHER score = BETTER:
-  earnings_yield  : high E/P → high score (cheap stock)
-  book_to_market  : high B/P → high score (cheap stock)
-  fcf_yield       : high FCF/P → high score (cash-generative)
+items and shares are selected at or before the flow period end.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -39,91 +24,6 @@ logger = structlog.get_logger(__name__)
 _REQUIRED_FUND_COLS = {"ticker", "period_end_date", "release_date", "period_type", "item_name", "value"}
 _REQUIRED_PRICE_COLS = {"ticker", "date", "close"}
 _MAX_FUNDAMENTAL_AGE_DAYS = 550
-
-
-def compute_value_scores(
-    fundamentals: pd.DataFrame,
-    prices: pd.DataFrame,
-    score_dates: Optional[list] = None,
-    min_tickers: int = 10,
-) -> pd.DataFrame:
-    """Compute cross-sectional value scores at each score date.
-
-    Args:
-        fundamentals: Long-format financial_statements rows.  Must include
-            items 'net_income', 'total_equity', 'free_cash_flow',
-            'shares_outstanding'.  Period-type filtering (quarterly/annual)
-            is the caller's responsibility.
-        prices: Long-format daily_prices rows (ticker, date, close).
-        score_dates: Dates to compute scores for.  Defaults to all dates
-            present in prices.
-        min_tickers: Minimum number of tickers with valid fundamental data
-            required to compute scores for a date.  Dates below this are
-            dropped.
-
-    Returns:
-        Long-format DataFrame with columns:
-            ticker, date,
-            earnings_yield, book_to_market, fcf_yield,
-            value_score  (equal-weight composite of available sub-scores)
-
-        Returns empty DataFrame if fundamentals or prices are empty.
-    """
-    _validate_fundamentals(fundamentals)
-    _validate_prices(prices)
-
-    if score_dates is None:
-        score_dates = sorted(prices["date"].unique())
-
-    rows: list[dict] = []
-
-    for score_date in score_dates:
-        visible = _pit_visible_fundamentals(fundamentals, score_date)
-        if visible.empty:
-            continue
-
-        # Prices on score_date
-        price_snap = (
-            prices[prices["date"] == score_date][["ticker", "close"]]
-            .assign(close=lambda df: df["close"].astype(float))
-            .set_index("ticker")
-        )
-        if price_snap.empty:
-            continue
-
-        # Market cap requires shares_outstanding from fundamentals.
-        # NOTE: shares_outstanding is a quarterly filing value and may lag
-        # the actual share count by up to 90 days.  This is a known
-        # approximation; a more precise source (e.g. daily share counts)
-        # would improve accuracy for companies with active buyback programs.
-        date_rows = _compute_ratios(visible, price_snap["close"], score_date)
-        if len(date_rows) < min_tickers:
-            continue
-        rows.extend(date_rows)
-
-    if not rows:
-        return pd.DataFrame(
-            columns=["ticker", "date", "earnings_yield", "book_to_market", "fcf_yield", "value_score"]
-        )
-
-    df = pd.DataFrame(rows)
-    sub_cols = [c for c in ["earnings_yield", "book_to_market", "fcf_yield"] if c in df.columns]
-
-    # Cross-sectional z-score per date, per sub-factor
-    for col in sub_cols:
-        df[col] = df.groupby("date")[col].transform(_zscore)
-
-    df["value_score"] = df[sub_cols].mean(axis=1, skipna=True)
-    df = df.dropna(subset=sub_cols, how="all")
-    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    logger.info(
-        "value_scores_computed",
-        dates=df["date"].nunique(),
-        tickers=df["ticker"].nunique(),
-        sub_factors=sub_cols,
-    )
-    return df
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────

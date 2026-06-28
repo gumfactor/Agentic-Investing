@@ -25,7 +25,7 @@ from signals.indicators.quality.capital_efficiency.receivables_turnover import c
 from signals.indicators.quality.earnings_stability.eps_stability import compute_eps_stability_scores
 from signals.indicators.quality.earnings_stability.revenue_stability import compute_revenue_stability_scores
 from signals.indicators.quality.earnings_stability.earnings_consistency import compute_earnings_consistency_scores
-from signals.indicators.quality.composite.piotroski_f_score import compute_piotroski_f_score_scores
+from signals.composites.piotroski_f_score import compute_piotroski_f_score_scores
 
 from signals.tests.indicators.conftest import make_fixed_prices, make_fundamentals, _latest_scores
 

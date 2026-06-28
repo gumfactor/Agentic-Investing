@@ -1,44 +1,29 @@
-"""Low-volatility factor.
+"""Low-volatility composite signal.
 
-Computes cross-sectional low-volatility scores from daily OHLCV data.
+Blends three realized-volatility windows (21d, 63d, 252d) into a single
+lowvol_score. Low volatility relative to peers = positive score, consistent
+with the rest of the signal library where higher = stronger long candidate.
+
+Optionally incorporates rolling 252-day beta when market_prices are supplied;
+beta is included in the output but excluded from the composite (it captures a
+different risk dimension).
 
 Methodology
 -----------
 The low-volatility anomaly (Blitz & van Vliet 2007, Baker et al. 2011)
 observes that low-risk stocks deliver higher risk-adjusted returns than
-high-risk stocks.  Scores here reflect *low* volatility as a positive
-signal, consistent with the rest of the factor library where a higher
-score = stronger long candidate.
+high-risk stocks.
 
-Metrics computed
-~~~~~~~~~~~~~~~~
-vol_21d   Realised volatility, 21-day window  (annualised, %)
-vol_63d   Realised volatility, 63-day window  (annualised, %)
-vol_252d  Realised volatility, 252-day window (annualised, %)
-beta_252d Rolling 252-day market beta (requires market_prices; NaN if absent)
-
-Composite score
-~~~~~~~~~~~~~~~
-lowvol_score = cross-sectional z-score of *negative* composite volatility.
-A stock less volatile than its peers receives a positive score.
-
-Composite volatility = equal-weight mean of available vol window z-scores
-(not negated yet), then the whole thing is negated at the end so that the
-output sign convention matches the rest of the factor library.
+Individual vol measures (vol_21d, vol_63d, vol_252d, beta_252d) are also
+returned so strategies can reference them independently.
 
 Annualisation
 ~~~~~~~~~~~~~
-Daily log-return std × sqrt(252).  Log returns used instead of simple
-returns to avoid compounding artefacts in long windows.
+Daily log-return std × sqrt(252).
 
 Point-in-time safety
 ~~~~~~~~~~~~~~~~~~~~
-Only ``date`` and ``close`` are consumed from the prices DataFrame (plus
-the optional market series).  No future information enters.
-
-Survivorship bias
-~~~~~~~~~~~~~~~~~
-Same caveat as momentum.py — Phase 1 uses current-membership universe.
+Only ``date`` and ``close`` are consumed from the prices DataFrame.
 """
 
 from __future__ import annotations
@@ -53,17 +38,13 @@ logger = structlog.get_logger(__name__)
 
 _TRADING_DAYS_PER_YEAR = 252
 
-# Volatility lookback windows (trading-day rows)
 _VOL_WINDOWS: dict[str, int] = {
     "vol_21d":  21,
     "vol_63d":  63,
     "vol_252d": 252,
 }
 
-# Minimum fraction of window that must have valid returns for a score
 _MIN_OBS_FRACTION = 0.7
-
-# Beta lookback
 _BETA_WINDOW = 252
 
 
@@ -80,9 +61,8 @@ def compute_lowvol_scores(
         prices: Long-format DataFrame with columns ``ticker``, ``date``,
             ``close``.  Multiple tickers expected.
         market_prices: Optional single-ticker long-format DataFrame with
-            the market index (e.g. SPY) in the same ``ticker``/``date``/
-            ``close`` schema.  Used for beta; if None, ``beta_252d`` is
-            omitted from output.
+            the market index (e.g. SPY).  Used for beta; if None, ``beta_252d``
+            is omitted from output.
         vol_windows: Mapping of column name → lookback in trading-day rows.
             Defaults to 21 / 63 / 252-day windows.
         beta_window: Lookback for rolling beta computation (rows).
@@ -95,30 +75,23 @@ def compute_lowvol_scores(
             ``vol_21d``, ``vol_63d``, ``vol_252d``,   (annualised %)
             ``beta_252d``                               (if market_prices supplied),
             ``lowvol_score``                            (higher = less volatile)
-
-        Rows where no volatility score can be computed are dropped.
     """
     if vol_windows is None:
         vol_windows = _VOL_WINDOWS
 
     _validate_input(prices)
 
-    # Wide price matrix: index=date, columns=ticker
     wide = _to_wide(prices)
-
-    # Log-returns (avoids compounding distortion over long windows)
     log_ret = np.log(wide / wide.shift(1))
 
     long_frames: list[pd.DataFrame] = []
 
-    # ── Realised volatility windows ───────────────────────────────────────
     for col_name, window in vol_windows.items():
         min_obs = int(window * min_obs_fraction)
 
         rolling_std = log_ret.rolling(window=window, min_periods=min_obs).std()
         annualised_vol = rolling_std * np.sqrt(_TRADING_DAYS_PER_YEAR)
 
-        # Cross-sectional z-score (per date, across tickers)
         z = _cross_sectional_zscore(annualised_vol)
 
         long_frames.append(
@@ -127,11 +100,9 @@ def compute_lowvol_scores(
             .set_index(["date", "ticker"])
         )
 
-    # ── Rolling beta ──────────────────────────────────────────────────────
     if market_prices is not None:
         _validate_input(market_prices)
         mkt_wide = _to_wide(market_prices)
-        # Align to the same dates as the universe prices
         mkt_ret = np.log(mkt_wide / mkt_wide.shift(1))
         mkt_ret = mkt_ret.reindex(log_ret.index)
 
@@ -148,32 +119,23 @@ def compute_lowvol_scores(
             cols.insert(-1, "beta_252d")
         return pd.DataFrame(columns=cols)
 
-    # Outer-join all metric frames on (date, ticker)
     result = long_frames[0]
     for frame in long_frames[1:]:
         result = result.join(frame, how="outer")
     result = result.reset_index()
 
-    # ── Composite low-vol score ───────────────────────────────────────────
-    # Composite = mean of vol window z-scores (beta excluded from composite;
-    # it captures a different risk dimension).
     vol_cols = list(vol_windows.keys())
     available_vol = [c for c in vol_cols if c in result.columns]
 
-    # Mean of z-scores per row, then negate (low vol → positive score)
     composite_vol_z = result[available_vol].mean(axis=1, skipna=True)
     result["lowvol_score"] = -composite_vol_z
 
-    # Re-standardise the composite so it's centred and unit-variance per date
     def _restandardise(df: pd.DataFrame, col: str) -> pd.Series:
         grp = df.groupby("date")[col]
         return (df[col] - grp.transform("mean")) / grp.transform("std")
 
     result["lowvol_score"] = _restandardise(result, "lowvol_score")
-
-    # Drop rows where no vol score was computable
     result = result.dropna(subset=available_vol, how="all")
-
     result = result.sort_values(["date", "ticker"]).reset_index(drop=True)
 
     logger.info(
@@ -186,12 +148,7 @@ def compute_lowvol_scores(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
 def _to_wide(prices: pd.DataFrame) -> pd.DataFrame:
-    """Pivot long-format prices to wide (index=date, columns=ticker)."""
     wide = (
         prices[["ticker", "date", "close"]]
         .assign(close=lambda df: df["close"].astype(float))
@@ -203,7 +160,6 @@ def _to_wide(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 def _cross_sectional_zscore(wide: pd.DataFrame) -> pd.DataFrame:
-    """Z-score each row of a wide DataFrame cross-sectionally."""
     row_mean = wide.mean(axis=1)
     row_std = wide.std(axis=1, ddof=1)
     return wide.sub(row_mean, axis=0).div(row_std, axis=0)
@@ -215,14 +171,9 @@ def _compute_beta(
     window: int,
     min_obs_fraction: float,
 ) -> pd.DataFrame:
-    """Rolling OLS beta for each ticker vs a single market return series.
-
-    Beta = Cov(stock, market) / Var(market), computed via rolling window.
-    Returns a wide DataFrame of beta values (index=date, columns=ticker).
-    """
+    """Rolling OLS beta for each ticker vs a single market return series."""
     min_obs = int(window * min_obs_fraction)
 
-    # Market return is a single-column DataFrame; squeeze to Series
     mkt_series = mkt_ret.squeeze()
     if isinstance(mkt_series, pd.DataFrame):
         mkt_series = mkt_series.iloc[:, 0]
@@ -230,7 +181,6 @@ def _compute_beta(
     result_cols = {}
     for ticker in stock_ret.columns:
         s = stock_ret[ticker]
-        # Align and drop rows where either is NaN before rolling
         combined = pd.concat([s, mkt_series], axis=1, join="inner")
         combined.columns = ["stock", "market"]
 
@@ -248,8 +198,6 @@ def _compute_beta(
         result_cols[ticker] = beta.reindex(stock_ret.index)
 
     beta_wide = pd.DataFrame(result_cols)
-
-    # Cross-sectional z-score so beta is on the same scale as vol metrics
     return _cross_sectional_zscore(beta_wide)
 
 

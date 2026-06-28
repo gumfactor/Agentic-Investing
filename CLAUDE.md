@@ -41,7 +41,7 @@ It is built to eventually trade real capital. Every decision you make must treat
 | 2 | Signal Library | **Complete** | Week 12 |
 | 3 | Backtesting Engine | **Live validation complete** | Week 18 |
 | 4 | Portfolio + Paper Trading | **Implementation complete — tiny paper submission recorded** | Week 26 |
-| 5 | Strategy Library, Automated Paper Trading, Reporting & Live Trading | **In progress — M5.2 complete** | Week 42 |
+| 5 | Strategy Library, Automated Paper Trading, Reporting & Live Trading | **In progress — M5.4 complete** | Week 42 |
 
 **Active branch:** `main`
 
@@ -62,9 +62,23 @@ All three module trees (portfolio/, execution/, risk/) are now fully implemented
 Three Claude skills added: `portfolio_construct` (safe), `risk_check` (safe),
 `execute_trade` (requires dashboard blotter approval with per-order selection and double confirmation — C1).
 
+Phase 5 milestones completed as of 2026-06-28:
+
+- **M5.1 Strategy Registry** — **COMPLETE (2026-06-23).** DB-backed strategy catalog
+  with lifecycle transitions, C7/C8 enforcement, adversarial-review-hardened.
+- **M5.2 Trade Journal** — **COMPLETE (2026-06-23).** Append-only fill store with FIFO
+  P&L and wash-sale history. `_check_wash_sale` compliance rule is now live.
+- **M5.3 Tearsheets** — **COMPLETE (2026-06-24).** `reporting/tearsheets/` — 17 metrics,
+  9 chart builders, HTML + PNG output, two adversarial review passes. 98 tests passing.
+- **M5.4 Airflow DAG** — **COMPLETE (2026-06-25).** `airflow/dags/daily_paper_trading.py`
+  — 13-task automated paper pipeline; `BlotterApprovalSensor` (C1 gate with SHA-256
+  tamper detection); CLI approval bridge; `blotter_approvals` migration. 42 tests passing.
+- **M5.6 Additional signal library** — **IN PROGRESS (branch: `claude/trading-strategies-indicators-krxubp`).**
+  21 composite signals across 8 thematic groups built and tested. 753 signal tests passing.
+
 **Last recorded validation:** 675 local tests passed on 2026-06-20 (Phase 4
-baseline); 58/58 execution suite tests passed on 2026-06-23 after M5.2
-trade journal (+31 trade_history tests, +2 OMS integration tests).
+baseline). Signals suite: 753 tests as of 2026-06-28 (branch). Tearsheets: 98
+tests. Airflow DAG: 42 tests.
 
 Exit criterion for the current supervised Phase 4 plumbing rehearsal: 4
 consecutive trading days of operator-run paper workflow with zero critical
@@ -74,30 +88,35 @@ rehearsal is not complete. No real capital is at risk. The IBKR paper account
 connection (port 7497) has been smoke-tested, including a Canadian CAD NAV
 account with USD-equivalent NAV conversion.
 
-After the supervised plumbing rehearsal, Phase 5 begins. The confirmed priority
-sequence for Phase 5 is:
+The confirmed priority sequence for Phase 5 is:
 
-1. **Strategy Registry** — a DB-backed catalog tracking each strategy's id,
-   config path, status (backtesting/paper/live/archived), and performance
-   metadata. Activation means passing `--strategy-config` for a registered
-   strategy; deactivation is a status update, not a code deletion.
+1. **Strategy Registry** — **COMPLETE (M5.1, 2026-06-23).** DB-backed catalog with
+   status lifecycle, C7/C8 enforcement, adversarial-review-hardened.
 2. **Trading journal** (`execution/oms/trade_history.py`) — **COMPLETE (M5.2,
    2026-06-23).** Append-only fill store with FIFO P&L and wash-sale history.
    `_check_wash_sale` compliance rule is now live (no longer a dead letter).
-3. **Tearsheets with charting output** — unified backtest + paper performance;
-   visual entry/exit charts so signals can be eyeballed against price history.
-4. **Airflow DAG** — fully automated daily paper-trading pipeline (data refresh
-   → scoring → target → candidates → risk/compliance → blotter → dashboard
-   blotter-review approval gate → submit → reconcile → ledger). DAG pauses
-   at the approval gate; operator reviews the blotter in the dashboard,
-   selects which orders to submit (per-order checkboxes), and double-confirms.
-   C1 is satisfied via the F7.4 dashboard UI — same flow for paper and live.
+3. **Tearsheets with charting output** — **COMPLETE (M5.3, 2026-06-24).**
+   `reporting/tearsheets/` with 17 metrics, 9 chart builders (equity curve,
+   drawdown, monthly heatmap, rolling Sharpe, annual returns, return distribution,
+   position concentration, transaction costs, trade entry/exit overlays), HTML +
+   PNG output. 98 tests. Wire into `BacktestLogger.log_run()` still pending.
+4. **Airflow DAG** — **COMPLETE (M5.4, 2026-06-25).** `airflow/dags/daily_paper_trading.py`
+   — 13-task pipeline with `BlotterApprovalSensor` (SHA-256 C1 gate),
+   `scripts/paper_approve_blotter.py` CLI bridge, and `blotter_approvals` DB migration.
+   42 tests. The `fetch_ibkr_snapshot` task replaces the manual local JSON snapshot
+   used in the Phase 4 manual workflow.
 5. **4-week automated paper-trading qualification** — runs on top of the Airflow
    DAG; required before any live-capital discussion (C8).
-6. **Additional strategies** — new signal modules (technical analysis, additional
-   fundamental combos) + new strategy YAML configs (v3+). Strategies are
-   config-driven, not independent codebases; new strategies share all
-   infrastructure and differ only in signal weights and portfolio parameters.
+6. **Additional strategies** — **IN PROGRESS (M5.6).** New individual indicators and
+   composite signals (`signals/indicators/`, `signals/composites/`) + new strategy
+   YAML configs (v3+). Strategies are config-driven: a strategy YAML declares which
+   named signals (individual indicators, composites, or a mix) to use and at what
+   weights, plus portfolio construction parameters. New strategies share all
+   infrastructure and differ only in those declarations. Composites may combine
+   signals within a single category or across categories (e.g., a growth + momentum
+   composite) and are referenced by strategies exactly like any other signal.
+   21 composite signals across 8 groups are built on branch
+   `claude/trading-strategies-indicators-krxubp` pending merge.
 7. **Market regime detector** — classify current regime (bull/bear/high-vol/
    mean-reverting) and surface which strategy mix is best suited to each.
 8. **Streamlit dashboard + monitor/report skills** — real-time positions, risk,
@@ -132,7 +151,7 @@ These are non-negotiable. If you are ever about to violate one, stop and ask the
 rqis/
 ├── .claude/skills/        ← Claude Code skill definitions (11 skills)
 ├── data/                  ← Data ingestion, normalization, storage
-├── signals/               ← Factor library, signal research, scoring
+├── signals/               ← Signal library: indicators/, composites/, scoring/, research/
 ├── portfolio/             ← Optimization, risk model, rebalancing
 ├── execution/             ← OMS, brokers, algos, transaction costs
 ├── risk/                  ← Real-time risk, alerts, circuit breaker
@@ -148,6 +167,15 @@ rqis/
 ```
 
 Full directory tree with file-level detail: `PRD.md` Section 5.
+
+**Signal architecture (2-tier):** `signals/indicators/` contains atomic signals organized
+by category (momentum, value, quality, growth, volatility, volume, moving_averages,
+oscillators, size, sentiment). `signals/composites/` contains named composite signals —
+pre-built blends of two or more indicators, which may span categories (e.g., PE ratio +
+momentum). Both individual indicators and composites are first-class signals: strategies
+reference them identically by name in YAML config, and the scorer weights them the same way.
+There is no mandatory intermediate composite layer. The scorer validates that a strategy
+does not reference both a composite and any of its constituent indicators simultaneously.
 
 ---
 
@@ -524,9 +552,10 @@ roughly in late 2018 so the 273-trading-day momentum lookback is available.
 
 ---
 
-## MCP servers (not yet built — Phase 0)
+## MCP servers (not yet built — deferred to Phase 5+)
 
-When built, these servers expose RQIS APIs to Claude skills:
+The `mcp_servers/` directory exists but contains only a stub `__init__.py`.
+When built, these servers will expose RQIS APIs to Claude skills:
 
 | Server | Module | Key tools |
 |--------|--------|-----------|
@@ -538,21 +567,22 @@ When built, these servers expose RQIS APIs to Claude skills:
 
 ## The 11 Claude skills
 
-Defined in `.claude/skills/*.md` (not yet created — Phase 0).
+Defined in `.claude/skills/*.md`. 8 of 11 are implemented; `data_fetch`, `monitor`,
+and `report` are pending (deferred to M5.8 Streamlit dashboard).
 
-| Skill | Safe to run autonomously? | Touches broker? |
-|-------|--------------------------|-----------------|
-| `data_fetch` | Yes | No |
-| `signal_research` | Yes | No |
-| `screen` | Yes | No |
-| `score` | Yes | No |
-| `portfolio_construct` | Yes (output is STAGED orders only) | No |
-| `risk_check` | Yes | No |
-| `execute_trade` | **No — requires `"YES"` confirmation** | **Yes** |
-| `backtest` | Yes | No |
-| `attribute` | Yes | No |
-| `report` | Yes | No |
-| `monitor` | Yes (read-only) | No |
+| Skill | Status | Safe to run autonomously? | Touches broker? |
+|-------|--------|--------------------------|-----------------|
+| `data_fetch` | Pending | Yes | No |
+| `signal_research` | **Built** | Yes | No |
+| `screen` | **Built** | Yes | No |
+| `score` | **Built** | Yes | No |
+| `portfolio_construct` | **Built** | Yes (output is STAGED orders only) | No |
+| `risk_check` | **Built** | Yes | No |
+| `execute_trade` | **Built** | **No — requires dashboard blotter approval (C1)** | **Yes** |
+| `backtest` | **Built** | Yes | No |
+| `attribute` | **Built** | Yes | No |
+| `report` | Pending | Yes | No |
+| `monitor` | Pending | Yes (read-only) | No |
 
 ---
 

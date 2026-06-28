@@ -84,7 +84,7 @@ def run(
     snapshots=None,  # injectable for testing; None → construct from env vars
 ) -> None:
     from data.storage.timescale_writer import TimescaleWriter
-    from signals.indicators.momentum import compute_momentum_scores
+    from signals.composites.momentum_score import compute_momentum_scores
     from signals.scoring.scorer import combine_factor_scores
 
     if snapshots is None:
