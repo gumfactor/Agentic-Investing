@@ -58,6 +58,14 @@ from signals.composites._blend import blend_scores
 logger = structlog.get_logger(__name__)
 
 
+def _cs_normalize(s: pd.Series) -> pd.Series:
+    """Cross-sectional z-score per date group; returns zeros for tied values, preserves NaN."""
+    std = s.std(ddof=1)
+    if pd.isna(std) or std == 0:
+        return s * 0.0
+    return (s - s.mean()) / std
+
+
 def compute_quality_dip_scores(
     quality_scores: pd.DataFrame,
     rsi_raw_scores: pd.DataFrame,
@@ -118,6 +126,12 @@ def compute_quality_dip_scores(
     merged = merged.copy()
     merged["_rsi_oversold"] = -merged["rsi_14_raw"]
     merged["_price_depressed"] = -merged["rolling_zscore_252d_raw"]
+
+    # Cross-sectionally normalize raw oscillators per date so RSI's 0–100 scale
+    # does not overwhelm the unit-normal quality_score in the weighted blend.
+    # Without this step, RSI variance (~20× larger) renders quality_weight ineffective.
+    for _col in ("_rsi_oversold", "_price_depressed"):
+        merged[_col] = merged.groupby("date")[_col].transform(_cs_normalize)
 
     weights = {
         "quality_score": quality_weight,
