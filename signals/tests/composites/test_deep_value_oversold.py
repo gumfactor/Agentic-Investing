@@ -79,7 +79,7 @@ def test_cross_sectional_zscore_per_date():
 def test_near_lower_band_boosts_score():
     """A ticker with low %B (near lower Bollinger band) should score higher than
     one near the upper band, given equal value."""
-    val = _make("value_score", {DATES[0]: _z([3, 3, 3, 3, 3])})  # all equal
+    val = _make("value_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})  # all equal (at cross-sectional mean)
     rsi = _make("rsi_14_raw", {DATES[0]: [50, 50, 50, 50, 50]})  # all equal
     bb = _make("bb_pct_b_20_raw", {DATES[0]: [0.05, 0.2, 0.5, 0.7, 0.95]})  # A near lower, E near upper
     r = compute_deep_value_oversold_scores(val, rsi, bb)

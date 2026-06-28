@@ -80,8 +80,8 @@ def test_cross_sectional_zscore_per_date():
 def test_below_mean_boosts_score():
     """Lower bb_z_score (price further below 20-day mean) should boost the
     composite score, given equal reversal signals."""
-    rev1m = _make("reversal_1m_score", {DATES[0]: _z([3, 3, 3, 3, 3])})   # all equal
-    rev1w = _make("reversal_1w_score", {DATES[0]: _z([3, 3, 3, 3, 3])})   # all equal
+    rev1m = _make("reversal_1m_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})   # all equal (at cross-sectional mean)
+    rev1w = _make("reversal_1w_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})   # all equal (at cross-sectional mean)
     bb = _make("bb_z_score_20_score", {DATES[0]: _z([1, 2, 3, 4, 5])})    # A = most below mean
     r = compute_short_term_reversal_scores(rev1m, rev1w, bb)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["short_term_reversal_score"]

@@ -79,8 +79,8 @@ def test_cross_sectional_zscore_per_date():
 def test_low_vol_boosts_score():
     """Lower realized_vol_21d_score (less volatile) should boost composite
     score, given equal size and quality signals."""
-    mktcap = _make("log_market_cap_score", {DATES[0]: _z([3, 3, 3, 3, 3])})
-    qual = _make("quality_score", {DATES[0]: _z([3, 3, 3, 3, 3])})
+    mktcap = _make("log_market_cap_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})
+    qual = _make("quality_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})
     vol = _make("realized_vol_21d_score", {DATES[0]: _z([1, 2, 3, 4, 5])})  # A = lowest vol
     r = compute_small_cap_quality_scores(mktcap, qual, vol)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["small_cap_quality_score"]

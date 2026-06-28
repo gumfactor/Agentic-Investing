@@ -84,7 +84,7 @@ def test_top_rs_on_all_tops_composite():
 def test_strong_12m_rs_boosts_score():
     """Equal 3m RS and MA slope: stronger 12m RS → higher composite."""
     rs12 = _make("rel_strength_vs_spy_12m_score", {DATES[0]: _z([5, 4, 3, 2, 1])})
-    equal = {DATES[0]: _z([3, 3, 3, 3, 3])}
+    equal = {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]}
     r = compute_relative_strength_scores(rs12, _rs_3m(equal), _ma_slope(equal))
     scores = r[r["date"] == DATES[0]].set_index("ticker")["relative_strength_score"]
     assert scores["A"] > scores["E"]

@@ -83,7 +83,7 @@ def test_top_on_all_tops_composite():
 
 def test_momentum_confirms_growth():
     """Equal growth but strong momentum + EPS acceleration should lift rank."""
-    growth = _make("growth_score", {DATES[0]: _z([3, 3, 3, 3, 3])})   # all equal
+    growth = _make("growth_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})   # all equal (at cross-sectional mean)
     mom = _make("vol_adjusted_mom_12m_score", {DATES[0]: _z([5, 4, 3, 2, 1])})    # A = best
     accel = _make("eps_growth_acceleration_score", {DATES[0]: _z([5, 4, 3, 2, 1])})  # A = best
     r = compute_growth_momentum_scores(growth, mom, accel)

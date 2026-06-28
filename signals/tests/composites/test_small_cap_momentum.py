@@ -93,7 +93,7 @@ def test_smallest_best_momentum_tops():
 def test_strong_vol_mom_boosts_score():
     """Equal size and relative strength: stronger vol-adj momentum → higher score."""
     vol_mom = _make("vol_adjusted_mom_12m_score", {DATES[0]: _z([5, 4, 3, 2, 1])})
-    equal = {DATES[0]: _z([3, 3, 3, 3, 3])}
+    equal = {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]}
     r = compute_small_cap_momentum_scores(_mktcap(equal), vol_mom, _rs_12m(equal))
     scores = r[r["date"] == DATES[0]].set_index("ticker")["small_cap_momentum_score"]
     assert scores["A"] > scores["E"]
@@ -102,7 +102,7 @@ def test_strong_vol_mom_boosts_score():
 def test_strong_rs_boosts_score():
     """Equal size and vol-adj momentum: stronger relative strength → higher score."""
     rs = _make("rel_strength_vs_spy_12m_score", {DATES[0]: _z([5, 4, 3, 2, 1])})
-    equal = {DATES[0]: _z([3, 3, 3, 3, 3])}
+    equal = {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]}
     r = compute_small_cap_momentum_scores(_mktcap(equal), _vol_mom(equal), rs)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["small_cap_momentum_score"]
     assert scores["A"] > scores["E"]

@@ -92,7 +92,7 @@ def test_worst_breakout_bottom():
 def test_near_52w_high_boosts_score():
     """Equal Donchian and MA cross: higher 52w high proximity → higher score."""
     high = _make("price_vs_52w_high_score", {DATES[0]: _z([5, 4, 3, 2, 1])})
-    equal = {DATES[0]: _z([3, 3, 3, 3, 3])}
+    equal = {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]}
     r = compute_breakout_momentum_scores(
         high,
         _donchian(equal), _ma_cross(equal),

@@ -79,8 +79,8 @@ def test_low_drawdown_boosts_score():
     """A ticker with a lower drawdown score (less severe drawdown) should
     score higher than one with a higher drawdown score, given equal value
     and Sharpe."""
-    val = _make("value_score", {DATES[0]: _z([3, 3, 3, 3, 3])})           # all equal
-    sharpe = _make("sharpe_ratio_252d_score", {DATES[0]: _z([3, 3, 3, 3, 3])})  # all equal
+    val = _make("value_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})           # all equal (at cross-sectional mean)
+    sharpe = _make("sharpe_ratio_252d_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})  # all equal (at cross-sectional mean)
     dd = _make("max_drawdown_63d_score", {DATES[0]: _z([1, 2, 3, 4, 5])})  # A = smallest drawdown
     r = compute_risk_adjusted_value_scores(val, sharpe, dd)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["risk_adjusted_value_score"]

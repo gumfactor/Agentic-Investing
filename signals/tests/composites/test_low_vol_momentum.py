@@ -78,8 +78,8 @@ def test_cross_sectional_zscore_per_date():
 def test_low_vol_boosts_score():
     """A ticker with lower realized vol should score higher than one with
     higher vol, given equal vol-adjusted momentum and Sortino."""
-    mom = _make("vol_adjusted_mom_12m_score", {DATES[0]: _z([3, 3, 3, 3, 3])})  # all equal
-    sortino = _make("sortino_ratio_63d_score", {DATES[0]: _z([3, 3, 3, 3, 3])})  # all equal
+    mom = _make("vol_adjusted_mom_12m_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})  # all equal (at cross-sectional mean)
+    sortino = _make("sortino_ratio_63d_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})  # all equal (at cross-sectional mean)
     vol = _make("realized_vol_21d_score", {DATES[0]: _z([1, 2, 3, 4, 5])})  # A = least volatile
     r = compute_low_vol_momentum_scores(mom, vol, sortino)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["low_vol_momentum_score"]

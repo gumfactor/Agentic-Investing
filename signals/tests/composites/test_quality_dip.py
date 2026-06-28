@@ -83,7 +83,7 @@ def test_oversold_boosts_score():
     """A ticker with high quality AND low RSI (oversold) should outscore
     the same quality ticker with a high RSI (overbought)."""
     # A and E both have middling quality; A is oversold (RSI=25), E is overbought (RSI=75)
-    qual = _make("quality_score", {DATES[0]: _z([3, 3, 3, 3, 3])})  # all equal
+    qual = _make("quality_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})  # all equal (at cross-sectional mean)
     rsi = _make("rsi_14_raw", {DATES[0]: [25, 40, 50, 60, 75]})     # A oversold, E overbought
     zsc = _make("rolling_zscore_252d_raw", {DATES[0]: [-2.0, -1.0, 0.0, 0.5, 1.0]})
     r = compute_quality_dip_scores(qual, rsi, zsc)

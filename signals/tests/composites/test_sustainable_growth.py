@@ -85,8 +85,8 @@ def test_top_on_all_tops_composite():
 
 def test_high_quality_boosts_equally_growing():
     """Two tickers with equal growth: higher quality should win."""
-    growth = _make("growth_score", {DATES[0]: _z([3, 3, 3, 3, 3])})      # all equal
-    roic = _make("roic_improvement_yoy_score", {DATES[0]: _z([3, 3, 3, 3, 3])})  # all equal
+    growth = _make("growth_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})      # all equal (at cross-sectional mean)
+    roic = _make("roic_improvement_yoy_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})  # all equal (at cross-sectional mean)
     quality = _make("quality_score", {DATES[0]: _z([5, 4, 3, 2, 1])})    # A = highest
     r = compute_sustainable_growth_scores(growth, quality, roic)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["sustainable_growth_score"]
@@ -95,8 +95,8 @@ def test_high_quality_boosts_equally_growing():
 
 def test_high_roic_improvement_boosts_equally_growing():
     """Two tickers with equal growth and quality: higher ROIC improvement should win."""
-    growth = _make("growth_score", {DATES[0]: _z([3, 3, 3, 3, 3])})
-    quality = _make("quality_score", {DATES[0]: _z([3, 3, 3, 3, 3])})
+    growth = _make("growth_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})
+    quality = _make("quality_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})
     roic = _make("roic_improvement_yoy_score", {DATES[0]: _z([5, 4, 3, 2, 1])})  # A = best
     r = compute_sustainable_growth_scores(growth, quality, roic)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["sustainable_growth_score"]

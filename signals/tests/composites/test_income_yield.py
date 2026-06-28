@@ -101,7 +101,7 @@ def test_lowest_yield_across_all_bottom():
 def test_high_shareholder_yield_boosts_score():
     """Equal dividend and buyback: higher shareholder yield → higher composite."""
     shy = _make("shareholder_yield_score", {DATES[0]: _z([5, 4, 3, 2, 1])})
-    equal = {DATES[0]: _z([3, 3, 3, 3, 3])}
+    equal = {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]}
     r = compute_income_yield_scores(shy, _div_yield(equal), _bb_yield(equal))
     scores = r[r["date"] == DATES[0]].set_index("ticker")["income_yield_score"]
     assert scores["A"] > scores["E"]
@@ -110,7 +110,7 @@ def test_high_shareholder_yield_boosts_score():
 def test_high_dividend_yield_boosts_score():
     """Equal shareholder and buyback: higher dividend yield → higher composite."""
     divy = _make("dividend_yield_score", {DATES[0]: _z([5, 4, 3, 2, 1])})
-    equal = {DATES[0]: _z([3, 3, 3, 3, 3])}
+    equal = {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]}
     r = compute_income_yield_scores(_sh_yield(equal), divy, _bb_yield(equal))
     scores = r[r["date"] == DATES[0]].set_index("ticker")["income_yield_score"]
     assert scores["A"] > scores["E"]

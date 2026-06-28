@@ -78,8 +78,8 @@ def test_cross_sectional_zscore_per_date():
 def test_low_beta_boosts_score():
     """A ticker with lower beta should score higher than one with higher
     beta, given equal quality and up/down vol ratio."""
-    qual = _make("quality_score", {DATES[0]: _z([3, 3, 3, 3, 3])})          # all equal
-    up_down = _make("up_down_vol_ratio_63d_score", {DATES[0]: _z([3, 3, 3, 3, 3])})  # all equal
+    qual = _make("quality_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})          # all equal (at cross-sectional mean)
+    up_down = _make("up_down_vol_ratio_63d_score", {DATES[0]: [0.0, 0.0, 0.0, 0.0, 0.0]})  # all equal (at cross-sectional mean)
     beta = _make("beta_252d_score", {DATES[0]: _z([1, 2, 3, 4, 5])})         # A = lowest beta
     r = compute_defensive_quality_scores(qual, beta, up_down)
     scores = r[r["date"] == DATES[0]].set_index("ticker")["defensive_quality_score"]
