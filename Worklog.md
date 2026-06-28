@@ -13,6 +13,65 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-28
 
+### Session 45 — Roadmap: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** none (roadmap/documentation only)
+
+---
+
+#### What was done
+
+Reviewed an external backtesting framework (9,000+ backtest sweep across 30
+assets, 15 years) and compared its methodology against RQIS. Conclusion: RQIS
+is already architecturally ahead on walk-forward validation, multiple-testing
+corrections (DSR, BH-FDR), signal richness, risk management, and
+cross-sectional design. Three meaningful gaps were identified and added to the
+roadmap as M5.65.
+
+#### [DECISION] Add M5.65 Backtesting Validation Suite before M5.7 Regime Detector
+
+**Rationale:** Regime detection is a production routing layer — it decides which
+validated strategy to apply in each market condition. It is premature to build
+that layer before knowing which strategies are actually robust. M5.65 provides
+the quality-control mechanisms needed to declare a strategy hardened:
+
+1. **Parameter sensitivity sweep** (`backtesting/validation/parameter_sensitivity.py`)
+   — runs a parameter grid for each strategy and checks dispersion of OOS Sharpe
+   across variants. A strategy that only survives at one magic setting is a
+   curve-fit artifact and must be rejected before it enters the paper-trading
+   qualification.
+
+2. **Bootstrap stress test** (`backtesting/validation/bootstrap_stress.py`)
+   — reshuffles each surviving strategy's OOS daily return sequence 500 times to
+   build a distribution of equity paths. Reports 5th/50th/95th percentile Sharpe
+   and worst-case drawdown. Catches strategies whose good performance depended on
+   a specific lucky ordering of trades — a failure mode that walk-forward alone
+   does not detect.
+
+3. **Survival funnel / validation gate** (`backtesting/validation/survival_funnel.py`)
+   — a formal configurable pass/fail pipeline (OOS Sharpe > 0.5, max DD < -35%,
+   OOS Sharpe < 2.5, OOS/IS gap < 30%, minimum trade count, IS Sharpe positive)
+   that a strategy must clear before being promoted to VALIDATED in the Strategy
+   Registry. Integrates with `BacktestLogger.log_run()` so gate results are
+   recorded in MLflow alongside backtest metrics.
+
+**Sequencing:** M5.65 is inserted between M5.6 (Additional signal library) and
+M5.7 (Market regime detector). The regime detector is explicitly deferred until
+M5.65 identifies the hardened strategy set it will switch between.
+
+**Observation from the external framework review:** The referenced system found
+that mean-reversion strategies survive broad testing while trend/momentum is
+situational. RQIS's current v1_base_momentum is cross-sectional (rank stocks
+against each other), not single-asset time-series momentum — which the external
+framework separately tested and found to score meaningfully better. So this is
+not a contradiction. But M5.65 parameter sweeps will empirically confirm which
+of our strategy configs actually hold up before committing to them for the
+4-week paper qualification.
+
+---
+
 ### Session 44 — Phase 5 M5.6: Composite Signal Library (Groups 4–8)
 
 **Operator:** mshane@thecanadalist.ca

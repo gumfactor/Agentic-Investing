@@ -117,8 +117,32 @@ The confirmed priority sequence for Phase 5 is:
    composite) and are referenced by strategies exactly like any other signal.
    21 composite signals across 8 groups are built on branch
    `claude/trading-strategies-indicators-krxubp` pending merge.
-7. **Market regime detector** — classify current regime (bull/bear/high-vol/
+7. **Backtesting validation suite (M5.65)** — three quality-control additions to
+   the backtest engine required before strategies can be considered hardened.
+   Sequence matters: identify robust strategies first, then add regime switching
+   to move between them.
+   - **Parameter sensitivity sweep** — for each strategy, run a configurable grid
+     of parameter variants (e.g., RSI lookback 10/14/20, momentum window 3m/6m/12m)
+     and report mean, std, and positive-fraction of OOS Sharpe across configs. A
+     strategy that only survives at one magic setting is flagged as curve-fit and
+     rejected. Lives in `backtesting/validation/parameter_sensitivity.py`.
+   - **Bootstrap stress test** — for each surviving strategy, reshuffle the
+     out-of-sample daily return sequence N times (default 500) to build a
+     distribution of equity paths. Report 5th/50th/95th percentile Sharpe and
+     worst-case drawdown across reshuffles. Strategies whose worst-case drawdown
+     is unacceptable are flagged fragile. Lives in
+     `backtesting/validation/bootstrap_stress.py`.
+   - **Survival funnel / validation gate** — a formal configurable pass/fail
+     pipeline (OOS Sharpe > 0.5, max DD < -35%, OOS Sharpe < 2.5 to exclude
+     lucky artifacts, OOS/IS Sharpe gap < 30%, minimum trade count, IS Sharpe
+     positive) that a strategy must clear before being promoted to `VALIDATED`
+     status in the Strategy Registry. Lives in
+     `backtesting/validation/survival_funnel.py`. Integrates with
+     `BacktestLogger.log_run()` so gate results are recorded in MLflow alongside
+     the backtest metrics.
+8. **Market regime detector** — classify current regime (bull/bear/high-vol/
    mean-reverting) and surface which strategy mix is best suited to each.
+   Deferred until M5.65 identifies the hardened strategy set to switch between.
 8. **Streamlit dashboard + monitor/report skills** — real-time positions, risk,
    PnL; blotter approval UI with per-order selection and double confirmation
    (F7.4 — universal C1 gate, replaces CLI confirmation for all scenarios).
