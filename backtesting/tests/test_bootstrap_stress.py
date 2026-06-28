@@ -184,3 +184,11 @@ def test_max_drawdown_with_drop():
     arr = np.array([0.1, -0.2, 0.1])
     dd = _max_drawdown(arr)
     assert dd < 0.0
+
+
+def test_max_drawdown_includes_initial_peak():
+    """Losses from the very start must be measured from 1.0, not the first post-loss value."""
+    arr = np.array([-0.10, -0.10])
+    dd = _max_drawdown(arr)
+    # cumulative: [0.90, 0.81]; true drawdown from 1.0 is ≈ -19%, not -10%
+    assert dd == pytest.approx(-0.19, rel=1e-3)

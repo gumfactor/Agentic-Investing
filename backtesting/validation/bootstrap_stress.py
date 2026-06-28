@@ -143,8 +143,14 @@ def _annualised_sharpe(returns: np.ndarray) -> float:
 
 
 def _max_drawdown(returns: np.ndarray) -> float:
-    """Maximum drawdown of a return sequence.  Assumes all returns > -1.0."""
+    """Maximum drawdown of a return sequence.  Assumes all returns > -1.0.
+
+    The initial equity is treated as 1.0 (the peak before any returns arrive),
+    so a path that opens with losses correctly captures the drawdown from
+    starting capital — e.g. [-0.10, -0.10] reports ≈ -19%, not -10%.
+    """
     cumulative = np.cumprod(1.0 + returns)
-    rolling_max = np.maximum.accumulate(cumulative)
+    # Anchor the running peak at 1.0 (starting capital) before any compounding.
+    rolling_max = np.maximum(np.maximum.accumulate(cumulative), 1.0)
     dd = cumulative / rolling_max - 1.0
     return float(dd.min())
