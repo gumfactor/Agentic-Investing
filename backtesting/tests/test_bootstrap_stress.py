@@ -137,6 +137,20 @@ def test_single_observation_raises():
         bootstrap_stress(pd.Series([0.01]))
 
 
+def test_total_loss_return_raises():
+    """A daily return of -1.0 (total loss) must raise ValueError, not silently NaN."""
+    returns = pd.Series([0.01, -1.0, 0.02])
+    with pytest.raises(ValueError, match="-1.0"):
+        bootstrap_stress(returns)
+
+
+def test_worse_than_total_loss_raises():
+    """Return < -1.0 is mathematically invalid for a portfolio."""
+    returns = pd.Series([0.01, -1.5, 0.02])
+    with pytest.raises(ValueError, match="-1.0"):
+        bootstrap_stress(returns)
+
+
 def test_nan_values_are_dropped():
     returns = pd.Series([0.01, float("nan"), 0.02, float("nan"), 0.005])
     result = bootstrap_stress(returns, n_reshuffles=50, seed=0)

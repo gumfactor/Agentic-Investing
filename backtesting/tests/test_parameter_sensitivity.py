@@ -325,7 +325,94 @@ def test_to_dataframe_columns_and_row_count():
     df = result.to_dataframe()
     assert len(df) == 2
     assert "portfolio.n_long" in df.columns
+    assert "status" in df.columns
     assert "oos_sharpe" in df.columns
     assert "oos_max_drawdown" in df.columns
     assert "trade_count" in df.columns
     assert "avg_is_sharpe" in df.columns
+
+
+def test_to_dataframe_empty_rows():
+    """to_dataframe() on an empty result must return an empty DataFrame without raising."""
+    result = ParameterSensitivityResult(
+        base_config_name="empty",
+        param_grid={"portfolio.n_long": [2]},
+        configs_tested=0,
+        rows=[],
+    )
+    df = result.to_dataframe()
+    assert len(df) == 0
+
+
+def test_to_dataframe_status_column():
+    """Errored rows (NaN oos_sharpe) must show status='error', not status='ok'."""
+    result = ParameterSensitivityResult(
+        base_config_name="test",
+        param_grid={"portfolio.n_long": [2, 3]},
+        configs_tested=2,
+        rows=[
+            ParameterSensitivityRow(
+                params={"portfolio.n_long": 2},
+                oos_sharpe=0.8,
+                oos_max_drawdown=-0.15,
+                trade_count=20,
+                avg_is_sharpe=0.9,
+            ),
+            ParameterSensitivityRow(
+                params={"portfolio.n_long": 3},
+                oos_sharpe=float("nan"),
+                oos_max_drawdown=float("nan"),
+                trade_count=0,
+                avg_is_sharpe=float("nan"),
+            ),
+        ],
+    )
+    df = result.to_dataframe()
+    assert df.iloc[0]["status"] == "ok"
+    assert df.iloc[1]["status"] == "error"
+
+
+def test_single_variant_grid_produces_robust_verdict():
+    """A single-variant grid skips the std gate and can legitimately return 'robust'."""
+    handler = _make_handler()
+    dates = _make_trading_dates(900)
+    config = _base_config(dates)
+    sweeper = ParameterSweeper(
+        fill_simulator=FillSimulator(fill_model="perfect"),
+        min_positive_fraction=0.0,  # accept any result as positive-fraction-wise passing
+    )
+    result = sweeper.sweep(
+        base_config=config,
+        param_grid={"portfolio.n_long": [3]},  # single variant
+        data_handler=handler,
+        n_folds=2,
+        train_years=1.5,
+        test_months=6,
+    )
+    assert result.configs_tested == 1
+    assert result.std_oos_sharpe == 0.0
+
+
+def test_all_nan_sweep_returns_curve_fit():
+    """When all variants raise RuntimeError, the result is curve_fit with n_valid=0."""
+    from unittest.mock import patch, MagicMock
+    handler = _make_handler()
+    dates = _make_trading_dates(900)
+    config = _base_config(dates)
+    sweeper = ParameterSweeper(fill_simulator=FillSimulator(fill_model="perfect"))
+    with patch(
+        "backtesting.validation.parameter_sensitivity.WalkForwardValidator.run",
+        side_effect=RuntimeError("Simulated engine failure"),
+    ):
+        result = sweeper.sweep(
+            base_config=config,
+            param_grid={"portfolio.n_long": [2, 3]},
+            data_handler=handler,
+            n_folds=2,
+            train_years=1.5,
+            test_months=6,
+        )
+    assert result.curve_fit_flag is True
+    assert result.verdict == "curve_fit"
+    assert result.positive_fraction == 0.0
+    assert all(math.isnan(row.oos_sharpe) for row in result.rows)

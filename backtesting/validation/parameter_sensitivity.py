@@ -94,12 +94,15 @@ class ParameterSensitivityResult:
     def to_dataframe(self) -> "pd.DataFrame":
         """Return per-variant results as a DataFrame for easy analysis.
 
-        Columns: one column per param key, then oos_sharpe, oos_max_drawdown,
-        trade_count, avg_is_sharpe.  Rows are sorted by oos_sharpe descending.
+        Columns: one column per param key, then status ("ok" / "error"),
+        oos_sharpe, oos_max_drawdown, trade_count, avg_is_sharpe.  Rows are
+        sorted by oos_sharpe descending with errored variants (NaN) at the
+        bottom so they are distinguishable from legitimately negative Sharpes.
         """
         records = []
         for row in self.rows:
             record = dict(row.params)
+            record["status"] = "ok" if math.isfinite(row.oos_sharpe) else "error"
             record["oos_sharpe"] = row.oos_sharpe
             record["oos_max_drawdown"] = row.oos_max_drawdown
             record["trade_count"] = row.trade_count
@@ -107,7 +110,7 @@ class ParameterSensitivityResult:
             records.append(record)
         df = pd.DataFrame(records)
         if not df.empty:
-            df = df.sort_values("oos_sharpe", ascending=False, ignore_index=True)
+            df = df.sort_values("oos_sharpe", ascending=False, na_position="last", ignore_index=True)
         return df
 
 
@@ -237,6 +240,23 @@ class ParameterSweeper:
         mean_sharpe = float(np.mean(finite_sharpes)) if n_valid else float("nan")
         std_sharpe = float(np.std(finite_sharpes, ddof=1)) if n_valid > 1 else 0.0
         pos_frac = float(sum(s > 0 for s in finite_sharpes) / n_valid) if n_valid else 0.0
+
+        if n_valid == 0:
+            logger.warning(
+                "parameter_sweep_all_variants_failed",
+                strategy=base_config.get("name", "unknown"),
+                n_combos=len(combos),
+            )
+        elif n_valid == 1:
+            logger.warning(
+                "parameter_sweep_single_valid_variant",
+                strategy=base_config.get("name", "unknown"),
+                detail=(
+                    "Only one variant produced a finite OOS Sharpe; the std gate "
+                    "is skipped and the positive-fraction gate has no statistical power. "
+                    "Expand the param_grid for a meaningful robustness assessment."
+                ),
+            )
 
         curve_fit_flag = (
             pos_frac < self._min_positive_fraction

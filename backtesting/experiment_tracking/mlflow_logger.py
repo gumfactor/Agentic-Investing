@@ -16,7 +16,9 @@ Usage::
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -169,6 +171,10 @@ class BacktestLogger:
         Returns:
             MLflow run_id string.
         """
+        # data_version for walk-forward runs lives in the config dict (via
+        # BacktestEngine, which reads config["data_version"] and stores it on
+        # BacktestResult).  log_run() reads result.data_version instead, but
+        # both ultimately come from the same config field.
         data_version = (wf_result.config.get("data_version") or "").strip()
         if not data_version:
             raise ValueError(
@@ -176,10 +182,12 @@ class BacktestLogger:
                 "Set config['data_version'] to the DVC version or MinIO snapshot ID."
             )
 
+        config_hash = _hash_config(wf_result.config)
         mlflow.set_experiment(experiment_name)
 
         with mlflow.start_run(run_name=run_name) as run:
             mlflow.set_tag("data_version", data_version)
+            mlflow.set_tag("config_hash", config_hash)
             mlflow.set_tag("strategy_name", config.get("name", "unknown"))
             mlflow.set_tag("strategy_version", str(config.get("version", "?")))
             mlflow.set_tag("run_type", "walk_forward")
@@ -191,14 +199,20 @@ class BacktestLogger:
             for key, value in wf_result.oos_metrics.items():
                 if value is None:
                     continue
-                if isinstance(value, float) and value != value:
+                if not math.isfinite(float(value)):
                     continue
                 mlflow.log_metric(f"oos.{key}", float(value))
 
             for i, fold in enumerate(wf_result.folds):
                 is_sharpe = fold.in_sample.metrics.get("sharpe")
-                if is_sharpe is not None and is_sharpe == is_sharpe:
+                if is_sharpe is not None and math.isfinite(float(is_sharpe)):
                     mlflow.log_metric(f"is.fold_{i}.sharpe", float(is_sharpe))
+                oos_sharpe = fold.out_of_sample.metrics.get("sharpe")
+                if oos_sharpe is not None and math.isfinite(float(oos_sharpe)):
+                    mlflow.log_metric(f"oos.fold_{i}.sharpe", float(oos_sharpe))
+                oos_dd = fold.out_of_sample.metrics.get("max_drawdown")
+                if oos_dd is not None and math.isfinite(float(oos_dd)):
+                    mlflow.log_metric(f"oos.fold_{i}.max_drawdown", float(oos_dd))
 
             if funnel_result is not None:
                 mlflow.set_tag("survival_funnel.passed", str(funnel_result.passed))
@@ -240,3 +254,9 @@ def _log_params_flat(config: dict, prefix: str = "") -> None:
             _log_params_flat(value, full_key)
         else:
             mlflow.log_param(full_key, str(value)[:500])
+
+
+def _hash_config(config: dict) -> str:
+    """SHA-256 of the canonically serialised config dict."""
+    serialised = json.dumps(config, sort_keys=True, default=str)
+    return hashlib.sha256(serialised.encode()).hexdigest()

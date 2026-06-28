@@ -100,6 +100,11 @@ def bootstrap_stress(
             f"oos_returns must have at least 2 non-NaN observations; "
             f"got {len(returns_arr)}."
         )
+    if np.any(returns_arr <= -1.0):
+        raise ValueError(
+            "oos_returns contains a value <= -1.0 (total portfolio loss in a single day). "
+            "_max_drawdown assumes all daily returns are > -1.0."
+        )
 
     rng = np.random.default_rng(seed)
     drawdowns: list[float] = []
@@ -138,6 +143,7 @@ def _annualised_sharpe(returns: np.ndarray) -> float:
 
 
 def _max_drawdown(returns: np.ndarray) -> float:
+    """Maximum drawdown of a return sequence.  Assumes all returns > -1.0."""
     cumulative = np.cumprod(1.0 + returns)
     rolling_max = np.maximum.accumulate(cumulative)
     dd = cumulative / rolling_max - 1.0

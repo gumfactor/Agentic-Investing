@@ -195,6 +195,12 @@ class SurvivalFunnel:
         )
 
     def _gate_is_oos_consistency(self, is_sharpe: float, oos_sharpe: float) -> FunnelGate:
+        # Denominator is |IS|, not |OOS| or the average — this is IS-centric.
+        # The same absolute gap is penalised more heavily when IS is small,
+        # which means OOS outperformance is flagged at a lower absolute threshold
+        # than IS outperformance of equal magnitude.  This is intentional: an
+        # unexpectedly good OOS window is a stronger signal of a lucky draw than
+        # an unexpectedly bad one (which could simply be mild overfitting).
         if _ok(is_sharpe) and _ok(oos_sharpe) and abs(is_sharpe) > 1e-6:
             gap = abs(is_sharpe - oos_sharpe) / abs(is_sharpe)
         else:
@@ -243,7 +249,12 @@ def avg_is_sharpe_from_wf(wf_result: "WalkForwardResult") -> float:
 
 
 def oos_trade_count_from_wf(wf_result: "WalkForwardResult") -> int:
-    """Count total OOS trades across all folds of a WalkForwardResult."""
+    """Count total OOS trades across all folds of a WalkForwardResult.
+
+    Counts rows in BacktestResult.trades, which the engine populates with one
+    row per completed logical trade (not per fill event).  If the engine ever
+    changes to fill-level granularity this function would overcount.
+    """
     dfs = [f.out_of_sample.trades for f in wf_result.folds if not f.out_of_sample.trades.empty]
     if not dfs:
         return 0
