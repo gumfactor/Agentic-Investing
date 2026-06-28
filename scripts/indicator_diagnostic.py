@@ -30,6 +30,7 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -143,6 +144,11 @@ def main(argv: list[str] | None = None) -> int:
         "--output",
         help="Optional path to write JSON report (e.g. local/indicator_diagnostic.json)",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit 1 if any factor raises a reliability or validity flag (default: always exit 0)",
+    )
     args = parser.parse_args(argv)
 
     start_date = date.fromisoformat(args.start_date) if args.start_date else None
@@ -158,8 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"INFO: loading factor_scores for strategy_id={args.strategy_id!r}", flush=True)
     try:
         factor_scores = _load_factor_scores(engine, args.strategy_id, start_date, end_date)
-    except Exception as exc:
-        print(f"FAIL: could not load factor_scores — {exc}")
+    except SQLAlchemyError as exc:
+        print(f"FAIL: database error loading factor_scores — {exc}")
         return 1
 
     if factor_scores.empty:
@@ -194,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nINFO: report written to {out_path}")
 
     n_warn = report.n_factors - report.n_reliable
-    return 1 if n_warn > 0 else 0
+    return 1 if (args.strict and n_warn > 0) else 0
 
 
 if __name__ == "__main__":

@@ -97,6 +97,7 @@ _CATEGORY_KEYWORDS: list[tuple[str, str]] = sorted(
         ("garp", "growth"),
         ("low_vol", "volatility"),
         ("volume", "volume"),
+        ("vol", "volatility"),
         ("value", "value"),
     ],
     key=lambda kv: -len(kv[0]),
@@ -196,6 +197,8 @@ class DiagnosticReport:
         validity: Cross-factor validity results.
         n_reliable: Number of factors that cleared all reliability checks.
         summary: One-line overall verdict.
+        min_within_category_corr: Threshold used to flag low within-category pairs.
+        max_cross_category_corr: Threshold used to flag high cross-category mean.
     """
 
     strategy_id: str
@@ -207,6 +210,8 @@ class DiagnosticReport:
     validity: ValidityResult
     n_reliable: int
     summary: str
+    min_within_category_corr: float
+    max_cross_category_corr: float
 
 
 # ─── Diagnostic engine ────────────────────────────────────────────────────────
@@ -313,6 +318,8 @@ class IndicatorDiagnostic:
             validity=validity,
             n_reliable=n_reliable,
             summary=summary,
+            min_within_category_corr=self._min_within_category_corr,
+            max_cross_category_corr=self._max_cross_category_corr,
         )
 
     # ─── Reliability ──────────────────────────────────────────────────────────
@@ -453,13 +460,14 @@ class IndicatorDiagnostic:
                     continue
                 abs_r = abs(r)
                 same_cat = categories[fi] == categories[fj]
-                known_cat = categories[fi] != "other"
+                fi_known = categories[fi] != "other"
+                fj_known = categories[fj] != "other"
 
-                if same_cat and known_cat:
+                if same_cat and fi_known:
                     within_corrs.append(abs_r)
                     if abs_r < self._min_within_category_corr:
                         low_within_pairs.append((fi, fj, r))
-                elif not same_cat:
+                elif not same_cat and fi_known and fj_known:
                     cross_corrs.append(abs_r)
 
                 if abs_r > self._high_corr_threshold:
@@ -574,12 +582,12 @@ def format_report(report: DiagnosticReport) -> str:
     if not math.isnan(v.within_category_mean):
         lines.append(
             f"Within-category mean |r| : {v.within_category_mean:.3f}"
-            f"  (target > {_MIN_WITHIN_CATEGORY_CORR})"
+            f"  (target > {report.min_within_category_corr})"
         )
     if not math.isnan(v.cross_category_mean):
         lines.append(
             f"Cross-category  mean |r| : {v.cross_category_mean:.3f}"
-            f"  (target < {_MAX_CROSS_CATEGORY_CORR})"
+            f"  (target < {report.max_cross_category_corr})"
         )
     if v.flags:
         lines.append("Flags:")
@@ -603,6 +611,17 @@ def _validate_input(df: pd.DataFrame) -> None:
         )
     if df.empty:
         raise ValueError("factor_scores DataFrame is empty")
+    n_dupes = df.duplicated(subset=["ticker", "score_date", "factor_name"]).sum()
+    if n_dupes > 0:
+        logger.warning(
+            "indicator_diagnostic_duplicate_rows",
+            n_duplicates=int(n_dupes),
+            msg=(
+                "Duplicate (ticker, score_date, factor_name) rows detected. "
+                "pivot_table will silently average them. "
+                "Deduplicate before running diagnostics for accurate results."
+            ),
+        )
 
 
 def _pivot_wide(factor_scores: pd.DataFrame, factors: list[str]) -> pd.DataFrame:

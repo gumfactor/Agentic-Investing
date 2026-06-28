@@ -108,6 +108,15 @@ def _make_factor_scores(
     ("sustainable_growth", "growth"),
     ("garp", "growth"),
     ("low_vol_score", "volatility"),
+    # Real volatility indicator names — must resolve to "volatility" via "vol" keyword
+    ("realized_vol_21d_score", "volatility"),
+    ("vol_percentile_252d_score", "volatility"),
+    ("idiosyncratic_vol_63d_score", "volatility"),
+    ("garman_klass_vol_21d_score", "volatility"),
+    ("atr_14_score", "other"),            # "atr" has no keyword match
+    ("downside_deviation_63d_score", "other"),  # no keyword match
+    # "volume" should not bleed into "volatility"
+    ("volume_score", "volume"),
     ("totally_unknown_factor", "other"),
 ])
 def test_infer_category(name: str, expected: str) -> None:
@@ -452,3 +461,69 @@ def test_format_report_shows_flags() -> None:
 
     assert "WARN" in text
     assert "!" in text
+
+
+def test_format_report_displays_actual_thresholds_not_module_constants() -> None:
+    # Three factors: two momentum (produces within-category pair) plus one value
+    # (produces cross-category pair). Both threshold lines must appear in the report.
+    df = _make_factor_scores({
+        "momentum_score": 0.85,
+        "breakout_momentum": 0.80,
+        "value_score": 0.75,
+    })
+    custom_within = 0.55
+    custom_cross = 0.45
+    diag = IndicatorDiagnostic(
+        min_within_category_corr=custom_within,
+        max_cross_category_corr=custom_cross,
+    )
+    report = diag.run(df, strategy_id="threshold_test")
+    text = format_report(report)
+
+    assert str(custom_within) in text
+    assert str(custom_cross) in text
+    assert report.min_within_category_corr == custom_within
+    assert report.max_cross_category_corr == custom_cross
+
+
+# ─── Validity: "other" category excluded from cross_corrs ────────────────────
+
+def test_other_category_factors_excluded_from_cross_category_mean() -> None:
+    # Build one known-category factor and one "other" factor
+    df_mom = _make_factor_scores({"momentum_score": 0.85}, seed=1)
+    df_unk = _make_factor_scores({"totally_unknown_xyz": 0.80}, seed=77)
+    combined = pd.concat([df_mom, df_unk], ignore_index=True)
+
+    diag = IndicatorDiagnostic()
+    report = diag.run(combined)
+
+    # "other" factors must not contribute to cross_category_mean
+    assert math.isnan(report.validity.cross_category_mean), (
+        "cross_category_mean should be NaN when one of the two factors is 'other'"
+    )
+
+
+def test_two_other_category_factors_produce_nan_cross_category_mean() -> None:
+    df1 = _make_factor_scores({"unknown_a": 0.80}, seed=10)
+    df2 = _make_factor_scores({"unknown_b": 0.80}, seed=20)
+    combined = pd.concat([df1, df2], ignore_index=True)
+
+    diag = IndicatorDiagnostic()
+    report = diag.run(combined)
+
+    assert math.isnan(report.validity.cross_category_mean)
+    assert math.isnan(report.validity.within_category_mean)
+
+
+# ─── Duplicate row warning ────────────────────────────────────────────────────
+
+def test_duplicate_rows_do_not_raise_but_complete(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+    df = _make_factor_scores({"momentum_score": 0.85})
+    df_duped = pd.concat([df, df.head(10)], ignore_index=True)
+
+    diag = IndicatorDiagnostic()
+    # Should not raise — duplicates are warned but not fatal
+    with caplog.at_level(logging.WARNING):
+        report = diag.run(df_duped)
+    assert report.n_factors == 1
