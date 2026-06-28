@@ -13,6 +13,265 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-28
 
+### Session 48 — Second Adversarial Review Fixes: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** `600fd7a`
+
+---
+
+#### What was done
+
+Ran a second adversarial review of the M5.65 validation suite. Found 7 more
+bugs, addressed all of them, and added 18 new tests. 85 tests now passing.
+
+**Bugs fixed:**
+
+1. **`bootstrap_stress.py`: `_max_drawdown` silently NaN on total-loss returns**
+   — `np.cumprod(1 + returns)` goes to 0 when any return is -1.0, then
+   `0 / rolling_max = NaN`. NaN propagates through `nanmin` and underreports
+   the worst-case drawdown. Fixed: `bootstrap_stress()` now raises `ValueError`
+   before the reshuffle loop if any return is ≤ -1.0.
+
+2. **`parameter_sensitivity.py`: all-NaN sweep logs misleading `std=0.0`**
+   — When every variant errors, `std_oos_sharpe` was logged as `0.0` (the
+   `n_valid <= 1` fallback), which looks like zero dispersion rather than
+   total failure. Added a distinct `parameter_sweep_all_variants_failed`
+   warning log.
+
+3. **`parameter_sensitivity.py`: single-variant grid silently passes std gate**
+   — With only one valid variant, the std gate is skipped unconditionally.
+   A typo in the param_grid that accidentally produces a 1-element list would
+   yield a `robust` verdict with no operator signal. Added a
+   `parameter_sweep_single_valid_variant` warning.
+
+4. **`parameter_sensitivity.py`: `to_dataframe()` NaN indistinguishable from negative Sharpe**
+   — Rows with errored (NaN) OOS Sharpe sorted to the bottom alongside real
+   negative results. Added a `status` column ("ok"/"error") and explicit
+   `na_position="last"` on `sort_values`.
+
+5. **`mlflow_logger.py`: `log_walk_forward_run` missing `config_hash` tag**
+   — Walk-forward runs could not be queried by config in MLflow. Added
+   SHA-256 hash of the config dict (same algorithm as `BacktestEngine`).
+
+6. **`mlflow_logger.py`: per-fold OOS metrics not logged**
+   — Fold-level OOS Sharpe and max drawdown were discarded, making it
+   impossible to diagnose regime instability (e.g., fold 0 Sharpe 1.5 vs
+   fold 2 Sharpe -0.3). Now logged as `oos.fold_{i}.sharpe` and
+   `oos.fold_{i}.max_drawdown`.
+
+7. **`mlflow_logger.py`: fragile NaN guard in `log_walk_forward_run`**
+   — `value != value` float idiom replaced with `math.isfinite()`, which
+   also guards Inf and matches the idiom in `survival_funnel._ok`.
+
+**Documentation improvements:**
+
+- `survival_funnel._gate_is_oos_consistency`: documented that the IS-centric
+  denominator is intentional (OOS outperformance penalised at a lower absolute
+  threshold — conservative stance on lucky OOS draws).
+- `survival_funnel.oos_trade_count_from_wf`: documented one-row-per-trade
+  assumption and the consequence if the engine ever records fill-level rows.
+- `mlflow_logger.log_walk_forward_run`: explained why `data_version` is read
+  from `wf_result.config` rather than a result attribute.
+
+**Test count: 85 passing** (up from 67).
+
+[DECISION] Treat `returns <= -1.0` in `bootstrap_stress` as a hard error rather
+than a silent NaN. Rationale: daily equity returns can never legitimately
+reach -100% (that would require total portfolio liquidation to zero in a single
+day). If such a value appears it indicates a data pipeline bug, not a legitimate
+return. Failing loudly surfaces the upstream error rather than masking it.
+
+---
+
+### Session 47 — Adversarial Review Fixes: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** `ec0b2d2`
+
+---
+
+#### What was done
+
+Applied all fixes from a single-agent adversarial review of the M5.65 validation
+suite. 67 tests now pass (up from 62).
+
+**Critical bugs fixed:**
+
+1. **`bootstrap_stress.py`: Sharpe percentiles are permutation-invariant (Bug #3)**
+   — Sharpe = mean/std × √252. Because permutation does not change mean or std,
+   every reshuffle produces identical Sharpe. Removed `sharpe_p5/p50/p95` fields
+   from `BootstrapStressResult` entirely. Replaced with `drawdown_p5/p50/p95`
+   (max drawdown IS path-dependent and varies across reshuffles). Module docstring
+   updated to explain permutation vs bootstrap distinction.
+
+2. **`parameter_sensitivity.py`: misspelled terminal key silently runs wrong config (Bug #2 extension)**
+   — `_set_nested` only checked intermediate path segments; a misspelled final key
+   like `"portfolio.n_longg"` silently created a new config key, leaving `n_long`
+   unchanged and producing misleading NaN-free results. Fixed: `_set_nested` now
+   checks that the terminal key exists in the final sub-dict before assigning.
+
+3. **`parameter_sensitivity.py`: broad `except Exception` swallowed config errors**
+   — Already moved `_apply_params` outside the try block in the previous session;
+   this session verified the terminal-key check makes that protection effective.
+   Exception catch remains narrowed to `(ValueError, RuntimeError)`.
+
+4. **`survival_funnel.py`: dead zone inconsistency between gates 4 and 6 (Bug #1)**
+   — `_gate_is_oos_consistency` uses `abs(is_sharpe) > 1e-6` as denominator guard;
+   `_gate_positive_is_sharpe` used `is_sharpe > 0.0`. A strategy with IS Sharpe in
+   `(0, 1e-6]` would pass gate 6 but produce a NaN gap in gate 4 — silently failing
+   with no diagnostic. Threshold aligned to `1e-6` in both gates.
+
+**New features added:**
+
+- `ParameterSensitivityResult.to_dataframe()` — returns per-variant results as a
+  DataFrame sorted by OOS Sharpe descending, for notebook/reporting use.
+- `BacktestLogger.log_walk_forward_run()` — logs `WalkForwardResult` OOS metrics,
+  per-fold IS Sharpes, optional `SurvivalFunnelResult` gate verdicts, and optional
+  `BootstrapStressResult` drawdown distribution to MLflow (C7 enforced via
+  `config["data_version"]`).
+
+**Deduplication:**
+
+- Removed duplicate `_oos_trade_count` from `parameter_sensitivity.py`; now
+  imports `oos_trade_count_from_wf` from `survival_funnel.py`.
+
+**Test improvements (67 total):**
+
+- `test_bootstrap_stress`: replaced stale `sharpe_p50` references with `drawdown_p50`;
+  added `test_drawdown_percentile_ordering`, `test_drawdown_percentiles_are_nonpositive`,
+  `test_drawdown_varies_across_reshuffles` (verifies path-dependence).
+- `test_survival_funnel`: added `test_dead_zone_is_sharpe_fails_both_gates`
+  (IS Sharpe = 5e-7 fails gates 4 and 6 consistently).
+- `test_parameter_sensitivity`: added `test_bad_param_grid_key_raises_key_error`
+  (misspelled `portfolio.n_longg` raises `KeyError`, not silent NaN) and
+  `test_to_dataframe_columns_and_row_count`.
+
+[DECISION] Extended `_set_nested` to require the terminal key to exist in the
+config before overwriting. Rationale: all `param_grid` keys are overrides of
+existing config values — creating new keys from typos is always a bug, never
+intentional, and should fail loudly. If a strategy genuinely needs to add new
+config keys dynamically, that is a different operation that should be explicit.
+
+---
+
+### Session 46 — Implementation: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** `0f31d04`
+
+---
+
+#### What was done
+
+Implemented all three components of M5.65 and wired them into the existing
+infrastructure. 62 tests passing.
+
+**`backtesting/validation/bootstrap_stress.py`**
+- `bootstrap_stress(oos_returns, n_reshuffles=500, seed)` function
+- Reshuffles the OOS daily return sequence N times using `np.random.default_rng`
+- Reports 5th/50th/95th percentile annualised Sharpe and worst-case max drawdown
+  across reshuffles
+- Flags strategy as `"solid"` or `"fragile"` based on worst-case drawdown vs
+  configurable threshold (default -35%)
+- 17 tests
+
+**`backtesting/validation/survival_funnel.py`**
+- `SurvivalFunnel` class with six configurable gates:
+  1. OOS Sharpe >= min (default 0.5)
+  2. OOS max drawdown >= floor (default -35%)
+  3. OOS Sharpe < ceiling to exclude lucky artifacts (default 2.5)
+  4. IS/OOS Sharpe relative gap <= tolerance (default 30%) — catches both
+     overfit (IS >> OOS) and lucky-OOS (OOS >> IS) in one check
+  5. OOS trade count >= minimum (default 30)
+  6. Average IS Sharpe > 0
+- `avg_is_sharpe_from_wf(wf_result)` and `oos_trade_count_from_wf(wf_result)`
+  convenience helpers for extracting inputs from `WalkForwardResult`
+- 30 tests
+
+**`backtesting/validation/parameter_sensitivity.py`**
+- `ParameterSweeper.sweep(base_config, param_grid, data_handler)` — runs
+  the full `WalkForwardValidator` across the Cartesian product of all
+  dot-path parameter overrides (e.g. `{"portfolio.n_long": [30, 50, 75]}`)
+- Reports mean, std, and positive-fraction of OOS Sharpe across variants
+- Flags `"curve_fit"` when positive_fraction < 0.5 or std > 0.5 (both
+  configurable); `"robust"` otherwise
+- Failed variants are logged as warnings and recorded with NaN Sharpe; they
+  do not abort the sweep
+- 15 tests
+
+**`backtesting/experiment_tracking/mlflow_logger.py`**
+- `BacktestLogger.log_run()` gains optional `funnel_result: SurvivalFunnelResult`
+- When supplied, logs `survival_funnel.passed`, `survival_funnel.verdict`, and
+  per-gate `gate.<name>: PASS/FAIL` as MLflow tags alongside run metrics
+
+**`backtesting/validation/__init__.py`**
+- Exposes all new public classes and helpers via `__all__`
+
+---
+
+### Session 45 — Roadmap: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** none (roadmap/documentation only)
+
+---
+
+#### What was done
+
+Reviewed an external backtesting framework (9,000+ backtest sweep across 30
+assets, 15 years) and compared its methodology against RQIS. Conclusion: RQIS
+is already architecturally ahead on walk-forward validation, multiple-testing
+corrections (DSR, BH-FDR), signal richness, risk management, and
+cross-sectional design. Three meaningful gaps were identified and added to the
+roadmap as M5.65.
+
+#### [DECISION] Add M5.65 Backtesting Validation Suite before M5.7 Regime Detector
+
+**Rationale:** Regime detection is a production routing layer — it decides which
+validated strategy to apply in each market condition. It is premature to build
+that layer before knowing which strategies are actually robust. M5.65 provides
+the quality-control mechanisms needed to declare a strategy hardened:
+
+1. **Parameter sensitivity sweep** (`backtesting/validation/parameter_sensitivity.py`)
+   — runs a parameter grid for each strategy and checks dispersion of OOS Sharpe
+   across variants. A strategy that only survives at one magic setting is a
+   curve-fit artifact and must be rejected before it enters the paper-trading
+   qualification.
+
+2. **Bootstrap stress test** (`backtesting/validation/bootstrap_stress.py`)
+   — reshuffles each surviving strategy's OOS daily return sequence 500 times to
+   build a distribution of equity paths. Reports 5th/50th/95th percentile Sharpe
+   and worst-case drawdown. Catches strategies whose good performance depended on
+   a specific lucky ordering of trades — a failure mode that walk-forward alone
+   does not detect.
+
+3. **Survival funnel / validation gate** (`backtesting/validation/survival_funnel.py`)
+   — a formal configurable pass/fail pipeline (OOS Sharpe > 0.5, max DD < -35%,
+   OOS Sharpe < 2.5, OOS/IS gap < 30%, minimum trade count, IS Sharpe positive)
+   that a strategy must clear before being promoted to VALIDATED in the Strategy
+   Registry. Integrates with `BacktestLogger.log_run()` so gate results are
+   recorded in MLflow alongside backtest metrics.
+
+**Sequencing:** M5.65 is inserted between M5.6 (Additional signal library) and
+M5.7 (Market regime detector). The regime detector is explicitly deferred until
+M5.65 identifies the hardened strategy set it will switch between.
+
+**Observation from the external framework review:** The referenced system found
+that mean-reversion strategies survive broad testing while trend/momentum is
+situational. RQIS's current v1_base_momentum is cross-sectional (rank stocks
+against each other), not single-asset time-series momentum — which the external
+framework separately tested and found to score meaningfully better. So this is
+not a contradiction. But M5.65 parameter sweeps will empirically confirm which
+of our strategy configs actually hold up before committing to them for the
+4-week paper qualification.
+
+---
+
 ### Session 44 — Phase 5 M5.6: Composite Signal Library (Groups 4–8)
 
 **Operator:** mshane@thecanadalist.ca
