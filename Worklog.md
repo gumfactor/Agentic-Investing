@@ -13,6 +13,78 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-28
 
+### Session 48 — Second Adversarial Review Fixes: M5.65 Backtesting Validation Suite
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/trading-backtest-framework-review-rnqa2o`
+**Commits:** `600fd7a`
+
+---
+
+#### What was done
+
+Ran a second adversarial review of the M5.65 validation suite. Found 7 more
+bugs, addressed all of them, and added 18 new tests. 85 tests now passing.
+
+**Bugs fixed:**
+
+1. **`bootstrap_stress.py`: `_max_drawdown` silently NaN on total-loss returns**
+   — `np.cumprod(1 + returns)` goes to 0 when any return is -1.0, then
+   `0 / rolling_max = NaN`. NaN propagates through `nanmin` and underreports
+   the worst-case drawdown. Fixed: `bootstrap_stress()` now raises `ValueError`
+   before the reshuffle loop if any return is ≤ -1.0.
+
+2. **`parameter_sensitivity.py`: all-NaN sweep logs misleading `std=0.0`**
+   — When every variant errors, `std_oos_sharpe` was logged as `0.0` (the
+   `n_valid <= 1` fallback), which looks like zero dispersion rather than
+   total failure. Added a distinct `parameter_sweep_all_variants_failed`
+   warning log.
+
+3. **`parameter_sensitivity.py`: single-variant grid silently passes std gate**
+   — With only one valid variant, the std gate is skipped unconditionally.
+   A typo in the param_grid that accidentally produces a 1-element list would
+   yield a `robust` verdict with no operator signal. Added a
+   `parameter_sweep_single_valid_variant` warning.
+
+4. **`parameter_sensitivity.py`: `to_dataframe()` NaN indistinguishable from negative Sharpe**
+   — Rows with errored (NaN) OOS Sharpe sorted to the bottom alongside real
+   negative results. Added a `status` column ("ok"/"error") and explicit
+   `na_position="last"` on `sort_values`.
+
+5. **`mlflow_logger.py`: `log_walk_forward_run` missing `config_hash` tag**
+   — Walk-forward runs could not be queried by config in MLflow. Added
+   SHA-256 hash of the config dict (same algorithm as `BacktestEngine`).
+
+6. **`mlflow_logger.py`: per-fold OOS metrics not logged**
+   — Fold-level OOS Sharpe and max drawdown were discarded, making it
+   impossible to diagnose regime instability (e.g., fold 0 Sharpe 1.5 vs
+   fold 2 Sharpe -0.3). Now logged as `oos.fold_{i}.sharpe` and
+   `oos.fold_{i}.max_drawdown`.
+
+7. **`mlflow_logger.py`: fragile NaN guard in `log_walk_forward_run`**
+   — `value != value` float idiom replaced with `math.isfinite()`, which
+   also guards Inf and matches the idiom in `survival_funnel._ok`.
+
+**Documentation improvements:**
+
+- `survival_funnel._gate_is_oos_consistency`: documented that the IS-centric
+  denominator is intentional (OOS outperformance penalised at a lower absolute
+  threshold — conservative stance on lucky OOS draws).
+- `survival_funnel.oos_trade_count_from_wf`: documented one-row-per-trade
+  assumption and the consequence if the engine ever records fill-level rows.
+- `mlflow_logger.log_walk_forward_run`: explained why `data_version` is read
+  from `wf_result.config` rather than a result attribute.
+
+**Test count: 85 passing** (up from 67).
+
+[DECISION] Treat `returns <= -1.0` in `bootstrap_stress` as a hard error rather
+than a silent NaN. Rationale: daily equity returns can never legitimately
+reach -100% (that would require total portfolio liquidation to zero in a single
+day). If such a value appears it indicates a data pipeline bug, not a legitimate
+return. Failing loudly surfaces the upstream error rather than masking it.
+
+---
+
 ### Session 47 — Adversarial Review Fixes: M5.65 Backtesting Validation Suite
 
 **Operator:** mshane@thecanadalist.ca
