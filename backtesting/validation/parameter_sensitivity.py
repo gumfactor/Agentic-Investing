@@ -32,12 +32,14 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
+import pandas as pd
 import structlog
 
 from backtesting.engine.data_handler import DataHandler
 from backtesting.engine.event_loop import BacktestEngine
 from backtesting.engine.fill_simulator import FillSimulator
 from backtesting.validation.walk_forward import WalkForwardValidator
+from backtesting.validation.survival_funnel import oos_trade_count_from_wf
 
 logger = structlog.get_logger(__name__)
 
@@ -88,6 +90,25 @@ class ParameterSensitivityResult:
     positive_fraction: float = 0.0
     curve_fit_flag: bool = False
     verdict: str = "curve_fit"
+
+    def to_dataframe(self) -> "pd.DataFrame":
+        """Return per-variant results as a DataFrame for easy analysis.
+
+        Columns: one column per param key, then oos_sharpe, oos_max_drawdown,
+        trade_count, avg_is_sharpe.  Rows are sorted by oos_sharpe descending.
+        """
+        records = []
+        for row in self.rows:
+            record = dict(row.params)
+            record["oos_sharpe"] = row.oos_sharpe
+            record["oos_max_drawdown"] = row.oos_max_drawdown
+            record["trade_count"] = row.trade_count
+            record["avg_is_sharpe"] = row.avg_is_sharpe
+            records.append(record)
+        df = pd.DataFrame(records)
+        if not df.empty:
+            df = df.sort_values("oos_sharpe", ascending=False, ignore_index=True)
+        return df
 
 
 class ParameterSweeper:
@@ -173,6 +194,9 @@ class ParameterSweeper:
         rows: list[ParameterSensitivityRow] = []
         for combo in combos:
             params = dict(zip(param_keys, combo))
+            # _apply_params is outside the try block so that a KeyError from a
+            # misspelled dot-path key propagates to the caller rather than being
+            # silently recorded as a NaN variant.
             cfg = _apply_params(base_config, params)
             try:
                 wf = validator.run(
@@ -186,8 +210,10 @@ class ParameterSweeper:
                 oos_sharpe = float(wf.oos_metrics.get("sharpe", float("nan")))
                 oos_dd = float(wf.oos_metrics.get("max_drawdown", float("nan")))
                 avg_is = _avg_is_sharpe(wf)
-                trade_count = _oos_trade_count(wf)
-            except Exception as exc:
+                trade_count = oos_trade_count_from_wf(wf)
+            except (ValueError, RuntimeError) as exc:
+                # Catch engine-level failures (e.g. insufficient data for a
+                # specific param combo) but not configuration errors.
                 logger.warning(
                     "parameter_sweep_variant_failed",
                     params=params,
@@ -264,7 +290,12 @@ def _set_nested(d: dict, dot_path: str, value: Any) -> None:
                 f"dot-path '{dot_path}' not found in config at segment '{key}'."
             )
         node = node[key]
-    node[keys[-1]] = value
+    final_key = keys[-1]
+    if final_key not in node:
+        raise KeyError(
+            f"dot-path '{dot_path}' not found in config: terminal key '{final_key}' does not exist."
+        )
+    node[final_key] = value
 
 
 def _avg_is_sharpe(wf) -> float:
@@ -273,11 +304,3 @@ def _avg_is_sharpe(wf) -> float:
         for f in wf.folds
     ]
     return float(np.nanmean(sharpes)) if sharpes else float("nan")
-
-
-def _oos_trade_count(wf) -> int:
-    import pandas as pd
-    dfs = [f.out_of_sample.trades for f in wf.folds if not f.out_of_sample.trades.empty]
-    if not dfs:
-        return 0
-    return len(pd.concat(dfs, ignore_index=True))

@@ -30,9 +30,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+import structlog
 
 if TYPE_CHECKING:
     from backtesting.validation.walk_forward import WalkForwardResult
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -149,6 +152,15 @@ class SurvivalFunnel:
             if passed
             else f"FAIL — gates not cleared: {', '.join(failed)}"
         )
+        if not passed:
+            logger.warning(
+                "survival_funnel_failed",
+                failed_gates=failed,
+                oos_sharpe=oos_sharpe,
+                oos_max_drawdown=oos_dd,
+                avg_is_sharpe=is_sharpe,
+                trade_count=trade_count,
+            )
         return SurvivalFunnelResult(passed=passed, gates=gates, verdict=verdict)
 
     # ------------------------------------------------------------------
@@ -205,12 +217,15 @@ class SurvivalFunnel:
         )
 
     def _gate_positive_is_sharpe(self, is_sharpe: float) -> FunnelGate:
+        # Threshold matches the dead zone in _gate_is_oos_consistency (abs(is) > 1e-6).
+        # A near-zero IS Sharpe would make the consistency gap ratio undefined;
+        # requiring it to exceed 1e-6 keeps both gates consistent.
         return FunnelGate(
             name="positive_is_sharpe",
-            passed=_ok(is_sharpe) and is_sharpe > 0.0,
+            passed=_ok(is_sharpe) and is_sharpe > 1e-6,
             value=is_sharpe,
-            threshold=0.0,
-            description="Average IS Sharpe > 0",
+            threshold=1e-6,
+            description="Average IS Sharpe > 0 (above numerical dead zone)",
         )
 
 

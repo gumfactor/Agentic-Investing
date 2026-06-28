@@ -43,9 +43,25 @@ def test_n_reshuffles_recorded():
     assert result.n_reshuffles == 100
 
 
-def test_percentile_ordering():
+def test_drawdown_percentile_ordering():
     result = bootstrap_stress(_volatile_returns(), n_reshuffles=200, seed=42)
-    assert result.sharpe_p5 <= result.sharpe_p50 <= result.sharpe_p95
+    # All drawdowns are <= 0; p5 is worst (most negative), p95 is best (least negative)
+    assert result.drawdown_p5 <= result.drawdown_p50 <= result.drawdown_p95
+
+
+def test_drawdown_percentiles_are_nonpositive():
+    result = bootstrap_stress(_volatile_returns(), n_reshuffles=100, seed=0)
+    assert result.drawdown_p5 <= 0.0
+    assert result.drawdown_p50 <= 0.0
+    assert result.drawdown_p95 <= 0.0
+
+
+def test_drawdown_varies_across_reshuffles():
+    """Max drawdown is path-dependent, so different reshuffles should produce different values."""
+    returns = _volatile_returns(n=252, seed=7)
+    result = bootstrap_stress(returns, n_reshuffles=200, seed=42)
+    # If drawdown were permutation-invariant, p5 == p95; verify they differ
+    assert result.drawdown_p5 < result.drawdown_p95
 
 
 def test_worst_case_drawdown_is_nonpositive():
@@ -96,7 +112,7 @@ def test_seed_reproducibility():
     returns = _volatile_returns()
     r1 = bootstrap_stress(returns, n_reshuffles=100, seed=99)
     r2 = bootstrap_stress(returns, n_reshuffles=100, seed=99)
-    assert r1.sharpe_p50 == r2.sharpe_p50
+    assert r1.drawdown_p50 == r2.drawdown_p50
     assert r1.worst_case_drawdown == r2.worst_case_drawdown
 
 
@@ -104,8 +120,7 @@ def test_different_seeds_differ():
     returns = _volatile_returns()
     r1 = bootstrap_stress(returns, n_reshuffles=200, seed=1)
     r2 = bootstrap_stress(returns, n_reshuffles=200, seed=2)
-    # With enough reshuffles the medians will differ at least slightly
-    assert r1.sharpe_p50 != r2.sharpe_p50 or r1.worst_case_drawdown != r2.worst_case_drawdown
+    assert r1.drawdown_p50 != r2.drawdown_p50 or r1.worst_case_drawdown != r2.worst_case_drawdown
 
 
 # ------------------------------------------------------------------

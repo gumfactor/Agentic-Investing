@@ -290,3 +290,42 @@ def test_low_positive_fraction_flags_curve_fit():
     )
     assert result.curve_fit_flag is True
     assert result.verdict == "curve_fit"
+
+
+def test_bad_param_grid_key_raises_key_error():
+    """A misspelled dot-path key must raise KeyError, not silently produce NaN."""
+    handler = _make_handler()
+    dates = _make_trading_dates(900)
+    config = _base_config(dates)
+    sweeper = ParameterSweeper(fill_simulator=FillSimulator(fill_model="perfect"))
+    with pytest.raises(KeyError):
+        sweeper.sweep(
+            base_config=config,
+            param_grid={"portfolio.n_longg": [2, 3]},  # misspelled key
+            data_handler=handler,
+            n_folds=2,
+            train_years=1.5,
+            test_months=6,
+        )
+
+
+def test_to_dataframe_columns_and_row_count():
+    handler = _make_handler()
+    dates = _make_trading_dates(900)
+    config = _base_config(dates)
+    sweeper = ParameterSweeper(fill_simulator=FillSimulator(fill_model="perfect"))
+    result = sweeper.sweep(
+        base_config=config,
+        param_grid={"portfolio.n_long": [2, 3]},
+        data_handler=handler,
+        n_folds=2,
+        train_years=1.5,
+        test_months=6,
+    )
+    df = result.to_dataframe()
+    assert len(df) == 2
+    assert "portfolio.n_long" in df.columns
+    assert "oos_sharpe" in df.columns
+    assert "oos_max_drawdown" in df.columns
+    assert "trade_count" in df.columns
+    assert "avg_is_sharpe" in df.columns

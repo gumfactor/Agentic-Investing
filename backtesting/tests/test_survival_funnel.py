@@ -205,6 +205,22 @@ def test_zero_is_sharpe_fails():
     assert gate.passed is False
 
 
+def test_dead_zone_is_sharpe_fails_both_gates():
+    """IS Sharpe in (0, 1e-6] must fail gate 6 (positive_is_sharpe) AND gate 4
+    (is_oos_consistency) consistently — the two gates use the same 1e-6 dead zone."""
+    dead_zone_sharpe = 5e-7   # positive but below 1e-6
+    result = _check(
+        avg_is_sharpe=dead_zone_sharpe,
+        oos_metrics={"sharpe": 0.80, "max_drawdown": -0.15},
+    )
+    gate_pos = next(g for g in result.gates if g.name == "positive_is_sharpe")
+    gate_con = next(g for g in result.gates if g.name == "is_oos_consistency")
+    # Gate 6 must fail — IS Sharpe is below the 1e-6 threshold
+    assert gate_pos.passed is False
+    # Gate 4 also fails — IS Sharpe triggers the dead-zone guard (NaN gap)
+    assert gate_con.passed is False
+
+
 # ------------------------------------------------------------------
 # Configurable thresholds
 # ------------------------------------------------------------------
