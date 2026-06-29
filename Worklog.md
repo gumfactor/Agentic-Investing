@@ -13,6 +13,90 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-28
 
+### Session 49 — Indicator Diagnostic: Adversarial Review Fixes
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/indicator-stress-test-validation-xg25he`
+**Commits:** (this session)
+
+---
+
+#### What was done
+
+Built and adversarially reviewed the indicator reliability and validity diagnostic
+(`backtesting/validation/indicator_diagnostic.py` + `scripts/indicator_diagnostic.py`).
+A single-agent adversarial review found 6 bugs; all were fixed and 11 new tests
+added. 61 tests now passing.
+
+**Bugs fixed:**
+
+1. **`infer_category` — volatility keyword missing (CRITICAL)**
+   — `"vol"` was not in `_CATEGORY_KEYWORDS`, so every real volatility indicator
+   (`realized_vol_21d_score`, `garman_klass_vol_21d_score`, etc.) silently
+   resolved to `"other"`, making the entire volatility category invisible to
+   both convergent and discriminant validity checks. Fixed by adding
+   `("vol", "volatility")` to the keyword list, positioned after the longer
+   `"low_vol"` and `"volume"` entries so longest-match priority still holds.
+
+2. **`format_report` hardcodes module constants instead of instance thresholds (HIGH)**
+   — The formatted report printed `(target > 0.30)` and `(target < 0.65)`
+   regardless of what thresholds the `IndicatorDiagnostic` was instantiated with,
+   making the report misleading whenever non-default thresholds were used.
+   Fixed by adding `min_within_category_corr` and `max_cross_category_corr`
+   fields to `DiagnosticReport`, populating them from instance thresholds in
+   `run()`, and using `report.min_within_category_corr` /
+   `report.max_cross_category_corr` in `format_report`.
+
+3. **`_check_validity` — "other" factors pollute cross-category correlations (HIGH)**
+   — The cross-category condition was `not same_cat` alone. If one factor was
+   `"momentum"` and the other was `"other"`, the pair was counted as
+   cross-category, pulling in noise that should be excluded. Fixed by requiring
+   both `fi_known` and `fj_known` (neither category is `"other"`) before adding
+   to `cross_corrs`.
+
+4. **Silent duplicate row averaging (MEDIUM)**
+   — `_pivot_wide` uses `pivot_table` with default `aggfunc='mean'`, which
+   silently averages duplicate `(ticker, score_date, factor_name)` rows.
+   Fixed by adding duplicate detection in `_validate_input` with a
+   `logger.warning` that names the count and advises deduplication. The
+   diagnostic still completes rather than raising.
+
+5. **Bare `except Exception` in CLI (CONVENTION)**
+   — `scripts/indicator_diagnostic.py` caught all exceptions including
+   programming errors. Fixed by importing `SQLAlchemyError` and catching
+   that specifically.
+
+6. **CLI always exits 1 on any reliability flag (DESIGN)**
+   — The original script exited 1 whenever any factor was unreliable, making
+   it unusable as a non-blocking informational step. Fixed by making exit 0 the
+   default and adding `--strict` flag for callers who want strict failure.
+
+**Test additions (11 new, up from 50 → 61):**
+- Parametrized category inference tests for real volatility indicator names
+  (`realized_vol_21d_score`, `vol_percentile_252d_score`,
+  `idiosyncratic_vol_63d_score`, `garman_klass_vol_21d_score`)
+- `test_format_report_displays_actual_thresholds_not_module_constants`
+- `test_other_category_factors_excluded_from_cross_category_mean`
+- `test_two_other_category_factors_produce_nan_cross_category_mean`
+- `test_duplicate_rows_do_not_raise_but_complete`
+
+**Test count: 61 passing.**
+
+[DECISION] The indicator diagnostic is measurement-quality focused (reliability +
+validity), NOT predictive efficacy (IC analysis). Reliability answers "does the
+indicator produce stable, well-calibrated output?" Validity answers "does it
+measure what it claims?" These are prerequisites for trusting IC analysis,
+not a replacement for it.
+
+[DECISION] Category inference uses longest-match keyword priority to handle
+compound names (e.g., "low_vol_momentum" → "momentum" not "volatility").
+The `"other"` category is a legitimate outcome for indicators whose names are
+not semantically meaningful (e.g., "atr_14_score"). "Other" factors are
+excluded from both within-category and cross-category correlation statistics
+to avoid polluting the validity signal with uncategorized noise.
+
+---
+
 ### Session 48 — Second Adversarial Review Fixes: M5.65 Backtesting Validation Suite
 
 **Operator:** mshane@thecanadalist.ca
