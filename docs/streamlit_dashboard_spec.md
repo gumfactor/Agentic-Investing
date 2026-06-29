@@ -1,9 +1,9 @@
 # Streamlit Dashboard — Implementation Specification
 ## RQIS M5.8
 
-**Document status:** Approved for implementation  
-**Last updated:** 2026-06-29  
-**Author:** Operator + Claude Code  
+**Document status:** Implemented, pending manual UI verification and two backend producer tasks
+**Last updated:** 2026-06-29
+**Author:** Operator + Claude Code
 **Prerequisite reading:** `CLAUDE.md`, `docs/airflow_paper_dag_spec.md`, `docs/strategy_registry_spec.md`
 
 ---
@@ -49,6 +49,7 @@ reporting/dashboards/
 ├── app.py                      ← Streamlit entry point; sidebar + env banner
 ├── db.py                       ← SQLAlchemy engine factory (singleton, cached)
 ├── queries.py                  ← All DB query helpers; no raw SQL in pages
+├── session.py                  ← Shared Streamlit session-state initialization
 ├── broker.py                   ← IBKRBroker wrapper for dashboard use (cached)
 ├── simulation.py               ← Forward simulation helpers (shadow strategies)
 ├── components/
@@ -73,15 +74,15 @@ streamlit run reporting/dashboards/app.py
 
 ---
 
-## 4. Prerequisites — Backend Work Required Before Full Dashboard
+## 4. Implementation Status and Remaining Backend Producers
 
-Two small backend pieces must be built alongside (not before) the dashboard. They do not block most pages but are required for specific features.
+The dashboard application and required schema migrations have been implemented. Two producer-side jobs remain before every panel can be fully populated from automated daily data: the Airflow task that persists `portfolio_snapshots`, and the signal-pipeline task that writes daily `strategy_simulations` rows.
 
 ### 4.1 `portfolio_snapshots` Table and Airflow Task Change
 
-**Blocks:** Page 2 (Positions) live position data.
+**Status:** Table migration implemented as `infra/db/migrations/versions/007_portfolio_snapshots.py`; Airflow DB write still outstanding.
 
-**Why:** The dashboard should not make its own IBKR connection. The Airflow DAG's `fetch_ibkr_snapshot` task already pulls current positions from IBKR every night. A minor change to that task writes the snapshot to the DB, which the dashboard then reads.
+**Why:** The dashboard should not make its own IBKR connection. The Airflow DAG's `fetch_ibkr_snapshot` task already pulls current positions from IBKR every night and writes the JSON artifact. The remaining producer task is to also persist that snapshot to the DB, which the dashboard then reads.
 
 **Schema:**
 
@@ -112,7 +113,7 @@ If `open_position_cost_basis()` returns no entry for a ticker (e.g., a position 
 
 ### 4.2 `strategy_simulations` Table and Forward Simulation Task
 
-**Blocks:** Strategy comparison panel on Page 5 (forward simulation returns only; historical MLflow backtests are available immediately).
+**Status:** Table migration implemented as `infra/db/migrations/versions/008_strategy_simulations.py`; daily signal-pipeline producer task still outstanding.
 
 **Why:** Once the live paper portfolio starts, we need to know how each shadow (non-paper, non-live) strategy *would have* performed over the same period. Historical MLflow backtests stop at paper trading inception. This task extends them forward daily.
 
@@ -149,11 +150,13 @@ For each strategy with status IN ('backtesting', 'paper') FROM strategies:
 
 The active live strategy is also tracked here for consistent comparison (its simulated NAV will match the real NAV only approximately, since it excludes transaction costs and fill slippage).
 
-### 4.3 `quantity_overrides` Column on `blotter_approvals` — **RESOLVED: New JSONB column**
+### 4.3 `quantity_overrides` Column on `blotter_approvals` — **IMPLEMENTED: New JSONB column**
 
 **Decision (2026-06-29):** Add a `quantity_overrides JSONB` column to `blotter_approvals`. The existing `selected_order_ids` column (array of approved order ID strings) is unchanged. Quantity edits are stored separately.
 
-**Alembic migration required before Sprint 1:**
+**Implemented migration:** `infra/db/migrations/versions/006_add_quantity_overrides_to_blotter_approvals.py`
+
+**Migration shape:**
 
 ```python
 # infra/db/migrations/versions/xxxx_add_quantity_overrides_to_blotter_approvals.py
@@ -169,16 +172,14 @@ def downgrade():
 
 `quantity_overrides` stores only the orders where the operator changed the quantity: `{"order_id_abc": 7, "order_id_def": 4}`. Orders with no quantity change are absent from this dict. An empty dict or NULL means no quantities were edited.
 
-**Required changes to Airflow sensor and submit task (Finding 2):**
-
-The `BlotterApprovalSensor.poke()` currently pushes only `selected_order_ids` and `approved_by` to XCom. It must also fetch and push `quantity_overrides`:
+**Airflow sensor and submit task status:** Implemented. `BlotterApprovalSensor.poke()` fetches and pushes `quantity_overrides` to XCom:
 
 ```python
 # In BlotterApprovalSensor.poke() — add after existing XCom pushes:
 ti.xcom_push(key="quantity_overrides", value=row["quantity_overrides"] or {})
 ```
 
-The `_submit_orders` task must read `quantity_overrides` from XCom and apply it before submitting:
+The `_submit_orders` task reads `quantity_overrides` from XCom and applies it before submitting:
 
 ```python
 quantity_overrides = ti.xcom_pull(key="quantity_overrides", task_ids="wait_approval") or {}
@@ -189,7 +190,7 @@ for row in rows_to_submit:
         row = {**row, "quantity": override_qty}
 ```
 
-Without these two changes, operator quantity reductions entered in the dashboard are silently ignored and the original blotter quantity is submitted to IBKR.
+This preserves operator quantity reductions entered in the dashboard and prevents the original blotter quantity from being submitted by mistake.
 
 ### 4.5 Blotter Artifact Location — **RESOLVED: Shared Docker volume**
 
@@ -219,7 +220,7 @@ The `RQIS_PAPER_ARTIFACT_DIR` env var must be set to `/opt/rqis/paper_artifacts`
 
 ## 5. Shared Components
 
-These run on every page. They are rendered in `app.py` before the page router loads.
+These run on every page. In the implemented multipage app, each Streamlit page imports and renders the shared components it needs; `app.py` handles the landing page and shared sidebar state for that page.
 
 ### 5.1 Environment Banner (`components/env_banner.py`)
 
@@ -284,18 +285,17 @@ def pending_blotter(artifact_dir: Path, engine) -> dict | None:
 
 This function is called once at sidebar render time and its result passed to Page 4.
 
-### 5.4 Session State Initialization (`app.py`)
+### 5.4 Session State Initialization (`session.py`)
 
-On every cold start:
+Session initialization is centralized in `reporting/dashboards/session.py` and called from `app.py` and any page that directly needs the common keys:
 
 ```python
-if "session_id" not in st.session_state:
-    st.session_state["session_id"] = str(uuid.uuid4())
-if "operator_email" not in st.session_state:
-    st.session_state["operator_email"] = os.environ.get("OPERATOR_EMAIL", "unknown")
+from reporting.dashboards.session import init_dashboard_session
+
+init_dashboard_session()
 ```
 
-`session_id` is per-tab (stored in `st.session_state`) and is passed to `blotter_approvals.dashboard_session_id` at approval time for audit purposes. `operator_email` is passed to `blotter_approvals.approved_by`.
+The helper ensures `session_id` and `operator_email` exist in `st.session_state`. `session_id` is per-tab and is passed to `blotter_approvals.dashboard_session_id` at approval time for audit purposes. `operator_email` defaults from the `OPERATOR_EMAIL` environment variable and is passed to `blotter_approvals.approved_by`.
 
 **Caching rules:** Use `@st.cache_resource` for any stateful shared object (DB engine, CircuitBreaker, AlertManager). Use `st.session_state` only for per-tab transient state (session ID, current page form values). Never store CircuitBreaker or AlertManager in `st.session_state` — each tab would get an independent instance with divergent state.
 
@@ -305,9 +305,9 @@ if "operator_email" not in st.session_state:
 
 ### Page 1 — Overview
 
-**File:** `pages/1_Overview.py`  
-**Purpose:** Immediate system state at a glance. Designed for the 23:05 ET check: "Did the pipeline run? Is approval needed?"  
-**Refresh:** Auto-refresh every 60 seconds via `st_autorefresh(interval=60_000, key="overview_refresh")` at top of page.  
+**File:** `pages/1_Overview.py`
+**Purpose:** Immediate system state at a glance. Designed for the 23:05 ET check: "Did the pipeline run? Is approval needed?"
+**Refresh:** Auto-refresh every 60 seconds via `st_autorefresh(interval=60_000, key="overview_refresh")` at top of page.
 **IBKR connection:** Not required. All data from DB.
 
 **Sections:**
@@ -319,7 +319,7 @@ if "operator_email" not in st.session_state:
 | Open positions count | `portfolio_snapshots.positions` | `len(positions)` from latest snapshot |
 | Pending blotter | Artifact volume + `blotter_approvals` | `pending_blotter(artifact_dir, engine)` — filesystem scan; see Section 5.3 |
 | Pipeline health | `alpha_scores`, `daily_prices`, `strategy_simulations` | Data recency inference — see below |
-| Active alerts | `AlertManager.unacknowledged()` | In-memory; AlertManager must be instantiated at app startup and shared via `st.session_state` |
+| Active alerts | `AlertManager.unacknowledged()` | In-memory; AlertManager is shared with `@st.cache_resource`, not `st.session_state` |
 
 **Pipeline health — RESOLVED: Infer from data recency (D3, 2026-06-29).**
 
@@ -353,9 +353,9 @@ Display as a three-row status table: pipeline name, last updated (human-readable
 
 ### Page 2 — Positions & P&L
 
-**File:** `pages/2_Positions.py`  
-**Purpose:** What do we own, what did it cost, what is it worth.  
-**Refresh:** Manual (button). Positions data is at most one trading day stale.  
+**File:** `pages/2_Positions.py`
+**Purpose:** What do we own, what did it cost, what is it worth.
+**Refresh:** Manual (button). Positions data is at most one trading day stale.
 **IBKR connection:** Not required. Reads from `portfolio_snapshots` and `alpha_scores`.
 
 **Sections:**
@@ -389,9 +389,9 @@ Rows highlighted amber where `alpha_score_rank > n_long * 1.5` (position held bu
 
 ### Page 3 — Risk Monitor
 
-**File:** `pages/3_Risk.py`  
-**Purpose:** Real-time risk metrics. The page that should alarm you.  
-**Refresh:** `st_autorefresh(interval=30_000, key="risk_refresh")` at top of page, active only during market hours (09:30–16:00 ET). Outside market hours, render a static snapshot with a "Last updated" timestamp instead of continuously re-running.  
+**File:** `pages/3_Risk.py`
+**Purpose:** Real-time risk metrics. The page that should alarm you.
+**Refresh:** `st_autorefresh(interval=30_000, key="risk_refresh")` at top of page, active only during market hours (09:30–16:00 ET). Outside market hours, render a static snapshot with a "Last updated" timestamp instead of continuously re-running.
 **IBKR connection:** Not required. Risk metrics computed from DB data.
 
 **Risk computation:** Call `RiskMonitor.snapshot()` with:
@@ -432,9 +432,9 @@ When any hard threshold is breached, a `st.error()` banner renders above the met
 
 ### Page 4 — Blotter Approval *(C1 Gate)*
 
-**File:** `pages/4_Blotter_Approval.py`  
-**Priority:** Highest. This page must be complete before the automated paper pipeline can replace the CLI approval path.  
-**Safety rules enforced:** C1, C3, C5, C9.  
+**File:** `pages/4_Blotter_Approval.py`
+**Priority:** Highest. This page must be complete before the automated paper pipeline can replace the CLI approval path.
+**Safety rules enforced:** C1, C3, C5, C9.
 **IBKR connection:** Not required (reads blotter artifact; Airflow handles IBKR submission).
 
 **Page states:**
@@ -579,7 +579,7 @@ with db.engine.begin() as conn:
 
 The `UNIQUE constraint on blotter_run_id` enforces that a second approval attempt for the same blotter raises an `IntegrityError`, which the page catches and renders as: `"This blotter has already been approved. Refresh the page to see the receipt."` No silent double-submission is possible.
 
-Note: `quantity_overrides` is a new JSONB column — see Section 4.3 for the required Alembic migration. The `BlotterApprovalSensor` must also be updated to fetch and push this field to XCom (see Section 4.3).
+Implementation note: `quantity_overrides` is stored in the JSONB column described in Section 4.3. The migration, `BlotterApprovalSensor` XCom propagation, and submit-task application are implemented.
 
 **Step 5: Post-submission receipt:**
 
@@ -604,9 +604,9 @@ Table of all past `blotter_approvals` rows, newest first: `approved_at_utc`, `bl
 
 ### Page 5 — Performance
 
-**File:** `pages/5_Performance.py`  
-**Purpose:** How is the strategy performing over time, and how does it compare to shadow strategies.  
-**Refresh:** Manual.  
+**File:** `pages/5_Performance.py`
+**Purpose:** How is the strategy performing over time, and how does it compare to shadow strategies.
+**Refresh:** Manual.
 **IBKR connection:** Not required.
 
 **Date range selector:** `YTD / 3M / 6M / 1Y / All` (default: YTD).
@@ -660,9 +660,9 @@ The two sources are concatenated into a single return series per strategy: MLflo
 
 ### Page 6 — Signals
 
-**File:** `pages/6_Signals.py`  
-**Purpose:** Why does the portfolio hold what it holds. Signal decomposition and strategy comparison at the ticker level. Not in original PRD — added because the 21-composite signal library makes this analysis possible and valuable for strategy selection decisions.  
-**Refresh:** Manual.  
+**File:** `pages/6_Signals.py`
+**Purpose:** Why does the portfolio hold what it holds. Signal decomposition and strategy comparison at the ticker level. Not in original PRD — added because the 21-composite signal library makes this analysis possible and valuable for strategy selection decisions.
+**Refresh:** Manual.
 **IBKR connection:** Not required.
 
 **Strategy selector** (top of page, single select): all strategies from the `strategies` table. Default: the strategy with `status = 'paper'`.
@@ -727,9 +727,9 @@ For the top N positions of each `backtesting` or `paper` strategy (i.e., those w
 
 ### Page 7 — Audit Trail
 
-**File:** `pages/7_Audit_Trail.py`  
-**Purpose:** Immutable record of all fills, decisions, and compliance events. Read-only; no interactive mutations (C3 enforced — no UPDATE/DELETE paths in any query on this page).  
-**Refresh:** Manual.  
+**File:** `pages/7_Audit_Trail.py`
+**Purpose:** Immutable record of all fills, decisions, and compliance events. Read-only; no interactive mutations (C3 enforced — no UPDATE/DELETE paths in any query on this page).
+**Refresh:** Manual.
 **IBKR connection:** Not required.
 
 **Section A: Fill History**
@@ -856,9 +856,9 @@ When live trading is enabled (post C8 clearance), this will be implemented to pr
 
 ---
 
-## 9. Build Order
+## 9. Build Order and Current Status
 
-Build in this sequence. Each item is independently deployable and testable.
+The build order below is retained as implementation history. The dashboard code for all four sprints is implemented; items explicitly called out as producer tasks remain outstanding where noted.
 
 ### Sprint 1 — Foundation + C1 Gate *(highest priority)*
 
@@ -866,7 +866,7 @@ Build in this sequence. Each item is independently deployable and testable.
 2. `queries.py` — stub all query functions (can return mock data initially)
 3. `components/env_banner.py` — environment banner
 4. `components/circuit_breaker.py` — CB sidebar widget
-5. `app.py` — entry point, sidebar, session state init
+5. `app.py` + `session.py` — entry point, sidebar, shared session state init
 6. **Page 4 — Blotter Approval** — complete implementation including SHA-256 verification, data_editor grid, confirmation dialog, and `blotter_approvals` INSERT
 
 Sprint 1 deliverable: CLI confirmation path (`paper_approve_blotter.py`) can be retired; all future approvals go through the dashboard.
@@ -876,14 +876,14 @@ Sprint 1 deliverable: CLI confirmation path (`paper_approve_blotter.py`) can be 
 7. **Page 1 — Overview** — NAV, drawdown, pipeline health, alert count
 8. **Page 2 — Positions & P&L** — holdings table, realized P&L (using `trade_fills` fallback until `portfolio_snapshots` exists)
 9. **Page 3 — Risk Monitor** — VaR, CVaR, beta, concentrations, alert feed, CB reset form
-10. Backend: **`portfolio_snapshots` table migration + Airflow task change**
+10. Backend: **`portfolio_snapshots` table migration implemented; Airflow DB write still outstanding**
 
 Sprint 2 deliverable: Full operational visibility during the paper trading qualification. Can observe positions, risk, and P&L without CLI scripts.
 
 ### Sprint 3 — Performance and Strategy Analysis
 
 11. **Page 5 — Performance** — metrics cards + tearsheet charts (live strategy only first)
-12. Backend: **`strategy_simulations` table migration + Airflow task**
+12. Backend: **`strategy_simulations` table migration implemented; daily signal-pipeline producer task still outstanding**
 13. **Page 5 — Strategy Comparison panel** (requires `strategy_simulations`)
 14. **Page 6 — Signals** — alpha leaderboard, factor breakdown, strategy registry
 
@@ -901,15 +901,20 @@ Sprint 3 deliverable: Strategy comparison capability. Can evaluate shadow strate
 
 ## 10. Testing Requirements
 
-### Unit tests
+### Automated tests currently implemented
 
-- `tests/reporting/dashboards/test_queries.py` — test each query function against a test DB (fixture-seeded with known data). No mocking of the DB — use a real test TimescaleDB instance.
-- `tests/reporting/dashboards/test_simulation.py` — test forward simulation NAV computation against known alpha_scores and daily_prices fixtures.
-- `tests/reporting/dashboards/test_blotter_approval.py` — test SHA-256 verification logic, quantity edit validation, and blotter_approvals INSERT logic as pure Python (no Streamlit dependency).
+The dashboard test suite currently has 100 passing tests across these files:
 
-### Integration tests
+- `tests/reporting/dashboards/test_queries.py` — blotter approval query helpers and pending-blotter detection.
+- `tests/reporting/dashboards/test_blotter_approval.py` — SHA-256 verification, quantity edit validation, and `blotter_approvals` INSERT behavior as pure Python.
+- `tests/reporting/dashboards/test_page4_integration.py` — end-to-end blotter approval against a temporary artifact directory and DB fixture.
+- `tests/reporting/dashboards/test_components.py` — shared component behavior for circuit breaker and alerts.
+- `tests/reporting/dashboards/test_sprint2_queries.py` — portfolio snapshot, NAV history, active strategy, realized P&L, and `daily_prices.date` query regressions.
+- `tests/reporting/dashboards/test_sprint2_risk.py` — risk snapshot, alert manager, and circuit-breaker reset flow.
+- `tests/reporting/dashboards/test_sprint3_queries.py` — alpha/factor queries, strategy simulations query, and `strategies.registered_at AS created_at` alias regression.
+- `tests/reporting/dashboards/test_sprint4.py` — simulation helpers, alpha overlap, audit trail, and fill/wash-sale queries.
 
-- `tests/reporting/dashboards/test_page4_integration.py` — end-to-end blotter approval: seed a blotter artifact file on a temp volume path with no corresponding `blotter_approvals` row, run the approval logic, assert an approval row is INSERTed correctly and a second approval attempt raises an `IntegrityError` (UNIQUE constraint on `blotter_run_id`).
+The tests use fast SQLite fixtures that mirror the relevant Alembic column names where the dashboard queries depend on schema contracts. Production remains PostgreSQL/TimescaleDB.
 
 ### Manual verification checklist (before retiring CLI approval path)
 
@@ -939,7 +944,7 @@ Sprint 3 deliverable: Strategy comparison capability. Can evaluate shadow strate
 
 ## 12. Architecture Decisions Log
 
-All pre-implementation decisions are resolved. Sprint 1 may begin.
+All pre-implementation decisions are resolved. The four dashboard sprints are implemented; remaining work is manual UI verification plus the two backend producer tasks in Section 4.
 
 | # | Decision | Resolution | Date |
 |---|----------|-----------|------|

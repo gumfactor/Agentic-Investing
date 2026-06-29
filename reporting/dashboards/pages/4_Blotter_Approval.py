@@ -25,6 +25,7 @@ from reporting.dashboards.queries import (
     insert_blotter_approval,
     pending_blotter,
 )
+from reporting.dashboards.session import init_dashboard_session
 
 # -- Page config --
 st.set_page_config(
@@ -34,6 +35,7 @@ st.set_page_config(
 )
 
 # -- Shared components --
+init_dashboard_session()
 render_env_banner()
 
 from reporting.dashboards.components.circuit_breaker import (

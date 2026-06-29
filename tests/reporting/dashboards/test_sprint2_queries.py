@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, text
 
 from reporting.dashboards.queries import (
     active_strategy_id,
+    daily_returns_for_tickers,
     latest_portfolio_snapshot,
+    latest_prices,
     nav_history,
     previous_portfolio_snapshot,
     realized_pnl_summary,
@@ -38,7 +39,16 @@ def engine():
             CREATE TABLE strategies (
                 strategy_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE daily_prices (
+                ticker TEXT NOT NULL,
+                date DATE NOT NULL,
+                close NUMERIC(18,6) NOT NULL,
+                ingested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, date)
             )
         """))
         conn.execute(text("""
@@ -197,3 +207,41 @@ class TestRealizedPnlSummary:
         msft_row = df[df["ticker"] == "MSFT"].iloc[0]
         assert float(msft_row["total_pnl"]) == -20.0
         assert int(msft_row["has_wash_sale"]) == 1
+
+
+class TestDailyPriceQueries:
+    def test_latest_prices_uses_migration_date_column(self, engine):
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO daily_prices (ticker, date, close)
+                VALUES
+                    ('AAPL', '2026-06-28', 199.0),
+                    ('AAPL', '2026-06-29', 201.5),
+                    ('MSFT', '2026-06-29', 410.25)
+            """))
+
+        df = latest_prices(engine, ["AAPL", "MSFT"])
+
+        assert len(df) == 2
+        assert set(df["ticker"].tolist()) == {"AAPL", "MSFT"}
+        assert float(df[df["ticker"] == "AAPL"].iloc[0]["close"]) == 201.5
+        assert "price_date" in df.columns
+
+    def test_daily_returns_uses_migration_date_column(self, engine):
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO daily_prices (ticker, date, close)
+                VALUES
+                    ('AAPL', '2026-06-26', 100.0),
+                    ('AAPL', '2026-06-27', 110.0),
+                    ('AAPL', '2026-06-28', 121.0),
+                    ('MSFT', '2026-06-26', 200.0),
+                    ('MSFT', '2026-06-27', 210.0),
+                    ('MSFT', '2026-06-28', 231.0)
+            """))
+
+        df = daily_returns_for_tickers(engine, ["AAPL", "MSFT"], lookback_days=3650)
+
+        assert list(df.columns) == ["AAPL", "MSFT"]
+        assert len(df) == 2
+        assert round(float(df.iloc[0]["AAPL"]), 6) == 0.1

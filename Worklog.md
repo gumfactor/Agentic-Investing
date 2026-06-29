@@ -13,6 +13,34 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-29
 
+### Session 52 — Dashboard Documentation Refresh After Schema Alignment Review
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `work`
+**Commits:** documentation refresh for dashboard progress and remaining producer tasks
+
+**What was done:**
+
+- Reviewed the dashboard documentation against the current branch state after the schema-alignment fixes.
+- Updated `docs/streamlit_dashboard_spec.md` from a pre-implementation spec to an implemented-status reference.
+- Added `reporting/dashboards/session.py` to the documented dashboard file structure and documented `init_dashboard_session()` as the canonical source of `session_id` / `operator_email` initialization.
+- Corrected the spec to distinguish implemented schema migrations from remaining backend producer work:
+  - `portfolio_snapshots` migration exists; the Airflow `fetch_ibkr_snapshot` DB insert is still outstanding.
+  - `strategy_simulations` migration exists; the daily signal-pipeline simulation writer is still outstanding.
+  - `quantity_overrides` migration, sensor XCom propagation, and submit-task application are implemented.
+- Corrected shared component documentation: alert and circuit-breaker objects are shared with `@st.cache_resource`, not `st.session_state`.
+- Updated the testing section to reflect the actual dashboard suite: 100 passing tests across 8 dashboard test files, with SQLite fixtures mirroring the relevant Alembic schema contracts.
+
+**[DECISION] Documentation now separates dashboard UI completeness from producer-task completeness**
+The dashboard pages and query layer are implemented, but some panels depend on daily producers that are not fully wired yet. The spec now explicitly tracks this distinction so future sessions do not mistake table migrations for end-to-end data population.
+
+**Next steps:**
+- Run Streamlit manually with `streamlit run reporting/dashboards/app.py` and complete the manual verification checklist.
+- Wire the `portfolio_snapshots` INSERT into Airflow `fetch_ibkr_snapshot`.
+- Wire the daily `strategy_simulations` producer task into `daily_signal_pipeline.py`.
+
+---
+
 ### Session 51 — Streamlit Dashboard Implementation: All 4 Sprints (M5.8)
 
 **Operator:** mshane@thecanadalist.ca

@@ -6,15 +6,15 @@ Launch with:
 from __future__ import annotations
 
 import os
-import uuid
 
 import streamlit as st
 
-from reporting.dashboards.components.env_banner import render_env_banner
 from reporting.dashboards.components.circuit_breaker import (
     render_circuit_breaker_sidebar,
     render_circuit_breaker_warning,
 )
+from reporting.dashboards.components.env_banner import render_env_banner
+from reporting.dashboards.session import init_dashboard_session
 
 # -- Page config (must be first Streamlit command) --
 st.set_page_config(
@@ -25,12 +25,7 @@ st.set_page_config(
 )
 
 # -- Session state init (Section 5.4) --
-if "session_id" not in st.session_state:
-    st.session_state["session_id"] = str(uuid.uuid4())
-if "operator_email" not in st.session_state:
-    st.session_state["operator_email"] = os.environ.get(
-        "OPERATOR_EMAIL", "unknown"
-    )
+init_dashboard_session()
 
 # -- Shared components (every page) --
 render_env_banner()

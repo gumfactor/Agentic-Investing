@@ -260,14 +260,14 @@ def latest_prices(engine: "Engine", tickers: list[str]) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql_query(
             text(f"""
-                SELECT dp.ticker, dp.close, dp.price_date
+                SELECT dp.ticker, dp.close, dp.date AS price_date
                 FROM daily_prices dp
                 INNER JOIN (
-                    SELECT ticker, MAX(price_date) AS max_date
+                    SELECT ticker, MAX(date) AS max_date
                     FROM daily_prices
                     WHERE ticker IN ({placeholders})
                     GROUP BY ticker
-                ) latest ON dp.ticker = latest.ticker AND dp.price_date = latest.max_date
+                ) latest ON dp.ticker = latest.ticker AND dp.date = latest.max_date
                 ORDER BY dp.ticker
             """),
             conn,
@@ -288,11 +288,11 @@ def daily_returns_for_tickers(
     with engine.connect() as conn:
         df = pd.read_sql_query(
             text(f"""
-                SELECT ticker, price_date, close
+                SELECT ticker, date AS price_date, close
                 FROM daily_prices
                 WHERE ticker IN ({placeholders})
-                  AND price_date >= :cutoff
-                ORDER BY ticker, price_date ASC
+                  AND date >= :cutoff
+                ORDER BY ticker, date ASC
             """),
             conn,
             params=params,
@@ -490,9 +490,9 @@ def all_strategies(engine: "Engine") -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql_query(
             text("""
-                SELECT strategy_id, status, created_at
+                SELECT strategy_id, status, registered_at AS created_at
                 FROM strategies
-                ORDER BY created_at DESC
+                ORDER BY registered_at DESC
             """),
             conn,
         )
