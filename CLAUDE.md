@@ -223,6 +223,7 @@ does not reference both a composite and any of its constituent indicators simult
 | `IBKR_FX_RATE_CAD_USD_AS_OF` | Required `YYYY-MM-DD` date for manual CAD→USD fallback; stale dates are rejected |
 | `MLFLOW_TRACKING_URI` | MLflow tracking server URL |
 | `PAPER_TRADING` | `"true"` or `"false"` — NEVER change from `"false"` without operator `"YES"` confirmation (C9) |
+| `C8_CLEARED` | `"true"` or unset — enables the live trading submit path in the Streamlit dashboard. Must only be set after completing the 4-week paper qualification (C8 rule). Requires `PAPER_TRADING=false` AND `IBKR_PORT=7496` simultaneously — setting this alone has no effect. |
 
 Reference `.env.example` for the full list.
 

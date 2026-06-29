@@ -11,6 +11,41 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-29
+
+### Session 50 — Streamlit Dashboard Planning (M5.8)
+
+**Operator:** mshane@thecanadalist.ca  
+**Branch:** `claude/streamlit-dashboard-scope-c8eadq`  
+**Commits:** planning session only — no code committed
+
+**What was done:**
+
+- Conducted full codebase survey to establish current observable layers: determined there is no integrated UI — only disconnected CLI scripts, Airflow UI, MLflow UI, and local JSON artifacts.
+- Planned the Streamlit dashboard (M5.8) end-to-end with operator.
+- Resolved multi-strategy architecture: one real executable portfolio in IBKR; additional strategies run as shadow (simulated) portfolios using `alpha_scores` + `daily_prices` daily returns. No multi-account IBKR complexity.
+- Confirmed shadow portfolios need full risk analytics (drawdown, VaR, beta, concentration, Sharpe) not just returns — the comparison is risk-adjusted, not return-only.
+- Identified two new backend prerequisites:
+  - `portfolio_snapshots` table + Airflow task change (`fetch_ibkr_snapshot` writes to DB)
+  - `strategy_simulations` table + new Airflow forward simulation task in `daily_signal_pipeline.py`
+- Identified three open decisions (D1: blotter artifact location, D2: quantity_overrides column, D3: Airflow metadata DB access).
+
+**[DECISION] Shadow portfolio comparison via `strategy_simulations` table**  
+Rather than requiring multiple IBKR accounts or real parallel capital allocation, shadow strategies are forward-simulated daily using their `alpha_scores` and `daily_prices`. The comparison view on the Performance page joins MLflow historical backtests (up to paper trading inception) with `strategy_simulations` (forward from inception). This enables meaningful strategy switching decisions without operational complexity.
+
+**[DECISION] Dashboard does not make its own IBKR connection**  
+The Airflow DAG owns the IBKR connection. The dashboard reads positions from `portfolio_snapshots` (written by the Airflow `fetch_ibkr_snapshot` task). This avoids two competing connections to TWS/Gateway and keeps the dashboard stateless with respect to the broker.
+
+**Deliverables:**
+- `docs/streamlit_dashboard_spec.md` — complete implementation specification (13 sections, 7 pages, 4 sprints, safety rule enforcement summary, open decisions, build order, testing requirements)
+
+**Next steps:**
+- Operator to resolve D1 (blotter artifact location) and D2 (quantity_overrides) before Sprint 1 begins
+- Sprint 1: `db.py`, `queries.py`, shared components, Page 4 (Blotter Approval / C1 gate)
+- Sprint 1 exit criterion: CLI confirmation path (`paper_approve_blotter.py`) can be retired; all approvals go through dashboard
+
+---
+
 ## 2026-06-28
 
 ### Session 49 — Indicator Diagnostic: Adversarial Review Fixes
