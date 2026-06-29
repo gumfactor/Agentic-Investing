@@ -608,6 +608,7 @@ def _submit_orders(**context: Any) -> None:
     blotter_sha256: str = ti.xcom_pull(key="blotter_sha256", task_ids="build_blotter")
     selected_order_ids = ti.xcom_pull(key="selected_order_ids", task_ids="wait_approval")
     approved_by: str = ti.xcom_pull(key="approved_by", task_ids="wait_approval")
+    quantity_overrides = ti.xcom_pull(key="quantity_overrides", task_ids="wait_approval") or {}
 
     blotter_path = _Path(blotter_path_str)
 
@@ -658,6 +659,12 @@ def _submit_orders(**context: Any) -> None:
             "No candidate rows remain after filtering by selected_order_ids. "
             "Verify that the approval selected at least one order."
         )
+
+    if quantity_overrides:
+        for i, row in enumerate(rows_to_submit):
+            override_qty = quantity_overrides.get(str(row["sequence"]))
+            if override_qty is not None:
+                rows_to_submit[i] = {**row, "quantity": override_qty}
 
     _validate_api_submittable_quantities(rows_to_submit)
     _validate_api_submittable_prices(rows_to_submit)

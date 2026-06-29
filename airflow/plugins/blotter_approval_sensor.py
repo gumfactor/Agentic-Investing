@@ -75,7 +75,8 @@ class BlotterApprovalSensor(BaseSensorOperator):
                 row = conn.execute(
                     text(
                         "SELECT selected_order_ids, approved_by, "
-                        "confirmed_blotter_sha256, approved_at_utc "
+                        "confirmed_blotter_sha256, approved_at_utc, "
+                        "quantity_overrides "
                         "FROM blotter_approvals "
                         "WHERE blotter_run_id = :run_id "
                         "ORDER BY approved_at_utc DESC "
@@ -108,4 +109,5 @@ class BlotterApprovalSensor(BaseSensorOperator):
         ti.xcom_push(key="selected_order_ids", value=row.selected_order_ids)
         ti.xcom_push(key="approved_by", value=str(row.approved_by))
         ti.xcom_push(key="approved_at_utc", value=str(row.approved_at_utc))
+        ti.xcom_push(key="quantity_overrides", value=row.quantity_overrides or {})
         return True
