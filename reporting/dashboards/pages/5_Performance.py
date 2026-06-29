@@ -5,7 +5,6 @@ and strategy comparison panel.
 """
 from __future__ import annotations
 
-import json
 from datetime import date, timedelta
 
 import matplotlib
@@ -116,8 +115,8 @@ else:
             col6.metric("Calmar Ratio", f"{calmar:.2f}")
             col7.metric("Volatility", f"{vol:.2%}")
 
-        except (ImportError, Exception) as exc:
-            st.warning(f"Metrics computation failed: {type(exc).__name__}")
+        except (ImportError, ValueError, ZeroDivisionError, TypeError, KeyError) as exc:
+            st.warning(f"Metrics computation failed: {type(exc).__name__}: {exc}")
 
         # Section B: Charts
         st.subheader("Charts")
@@ -171,8 +170,8 @@ else:
                 st.pyplot(fig)
                 plt.close(fig)
 
-        except (ImportError, Exception) as exc:
-            st.warning(f"Chart rendering failed: {type(exc).__name__}")
+        except (ImportError, ValueError, TypeError, KeyError) as exc:
+            st.warning(f"Chart rendering failed: {type(exc).__name__}: {exc}")
 
 # ── Section C: Strategy Comparison ──────────────────────────────────────────
 
@@ -245,8 +244,8 @@ else:
                 st.dataframe(
                     comp_df,
                     column_config={
-                        "Return": st.column_config.NumberColumn("Return", format="%.2%%"),
-                        "Max DD": st.column_config.NumberColumn("Max DD", format="%.2%%"),
+                        "Return": st.column_config.NumberColumn("Return", format="%.2f%%"),
+                        "Max DD": st.column_config.NumberColumn("Max DD", format="%.2f%%"),
                         "Sharpe": st.column_config.NumberColumn("Sharpe", format="%.2f"),
                     },
                     use_container_width=True,
@@ -254,6 +253,7 @@ else:
                 )
 
                 # Equity curve overlay
+                fig = None
                 try:
                     fig, ax = plt.subplots(figsize=(10, 5))
                     for sid in selected_sids:
@@ -273,6 +273,8 @@ else:
                     ax.legend()
                     ax.set_ylabel("NAV (indexed)")
                     st.pyplot(fig)
-                    plt.close(fig)
-                except Exception as exc:
+                except (ValueError, TypeError, KeyError) as exc:
                     st.caption(f"Comparison chart unavailable: {type(exc).__name__}")
+                finally:
+                    if fig is not None:
+                        plt.close(fig)

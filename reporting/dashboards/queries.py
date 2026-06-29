@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import exc as sa_exc, text
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
@@ -209,7 +209,7 @@ def pipeline_health(engine: "Engine") -> dict:
             sim_ts = conn.execute(
                 text("SELECT MAX(computed_at_utc) FROM strategy_simulations")
             ).scalar()
-        except Exception:
+        except (sa_exc.OperationalError, sa_exc.ProgrammingError):
             sim_ts = None
 
     def _age(ts: datetime | None) -> timedelta | None:
@@ -337,6 +337,28 @@ def latest_alpha_scores(
         )
 
 
+def bottom_alpha_scores(
+    engine: "Engine", strategy_id: str, limit: int = 25
+) -> pd.DataFrame:
+    """Return bottom-ranked alpha scores for the latest score_date."""
+    with engine.connect() as conn:
+        return pd.read_sql_query(
+            text("""
+                SELECT ticker, alpha_score, rank, universe_size
+                FROM alpha_scores
+                WHERE score_date = (
+                    SELECT MAX(score_date) FROM alpha_scores
+                    WHERE strategy_id = :sid
+                )
+                AND strategy_id = :sid
+                ORDER BY rank DESC
+                LIMIT :lim
+            """),
+            conn,
+            params={"sid": strategy_id, "lim": limit},
+        )
+
+
 def factor_scores_for_ticker(
     engine: "Engine", ticker: str, strategy_id: str, lookback_days: int = 30
 ) -> pd.DataFrame:
@@ -437,6 +459,8 @@ def strategy_simulations_query(
     start: date | None = None,
     end: date | None = None,
 ) -> pd.DataFrame:
+    if not strategy_ids:
+        return pd.DataFrame()
     placeholders = ", ".join(f":sid_{i}" for i in range(len(strategy_ids)))
     conditions = [f"strategy_id IN ({placeholders})"]
     params: dict = {f"sid_{i}": sid for i, sid in enumerate(strategy_ids)}

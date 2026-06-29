@@ -21,6 +21,7 @@ from reporting.dashboards.db import get_engine
 from reporting.dashboards.queries import (
     active_strategy_id,
     all_strategies,
+    bottom_alpha_scores,
     factor_scores_for_ticker,
     latest_alpha_scores,
 )
@@ -62,8 +63,11 @@ else:
 
     # Top 25
     top = scores_df.head(25)
-    # Bottom 25
-    bottom = scores_df.tail(25) if len(scores_df) > 25 else pd.DataFrame()
+    # Bottom 25 — separate query to get actual worst-ranked tickers
+    try:
+        bottom = bottom_alpha_scores(engine, strategy_id, limit=25)
+    except (sa_exc.SQLAlchemyError, OSError):
+        bottom = pd.DataFrame()
 
     col_top, col_bottom = st.columns(2)
 
@@ -176,8 +180,9 @@ except (sa_exc.SQLAlchemyError, OSError):
 if strats_df.empty:
     st.info("No strategies registered.")
 else:
-    display_df = strats_df.copy()
-    display_df.columns = ["Strategy ID", "Status", "Created"]
+    display_df = strats_df.rename(columns={
+        "strategy_id": "Strategy ID", "status": "Status", "created_at": "Created",
+    })
 
     st.dataframe(
         display_df,
