@@ -227,6 +227,83 @@ def pipeline_health(engine: "Engine") -> dict:
     }
 
 
+def previous_portfolio_snapshot(
+    engine: "Engine", strategy_id: str
+) -> dict | None:
+    """Return the second-latest portfolio snapshot row (yesterday), or None."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT snapshot_date, strategy_id, cash_usd, positions,
+                       nav_usd, source, fetched_at_utc
+                FROM portfolio_snapshots
+                WHERE strategy_id = :sid
+                ORDER BY snapshot_date DESC
+                LIMIT 1 OFFSET 1
+            """),
+            {"sid": strategy_id},
+        ).mappings().fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def latest_prices(engine: "Engine", tickers: list[str]) -> pd.DataFrame:
+    """Return latest close prices for given tickers from daily_prices."""
+    if not tickers:
+        return pd.DataFrame(columns=["ticker", "close", "price_date"])
+    placeholders = ", ".join(f":t_{i}" for i in range(len(tickers)))
+    params = {f"t_{i}": t for i, t in enumerate(tickers)}
+    with engine.connect() as conn:
+        return pd.read_sql_query(
+            text(f"""
+                SELECT DISTINCT ON (ticker) ticker, close, price_date
+                FROM daily_prices
+                WHERE ticker IN ({placeholders})
+                ORDER BY ticker, price_date DESC
+            """),
+            conn,
+            params=params,
+        )
+
+
+def daily_returns_for_tickers(
+    engine: "Engine", tickers: list[str], lookback_days: int = 252
+) -> pd.DataFrame:
+    """Return daily returns (close-to-close) for risk computation."""
+    if not tickers:
+        return pd.DataFrame()
+    cutoff = date.today() - timedelta(days=lookback_days + 30)
+    placeholders = ", ".join(f":t_{i}" for i in range(len(tickers)))
+    params = {f"t_{i}": t for i, t in enumerate(tickers)}
+    params["cutoff"] = cutoff
+    with engine.connect() as conn:
+        df = pd.read_sql_query(
+            text(f"""
+                SELECT ticker, price_date, close
+                FROM daily_prices
+                WHERE ticker IN ({placeholders})
+                  AND price_date >= :cutoff
+                ORDER BY ticker, price_date ASC
+            """),
+            conn,
+            params=params,
+        )
+    if df.empty:
+        return pd.DataFrame()
+    pivot = df.pivot(index="price_date", columns="ticker", values="close")
+    return pivot.pct_change().dropna(how="all")
+
+
+def active_strategy_id(engine: "Engine") -> str | None:
+    """Return the strategy_id with status='paper' (the active paper strategy)."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT strategy_id FROM strategies WHERE status = 'paper' LIMIT 1")
+        ).fetchone()
+    return row[0] if row else None
+
+
 # ---------------------------------------------------------------------------
 # Signal queries (Sprint 3 stubs)
 # ---------------------------------------------------------------------------

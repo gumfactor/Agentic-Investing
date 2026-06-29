@@ -1,18 +1,24 @@
-"""Circuit breaker sidebar widget — rendered on every page.
+"""Circuit breaker and alert manager singletons — rendered on every page.
 
-Uses @st.cache_resource so all tabs share a single CircuitBreaker instance
+Uses @st.cache_resource so all tabs share single instances
 with consistent state (spec Section 5.2).
 """
 from __future__ import annotations
 
 import streamlit as st
 
+from risk.alerts.alert_manager import AlertManager
 from risk.circuit_breaker import CircuitBreaker
 
 
 @st.cache_resource
 def get_circuit_breaker() -> CircuitBreaker:
     return CircuitBreaker()
+
+
+@st.cache_resource
+def get_alert_manager() -> AlertManager:
+    return AlertManager()
 
 
 def render_circuit_breaker_sidebar() -> None:
