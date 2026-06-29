@@ -30,6 +30,7 @@ def upgrade() -> None:
         sa.Column("positions", postgresql.JSONB, nullable=False),
         sa.Column("nav_usd", sa.Numeric(18, 6), nullable=False),
         sa.Column("source", sa.Text, server_default="ibkr_paper", nullable=False),
+        sa.UniqueConstraint("snapshot_date", "strategy_id", name="uq_portfolio_snapshots_date_strategy"),
     )
     op.create_index(
         "ix_portfolio_snapshots_date_strategy",

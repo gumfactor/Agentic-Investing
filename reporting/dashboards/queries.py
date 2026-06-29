@@ -205,9 +205,12 @@ def pipeline_health(engine: "Engine") -> dict:
         scores_ts = conn.execute(
             text("SELECT MAX(computed_at) FROM alpha_scores")
         ).scalar()
-        sim_ts = conn.execute(
-            text("SELECT MAX(computed_at_utc) FROM strategy_simulations")
-        ).scalar()
+        try:
+            sim_ts = conn.execute(
+                text("SELECT MAX(computed_at_utc) FROM strategy_simulations")
+            ).scalar()
+        except Exception:
+            sim_ts = None
 
     def _age(ts: datetime | None) -> timedelta | None:
         if ts is None:
@@ -257,10 +260,15 @@ def latest_prices(engine: "Engine", tickers: list[str]) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql_query(
             text(f"""
-                SELECT DISTINCT ON (ticker) ticker, close, price_date
-                FROM daily_prices
-                WHERE ticker IN ({placeholders})
-                ORDER BY ticker, price_date DESC
+                SELECT dp.ticker, dp.close, dp.price_date
+                FROM daily_prices dp
+                INNER JOIN (
+                    SELECT ticker, MAX(price_date) AS max_date
+                    FROM daily_prices
+                    WHERE ticker IN ({placeholders})
+                    GROUP BY ticker
+                ) latest ON dp.ticker = latest.ticker AND dp.price_date = latest.max_date
+                ORDER BY dp.ticker
             """),
             conn,
             params=params,

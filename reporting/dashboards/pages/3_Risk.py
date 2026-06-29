@@ -79,17 +79,26 @@ if not positions_raw or nav <= 0:
     st.info("Portfolio is empty or NAV is zero. Risk metrics require positions.")
     st.stop()
 
-# Build weights
+# Build weights — only from positions with a valid current_price
 tickers = [p["ticker"] for p in positions_raw]
 quantities = {p["ticker"]: float(p.get("quantity", 0)) for p in positions_raw}
 prices = {
-    p["ticker"]: float(p.get("current_price", 0)) for p in positions_raw
+    p["ticker"]: float(p.get("current_price", 0))
+    for p in positions_raw
     if p.get("current_price")
 }
 
-mkt_values = {t: quantities[t] * prices.get(t, 0) for t in tickers}
+missing_price_tickers = [t for t in tickers if t not in prices]
+if missing_price_tickers:
+    st.warning(
+        f"{len(missing_price_tickers)} position(s) missing current_price and excluded "
+        f"from risk weights: {', '.join(missing_price_tickers[:10])}"
+    )
+
+priced_tickers = [t for t in tickers if t in prices]
+mkt_values = {t: quantities[t] * prices[t] for t in priced_tickers}
 total_mkt = sum(mkt_values.values())
-weights_dict = {t: mkt_values[t] / total_mkt for t in tickers} if total_mkt > 0 else {}
+weights_dict = {t: mkt_values[t] / total_mkt for t in priced_tickers} if total_mkt > 0 else {}
 weights_series = pd.Series(weights_dict)
 
 # Fetch daily returns
@@ -122,9 +131,16 @@ try:
             asset_returns=asset_rets,
             benchmark_returns=benchmark_rets,
         )
-except (sa_exc.SQLAlchemyError, OSError, Exception) as exc:
+except (sa_exc.SQLAlchemyError, OSError, ValueError, TypeError) as exc:
     st.warning(f"Risk computation failed: {type(exc).__name__}: {exc}")
     risk_snap = None
+
+# Wire risk snapshot into circuit breaker and alert manager (F4 fix)
+if risk_snap is not None:
+    cb = get_circuit_breaker()
+    am = get_alert_manager()
+    cb.evaluate(risk_snap)
+    am.fire_from_snapshot(risk_snap)
 
 # ── Risk metric cards ───────────────────────────────────────────────────────
 
@@ -202,6 +218,8 @@ cb = get_circuit_breaker()
 
 if cb.is_closed:
     st.success("Circuit Breaker: CLOSED — trading is enabled.")
+    if st.session_state.get("cb_reset_pending"):
+        st.session_state["cb_reset_pending"] = False
 else:
     st.error("Circuit Breaker: OPEN — trading is halted.")
 
