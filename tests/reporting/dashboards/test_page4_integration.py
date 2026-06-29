@@ -45,9 +45,54 @@ def engine():
     return eng
 
 
+def _rows_checksum(rows: list[dict]) -> str:
+    """Match the production checksum logic in paper_stage_blotter_check."""
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _create_blotter_artifact(artifact_dir: Path) -> tuple[Path, dict, str]:
-    """Create a realistic blotter artifact and return (path, data, sha256)."""
+    """Create a realistic blotter artifact and return (path, data, file_sha256)."""
     artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    candidate_rows = [
+        {
+            "sequence": 1,
+            "ticker": "AAPL",
+            "side": "BUY",
+            "quantity": 10,
+            "reference_price": 195.50,
+            "estimated_notional": 1955.00,
+            "risk_flag": "",
+        },
+        {
+            "sequence": 2,
+            "ticker": "MSFT",
+            "side": "BUY",
+            "quantity": 5,
+            "reference_price": 420.00,
+            "estimated_notional": 2100.00,
+            "risk_flag": "",
+        },
+        {
+            "sequence": 3,
+            "ticker": "NVDA",
+            "side": "BUY",
+            "quantity": 3,
+            "reference_price": 130.00,
+            "estimated_notional": 390.00,
+            "risk_flag": "CONCENTRATION",
+        },
+        {
+            "sequence": 4,
+            "ticker": "GOOG",
+            "side": "SELL",
+            "quantity": 8,
+            "reference_price": 178.25,
+            "estimated_notional": 1426.00,
+            "risk_flag": "",
+        },
+    ]
 
     blotter = {
         "schema_version": "1.0",
@@ -57,49 +102,9 @@ def _create_blotter_artifact(artifact_dir: Path) -> tuple[Path, dict, str]:
         "paper_only": True,
         "stage_only": True,
         "strategy_id": "v1_base_momentum",
-        "candidate_rows": [
-            {
-                "sequence": 1,
-                "ticker": "AAPL",
-                "side": "BUY",
-                "quantity": 10,
-                "reference_price": 195.50,
-                "estimated_notional": 1955.00,
-                "risk_flag": "",
-            },
-            {
-                "sequence": 2,
-                "ticker": "MSFT",
-                "side": "BUY",
-                "quantity": 5,
-                "reference_price": 420.00,
-                "estimated_notional": 2100.00,
-                "risk_flag": "",
-            },
-            {
-                "sequence": 3,
-                "ticker": "NVDA",
-                "side": "BUY",
-                "quantity": 3,
-                "reference_price": 130.00,
-                "estimated_notional": 390.00,
-                "risk_flag": "CONCENTRATION",
-            },
-            {
-                "sequence": 4,
-                "ticker": "GOOG",
-                "side": "SELL",
-                "quantity": 8,
-                "reference_price": 178.25,
-                "estimated_notional": 1426.00,
-                "risk_flag": "",
-            },
-        ],
+        "candidate_rows": candidate_rows,
+        "candidate_rows_sha256": _rows_checksum(candidate_rows),
     }
-
-    content = json.dumps(blotter, indent=2).encode()
-    sha = hashlib.sha256(content).hexdigest()
-    blotter["candidate_rows_sha256"] = sha
 
     final_content = json.dumps(blotter, indent=2).encode()
     path = artifact_dir / f"blotter_{blotter['run_id']}.json"

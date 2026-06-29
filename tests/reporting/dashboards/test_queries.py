@@ -4,6 +4,7 @@ Uses an in-memory SQLite database seeded with known data.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -54,20 +55,27 @@ def artifact_dir(tmp_path: Path) -> Path:
     return tmp_path / "artifacts"
 
 
+def _rows_checksum(rows: list[dict]) -> str:
+    """Match the production checksum logic in paper_stage_blotter_check."""
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _write_blotter(artifact_dir: Path, run_id: str, age_hours: float = 0) -> Path:
     """Write a minimal blotter JSON artifact and return the path."""
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    candidate_rows = [
+        {"sequence": 1, "ticker": "AAPL", "side": "BUY", "quantity": 10,
+         "reference_price": 200.0, "estimated_notional": 2000.0},
+    ]
     blotter = {
         "run_id": run_id,
         "generated_at_utc": "2026-06-29T23:00:00Z",
         "paper_only": True,
         "stage_only": True,
         "strategy_id": "v1_base_momentum",
-        "candidate_rows": [
-            {"sequence": 1, "ticker": "AAPL", "side": "BUY", "quantity": 10,
-             "reference_price": 200.0, "estimated_notional": 2000.0},
-        ],
-        "candidate_rows_sha256": "a" * 64,
+        "candidate_rows": candidate_rows,
+        "candidate_rows_sha256": _rows_checksum(candidate_rows),
     }
     path = artifact_dir / f"blotter_{run_id}.json"
     with open(path, "w") as f:

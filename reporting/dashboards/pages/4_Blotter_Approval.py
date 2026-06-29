@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy.exc import IntegrityError
 
 from reporting.dashboards.components.circuit_breaker import get_circuit_breaker
@@ -55,6 +56,12 @@ def _compute_file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _compute_rows_sha256(rows: list[dict]) -> str:
+    """Match the checksum logic in paper_stage_blotter_check._rows_checksum."""
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _is_submit_enabled() -> tuple[bool, str]:
     """Check whether submission should be enabled. Returns (enabled, reason)."""
     cb = get_circuit_breaker()
@@ -93,17 +100,30 @@ else:
     # State B — Blotter awaiting approval
     artifact_path: Path = pending["path"]
     blotter: dict = pending["blotter"]
+    current_run_id = blotter.get("run_id", "unknown")
+
+    # Clear stale session state if the blotter changed
+    if st.session_state.get("_blotter_run_id") != current_run_id:
+        st.session_state["_blotter_run_id"] = current_run_id
+        st.session_state.pop("show_confirmation", None)
 
     # Step 2: SHA-256 verification at page load
-    computed_hash = _compute_file_sha256(artifact_path)
-    stored_hash = blotter.get("candidate_rows_sha256")
+    # Two independent checks:
+    # a) Verify candidate_rows_sha256 matches the rows inside the artifact
+    #    (detects row tampering without changing the wrapping artifact)
+    # b) Compute file hash for TOCTOU detection between load and submission
+    file_hash_at_load = _compute_file_sha256(artifact_path)
+    stored_rows_hash = blotter.get("candidate_rows_sha256")
+    candidate_rows_raw = blotter.get("candidate_rows", [])
 
-    if stored_hash and computed_hash != stored_hash:
-        st.error(
-            "INTEGRITY CHECK FAILED: Blotter file has been modified "
-            "since it was generated."
-        )
-        st.stop()
+    if stored_rows_hash:
+        recomputed_rows_hash = _compute_rows_sha256(candidate_rows_raw)
+        if recomputed_rows_hash != stored_rows_hash:
+            st.error(
+                "INTEGRITY CHECK FAILED: Blotter candidate rows have been "
+                "modified since the artifact was generated."
+            )
+            st.stop()
 
     # Step 1: Blotter header
     st.subheader("Blotter Details")
@@ -125,8 +145,8 @@ else:
     col6.metric("Total Notional", f"${total_notional:,.2f}")
 
     st.caption(
-        f"SHA-256: `{computed_hash[:16]}...` "
-        f"(full: `{computed_hash}`)"
+        f"File SHA-256: `{file_hash_at_load[:16]}...` "
+        f"(full: `{file_hash_at_load}`)"
     )
     st.caption(f"Strategy: {blotter.get('strategy_id', 'N/A')}")
 
@@ -178,25 +198,28 @@ else:
         },
         use_container_width=True,
         hide_index=True,
-        key="blotter_grid",
+        key=f"blotter_grid_{current_run_id}",
     )
 
-    # Quantity edit validation — reject increases, revert to original
+    # Quantity edit validation — cap at original values (increases rejected)
     quantity_issues = []
-    for _, row in edited_df.iterrows():
+    capped_df = edited_df.copy()
+    for idx, row in capped_df.iterrows():
         seq = int(row["sequence"])
         edited_qty = int(row["quantity"])
         orig_qty = int(original_quantities.get(seq, edited_qty))
         if edited_qty > orig_qty:
+            capped_df.at[idx, "quantity"] = orig_qty
             quantity_issues.append(
-                f"Row {seq} ({row['ticker']}): quantity increased from "
-                f"{orig_qty} to {edited_qty} — reverted."
+                f"Row {seq} ({row['ticker']}): quantity may not exceed "
+                f"blotter value of {orig_qty}. Submission blocked."
             )
 
     if quantity_issues:
         for msg in quantity_issues:
             st.warning(msg)
-        st.warning("Quantity may not be increased from the blotter value.")
+
+    edited_df = capped_df
 
     # Running totals
     selected_mask = edited_df["selected"] == True  # noqa: E712
@@ -256,21 +279,34 @@ else:
 
         confirmed = st.checkbox(
             "I have reviewed all orders and confirm this submission.",
-            key="confirm_checkbox",
+            key=f"confirm_checkbox_{current_run_id}",
         )
 
         if st.button(
             "CONFIRM SUBMISSION",
             disabled=not confirmed,
             type="primary",
-            key="confirm_submit",
+            key=f"confirm_submit_{current_run_id}",
         ):
-            # Re-verify SHA-256 at submission time
+            # Re-verify file SHA-256 at submission time (TOCTOU detection)
             confirmed_hash = _compute_file_sha256(artifact_path)
-            if stored_hash and confirmed_hash != stored_hash:
+            if confirmed_hash != file_hash_at_load:
                 st.error(
                     "Blotter file changed between review and submission. Aborting."
                 )
+                st.stop()
+
+            # Re-verify run_id hasn't changed (prevents file replacement attack)
+            try:
+                with open(artifact_path) as f:
+                    reloaded = json.load(f)
+                if reloaded.get("run_id") != current_run_id:
+                    st.error(
+                        "Blotter run_id changed between review and submission. Aborting."
+                    )
+                    st.stop()
+            except (json.JSONDecodeError, OSError):
+                st.error("Blotter file unreadable at submission time. Aborting.")
                 st.stop()
 
             # Resolve selected order IDs
@@ -358,5 +394,5 @@ try:
             ] if c in display_df.columns
         ]
         st.dataframe(display_df[cols_to_show], use_container_width=True)
-except Exception:
-    st.caption("Approval history unavailable (database not connected).")
+except (sqlalchemy_exc.SQLAlchemyError, OSError) as exc:
+    st.caption(f"Approval history unavailable: {type(exc).__name__}")

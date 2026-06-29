@@ -5,7 +5,7 @@ No raw SQL in page files — pages import from this module only.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,33 +30,47 @@ def pending_blotter(artifact_dir: Path, engine: "Engine") -> dict | None:
     if not artifact_dir.is_dir():
         return None
 
-    cutoff = datetime.utcnow() - timedelta(hours=36)
+    cutoff = datetime.now(timezone.utc)- timedelta(hours=36)
     candidates = sorted(
         artifact_dir.glob("**/blotter*.json"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
 
+    # Phase 1: collect candidate run_ids from recent files
+    parsed: list[tuple[Path, dict]] = []
     for path in candidates:
-        if datetime.utcfromtimestamp(path.stat().st_mtime) < cutoff:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        if mtime < cutoff:
             break
         try:
             with open(path) as f:
                 blotter = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
-
         run_id = blotter.get("run_id")
         if not run_id:
             continue
+        parsed.append((path, blotter))
 
-        with engine.connect() as conn:
-            exists = conn.execute(
+    if not parsed:
+        return None
+
+    # Phase 2: batch check which run_ids are already approved
+    run_ids = [b.get("run_id") for _, b in parsed]
+    approved_ids: set[str] = set()
+    with engine.connect() as conn:
+        for rid in run_ids:
+            row = conn.execute(
                 text("SELECT 1 FROM blotter_approvals WHERE blotter_run_id = :rid"),
-                {"rid": run_id},
+                {"rid": rid},
             ).fetchone()
+            if row:
+                approved_ids.add(rid)
 
-        if not exists:
+    # Phase 3: return the most recent pending
+    for path, blotter in parsed:
+        if blotter["run_id"] not in approved_ids:
             return {"path": path, "blotter": blotter}
 
     return None
@@ -183,16 +197,28 @@ def nav_history(
 
 def pipeline_health(engine: "Engine") -> dict:
     """Infer pipeline health from data recency (D3 decision)."""
+    now = datetime.now(timezone.utc)
     with engine.connect() as conn:
-        prices_age = conn.execute(
-            text("SELECT NOW() - MAX(ingested_at) FROM daily_prices")
+        prices_ts = conn.execute(
+            text("SELECT MAX(ingested_at) FROM daily_prices")
         ).scalar()
-        scores_age = conn.execute(
-            text("SELECT NOW() - MAX(computed_at) FROM alpha_scores")
+        scores_ts = conn.execute(
+            text("SELECT MAX(computed_at) FROM alpha_scores")
         ).scalar()
-        sim_age = conn.execute(
-            text("SELECT NOW() - MAX(computed_at_utc) FROM strategy_simulations")
+        sim_ts = conn.execute(
+            text("SELECT MAX(computed_at_utc) FROM strategy_simulations")
         ).scalar()
+
+    def _age(ts: datetime | None) -> timedelta | None:
+        if ts is None:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return now - ts
+
+    prices_age = _age(prices_ts)
+    scores_age = _age(scores_ts)
+    sim_age = _age(sim_ts)
 
     return {
         "prices": {"age": prices_age, "ok": prices_age is not None and prices_age < timedelta(hours=28)},
@@ -272,8 +298,10 @@ def fill_history(
         conditions.append("fill_timestamp <= :end")
         params["end"] = end
     if side:
+        if side.upper() not in ("BUY", "SELL"):
+            raise ValueError(f"Invalid side: {side!r} — must be 'BUY' or 'SELL'")
         conditions.append("side = :side")
-        params["side"] = side
+        params["side"] = side.upper()
 
     where = " AND ".join(conditions)
     with engine.connect() as conn:
@@ -307,7 +335,7 @@ def realized_pnl_summary(
             text(f"""
                 SELECT ticker, SUM(realized_pnl) AS total_pnl,
                        COUNT(*) AS n_fills,
-                       bool_or(wash_sale_disallowed) AS has_wash_sale
+                       MAX(CASE WHEN wash_sale_disallowed THEN 1 ELSE 0 END) AS has_wash_sale
                 FROM trade_fills
                 WHERE {where}
                 GROUP BY ticker
@@ -324,8 +352,9 @@ def strategy_simulations_query(
     start: date | None = None,
     end: date | None = None,
 ) -> pd.DataFrame:
-    conditions = ["strategy_id = ANY(:sids)"]
-    params: dict = {"sids": strategy_ids}
+    placeholders = ", ".join(f":sid_{i}" for i in range(len(strategy_ids)))
+    conditions = [f"strategy_id IN ({placeholders})"]
+    params: dict = {f"sid_{i}": sid for i, sid in enumerate(strategy_ids)}
     if start:
         conditions.append("sim_date >= :start")
         params["start"] = start

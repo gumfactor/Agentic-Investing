@@ -14,5 +14,10 @@ from sqlalchemy.engine import Engine
 
 @st.cache_resource
 def get_engine() -> Engine:
-    url = os.environ["DATABASE_URL"]
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "The dashboard requires a PostgreSQL connection string."
+        )
     return create_engine(url, pool_size=5, max_overflow=2, pool_pre_ping=True)

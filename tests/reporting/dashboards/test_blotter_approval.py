@@ -40,27 +40,31 @@ def engine():
     return eng
 
 
+def _rows_checksum(rows: list[dict]) -> str:
+    """Match the production checksum logic in paper_stage_blotter_check."""
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _make_blotter(tmp_path: Path, run_id: str = "run-test") -> tuple[Path, dict, str]:
-    """Create a blotter artifact file and return (path, blotter_dict, sha256)."""
+    """Create a blotter artifact file and return (path, blotter_dict, file_sha256)."""
+    candidate_rows = [
+        {"sequence": 1, "ticker": "AAPL", "side": "BUY", "quantity": 10,
+         "reference_price": 200.0, "estimated_notional": 2000.0},
+        {"sequence": 2, "ticker": "MSFT", "side": "BUY", "quantity": 5,
+         "reference_price": 400.0, "estimated_notional": 2000.0},
+        {"sequence": 3, "ticker": "GOOG", "side": "SELL", "quantity": 3,
+         "reference_price": 175.0, "estimated_notional": 525.0},
+    ]
     blotter = {
         "run_id": run_id,
         "generated_at_utc": "2026-06-29T23:00:00Z",
         "paper_only": True,
         "stage_only": True,
         "strategy_id": "v1_base_momentum",
-        "candidate_rows": [
-            {"sequence": 1, "ticker": "AAPL", "side": "BUY", "quantity": 10,
-             "reference_price": 200.0, "estimated_notional": 2000.0},
-            {"sequence": 2, "ticker": "MSFT", "side": "BUY", "quantity": 5,
-             "reference_price": 400.0, "estimated_notional": 2000.0},
-            {"sequence": 3, "ticker": "GOOG", "side": "SELL", "quantity": 3,
-             "reference_price": 175.0, "estimated_notional": 525.0},
-        ],
+        "candidate_rows": candidate_rows,
+        "candidate_rows_sha256": _rows_checksum(candidate_rows),
     }
-
-    content = json.dumps(blotter, indent=2).encode()
-    sha = hashlib.sha256(content).hexdigest()
-    blotter["candidate_rows_sha256"] = sha
 
     path = tmp_path / f"blotter_{run_id}.json"
     full_content = json.dumps(blotter, indent=2).encode()
