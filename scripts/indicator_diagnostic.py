@@ -199,8 +199,9 @@ def main(argv: list[str] | None = None) -> int:
         out_path.write_text(json.dumps(_report_to_dict(report), indent=2))
         print(f"\nINFO: report written to {out_path}")
 
-    n_warn = report.n_factors - report.n_reliable
-    return 1 if (args.strict and n_warn > 0) else 0
+    n_reliability_warn = report.n_factors - report.n_reliable
+    n_validity_flags = len(report.validity.flags)
+    return 1 if (args.strict and (n_reliability_warn > 0 or n_validity_flags > 0)) else 0
 
 
 if __name__ == "__main__":
