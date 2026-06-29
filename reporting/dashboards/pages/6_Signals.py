@@ -174,7 +174,8 @@ st.subheader("Strategy Registry")
 
 try:
     strats_df = all_strategies(engine)
-except (sa_exc.SQLAlchemyError, OSError):
+except (sa_exc.SQLAlchemyError, OSError) as exc:
+    st.error(f"Strategy registry query failed: {type(exc).__name__}")
     strats_df = pd.DataFrame()
 
 if strats_df.empty:

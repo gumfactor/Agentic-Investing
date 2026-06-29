@@ -1,7 +1,6 @@
 """Tests for Sprint 3 query functions — strategy simulations, alpha scores, factors."""
 from __future__ import annotations
 
-import json
 from datetime import date
 
 import pytest
@@ -56,7 +55,7 @@ def engine():
             CREATE TABLE strategies (
                 strategy_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
     return eng
@@ -171,11 +170,13 @@ class TestAllStrategies:
     def test_returns_all(self, engine):
         with engine.begin() as conn:
             conn.execute(text("""
-                INSERT INTO strategies (strategy_id, status) VALUES ('v1', 'paper')
+                INSERT INTO strategies (strategy_id, status, registered_at) VALUES ('v1', 'paper', '2026-06-29 10:00:00')
             """))
             conn.execute(text("""
-                INSERT INTO strategies (strategy_id, status) VALUES ('v2', 'backtesting')
+                INSERT INTO strategies (strategy_id, status, registered_at) VALUES ('v2', 'backtesting', '2026-06-28 10:00:00')
             """))
 
         df = all_strategies(engine)
         assert len(df) == 2
+        assert df.iloc[0]["strategy_id"] == "v1"
+        assert "created_at" in df.columns
