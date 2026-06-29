@@ -187,3 +187,48 @@ else:
         use_container_width=True,
         hide_index=True,
     )
+
+# ── Section E: Cross-Strategy Alpha Overlap ───────────────────────────────
+
+st.divider()
+st.subheader("Cross-Strategy Alpha Overlap")
+
+if not strats_df.empty and len(strats_df) >= 2:
+    overlap_sids = strats_df["strategy_id"].tolist()
+    top_n = st.slider("Top N positions for overlap", min_value=5, max_value=50, value=20)
+
+    try:
+        from reporting.dashboards.simulation import alpha_overlap_matrix
+
+        overlap_df = alpha_overlap_matrix(engine, overlap_sids, top_n=top_n)
+
+        if not overlap_df.empty:
+            import numpy as np
+
+            fig, ax = plt.subplots(figsize=(max(6, len(overlap_sids) * 1.2), max(5, len(overlap_sids))))
+            im = ax.imshow(overlap_df.values, cmap="YlOrRd", vmin=0, vmax=1, aspect="auto")
+            ax.set_xticks(range(len(overlap_sids)))
+            ax.set_yticks(range(len(overlap_sids)))
+            ax.set_xticklabels(overlap_sids, rotation=45, ha="right", fontsize=8)
+            ax.set_yticklabels(overlap_sids, fontsize=8)
+
+            for i in range(len(overlap_sids)):
+                for j in range(len(overlap_sids)):
+                    val = overlap_df.values[i, j]
+                    ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                            color="white" if val > 0.5 else "black", fontsize=8)
+
+            fig.colorbar(im, ax=ax, label="Jaccard Similarity")
+            ax.set_title(f"Alpha Overlap (Top {top_n} Positions)")
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            st.caption(
+                "High overlap (>0.7) suggests strategies are not diversifying well. "
+                "Low overlap (<0.3) indicates complementary signal sources."
+            )
+    except (sa_exc.SQLAlchemyError, OSError, ValueError) as exc:
+        st.caption(f"Alpha overlap unavailable: {type(exc).__name__}")
+else:
+    st.info("At least two strategies are needed for overlap analysis.")

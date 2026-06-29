@@ -176,38 +176,9 @@ else:
 
 st.subheader("Alerts")
 
-am = get_alert_manager()
-unacked = am.unacknowledged()
+from reporting.dashboards.components.alert_feed import render_alert_feed
 
-if not unacked:
-    st.success("No unacknowledged alerts.")
-else:
-    for alert in unacked:
-        acol1, acol2 = st.columns([4, 1])
-        if alert.severity == "hard":
-            acol1.error(
-                f"**{alert.metric}** = {alert.value:.4f} "
-                f"(threshold: {alert.threshold:.4f}) — {alert.fired_at:%H:%M UTC}"
-            )
-        else:
-            acol1.warning(
-                f"**{alert.metric}** = {alert.value:.4f} "
-                f"(threshold: {alert.threshold:.4f}) — {alert.fired_at:%H:%M UTC}"
-            )
-        if acol2.button("Ack", key=f"ack_{alert.alert_id}"):
-            am.acknowledge(alert.alert_id)
-            st.rerun()
-
-# Acknowledged alerts in expander
-all_alerts = am.all_alerts()
-acked = [a for a in all_alerts if a.acknowledged]
-if acked:
-    with st.expander(f"Acknowledged Alerts ({len(acked)})"):
-        for alert in acked[-20:]:
-            st.caption(
-                f"{alert.fired_at:%Y-%m-%d %H:%M} — {alert.severity}: "
-                f"{alert.metric} = {alert.value:.4f}"
-            )
+render_alert_feed(show_acknowledged=True, page_key="risk")
 
 # ── Circuit breaker controls ────────────────────────────────────────────────
 
