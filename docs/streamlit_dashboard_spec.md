@@ -145,18 +145,51 @@ For each strategy with status IN ('ACTIVE', 'VALIDATED') in strategy_registry:
 
 The active live strategy is also tracked here for consistent comparison (its simulated NAV will match the real NAV only approximately, since it excludes transaction costs and fill slippage).
 
-### 4.3 Blotter Artifact Location — Decision Required
+### 4.3 `quantity_overrides` Column on `blotter_approvals` — **RESOLVED: New JSONB column**
 
-**Blocks:** Page 4 (Blotter Approval) — requires reading the blotter JSON file.
+**Decision (2026-06-29):** Add a `quantity_overrides JSONB` column to `blotter_approvals`. The existing `selected_order_ids` column (array of approved order ID strings) is unchanged. Quantity edits are stored separately.
 
-**Decision needed from operator:** Choose one of the two options below before implementing Page 4.
+**Alembic migration required before Sprint 1:**
 
-| Option | How it works | Trade-off |
-|--------|-------------|-----------|
-| **A — Shared Docker volume** | Airflow container writes blotter JSON to a named Docker volume (`rqis_paper_artifacts`). Dashboard container mounts the same volume read-only. Dashboard reads the file at the path stored in `blotter_approvals.blotter_local_path`. | Simple. Requires both containers to mount the same volume in `docker-compose.yml`. |
-| **B — DB-backed blotter content** | Airflow's `build_blotter` task writes blotter JSON content into a `blotter_content` JSONB column on the `blotter_approvals` table (or a separate `blotter_artifacts` table). Dashboard reads from DB only. | No shared filesystem. Slightly more DB storage. Schema migration required. |
+```python
+# infra/db/migrations/versions/xxxx_add_quantity_overrides_to_blotter_approvals.py
+def upgrade():
+    op.add_column(
+        "blotter_approvals",
+        sa.Column("quantity_overrides", postgresql.JSONB, nullable=True)
+    )
 
-**Recommendation:** Option A if running Docker Compose locally (simpler). Option B if the dashboard may run on a separate host from the Airflow containers.
+def downgrade():
+    op.drop_column("blotter_approvals", "quantity_overrides")
+```
+
+`quantity_overrides` stores only the orders where the operator changed the quantity: `{"order_id_abc": 7, "order_id_def": 4}`. Orders with no quantity change are absent from this dict. An empty dict or NULL means no quantities were edited.
+
+**Airflow `submit_orders` task change:** The task must read both `selected_order_ids` and `quantity_overrides` from the approval row and apply overrides before submitting to IBKR. Orders in `selected_order_ids` but absent from `quantity_overrides` use the original blotter quantity.
+
+### 4.4 Blotter Artifact Location — **RESOLVED: Shared Docker volume** — **RESOLVED: Shared Docker volume**
+
+**Decision (2026-06-29):** Shared Docker volume (Option A).
+
+**Implementation:** Add a named volume `rqis_paper_artifacts` to `docker-compose.yml`. Mount it in the Airflow container (read-write) and the dashboard container (read-only) at the same path (`/opt/rqis/paper_artifacts`). The dashboard reads the blotter JSON file at the path stored in `blotter_approvals.blotter_local_path`. No schema changes required.
+
+```yaml
+# docker-compose.yml addition
+volumes:
+  rqis_paper_artifacts:
+
+services:
+  airflow-worker:
+    volumes:
+      - rqis_paper_artifacts:/opt/rqis/paper_artifacts
+  dashboard:
+    volumes:
+      - rqis_paper_artifacts:/opt/rqis/paper_artifacts:ro
+```
+
+The `RQIS_PAPER_ARTIFACT_DIR` env var must be set to `/opt/rqis/paper_artifacts` in both containers. The file remains the authoritative source for SHA-256 integrity checking — the hash is computed over bytes-on-disk, not a DB round-trip.
+
+**Future migration path:** If the dashboard is ever moved to a remote host, migrate to JSONB storage via an Alembic migration at that time. No code changes to the approval logic are needed — only the artifact-loading path in `queries.py` changes.
 
 ---
 
@@ -219,10 +252,34 @@ if "operator_email" not in st.session_state:
 | Drawdown from peak | `portfolio_snapshots` | Compute from NAV history: `(current_nav / max(nav_usd)) - 1` over all rows |
 | Open positions count | `portfolio_snapshots.positions` | `len(positions)` from latest snapshot |
 | Pending blotter | `blotter_approvals` | `SELECT COUNT(*) WHERE confirmed_blotter_sha256 IS NULL` |
-| Pipeline health | Airflow metadata DB | Query `dag_run` table for `daily_data_pipeline`, `daily_signal_pipeline`, `daily_paper_trading` — last run state and `execution_date` |
+| Pipeline health | `alpha_scores`, `daily_prices`, `strategy_simulations` | Data recency inference — see below |
 | Active alerts | `AlertManager.unacknowledged()` | In-memory; AlertManager must be instantiated at app startup and shared via `st.session_state` |
 
-**Pipeline health fallback:** If Airflow metadata DB is not accessible (separate connection string), fall back to checking `strategy_simulations` and `alpha_scores` for recency (e.g., "Scores last updated: 2 hours ago").
+**Pipeline health — RESOLVED: Infer from data recency (D3, 2026-06-29).**
+
+No direct Airflow metadata DB connection. Pipeline health is inferred from the freshness of the data each pipeline produces:
+
+```python
+# queries.py
+def pipeline_health(engine) -> dict:
+    with engine.connect() as conn:
+        prices_age = conn.execute(text(
+            "SELECT NOW() - MAX(ingested_at) FROM daily_prices"
+        )).scalar()
+        scores_age = conn.execute(text(
+            "SELECT NOW() - MAX(computed_at) FROM alpha_scores"
+        )).scalar()
+        sim_age = conn.execute(text(
+            "SELECT NOW() - MAX(computed_at_utc) FROM strategy_simulations"
+        )).scalar()
+    return {
+        "prices": {"age": prices_age, "ok": prices_age < timedelta(hours=28)},
+        "signals": {"age": scores_age, "ok": scores_age < timedelta(hours=6)},
+        "simulations": {"age": sim_age, "ok": sim_age < timedelta(hours=6)},
+    }
+```
+
+Display as a three-row status table: pipeline name, last updated (human-readable "2 hours ago"), status badge (✓ Fresh / ⚠ Stale). Thresholds: prices stale after 28 hours (allows for next-day ingestion window); signals and simulations stale after 6 hours (should run by 23:30 ET). For more detailed DAG-level diagnosis, the operator uses the Airflow UI directly.
 
 **Layout:** Two rows of `st.metric()` cards, then a `st.dataframe()` for the alert list, then a pipeline status table.
 
@@ -453,7 +510,7 @@ with db.engine.begin() as conn:
     )
 ```
 
-Note: `quantity_overrides` column may need to be added to `blotter_approvals` schema via Alembic migration.
+Note: `quantity_overrides` is a new JSONB column on `blotter_approvals` — see Section 4.4 for the required Alembic migration.
 
 **Step 5: Post-submission receipt:**
 
@@ -798,13 +855,15 @@ Sprint 3 deliverable: Strategy comparison capability. Can evaluate shadow strate
 
 ---
 
-## 12. Open Decisions (Must Resolve Before Sprint 1)
+## 12. Architecture Decisions Log
 
-| # | Decision | Options | Impact |
-|---|----------|---------|--------|
-| D1 | Blotter artifact location | A: Shared Docker volume; B: JSONB in `blotter_approvals` table | Affects Page 4 artifact loading code and `docker-compose.yml` |
-| D2 | `quantity_overrides` column on `blotter_approvals` | Add via Alembic migration or store inline in `selected_order_ids` JSON | Affects Page 4 schema and the Airflow `submit_orders` task which reads the approval row |
-| D3 | Airflow metadata DB access | Same `DATABASE_URL` or separate Airflow metadata connection string | Affects Page 1 pipeline health section |
+All pre-implementation decisions are resolved. Sprint 1 may begin.
+
+| # | Decision | Resolution | Date |
+|---|----------|-----------|------|
+| D1 | Blotter artifact location | Shared Docker volume (`rqis_paper_artifacts`). See Section 4.4. | 2026-06-29 |
+| D2 | `quantity_overrides` column | New JSONB column on `blotter_approvals` via Alembic migration. See Section 4.3. | 2026-06-29 |
+| D3 | Pipeline health / Airflow DB access | Infer from data recency (`alpha_scores`, `daily_prices`, `strategy_simulations`). No Airflow DB connection. See Page 1 spec. | 2026-06-29 |
 
 ---
 
