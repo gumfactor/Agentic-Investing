@@ -592,7 +592,7 @@ Monthly stress runs with scenarios:
 - Streamlit app (internal): real-time portfolio metrics, positions, risk exposures
 - Grafana: infrastructure metrics, data pipeline health, alert history
 - Daily auto-generated tearsheet: PDF with returns, Sharpe, drawdown chart, factor exposures, top contributors
-- Multi-strategy comparison panel: risk-adjusted side-by-side metrics (return, Sharpe, max drawdown, VaR, beta, concentration) across all ACTIVE and VALIDATED strategies; the live strategy is sourced from real fills, shadow strategies from daily forward simulation (`strategy_simulations` table); enables informed strategy-switching decisions without requiring parallel real capital allocation
+- Multi-strategy comparison panel: risk-adjusted side-by-side metrics (return, Sharpe, max drawdown, VaR, beta, concentration) across all `backtesting` and `paper` strategies (per the `strategies` table); the `paper` strategy is sourced from real fills, shadow `backtesting` strategies from daily forward simulation (`strategy_simulations` table); enables informed strategy-switching decisions without requiring parallel real capital allocation
 
 #### F7.2 Trade Audit Trail
 - Every signal score, portfolio weight decision, order, and fill recorded with timestamps
@@ -608,7 +608,7 @@ Monthly stress runs with scenarios:
 - Per-strategy alpha score leaderboard: top and bottom ranked tickers for today's scores
 - Per-ticker factor decomposition: horizontal bar chart of each signal factor's z-score contribution, explaining why a stock ranks where it does
 - Rolling factor history: 30-day z-score trend per factor per ticker, showing whether signal strength is improving or deteriorating
-- Strategy registry panel: all strategies with lifecycle status (DRAFT/ACTIVE/VALIDATED/RETIRED), last validation date, OOS Sharpe, bootstrap stress results, and survival funnel pass/fail
+- Strategy registry panel: all strategies with lifecycle status (`backtesting`/`paper`/`live`/`archived` per the `strategies` table), last validation date (from `strategy_runs` passed backtest), OOS Sharpe, bootstrap stress results, and survival funnel pass/fail
 - Cross-strategy alpha overlap heatmap: Jaccard similarity between top-N holdings of each strategy, surfacing when two strategies are not genuinely diversifying relative to each other
 
 #### F7.4 Blotter Approval UI (C1 gate — replaces CLI confirmation)

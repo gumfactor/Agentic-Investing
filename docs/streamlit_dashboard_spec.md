@@ -114,7 +114,7 @@ If `open_position_cost_basis()` returns no entry for a ticker (e.g., a position 
 
 **Blocks:** Strategy comparison panel on Page 5 (forward simulation returns only; historical MLflow backtests are available immediately).
 
-**Why:** Once the live paper portfolio starts, we need to know how each shadow (non-live) VALIDATED strategy *would have* performed over the same period. Historical MLflow backtests stop at paper trading inception. This task extends them forward daily.
+**Why:** Once the live paper portfolio starts, we need to know how each shadow (non-paper, non-live) strategy *would have* performed over the same period. Historical MLflow backtests stop at paper trading inception. This task extends them forward daily.
 
 **Schema:**
 
@@ -137,7 +137,7 @@ CREATE INDEX ON strategy_simulations (sim_date DESC, strategy_id);
 **New Airflow task** in `daily_signal_pipeline.py` (runs after all strategy scores are computed):
 
 ```
-For each strategy with status IN ('ACTIVE', 'VALIDATED') in strategy_registry:
+For each strategy with status IN ('backtesting', 'paper') FROM strategies:
     1. Read latest alpha_scores for this strategy
     2. Apply strategy's portfolio construction parameters (n_long, max_weight)
     3. Compute target weights (equal weight top N, or strategy-specified method)
@@ -632,7 +632,7 @@ Each chart rendered with `st.pyplot()`:
 
 **Section C: Strategy Comparison**
 
-Strategy selector: multi-select of all strategies with status IN ('ACTIVE', 'VALIDATED') from `strategy_registry`. Default: all.
+Strategy selector: multi-select of all strategies with `status IN ('backtesting', 'paper')` from `strategies`. Default: all.
 
 For each selected strategy, compute the same metrics suite from either:
 - `strategy_simulations` (forward simulation since paper trading inception)
@@ -644,11 +644,11 @@ The two sources are concatenated into a single return series per strategy: MLflo
 
 | Strategy | Status | Source | Return | Sharpe | Max DD | VaR 99% | Beta | Concentration |
 |----------|--------|--------|--------|--------|--------|---------|------|---------------|
-| v1_base_momentum | LIVE | Real fills | 8.2% | 0.91 | -9.4% | 1.8% | 0.82 | 6.1% |
-| v2_value_quality | VALIDATED | Simulated | 11.4% | 1.24 | -7.1% | 1.4% | 0.71 | 5.3% |
-| v3_low_vol | VALIDATED | Simulated | 6.1% | 1.47 | -4.2% | 0.9% | 0.51 | 8.2% |
+| v1_base_momentum | paper | Real fills | 8.2% | 0.91 | -9.4% | 1.8% | 0.82 | 6.1% |
+| v2_value_quality | backtesting | Simulated | 11.4% | 1.24 | -7.1% | 1.4% | 0.71 | 5.3% |
+| v3_low_vol | backtesting | Simulated | 6.1% | 1.47 | -4.2% | 0.9% | 0.51 | 8.2% |
 
-**Source column is critical.** The active live strategy's row must always be sourced from real `trade_fills`, never from `strategy_simulations`. The `strategy_simulations` table also contains a row for the live strategy (for internal consistency of the simulation job), but it will diverge from real P&L over time due to partial fills, wash-sale disallowances, and limit-order non-execution. The comparison query must explicitly prefer `trade_fills` for the live strategy: if `strategy_registry.status = 'ACTIVE'` and real fills exist, use them; use `strategy_simulations` only for strategies with no real fills (shadow strategies).
+**Source column is critical.** The active paper strategy's row must always be sourced from real `trade_fills`, never from `strategy_simulations`. The `strategy_simulations` table also contains a row for the paper strategy (for internal consistency of the simulation job), but it will diverge from real P&L over time due to partial fills, wash-sale disallowances, and limit-order non-execution. The comparison query must explicitly prefer `trade_fills` for the strategy with `strategies.status = 'paper'` when real fills exist; use `strategy_simulations` only for strategies with no real fills (shadow `backtesting` strategies).
 
 **Risk metrics for shadow strategies** are computed using `RiskMonitor`-compatible functions from `metrics.py` applied to `strategy_simulations` daily returns and `target_weights`. VaR and CVaR computed from the simulated return distribution. Beta computed against SPY returns from `daily_prices`. Concentration from `target_weights` JSON.
 
@@ -665,7 +665,7 @@ The two sources are concatenated into a single return series per strategy: MLflo
 **Refresh:** Manual.  
 **IBKR connection:** Not required.
 
-**Strategy selector** (top of page, single select): all strategies in `strategy_registry`. Default: active live strategy.
+**Strategy selector** (top of page, single select): all strategies from the `strategies` table. Default: the strategy with `status = 'paper'`.
 
 **Section A: Alpha Score Leaderboard**
 
@@ -704,24 +704,24 @@ Line chart of rolling z-scores for each factor for the selected ticker. One line
 
 **Section D: Strategy Registry**
 
-Table of all strategies from `strategy_registry`:
+Table of all strategies from the `strategies` table:
 
 | Column | Source |
 |--------|--------|
-| Strategy ID | `strategy_id` |
-| Status | `status` (DRAFT / ACTIVE / VALIDATED / RETIRED) |
-| Created | `created_at` |
-| Last validated | From MLflow: last `search_runs()` tag `survival_funnel.passed = true` |
-| OOS Sharpe | From MLflow: `metrics.oos_sharpe` on latest validated backtest run |
+| Strategy ID | `strategies.strategy_id` |
+| Status | `strategies.status` (`backtesting` / `paper` / `live` / `archived`) |
+| Created | `strategy_definitions.created_at` (joined via `canonical_config_hash`) |
+| Last validated | From MLflow: last `search_runs()` row with `run_type='backtest'` and `status='passed'` for this strategy |
+| OOS Sharpe | From MLflow: `metrics.oos_sharpe` on latest passed backtest run |
 | Max DD (OOS) | From MLflow: `metrics.oos_max_drawdown` |
 | Bootstrap 5th pct Sharpe | From MLflow: `tags.bootstrap_p05_sharpe` |
-| Survival funnel | Pass/fail badge |
+| Survival funnel | Pass/fail badge (pass = at least one `strategy_runs` row with `run_type='backtest'` and `status='passed'`) |
 
-Status badges: DRAFT (grey), ACTIVE (blue), VALIDATED (green), RETIRED (dark grey).
+Status badges: `backtesting` (grey), `paper` (blue), `live` (green), `archived` (dark grey).
 
 **Section E: Cross-Strategy Alpha Overlap**
 
-For the top N positions of each VALIDATED strategy, compute Jaccard similarity: `|A ∩ B| / |A ∪ B|`. Display as a heatmap. High overlap = strategies are not diversifying well against each other — relevant if you ever run multiple shadow portfolios.
+For the top N positions of each `backtesting` or `paper` strategy (i.e., those with at least one passed backtest run in `strategy_runs`), compute Jaccard similarity: `|A ∩ B| / |A ∪ B|`. Display as a heatmap. High overlap = strategies are not diversifying well against each other — relevant if you ever run multiple shadow portfolios.
 
 ---
 
@@ -815,7 +815,7 @@ def realized_pnl_summary(engine, strategy_id: str, start: date) -> pd.DataFrame:
 def pending_blotter(artifact_dir: Path, engine) -> dict | None: ...  # filesystem scan; see Section 5.3
 def blotter_approval_history(engine, limit: int = 50) -> pd.DataFrame: ...
 def strategy_simulations(engine, strategy_ids: list[str], start: date, end: date) -> pd.DataFrame: ...
-def all_strategies(engine) -> pd.DataFrame: ...  # from strategy_registry
+def all_strategies(engine) -> pd.DataFrame: ...  # from strategies table
 ```
 
 ### `broker.py` — IBKR Wrapper (optional, for future live data)
@@ -867,7 +867,7 @@ Build in this sequence. Each item is independently deployable and testable.
 3. `components/env_banner.py` — environment banner
 4. `components/circuit_breaker.py` — CB sidebar widget
 5. `app.py` — entry point, sidebar, session state init
-6. **Page 4 — Blotter Approval** — complete implementation including SHA-256 verification, data_editor grid, confirmation dialog, and `blotter_approvals` UPDATE
+6. **Page 4 — Blotter Approval** — complete implementation including SHA-256 verification, data_editor grid, confirmation dialog, and `blotter_approvals` INSERT
 
 Sprint 1 deliverable: CLI confirmation path (`paper_approve_blotter.py`) can be retired; all future approvals go through the dashboard.
 
@@ -909,7 +909,7 @@ Sprint 3 deliverable: Strategy comparison capability. Can evaluate shadow strate
 
 ### Integration tests
 
-- `tests/reporting/dashboards/test_page4_integration.py` — end-to-end blotter approval: seed a `blotter_approvals` row with `confirmed_blotter_sha256 IS NULL`, run the approval logic, assert the row is updated correctly and no second approval is possible.
+- `tests/reporting/dashboards/test_page4_integration.py` — end-to-end blotter approval: seed a blotter artifact file on a temp volume path with no corresponding `blotter_approvals` row, run the approval logic, assert an approval row is INSERTed correctly and a second approval attempt raises an `IntegrityError` (UNIQUE constraint on `blotter_run_id`).
 
 ### Manual verification checklist (before retiring CLI approval path)
 
@@ -919,7 +919,7 @@ Sprint 3 deliverable: Strategy comparison capability. Can evaluate shadow strate
 - [ ] Circuit breaker OPEN disables the submit button
 - [ ] Environment banner shows correctly for paper vs. misconfigured environments
 - [ ] Double confirmation cannot be bypassed (no keyboard shortcut past the dialog)
-- [ ] Second approval attempt on already-confirmed blotter is rejected by the `IS NULL` guard
+- [ ] Second approval attempt on already-approved blotter is rejected by the `UNIQUE` constraint on `blotter_run_id`
 
 ---
 
