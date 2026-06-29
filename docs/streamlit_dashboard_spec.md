@@ -36,7 +36,7 @@ The dashboard serves two roles:
 | Charts | **Matplotlib** via `st.pyplot()` | `reporting/tearsheets/charts.py` already returns Matplotlib figures |
 | Tabular data | `st.data_editor` | Supports editable cells and per-row checkboxes (required for blotter approval) |
 | Secrets | `st.secrets` + `os.environ` | Never hardcode credentials (C5) |
-| Scheduling/refresh | `st.rerun()` with `time.sleep()` in a loop | Auto-refresh for risk monitor; Streamlit does not support server-push |
+| Scheduling/refresh | `streamlit-autorefresh` (`st_autorefresh`) | Non-blocking auto-refresh; avoids tying up a Streamlit worker thread per open tab. Add `streamlit-autorefresh` to `requirements.txt`. Usage: `st_autorefresh(interval=30_000, key="risk_refresh")` at the top of any auto-refresh page. |
 
 ---
 
@@ -102,9 +102,13 @@ CREATE INDEX ON portfolio_snapshots (snapshot_date DESC, strategy_id);
 
 `positions` is a JSON array of `{"ticker": "AAPL", "quantity": 10.0, "avg_cost": 185.42, "current_price": 191.10}`.
 
-**Airflow change:** In `daily_paper_trading.py`, after `fetch_ibkr_snapshot` fetches positions from IBKR, add an INSERT to `portfolio_snapshots` using the same data. The XCom artifact is retained unchanged.
+**Airflow change:** In `daily_paper_trading.py`, after `fetch_ibkr_snapshot` fetches positions from IBKR, add an INSERT to `portfolio_snapshots`. The XCom artifact is retained unchanged.
 
-**Fallback:** If no snapshot exists for today, Page 2 reconstructs positions from `trade_fills` using `TradeJournal.open_position_cost_basis()` and prices from `daily_prices`. This is the fallback for the paper qualification period before Airflow has run.
+**Important — `avg_cost` source:** The `_fetch_ibkr_snapshot` Airflow task fetches live positions from IBKR but does not compute cost basis. The `avg_cost` field in `portfolio_snapshots.positions` must be populated by calling `TradeJournal.open_position_cost_basis(strategy_id)` inside the same task and merging the result into the positions array before writing the snapshot. This requires a `TradeJournal` instance and a DB connection in the Airflow worker, both of which are already available in that task's environment.
+
+If `open_position_cost_basis()` returns no entry for a ticker (e.g., a position opened before the trade journal was live), `avg_cost` should be set to `null` and the dashboard must handle this gracefully — display "N/A" for unrealized P&L rather than crashing.
+
+**Fallback:** If no snapshot exists for today (e.g., Airflow hasn't run yet or failed), Page 2 falls back to reconstructing positions entirely from `trade_fills` using `TradeJournal.open_position_cost_basis()` and `daily_prices`. This is the primary path during the early paper qualification period.
 
 ### 4.2 `strategy_simulations` Table and Forward Simulation Task
 
@@ -165,9 +169,29 @@ def downgrade():
 
 `quantity_overrides` stores only the orders where the operator changed the quantity: `{"order_id_abc": 7, "order_id_def": 4}`. Orders with no quantity change are absent from this dict. An empty dict or NULL means no quantities were edited.
 
-**Airflow `submit_orders` task change:** The task must read both `selected_order_ids` and `quantity_overrides` from the approval row and apply overrides before submitting to IBKR. Orders in `selected_order_ids` but absent from `quantity_overrides` use the original blotter quantity.
+**Required changes to Airflow sensor and submit task (Finding 2):**
 
-### 4.4 Blotter Artifact Location — **RESOLVED: Shared Docker volume** — **RESOLVED: Shared Docker volume**
+The `BlotterApprovalSensor.poke()` currently pushes only `selected_order_ids` and `approved_by` to XCom. It must also fetch and push `quantity_overrides`:
+
+```python
+# In BlotterApprovalSensor.poke() — add after existing XCom pushes:
+ti.xcom_push(key="quantity_overrides", value=row["quantity_overrides"] or {})
+```
+
+The `_submit_orders` task must read `quantity_overrides` from XCom and apply it before submitting:
+
+```python
+quantity_overrides = ti.xcom_pull(key="quantity_overrides", task_ids="wait_approval") or {}
+# Before _do_submit, for each row in rows_to_submit:
+for row in rows_to_submit:
+    override_qty = quantity_overrides.get(str(row["sequence"]))
+    if override_qty is not None:
+        row = {**row, "quantity": override_qty}
+```
+
+Without these two changes, operator quantity reductions entered in the dashboard are silently ignored and the original blotter quantity is submitted to IBKR.
+
+### 4.5 Blotter Artifact Location — **RESOLVED: Shared Docker volume**
 
 **Decision (2026-06-29):** Shared Docker volume (Option A).
 
@@ -209,7 +233,19 @@ The banner cannot be dismissed or hidden. It is the PRD F7.4 requirement that th
 
 ### 5.2 Circuit Breaker Status Widget (`components/circuit_breaker.py`)
 
-Rendered in the sidebar on every page. Reads `CircuitBreaker.status_dict()`.
+Rendered in the sidebar on every page. The `CircuitBreaker` instance must be cached with `@st.cache_resource` — not stored in `st.session_state` — so that all browser tabs share a single instance with consistent state:
+
+```python
+@st.cache_resource
+def get_circuit_breaker() -> CircuitBreaker:
+    return CircuitBreaker()
+
+@st.cache_resource
+def get_alert_manager() -> AlertManager:
+    return AlertManager()
+```
+
+Reads `CircuitBreaker.status_dict()`.
 
 - CLOSED → small green badge: `Circuit Breaker: CLOSED ✓`
 - OPEN → large red badge with trip reason and timestamp: `CIRCUIT BREAKER OPEN — [metric] breached [value] at [time]`
@@ -218,7 +254,35 @@ When OPEN, all pages display a non-dismissable warning banner below the env bann
 
 ### 5.3 Pending Blotter Badge
 
-Sidebar shows a red badge `● Blotter awaiting approval` whenever a row exists in `blotter_approvals` that has not yet been confirmed (i.e., `confirmed_blotter_sha256 IS NULL`). Clicking the badge navigates to Page 4.
+Sidebar shows a red badge `● Blotter awaiting approval` when a pending blotter exists. Clicking navigates to Page 4.
+
+**Pending detection — filesystem-based, not DB-based:** The `blotter_approvals` table is append-only with all columns NOT NULL — there is no NULL sentinel for "awaiting approval." A pending blotter is detected by scanning the shared artifact volume for blotter JSON files written in the last 36 hours whose `run_id` has no corresponding row in `blotter_approvals`:
+
+```python
+# queries.py
+def pending_blotter(artifact_dir: Path, engine) -> dict | None:
+    """Return the blotter artifact dict if one awaits approval, else None."""
+    cutoff = datetime.utcnow() - timedelta(hours=36)
+    candidates = sorted(artifact_dir.glob("**/blotter*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in candidates:
+        if datetime.utcfromtimestamp(path.stat().st_mtime) < cutoff:
+            break
+        with open(path) as f:
+            blotter = json.load(f)
+        run_id = blotter.get("run_id")
+        if not run_id:
+            continue
+        with engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM blotter_approvals WHERE blotter_run_id = :rid"),
+                {"rid": run_id}
+            ).fetchone()
+        if not exists:
+            return {"path": path, "blotter": blotter}
+    return None
+```
+
+This function is called once at sidebar render time and its result passed to Page 4.
 
 ### 5.4 Session State Initialization (`app.py`)
 
@@ -231,7 +295,9 @@ if "operator_email" not in st.session_state:
     st.session_state["operator_email"] = os.environ.get("OPERATOR_EMAIL", "unknown")
 ```
 
-`session_id` is passed to `blotter_approvals.dashboard_session_id` at approval time. `operator_email` is passed to `blotter_approvals.approved_by`.
+`session_id` is per-tab (stored in `st.session_state`) and is passed to `blotter_approvals.dashboard_session_id` at approval time for audit purposes. `operator_email` is passed to `blotter_approvals.approved_by`.
+
+**Caching rules:** Use `@st.cache_resource` for any stateful shared object (DB engine, CircuitBreaker, AlertManager). Use `st.session_state` only for per-tab transient state (session ID, current page form values). Never store CircuitBreaker or AlertManager in `st.session_state` — each tab would get an independent instance with divergent state.
 
 ---
 
@@ -241,7 +307,7 @@ if "operator_email" not in st.session_state:
 
 **File:** `pages/1_Overview.py`  
 **Purpose:** Immediate system state at a glance. Designed for the 23:05 ET check: "Did the pipeline run? Is approval needed?"  
-**Refresh:** Auto-refresh every 60 seconds using `st.rerun()`.  
+**Refresh:** Auto-refresh every 60 seconds via `st_autorefresh(interval=60_000, key="overview_refresh")` at top of page.  
 **IBKR connection:** Not required. All data from DB.
 
 **Sections:**
@@ -251,7 +317,7 @@ if "operator_email" not in st.session_state:
 | NAV (today vs. yesterday) | `portfolio_snapshots` | Latest two rows by `snapshot_date DESC` |
 | Drawdown from peak | `portfolio_snapshots` | Compute from NAV history: `(current_nav / max(nav_usd)) - 1` over all rows |
 | Open positions count | `portfolio_snapshots.positions` | `len(positions)` from latest snapshot |
-| Pending blotter | `blotter_approvals` | `SELECT COUNT(*) WHERE confirmed_blotter_sha256 IS NULL` |
+| Pending blotter | Artifact volume + `blotter_approvals` | `pending_blotter(artifact_dir, engine)` — filesystem scan; see Section 5.3 |
 | Pipeline health | `alpha_scores`, `daily_prices`, `strategy_simulations` | Data recency inference — see below |
 | Active alerts | `AlertManager.unacknowledged()` | In-memory; AlertManager must be instantiated at app startup and shared via `st.session_state` |
 
@@ -300,7 +366,7 @@ Display as a three-row status table: pipeline name, last updated (human-readable
 |--------|--------|
 | Ticker | `portfolio_snapshots.positions[].ticker` |
 | Quantity | `portfolio_snapshots.positions[].quantity` |
-| Avg cost | `portfolio_snapshots.positions[].avg_cost` (from TradeJournal FIFO, stored in snapshot) |
+| Avg cost | `portfolio_snapshots.positions[].avg_cost` (populated by Airflow task via `TradeJournal.open_position_cost_basis()`; falls back to direct `TradeJournal` call if `null` or no snapshot) |
 | Last price | `daily_prices.close` for latest date |
 | Unrealized P&L ($) | `(last_price - avg_cost) * quantity` |
 | Unrealized P&L (%) | `(last_price / avg_cost) - 1` |
@@ -325,7 +391,7 @@ Rows highlighted amber where `alpha_score_rank > n_long * 1.5` (position held bu
 
 **File:** `pages/3_Risk.py`  
 **Purpose:** Real-time risk metrics. The page that should alarm you.  
-**Refresh:** Auto-refresh every 30 seconds during market hours (09:30–16:00 ET). Pauses overnight.  
+**Refresh:** `st_autorefresh(interval=30_000, key="risk_refresh")` at top of page, active only during market hours (09:30–16:00 ET). Outside market hours, render a static snapshot with a "Last updated" timestamp instead of continuously re-running.  
 **IBKR connection:** Not required. Risk metrics computed from DB data.
 
 **Risk computation:** Call `RiskMonitor.snapshot()` with:
@@ -378,42 +444,39 @@ When any hard threshold is breached, a `st.error()` banner renders above the met
 ```
 No blotter is awaiting approval.
 The Airflow DAG runs at 23:00 ET on trading days.
-Last DAG run: [timestamp] — [status]
 ```
 
-Detect: `SELECT COUNT(*) FROM blotter_approvals WHERE confirmed_blotter_sha256 IS NULL` = 0.
+**Detect via `pending_blotter(artifact_dir, engine)` from Section 5.3.** The `blotter_approvals` table has no NULL sentinel state — all columns are NOT NULL. "Pending" means a blotter artifact file exists on the shared volume whose `run_id` has no row in `blotter_approvals` yet. If `pending_blotter()` returns `None`, render State A.
 
 #### State B — Blotter awaiting approval
+
+The `pending_blotter()` call returns `{"path": Path, "blotter": dict}`. All blotter content comes from the artifact file directly — no `blotter_approvals` row exists yet at this point.
 
 **Step 1: Blotter header** (read-only info block):
 
 | Field | Value |
 |-------|-------|
-| Run ID | `blotter_approvals.blotter_run_id` |
-| Generated at | `blotter artifact: generated_at_utc` |
-| Environment | `PAPER TRADING` or `LIVE TRADING` (from blotter artifact `paper_only` flag) |
+| Run ID | `blotter["run_id"]` |
+| Generated at | `blotter["generated_at_utc"]` |
+| Environment | `PAPER TRADING` or `LIVE TRADING` (from `blotter["paper_only"]` flag) |
 | IBKR Port | From env var (displayed prominently) |
-| SHA-256 fingerprint | `blotter_approvals.blotter_sha256` (first 16 chars displayed; full hash available on hover) |
-| Strategy | From blotter artifact |
-| Total orders | Count of candidate rows |
-| Total notional | Sum of `estimated_notional` across all rows |
+| SHA-256 fingerprint | Computed from file at load time (first 16 chars displayed; full hash on hover) |
+| Strategy | `blotter["strategy_id"]` |
+| Total orders | `len(blotter["candidate_rows"])` |
+| Total notional | Sum of `estimated_notional` across candidate rows |
 
 **Step 2: Load and verify blotter artifact:**
 
 ```python
-# Resolve artifact path
-artifact_path = row["blotter_local_path"]  # from blotter_approvals row
+# blotter and artifact_path already returned by pending_blotter()
+artifact_path: Path = pending["path"]
+blotter: dict = pending["blotter"]
 
-# Load JSON
-with open(artifact_path) as f:
-    blotter = json.load(f)
+# Compute SHA-256 at page load — this is the operator's independent verification
+computed_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+stored_hash = blotter.get("candidate_rows_sha256")  # written by build_blotter task
 
-# Verify SHA-256 matches what Airflow recorded
-computed_hash = hashlib.sha256(
-    open(artifact_path, "rb").read()
-).hexdigest()
-
-if computed_hash != row["blotter_sha256"]:
+if stored_hash and computed_hash != stored_hash:
     st.error("INTEGRITY CHECK FAILED: Blotter file has been modified since it was generated.")
     st.stop()
 ```
@@ -470,47 +533,53 @@ Operator must check a checkbox: `"I have reviewed all orders and confirm this su
 
 ```python
 # 1. Re-verify SHA-256 at submission time (not just at page load)
-confirmed_hash = hashlib.sha256(open(artifact_path, "rb").read()).hexdigest()
-if confirmed_hash != row["blotter_sha256"]:
+confirmed_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+stored_hash = blotter.get("candidate_rows_sha256")
+if stored_hash and confirmed_hash != stored_hash:
     st.error("Blotter file changed between review and submission. Aborting.")
     st.stop()
 
-# 2. Resolve selected order IDs from checkbox state
-selected_ids = [row["order_id"] for row in edited_df if row["selected"]]
+# 2. Resolve selected order IDs (sequence numbers) from checkbox state
+selected_ids = [str(r["sequence"]) for r in edited_df if r["selected"]]
 
-# 3. Quantity overrides (where operator edited)
+# 3. Quantity overrides — only entries where operator changed the value
 quantity_overrides = {
-    row["order_id"]: row["quantity"]
-    for row in edited_df
-    if row["quantity"] != original_quantities[row["order_id"]]
+    str(r["sequence"]): r["quantity"]
+    for r in edited_df
+    if r["quantity"] != original_quantities[r["sequence"]]
 }
 
-# 4. INSERT into blotter_approvals
+# 4. INSERT approval row (C3: append-only — never UPDATE this table)
+#    The UNIQUE constraint on blotter_run_id prevents double-approval.
 with db.engine.begin() as conn:
     conn.execute(
         text("""
-            UPDATE blotter_approvals
-            SET selected_order_ids = :selected_ids,
-                confirmed_blotter_sha256 = :confirmed_hash,
-                approved_by = :approved_by,
-                dashboard_session_id = :session_id,
-                quantity_overrides = :overrides,
-                approved_at_utc = NOW()
-            WHERE blotter_run_id = :run_id
-              AND confirmed_blotter_sha256 IS NULL
+            INSERT INTO blotter_approvals (
+                blotter_run_id, blotter_local_path, blotter_sha256,
+                selected_order_ids, approved_by, confirmed_blotter_sha256,
+                dashboard_session_id, quantity_overrides, notes
+            ) VALUES (
+                :run_id, :local_path, :blotter_sha256,
+                :selected_ids::jsonb, :approved_by, :confirmed_hash,
+                :session_id, :overrides::jsonb, NULL
+            )
         """),
         {
+            "run_id": blotter["run_id"],
+            "local_path": str(artifact_path),
+            "blotter_sha256": confirmed_hash,
             "selected_ids": json.dumps(selected_ids),
-            "confirmed_hash": confirmed_hash,
             "approved_by": st.session_state["operator_email"],
+            "confirmed_hash": confirmed_hash,
             "session_id": st.session_state["session_id"],
-            "overrides": json.dumps(quantity_overrides),
-            "run_id": row["blotter_run_id"],
+            "overrides": json.dumps(quantity_overrides) if quantity_overrides else "{}",
         }
     )
 ```
 
-Note: `quantity_overrides` is a new JSONB column on `blotter_approvals` — see Section 4.4 for the required Alembic migration.
+The `UNIQUE constraint on blotter_run_id` enforces that a second approval attempt for the same blotter raises an `IntegrityError`, which the page catches and renders as: `"This blotter has already been approved. Refresh the page to see the receipt."` No silent double-submission is possible.
+
+Note: `quantity_overrides` is a new JSONB column — see Section 4.3 for the required Alembic migration. The `BlotterApprovalSensor` must also be updated to fetch and push this field to XCom (see Section 4.3).
 
 **Step 5: Post-submission receipt:**
 
@@ -578,6 +647,8 @@ The two sources are concatenated into a single return series per strategy: MLflo
 | v1_base_momentum | LIVE | Real fills | 8.2% | 0.91 | -9.4% | 1.8% | 0.82 | 6.1% |
 | v2_value_quality | VALIDATED | Simulated | 11.4% | 1.24 | -7.1% | 1.4% | 0.71 | 5.3% |
 | v3_low_vol | VALIDATED | Simulated | 6.1% | 1.47 | -4.2% | 0.9% | 0.51 | 8.2% |
+
+**Source column is critical.** The active live strategy's row must always be sourced from real `trade_fills`, never from `strategy_simulations`. The `strategy_simulations` table also contains a row for the live strategy (for internal consistency of the simulation job), but it will diverge from real P&L over time due to partial fills, wash-sale disallowances, and limit-order non-execution. The comparison query must explicitly prefer `trade_fills` for the live strategy: if `strategy_registry.status = 'ACTIVE'` and real fills exist, use them; use `strategy_simulations` only for strategies with no real fills (shadow strategies).
 
 **Risk metrics for shadow strategies** are computed using `RiskMonitor`-compatible functions from `metrics.py` applied to `strategy_simulations` daily returns and `target_weights`. VaR and CVaR computed from the simulated return distribution. Beta computed against SPY returns from `daily_prices`. Concentration from `target_weights` JSON.
 
@@ -741,7 +812,7 @@ def latest_alpha_scores(engine, strategy_id: str, limit: int = 50) -> pd.DataFra
 def factor_scores_for_ticker(engine, ticker: str, strategy_id: str, lookback_days: int = 30) -> pd.DataFrame: ...
 def fill_history(engine, strategy_id: str | None, ticker: str | None, start: date, end: date, side: str | None) -> pd.DataFrame: ...
 def realized_pnl_summary(engine, strategy_id: str, start: date) -> pd.DataFrame: ...
-def pending_blotter(engine) -> dict | None: ...  # returns None if no pending approval
+def pending_blotter(artifact_dir: Path, engine) -> dict | None: ...  # filesystem scan; see Section 5.3
 def blotter_approval_history(engine, limit: int = 50) -> pd.DataFrame: ...
 def strategy_simulations(engine, strategy_ids: list[str], start: date, end: date) -> pd.DataFrame: ...
 def all_strategies(engine) -> pd.DataFrame: ...  # from strategy_registry
@@ -765,12 +836,23 @@ When live trading is enabled (post C8 clearance), this will be implemented to pr
 
 | Rule | Where enforced in dashboard |
 |------|----------------------------|
-| **C1** — No order submission without operator per-row selection and double confirmation | Page 4: checkboxes + confirmation dialog required before `blotter_approvals` UPDATE |
-| **C3** — Audit log append-only | Page 7: no UPDATE/DELETE queries anywhere; Page 4 uses UPDATE only on `confirmed_blotter_sha256 IS NULL` guard |
+| **C1** — No order submission without operator per-row selection and double confirmation | Page 4: per-row checkboxes + confirmation dialog + re-verified SHA-256 required before `blotter_approvals` INSERT |
+| **C3** — Audit log append-only | Page 7: no UPDATE/DELETE queries anywhere; Page 4 uses INSERT (never UPDATE) into `blotter_approvals`; UNIQUE constraint on `blotter_run_id` prevents double-approval |
 | **C4** — Circuit breaker cannot auto-reset | Page 3: reset requires operator ID + reason code + two-step confirmation; calls `CircuitBreaker.reset()` only |
 | **C5** — No secrets in code | All credentials via `os.environ` or `st.secrets`; no hardcoded values |
-| **C8** — No live trading until 4-week paper qualification | Page 4 submit button disabled if port is 7496 and `C8_CLEARED` env var is not `"true"` |
+| **C8** — No live trading until 4-week paper qualification | Page 4 submit button disabled unless `PAPER_TRADING=true` AND `IBKR_PORT=7497`. Live trading path (port 7496) additionally requires `C8_CLEARED=true` — see definition below |
 | **C9** — Confirmation before destructive actions | Page 4 (submission): confirmation dialog; Page 3 (CB reset): two-step form |
+
+**`C8_CLEARED` environment variable definition:**
+
+`C8_CLEARED` is a new env var that does not yet exist in the codebase. It must be added to `.env.example` and `CLAUDE.md` before the live trading path is implemented.
+
+- Value: `"true"` or unset/`"false"`
+- Who sets it: The operator, manually, after completing the 4-week paper trading qualification (C8 rule)
+- Prerequisite: 4 consecutive weeks of clean automated paper trading with no critical operational bugs and a successful circuit breaker fire-drill test
+- Effect: Setting `C8_CLEARED=true` and `PAPER_TRADING=false` and `IBKR_PORT=7496` together enables the live trading submit path on Page 4
+- All three must be set simultaneously — any one missing keeps the live path disabled
+- The operator must explicitly confirm this environment change per C9 before the dashboard will accept it
 
 ---
 
