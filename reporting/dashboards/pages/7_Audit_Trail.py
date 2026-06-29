@@ -10,7 +10,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import exc as sa_exc, text
+from sqlalchemy import exc as sa_exc
 
 from reporting.dashboards.components.circuit_breaker import (
     render_circuit_breaker_sidebar,
@@ -20,9 +20,11 @@ from reporting.dashboards.components.env_banner import render_env_banner
 from reporting.dashboards.db import get_engine
 from reporting.dashboards.queries import (
     active_strategy_id,
+    alpha_score_at_fill_date,
     blotter_approval_history,
+    factor_scores_at_fill_date,
     fill_history,
-    realized_pnl_summary,
+    wash_sale_history,
 )
 
 st.set_page_config(page_title="Audit Trail — RQIS", page_icon="📋", layout="wide")
@@ -99,16 +101,14 @@ else:
 
     fill_ids = fills_df["fill_id"].tolist()
     if fill_ids:
+        fill_labels = {
+            row["fill_id"]: f"{row['fill_id'][:12]}... — {row['ticker']} {row['side']}"
+            for _, row in fills_df.iterrows()
+        }
         selected_fill = st.selectbox(
             "Select a fill to view lineage",
             fill_ids,
-            format_func=lambda fid: (
-                f"{fid[:12]}... — "
-                f"{fills_df.loc[fills_df['fill_id'] == fid, 'ticker'].iloc[0]} "
-                f"{fills_df.loc[fills_df['fill_id'] == fid, 'side'].iloc[0]}"
-                if len(fills_df.loc[fills_df['fill_id'] == fid]) > 0
-                else str(fid)
-            ),
+            format_func=lambda fid: fill_labels.get(fid, str(fid)),
         )
 
         if selected_fill:
@@ -120,9 +120,9 @@ else:
                 detail_cols[0].markdown(f"**Side:** {fill_row['side']}")
                 detail_cols[0].markdown(f"**Quantity:** {fill_row['filled_quantity']}")
                 detail_cols[1].markdown(f"**Avg Fill Price:** ${float(fill_row['avg_fill_price']):.4f}")
-                if fill_row.get("realized_pnl") is not None:
+                if pd.notna(fill_row.get("realized_pnl")):
                     detail_cols[1].markdown(f"**Realized P&L:** ${float(fill_row['realized_pnl']):.2f}")
-                if fill_row.get("cost_basis_per_share") is not None:
+                if pd.notna(fill_row.get("cost_basis_per_share")):
                     detail_cols[1].markdown(f"**Cost Basis:** ${float(fill_row['cost_basis_per_share']):.4f}")
                 detail_cols[2].markdown(f"**Fill Time:** {fill_row['fill_timestamp']}")
                 detail_cols[2].markdown(f"**Strategy:** {fill_row.get('strategy_id', 'N/A')}")
@@ -136,19 +136,9 @@ else:
             fill_sid = fill_row.get("strategy_id", strategy_id)
 
             try:
-                with engine.connect() as conn:
-                    alpha_row = conn.execute(
-                        text("""
-                            SELECT alpha_score, rank, universe_size, score_date
-                            FROM alpha_scores
-                            WHERE ticker = :ticker AND strategy_id = :sid
-                              AND score_date <= :fdate
-                            ORDER BY score_date DESC
-                            LIMIT 1
-                        """),
-                        {"ticker": fill_ticker, "sid": fill_sid, "fdate": fill_date},
-                    ).mappings().fetchone()
-
+                alpha_row = alpha_score_at_fill_date(
+                    engine, fill_ticker, fill_sid, fill_date
+                )
                 if alpha_row:
                     with st.expander("Alpha Score at Fill Time"):
                         acols = st.columns(4)
@@ -161,24 +151,9 @@ else:
 
             # Factor scores on fill date
             try:
-                with engine.connect() as conn:
-                    factor_rows = pd.read_sql_query(
-                        text("""
-                            SELECT factor_name, z_score, raw_value, score_date
-                            FROM factor_scores
-                            WHERE ticker = :ticker AND strategy_id = :sid
-                              AND score_date <= :fdate
-                              AND score_date = (
-                                  SELECT MAX(score_date) FROM factor_scores
-                                  WHERE ticker = :ticker AND strategy_id = :sid
-                                    AND score_date <= :fdate
-                              )
-                            ORDER BY factor_name ASC
-                        """),
-                        conn,
-                        params={"ticker": fill_ticker, "sid": fill_sid, "fdate": fill_date},
-                    )
-
+                factor_rows = factor_scores_at_fill_date(
+                    engine, fill_ticker, fill_sid, fill_date
+                )
                 if not factor_rows.empty:
                     with st.expander("Factor Scores at Fill Time"):
                         st.dataframe(
@@ -199,18 +174,7 @@ st.divider()
 st.subheader("Wash-Sale History")
 
 try:
-    with engine.connect() as conn:
-        wash_df = pd.read_sql_query(
-            text("""
-                SELECT fill_id, fill_timestamp, ticker, filled_quantity,
-                       avg_fill_price, realized_pnl, wash_sale_disallowed
-                FROM trade_fills
-                WHERE side = 'SELL'
-                  AND (wash_sale_disallowed = 1 OR realized_pnl < 0)
-                ORDER BY fill_timestamp DESC
-            """),
-            conn,
-        )
+    wash_df = wash_sale_history(engine)
 
     if wash_df.empty:
         st.info("No wash-sale or loss fills recorded.")
@@ -246,9 +210,19 @@ try:
                 )
             )
         if "selected_order_ids" in display_approvals.columns:
-            display_approvals["n_selected"] = display_approvals["selected_order_ids"].apply(
-                lambda x: len(json.loads(x)) if isinstance(x, str) else (len(x) if isinstance(x, list) else 0)
-            )
+            def _count_selected(x):
+                if not x:
+                    return 0
+                if isinstance(x, list):
+                    return len(x)
+                if isinstance(x, str):
+                    try:
+                        return len(json.loads(x))
+                    except (json.JSONDecodeError, TypeError):
+                        return 0
+                return 0
+
+            display_approvals["n_selected"] = display_approvals["selected_order_ids"].apply(_count_selected)
 
         st.dataframe(
             display_approvals,

@@ -402,8 +402,8 @@ def fill_history(
         conditions.append("fill_timestamp >= :start")
         params["start"] = start
     if end:
-        conditions.append("fill_timestamp <= :end")
-        params["end"] = end
+        conditions.append("fill_timestamp < :end_exclusive")
+        params["end_exclusive"] = end + timedelta(days=1)
     if side:
         if side.upper() not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side: {side!r} — must be 'BUY' or 'SELL'")
@@ -493,6 +493,68 @@ def all_strategies(engine: "Engine") -> pd.DataFrame:
                 SELECT strategy_id, status, created_at
                 FROM strategies
                 ORDER BY created_at DESC
+            """),
+            conn,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Audit trail queries (Sprint 4 — Page 7 drill-down)
+# ---------------------------------------------------------------------------
+
+def alpha_score_at_fill_date(
+    engine: "Engine", ticker: str, strategy_id: str, fill_date: date | str
+) -> dict | None:
+    """Return the alpha score for a ticker on or before a fill date."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT alpha_score, rank, universe_size, score_date
+                FROM alpha_scores
+                WHERE ticker = :ticker AND strategy_id = :sid
+                  AND score_date <= :fdate
+                ORDER BY score_date DESC
+                LIMIT 1
+            """),
+            {"ticker": ticker, "sid": strategy_id, "fdate": fill_date},
+        ).mappings().fetchone()
+    return dict(row) if row else None
+
+
+def factor_scores_at_fill_date(
+    engine: "Engine", ticker: str, strategy_id: str, fill_date: date | str
+) -> pd.DataFrame:
+    """Return factor scores for a ticker on the latest score_date <= fill_date."""
+    with engine.connect() as conn:
+        return pd.read_sql_query(
+            text("""
+                SELECT factor_name, z_score, raw_value, score_date
+                FROM factor_scores
+                WHERE ticker = :ticker AND strategy_id = :sid
+                  AND score_date <= :fdate
+                  AND score_date = (
+                      SELECT MAX(score_date) FROM factor_scores
+                      WHERE ticker = :ticker AND strategy_id = :sid
+                        AND score_date <= :fdate
+                  )
+                ORDER BY factor_name ASC
+            """),
+            conn,
+            params={"ticker": ticker, "sid": strategy_id, "fdate": fill_date},
+        )
+
+
+def wash_sale_history(engine: "Engine") -> pd.DataFrame:
+    """Return sell fills that are wash-sale-flagged or have negative P&L."""
+    with engine.connect() as conn:
+        return pd.read_sql_query(
+            text("""
+                SELECT fill_id, fill_timestamp, ticker, filled_quantity,
+                       avg_fill_price, realized_pnl, wash_sale_disallowed
+                FROM trade_fills
+                WHERE side = 'SELL'
+                  AND (wash_sale_disallowed = TRUE OR realized_pnl < 0)
+                ORDER BY fill_timestamp DESC
             """),
             conn,
         )

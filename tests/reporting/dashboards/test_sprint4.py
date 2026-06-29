@@ -126,7 +126,7 @@ def engine():
                 avg_fill_price NUMERIC NOT NULL,
                 realized_pnl NUMERIC,
                 cost_basis_per_share NUMERIC,
-                wash_sale_disallowed INTEGER DEFAULT 0,
+                wash_sale_disallowed BOOLEAN DEFAULT FALSE,
                 notes TEXT
             )
         """))
