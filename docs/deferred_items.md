@@ -3,6 +3,8 @@
 Features and improvements that are intentionally deferred. No rush — revisit
 during Phase 5 or when the relevant subsystem is being built out.
 
+For defects, safety issues, and implementation weaknesses that must be triaged as fixes, use `bugs.md` as the canonical running tally. `bugs.md` classifies each known fix by category, severity, implementation priority, and short/medium/long-term horizon. This file remains for intentionally deferred feature work or design debt; if a deferred item is also a concrete bug, cross-reference its `BUG-XXX` entry in `bugs.md`.
+
 ---
 
 ## Portfolio Constraints — Unimplemented Fields
