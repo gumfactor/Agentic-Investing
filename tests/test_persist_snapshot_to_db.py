@@ -216,3 +216,64 @@ class TestFetchSnapshotDbPersistNonBlocking:
             if c[1]["key"] == "snapshot_path"
         )
         assert Path(snapshot_path).exists()
+
+    def test_db_positions_use_current_price_field(
+        self,
+        dag_mod: types.ModuleType,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """positions written to portfolio_snapshots use current_price (dashboard
+        schema), not the artifact's price/price_date fields."""
+        from datetime import date as _date
+
+        monkeypatch.setenv("PAPER_TRADING", "true")
+        monkeypatch.setenv("IBKR_PORT", "7497")
+        monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
+        monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
+
+        mock_row = MagicMock()
+        mock_row.ticker = "AAPL"
+        mock_row.close = 200.0
+        mock_row.price_date = _date.today().isoformat()
+
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchall.return_value = [mock_row]
+        ctx_mgr = MagicMock()
+        ctx_mgr.__enter__ = MagicMock(return_value=mock_conn)
+        ctx_mgr.__exit__ = MagicMock(return_value=False)
+        mock_engine = MagicMock()
+        mock_engine.connect.return_value = ctx_mgr
+
+        mock_broker = MagicMock()
+        mock_broker.is_paper = True
+        mock_broker.get_positions.return_value = {"AAPL": 10.0}
+        mock_broker.get_cash_balance_usd.return_value = 5000.0
+        mock_broker.get_account_value.return_value = 7000.0
+
+        mock_ti = MagicMock()
+        mock_ti.xcom_pull.return_value = "v1_base_momentum"
+        context = {"ti": mock_ti, "run_id": "test-field-map", "params": {}}
+
+        with patch.object(dag_mod, "IBKRBroker", return_value=mock_broker):
+            with patch.object(dag_mod, "create_engine", return_value=mock_engine):
+                with patch.object(dag_mod, "_persist_snapshot_to_db") as mock_persist:
+                    dag_mod._fetch_ibkr_snapshot(**context)
+
+        assert mock_persist.called
+        db_positions = mock_persist.call_args.kwargs["positions"]
+        assert len(db_positions) == 1
+        assert db_positions[0]["ticker"] == "AAPL"
+        assert db_positions[0]["current_price"] == 200.0
+        assert "price" not in db_positions[0]
+        assert "price_date" not in db_positions[0]
+
+        # Artifact written to disk must still use the pipeline's price field
+        snapshot_path = next(
+            c[1]["value"]
+            for c in mock_ti.xcom_push.call_args_list
+            if c[1]["key"] == "snapshot_path"
+        )
+        artifact = json.loads(Path(snapshot_path).read_text())
+        assert artifact["positions"][0]["price"] == 200.0
+        assert "current_price" not in artifact["positions"][0]

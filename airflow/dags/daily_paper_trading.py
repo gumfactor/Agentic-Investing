@@ -392,6 +392,14 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
     # Persist to DB so the Streamlit dashboard can read current portfolio state.
     # Non-blocking: the JSON artifact above is the durable record; the DB write
     # is a secondary read path for the dashboard and must not abort the pipeline.
+    #
+    # The DB payload uses dashboard field names (current_price) rather than the
+    # pipeline artifact field names (price/price_date).  The artifact is left
+    # unchanged so downstream pipeline tasks are unaffected.
+    _db_positions = [
+        {"ticker": p["ticker"], "quantity": p["quantity"], "current_price": p["price"]}
+        for p in position_list
+    ]
     try:
         _persist_snapshot_to_db(
             database_url=database_url,
@@ -399,7 +407,7 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
             strategy_id=strategy_id,
             dag_run_id=run_id,
             cash_usd=round(cash_usd, 2),
-            positions=position_list,
+            positions=_db_positions,
             nav_usd=round(nav_usd, 2),
         )
     except Exception as _exc:
