@@ -100,6 +100,94 @@ unrelated to these changes).
 
 ---
 
+### Session 54 — Adversarial Review Follow-up: 9 Findings Fixed
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** `065278a` — Fix 9 adversarial-review findings (Sessions 53-54)
+
+**What was done:**
+
+Ran a second adversarial review of the Session 53 fixes. The review found 9 issues.
+All 9 were fixed in this session (BUG-055 through BUG-063 now marked Fixed in bugs.md).
+
+- **BUG-055 (P0/Critical): prices_json=None crashed _write_simulation before per-strategy error handler.**
+  The new `write_simulations` task became the terminal node of the signal pipeline and thus
+  the `ExternalTaskSensor` target for the paper trading DAG. A None `prices_json` XCom
+  (e.g. when no price data for the day) was passed directly to `pd.read_json()`, crashing
+  the task with an uncaught TypeError before the per-strategy try/except, blocking the
+  entire paper pipeline. Fix: added a `not prices_json` early-exit guard immediately after
+  the existing `alpha_json` guard.
+
+- **BUG-056 (P1/High): wash_sale_context docstring said "SELL-side tickers".**
+  After BUG-040 renamed the context key and flipped the guard to block BUYs, the
+  `wash_sale_context()` docstring still described the input as "SELL-side tickers."
+  Fixed: now says "BUY-side tickers (the candidate replacement buys)."
+
+- **BUG-057 (P1/Medium): bool subclass passed isinstance(override_qty, int) in BUG-005 fix.**
+  In Python, `isinstance(True, int) == True`. A tampered DB row with `true` (JSON bool)
+  as an override quantity would pass the type check and submit 1 share silently.
+  Fix: added `isinstance(override_qty, bool)` guard (bool is a subclass of int, so this
+  must be checked separately). Also fixed the cap comparison to use
+  `original_row.get("quantity", original_row.get("estimated_shares", 0))` so the cap
+  is consistent with what actually gets submitted (finding #8, BUG-062).
+
+- **BUG-058 (P1/Medium): Second reconciliation artifact read swallowed exceptions.**
+  The BUG-006 fix correctly fail-closed the first read (deduplication safety). However,
+  the second read — used to populate `previous_responses` for the final audit artifact —
+  had a bare `except Exception: previous_responses = []`. On any I/O error between the
+  two reads, the audit trail would be silently truncated.
+  Fix: the second read now also raises AirflowException on failure, preserving the full
+  audit trail. The error message notes that deduplication was already safe (first read
+  succeeded).
+
+- **BUG-059 (P1/Medium): simulated_return divided by len(returns) not n_long.**
+  When some top-20 tickers lack prior-day prices, `len(returns) < n_long`. The original
+  code computed `sum(returns) / len(returns)`, the average over data-available tickers,
+  which overstates the equal-weight return versus the true portfolio (missing tickers
+  implicitly hold cash at 0% return). Fix: divide by `n_long` (20), matching true
+  equal-weight portfolio semantics.
+
+- **BUG-060 (P1/Medium): No test for fail-safe BUY rejection when as_of_date absent.**
+  BUG-040 added a deliberate fail-safe: if `recent_loss_sells` is populated but
+  `as_of_date` is missing from the context, the check rejects the BUY order (safe
+  default). No existing test covered this path. Added
+  `test_wash_sale_rejects_buy_when_as_of_date_missing` to `execution/tests/test_oms.py`.
+  28 OMS tests now pass.
+
+- **BUG-061 (P3/Low): deferred_items.md RESOLVED entry used stale key name.**
+  The RESOLVED entry for the wash-sale compliance fix still said
+  `ctx["recent_loss_buys"]`. Fixed: now says `recent_loss_sells` with an explanatory
+  note.
+
+- **BUG-062 (P3/Low): Override cap inconsistency between validation and submission fields.**
+  The BUG-005 validation read the cap from `estimated_shares`, while submission uses
+  `quantity` when present (set by the override apply loop). Addressed inline in BUG-057
+  fix — `original_qty` now uses `quantity` when set.
+
+- **BUG-063 (P3/Low): __import__("json").dumps() antipattern in _write_simulation.**
+  `json` was not imported at the top of the function; the developer used `__import__`
+  to work around the missing import. Fixed: added `import json` to the function's local
+  import block, used normally.
+
+**[DECISION] prices_json guard returns silently instead of raising (BUG-055)**
+A None prices_json means the load_prices task produced no data (rare, e.g. early run
+before price data arrives). This is not a code error — it is a data availability
+condition. Returning `{"simulations_written": 0, "reason": "no prices data"}` with
+`trigger_rule="none_failed"` means the downstream ExternalTaskSensor sees success
+(task completed with non-exception return), consistent with how the existing alpha_json
+guard handles "no data yet" cases.
+
+**Test results:** 28 OMS tests passing (was 27 — added missing fail-safe test).
+
+**Next steps (local environment required — same as Session 53):**
+1. Fix BUG-001–004 in `docker-compose.yml` and `infra/docker/Dockerfile.airflow`
+2. Smoke-test Docker stack and DAG imports
+3. Run Streamlit dashboard and complete manual verification checklist
+4. Start 4-week automated paper-trading qualification
+
+---
+
 ## 2026-06-29
 
 ### Session 52 — Dashboard Documentation Refresh After Schema Alignment Review

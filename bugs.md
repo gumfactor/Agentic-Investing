@@ -52,6 +52,12 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-038 | Data/Storage | P1 | F1 | Open | Snapshot version paths are mutable. |
 | BUG-039 | Backtesting | P1 | F1 | Open | Object-store failures can become unadjusted backtests. |
 | BUG-040 | Trading Safety | P1 | F1 | Fixed | Wash-sale guard checks the wrong order direction. |
+| BUG-055 | Trading Safety | P0 | F0 | Fixed | prices_json=None crashes _write_simulation before error handler, blocking ExternalTaskSensor. |
+| BUG-056 | Docs/Process | P1 | F1 | Fixed | wash_sale_context docstring says "SELL-side tickers" after BUG-040 fix renamed to BUY-side. |
+| BUG-057 | Trading Safety | P1 | F1 | Fixed | bool is int subclass; True passes isinstance(override_qty, int) and submits 1 share silently. |
+| BUG-058 | Trading Safety | P1 | F1 | Fixed | Second reconciliation artifact read swallows exceptions, truncating audit trail on retry. |
+| BUG-059 | Research/Signals | P1 | F1 | Fixed | simulated_return divides by len(returns) not n_long, overstating NAV when tickers lack prior-day data. |
+| BUG-060 | Trading Safety | P1 | F1 | Fixed | No test for fail-safe BUY rejection when recent_loss_sells set but as_of_date absent. |
 | BUG-041 | Risk | P1 | F1 | Open | Sector concentration is computed but not breach-checked. |
 | BUG-042 | Trading Safety | P1 | F1 | Open | IBKR order-ID timeout can leave live order untracked. |
 | BUG-043 | Packaging/CI | P1 | F1 | Open | Test collection can fail through MLflow/pkg_resources drift. |
@@ -94,6 +100,9 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-034 | Dashboard/API | P3 | F3 | Open | Performance table formats decimal returns as percentages incorrectly. |
 | BUG-035 | Dashboard/API | P3 | F3 | Open | No FastAPI/API route layer exists despite service-boundary expectations. |
 | BUG-054 | Data/Storage | P3 | F3 | Open | Fundamentals backfill skip logic can leave partial ingestions stale. |
+| BUG-061 | Docs/Process | P3 | F3 | Fixed | deferred_items.md RESOLVED entry used stale recent_loss_buys key after BUG-040 rename. |
+| BUG-062 | Trading Safety | P3 | F3 | Fixed | Override cap validated against estimated_shares while submission uses quantity field (inconsistent). |
+| BUG-063 | Packaging/CI | P3 | F3 | Fixed | __import__("json").dumps() antipattern in _write_simulation; replaced with proper import json. |
 
 ## Startup / repository state
 
