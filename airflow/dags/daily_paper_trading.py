@@ -1177,12 +1177,20 @@ with DAG(
     t_reconcile = PythonOperator(
         task_id="durable_reconcile",
         python_callable=_durable_reconcile,
+        # retries=0: connects to IBKR to query fills; auto-retry is inconsistent
+        # with the BUG-030 principle and can produce confusing duplicate audit artifacts.
+        retries=0,
         execution_timeout=timedelta(minutes=10),
     )
 
     t_ledger = PythonOperator(
         task_id="write_ledger",
         python_callable=_write_ledger,
+        # retries=0: writes a fail-closed no-clobber audit artifact and appends to
+        # the operational ledger. Auto-retry would hit the "artifact already exists"
+        # error from the first successful write and raise a misleading AirflowException,
+        # exhausting retries without ever writing the ledger.
+        retries=0,
     )
 
     # ── Dependency graph ─────────────────────────────────────────────────────

@@ -97,9 +97,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         metavar="N",
         help=(
-            "Reject blotters whose generated_at_utc is older than N calendar days "
-            "(default 1). Prevents submitting a stale-but-valid-checksum blotter "
-            "against outdated prices and positions."
+            "Reject blotters more than N calendar days old (default 1). A blotter "
+            "generated today or yesterday (age 0 or 1) passes; age 2+ is rejected. "
+            "Prevents submitting a stale-but-valid-checksum blotter against outdated "
+            "prices and positions."
         ),
     )
     return parser.parse_args(argv)
@@ -278,11 +279,14 @@ def validate_blotter(path: Path) -> dict[str, Any]:
 
 
 def _validate_blotter_freshness(artifact: Mapping[str, Any], max_age_days: int) -> None:
-    """Reject blotters older than max_age_days calendar days (BUG-051).
+    """Reject blotters more than max_age_days calendar days old (BUG-051).
+
+    A blotter aged exactly max_age_days is allowed (strictly greater than is rejected).
+    With the default of 1: today (age 0) and yesterday (age 1) both pass; age 2+ fails.
 
     A stale blotter has valid checksums but references outdated prices, positions,
-    and target weights. This check prevents accidentally re-submitting yesterday's
-    (or older) blotter via the CLI.
+    and target weights. This check prevents accidentally re-submitting a prior session's
+    blotter via the CLI.
     """
     generated_str = artifact.get("generated_at_utc")
     if not isinstance(generated_str, str):
@@ -524,12 +528,17 @@ def run(
         env_ok = _paper_env_is_valid(env_map, recorder)
         client_id = _resolve_client_id(env_map)
         blotter = validate_blotter(args.blotter)
-        _validate_blotter_freshness(blotter, args.max_blotter_age_days)
         rows = blotter["candidate_rows"]
+        # Display orders before freshness check so operators can always inspect
+        # what is in a blotter, even a stale one, via dry-run.
         _display_orders(rows, recorder)
         _display_review_hashes(args.blotter, blotter, recorder)
         if not env_ok:
             raise RuntimeError("Paper environment gates failed")
+        # Freshness check runs after display so the order list is always shown.
+        # A stale blotter exits nonzero on both dry-run and submission, but
+        # the operator has already seen the orders for inspection purposes.
+        _validate_blotter_freshness(blotter, args.max_blotter_age_days)
         if args.confirm != "YES":
             if args.confirm is not None:
                 recorder.fail('Submission confirmation must be the literal string "YES"')

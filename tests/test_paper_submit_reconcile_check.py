@@ -592,15 +592,18 @@ def test_rejects_adapter_with_live_port_metadata(tmp_path, capsys):
 # ── Freshness checks (BUG-051) ────────────────────────────────────────────────
 
 def test_freshness_check_rejects_stale_blotter(tmp_path, capsys):
-    """Blotter older than max_blotter_age_days must be rejected even with valid checksums."""
+    """Stale blotter must be rejected AND orders still displayed for operator inspection."""
     blotter_path = _write_blotter(tmp_path, generated_at_utc="2020-01-01T12:00:00+00:00")
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
+        broker_factory=lambda: FakeBroker(),
     )
     out = capsys.readouterr().out
     assert result == 1
     assert "calendar day" in out
+    # Orders must be displayed BEFORE freshness fails so operator can inspect
+    assert "AAPL" in out
 
 
 def test_freshness_check_accepts_fresh_blotter(tmp_path, capsys):
@@ -609,8 +612,11 @@ def test_freshness_check_accepts_fresh_blotter(tmp_path, capsys):
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
+        broker_factory=lambda: FakeBroker(),
     )
+    out = capsys.readouterr().out
     assert result == 0
+    assert "DRY-RUN OK" in out
 
 
 def test_freshness_check_custom_max_age(tmp_path, capsys):
@@ -621,31 +627,36 @@ def test_freshness_check_custom_max_age(tmp_path, capsys):
     result = check.run(
         ["--blotter", str(blotter_path), "--max-blotter-age-days", "7"],
         env=_env(),
+        broker_factory=lambda: FakeBroker(),
     )
     assert result == 0
 
 
 def test_freshness_check_boundary_exactly_one_day_old(tmp_path, capsys):
-    """Blotter generated exactly 1 day ago should pass the default max-age-days=1."""
+    """Blotter aged exactly 1 calendar day passes the default max-age-days=1 (strictly greater than rejects)."""
     from datetime import timedelta
     one_day_ago = (datetime.now(UTC) - timedelta(days=1)).isoformat()
     blotter_path = _write_blotter(tmp_path, generated_at_utc=one_day_ago)
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
+        broker_factory=lambda: FakeBroker(),
     )
     assert result == 0
 
 
 def test_freshness_check_boundary_two_days_old_fails(tmp_path, capsys):
-    """Blotter generated 2 days ago should fail the default max-age-days=1."""
+    """Blotter aged 2 calendar days fails the default max-age-days=1."""
     from datetime import timedelta
     two_days_ago = (datetime.now(UTC) - timedelta(days=2)).isoformat()
     blotter_path = _write_blotter(tmp_path, generated_at_utc=two_days_ago)
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
+        broker_factory=lambda: FakeBroker(),
     )
     out = capsys.readouterr().out
     assert result == 1
     assert "calendar day" in out
+    # Orders still displayed before freshness check fires
+    assert "AAPL" in out

@@ -80,7 +80,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-027 | Dashboard/API | P2 | F2 | Open | Approval UI can crash on malformed/null quantities. |
 | BUG-028 | Dashboard/API | P2 | F2 | Open | Artifact scanning lacks strong containment checks. |
 | BUG-029 | Trading Safety | P2 | F2 | Open | Live-clearance env var names differ across components. |
-| BUG-030 | Trading Safety | P2 | F2 | Fixed | Airflow retries are risky for broker submission actions. |
+| BUG-030 | Trading Safety | P2 | F2 | Fixed | Airflow retries are risky for broker submission/reconcile/ledger tasks. |
 | BUG-031 | Research/Signals | P2 | F2 | Open | Fundamental growth uses daily-row shifts after forward-fill. |
 | BUG-032 | Data/Storage | P2 | F2 | Open | `pivot_table()` silently averages duplicate records. |
 | BUG-033 | Infra/Deploy | P2 | F2 | Open | Prometheus scrape target is not backed by Compose service. |

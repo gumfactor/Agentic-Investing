@@ -20,7 +20,7 @@ Run this before promoting to a live trading environment.
 Open the Airflow UI at `http://localhost:8080`.  
 Go to **DAGs → daily_signal_pipeline → Trigger DAG ▶**.
 
-Wait until `fetch_ohlcv` starts (it takes ~30 s) — you want to interrupt during the longest task.
+Wait until `load_prices` starts (it fetches ~2 years of OHLCV — the longest task in the pipeline) — you want to interrupt during an active task.
 
 ### 2. Kill the scheduler and worker mid-run
 

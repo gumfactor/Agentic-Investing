@@ -100,6 +100,64 @@ unrelated to these changes).
 
 ---
 
+### Session 56 — Adversarial Review of Session 55: 6 Findings Fixed
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** see below
+
+**What was done:**
+
+Adversarial review of Session 55 changes found 8 findings (2 High, 3 Medium, 3 Low).
+All fixable findings addressed:
+
+- **Finding 1 (High): Runbook referenced `fetch_ohlcv` which doesn't exist in `daily_signal_pipeline`.**
+  `fetch_ohlcv` lives in `daily_data_pipeline` (the old name). The signal pipeline's
+  longest task is `load_prices`. Updated `airflow_fire_drill.md` to say `load_prices`
+  with an accurate description of why it's the right interrupt target.
+
+- **Finding 4a (High): `write_ledger` inherited `retries=3` from `_default_args`.**
+  On Airflow retry, `audit_run` hits the fail-closed no-clobber guard from the first
+  successful attempt and raises "artifact already exists", causing the task to exhaust
+  retries with a misleading error and never write the ledger. Set `retries=0`.
+
+- **Finding 4b (Medium): `durable_reconcile` inherited `retries=3` from `_default_args`.**
+  `durable_reconcile` connects to IBKR to query fill status. Auto-retrying a broker
+  query 3 times is inconsistent with the BUG-030 principle applied to `submit_orders`
+  and `wait_for_fills`. Set `retries=0`.
+
+- **Finding 2 (Medium): `_validate_blotter_freshness` blocked order display on dry-run.**
+  The check was called before `_display_orders`, so a stale blotter caused dry-run to
+  exit 1 without ever showing the operator the order list. Operators have a legitimate
+  need to inspect a stale blotter via dry-run (e.g. to understand what would have been
+  submitted). Moved the freshness check to after `_display_orders` and
+  `_display_review_hashes` so the order list always prints. Freshness still exits 1
+  on both dry-run and submission, but the orders are visible first.
+
+- **Finding 5/6 (Medium/Low): Freshness tests omitted `broker_factory=`.**
+  Default `_default_broker_factory` uses a lazy import, so dry-run tests don't actually
+  trigger an IBKR import — but the omission is fragile to future reorganization.
+  Added `broker_factory=lambda: FakeBroker()` to all five freshness tests. Also added
+  assertions that orders are displayed even when freshness fails (verifying the fix
+  to Finding 2).
+
+- **Finding 3 (Low): `--max-blotter-age-days` help text and docstring said "older than"
+  but the implementation is strictly-greater-than (age=N passes, age=N+1 fails).**
+  Updated `--help` text to "more than N calendar days old" with an explicit example
+  ("today (age 0) and yesterday (age 1) both pass; age 2+ is rejected") and updated
+  the docstring to match.
+
+**Not fixed (acknowledged):**
+- Finding 7 (Low): `check` target runs `fmt-check` before `lint`; if both fail, lint
+  errors are never shown. This is standard Make fail-fast behavior, not a correctness
+  bug. No change warranted.
+- Finding 8 (Review note): `ExternalTaskSensor` `execution_delta` correctly lines up
+  signal pipeline (21:30 UTC) with paper trading (23:00 UTC). Confirmed correct; no change.
+
+**Test results:** 23 submit/reconcile tests passing (all pass).
+
+---
+
 ### Session 55 — BUG-030, BUG-051, BUG-052, BUG-053 Fixed
 
 **Operator:** mshane@thecanadalist.ca
