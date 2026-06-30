@@ -30,9 +30,12 @@ for Phase 5 enforcement.
 
 `execution/oms/trade_history.py` was built in Session 41 (branch
 `claude/trade-journal`, commits `708c35a`, `bf2098f`).  The
-`TradeJournal.wash_sale_context()` method now populates `ctx["recent_loss_buys"]`
+`TradeJournal.wash_sale_context()` method now populates `ctx["recent_loss_sells"]`
 from real fill history, and `OrderManager.run_compliance()` auto-injects it when
 a `TradeJournal` is provided.  `_check_wash_sale` is no longer a dead letter.
+(Note: key was originally `recent_loss_buys`; renamed to `recent_loss_sells` in
+Session 53 when the wash-sale direction was corrected — the rule blocks replacement
+BUYs, not SELLs, so the context key now reflects which side triggers the lookup.)
 The Alembic migration is `infra/db/migrations/versions/004_trade_journal_schema.py`.
 
 ---

@@ -121,6 +121,20 @@ class TestComplianceEngine:
         passed, _ = engine.check(o, ctx)
         assert passed
 
+    def test_wash_sale_rejects_buy_when_as_of_date_missing(self):
+        """Fail-safe: BUY must be rejected when recent_loss_sells is populated but as_of_date is absent."""
+        engine = ComplianceEngine()
+        ctx = {
+            "circuit_breaker_open": False,
+            "recent_loss_sells": {"AAPL": date(2024, 1, 1)},
+            # as_of_date deliberately absent — compliance must fail closed
+        }
+        o = self._order(side=OrderSide.BUY)
+        passed, reason = engine.check(o, ctx)
+        assert not passed
+        assert "wash-sale" in reason
+        assert "as_of_date missing" in reason
+
     def test_min_notional_rejected(self):
         engine = ComplianceEngine()
         ctx = {"circuit_breaker_open": False, "min_order_notional": 1000.0}

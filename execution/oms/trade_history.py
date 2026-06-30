@@ -357,8 +357,8 @@ class TradeJournal:
         Parameters
         ----------
         tickers:
-            Tickers to query.  Typically the SELL-side tickers in the pending
-            order batch.
+            Tickers to query.  Typically the BUY-side tickers in the pending
+            order batch (the candidate replacement buys).
         window_days:
             Look-back window in calendar days (default 30 matches the IRS
             wash-sale window).

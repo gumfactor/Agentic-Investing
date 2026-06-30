@@ -771,10 +771,11 @@ def _submit_orders(**context: Any) -> None:
                     f"quantity_overrides references sequence {seq_str!r} which is not in "
                     "the approved rows. This may indicate a tampered approval record."
                 )
-            original_qty = float(original_row.get("estimated_shares", 0))
+            original_qty = float(original_row.get("quantity", original_row.get("estimated_shares", 0)))
             override_qty_f = float(override_qty)
             if (
                 not isinstance(override_qty, int)
+                or isinstance(override_qty, bool)  # bool is int subclass; reject True/False
                 or override_qty_f <= 0
                 or not _math.isfinite(override_qty_f)
                 or override_qty_f > original_qty + 1e-6
@@ -854,8 +855,14 @@ def _submit_orders(**context: Any) -> None:
         try:
             prev = json.loads(reconciliation_path.read_text(encoding="utf-8"))
             previous_responses = list(prev.get("broker_responses", []))
-        except Exception:
-            previous_responses = []
+        except Exception as _exc2:
+            # The first read already succeeded (deduplication is safe), but we
+            # must not silently drop prior responses from the audit trail.
+            raise AirflowException(
+                f"Reconciliation artifact at {reconciliation_path} was readable for "
+                f"deduplication but failed on second read for audit assembly: {_exc2}. "
+                "Manual reconciliation required."
+            ) from _exc2
 
     def _on_progress(
         responses: list[dict[str, Any]],

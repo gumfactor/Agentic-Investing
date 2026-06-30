@@ -281,6 +281,7 @@ def _write_simulation(**context: Any) -> dict:
     row carries the NAV implied by the previous row in the table plus today's
     simulated return.
     """
+    import json
     import os
     import uuid as _uuid
     from datetime import UTC, datetime as _datetime
@@ -295,6 +296,8 @@ def _write_simulation(**context: Any) -> dict:
 
     if not score_date_str or not alpha_json or alpha_json == "[]":
         return {"simulations_written": 0, "reason": "no alpha scores"}
+    if not prices_json:
+        return {"simulations_written": 0, "reason": "no prices data"}
 
     sim_date = date.fromisoformat(score_date_str)
     alpha_df = pd.read_json(alpha_json, orient="records", convert_dates=False)
@@ -345,7 +348,10 @@ def _write_simulation(**context: Any) -> dict:
             weight = 1.0 / len(tickers) if tickers else 0.0
             target_weights = {t: weight for t in tickers}
 
-            # Compute equal-weight portfolio return for sim_date
+            # Compute equal-weight portfolio return for sim_date.
+            # Divide by n_long (declared portfolio size), not len(returns), so
+            # tickers with missing prior-day prices contribute 0% to the average
+            # rather than inflating it.
             returns = []
             for ticker in tickers:
                 if ticker in today_closes.index and ticker in prev_day_closes.index:
@@ -353,7 +359,7 @@ def _write_simulation(**context: Any) -> dict:
                     c_prev = float(prev_day_closes[ticker])
                     if c_prev > 0:
                         returns.append((c_today - c_prev) / c_prev)
-            simulated_return = float(sum(returns) / len(returns)) if returns else 0.0
+            simulated_return = float(sum(returns) / n_long) if returns else 0.0
 
             # Compound NAV from prior row, starting at 1_000_000
             with engine.connect() as conn:
@@ -392,7 +398,7 @@ def _write_simulation(**context: Any) -> dict:
                         "id": str(_uuid.uuid4()),
                         "strategy_id": strategy_id,
                         "sim_date": sim_date,
-                        "target_weights": __import__("json").dumps(target_weights),
+                        "target_weights": json.dumps(target_weights),
                         "simulated_return": round(simulated_return, 8),
                         "simulated_nav": round(simulated_nav, 6),
                         "universe_size": len(strat_scores),
