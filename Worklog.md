@@ -13,6 +13,101 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-06-29
 
+### Session 52 — Dashboard Documentation Refresh After Schema Alignment Review
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `work`
+**Commits:** documentation refresh for dashboard progress and remaining producer tasks
+
+**What was done:**
+
+- Reviewed the dashboard documentation against the current branch state after the schema-alignment fixes.
+- Updated `docs/streamlit_dashboard_spec.md` from a pre-implementation spec to an implemented-status reference.
+- Added `reporting/dashboards/session.py` to the documented dashboard file structure and documented `init_dashboard_session()` as the canonical source of `session_id` / `operator_email` initialization.
+- Corrected the spec to distinguish implemented schema migrations from remaining backend producer work:
+  - `portfolio_snapshots` migration exists; the Airflow `fetch_ibkr_snapshot` DB insert is still outstanding.
+  - `strategy_simulations` migration exists; the daily signal-pipeline simulation writer is still outstanding.
+  - `quantity_overrides` migration, sensor XCom propagation, and submit-task application are implemented.
+- Corrected shared component documentation: alert and circuit-breaker objects are shared with `@st.cache_resource`, not `st.session_state`.
+- Updated the testing section to reflect the actual dashboard suite: 100 passing tests across 8 dashboard test files, with SQLite fixtures mirroring the relevant Alembic schema contracts.
+
+**[DECISION] Documentation now separates dashboard UI completeness from producer-task completeness**
+The dashboard pages and query layer are implemented, but some panels depend on daily producers that are not fully wired yet. The spec now explicitly tracks this distinction so future sessions do not mistake table migrations for end-to-end data population.
+
+**Next steps:**
+- Run Streamlit manually with `streamlit run reporting/dashboards/app.py` and complete the manual verification checklist.
+- Wire the `portfolio_snapshots` INSERT into Airflow `fetch_ibkr_snapshot`.
+- Wire the daily `strategy_simulations` producer task into `daily_signal_pipeline.py`.
+
+---
+
+### Session 51 — Streamlit Dashboard Implementation: All 4 Sprints (M5.8)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/streamlit-dashboard-sprint-1-8ae6uw`
+**Commits:** 10 commits (4 sprint implementations + 4 adversarial review fix commits + rebase for signing)
+
+**What was done:**
+
+- Implemented all 4 sprints of the RQIS Streamlit dashboard (M5.8) end-to-end.
+- Each sprint followed: implement -> test -> adversarial review via subagent -> fix all findings -> proceed.
+- **Sprint 1 (Foundation + C1 Gate):** `db.py`, `queries.py`, `components/env_banner.py`,
+  `components/circuit_breaker.py`, `app.py`, `broker.py` stub, Page 4 (Blotter Approval) with
+  SHA-256 verification, per-row checkboxes, quantity edit validation, double confirmation,
+  `blotter_approvals` INSERT (C3 append-only). Migration 006 for `quantity_overrides` JSONB column.
+  Wired `quantity_overrides` through `BlotterApprovalSensor` and Airflow submit task.
+  14 adversarial review findings addressed.
+- **Sprint 2 (Operational Visibility):** Page 1 (Overview) with NAV metrics, drawdown, pipeline
+  health, active alerts, auto-refresh. Page 2 (Positions) with holdings table, unrealized P&L,
+  alpha ranks, realized P&L summary. Page 3 (Risk Monitor) with VaR/CVaR/drawdown/beta/concentration,
+  alert feed, CB reset form (C4+C9). Migration 007 for `portfolio_snapshots` table.
+  7 adversarial review findings addressed (F2-F4 High, F5/F10/F15/F16 Medium).
+- **Sprint 3 (Performance + Signals):** Page 5 (Performance) with metrics cards, tearsheet charts
+  (equity curve, drawdown, monthly heatmap, rolling Sharpe, annual returns), strategy comparison
+  table and equity curve overlay. Page 6 (Signals) with alpha leaderboard (top/bottom 25),
+  factor z-score breakdown, 30-day factor history, strategy registry. Migration 008 for
+  `strategy_simulations` table.
+  8 adversarial review findings addressed (F1 High, F2-F4 Medium, F8-F10/F14 Low).
+- **Sprint 4 (Audit + Polish):** Page 7 (Audit Trail) with fill history filters, P&L lineage
+  drill-down (alpha scores + factor scores at fill time), wash-sale history, blotter approval
+  history (C3 read-only). `components/alert_feed.py` extracted shared widget.
+  `simulation.py` with forward simulation helpers and Jaccard overlap. Page 6 Section E
+  cross-strategy alpha overlap heatmap. Refactored Page 3 to use alert_feed component.
+  8 adversarial review findings addressed (F1-F3 High, F4-F5/F7 Medium, F8-F9 Low).
+- **98 dashboard tests passing** across 6 test files.
+- All SQL queries cross-dialect compatible (PostgreSQL production, SQLite tests).
+- All safety rules enforced: C1 (blotter approval), C3 (append-only audit), C4 (manual CB reset),
+  C5 (no secrets), C8 (live path gated), C9 (destructive confirmations).
+
+**Files created/modified (16 new files, 2546+ lines added):**
+- `reporting/dashboards/db.py`, `queries.py`, `broker.py`, `simulation.py`, `app.py`
+- `reporting/dashboards/components/env_banner.py`, `circuit_breaker.py`, `alert_feed.py`
+- `reporting/dashboards/pages/1_Overview.py` through `7_Audit_Trail.py`
+- `infra/db/migrations/versions/006_...py`, `007_...py`, `008_...py`
+- `tests/reporting/dashboards/test_queries.py`, `test_blotter_approval.py`,
+  `test_page4_integration.py`, `test_components.py`, `test_sprint2_queries.py`,
+  `test_sprint2_risk.py`, `test_sprint3_queries.py`, `test_sprint4.py`
+
+**[DECISION] Cross-dialect SQL portability strategy**
+All dashboard queries use portable SQL (no `DISTINCT ON`, `ANY()`, `bool_or()`, `NOW()`,
+`::jsonb` casts). PostgreSQL-specific syntax lives only in Alembic migrations (which only
+run against PostgreSQL). Test fixtures create simplified SQLite schemas. This avoids
+maintaining two query paths while keeping tests fast and dependency-free.
+
+**[DECISION] Alert feed extracted as shared component**
+The alert rendering logic (unacknowledged alerts with per-alert Ack buttons + acknowledged
+history expander) was duplicated between Pages 1 and 3. Extracted to
+`components/alert_feed.py` with a `page_key` parameter for unique button keys.
+
+**Next steps:**
+- Create PR for review
+- Manual verification of Streamlit UI (requires running with `streamlit run reporting/dashboards/app.py`)
+- Wire `portfolio_snapshots` INSERT into Airflow `fetch_ibkr_snapshot` task
+- Wire forward simulation task into `daily_signal_pipeline.py`
+- Complete manual verification checklist from spec Section 10
+
+---
+
 ### Session 50 — Streamlit Dashboard Planning (M5.8)
 
 **Operator:** mshane@thecanadalist.ca  

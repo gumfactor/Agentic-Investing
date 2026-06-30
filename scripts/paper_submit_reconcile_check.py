@@ -318,7 +318,7 @@ def _order_from_row(row: Mapping[str, Any], strategy_id: str) -> Order:
     return Order(
         ticker=str(row["ticker"]).strip().upper(),
         side=OrderSide(str(row["direction"])),
-        quantity=float(row["estimated_shares"]),
+        quantity=float(row.get("quantity", row["estimated_shares"])),
         limit_price=float(row["reference_price"]),
         strategy_id=strategy_id,
         notes="Step 7 paper submission from validated Step 6 blotter",
