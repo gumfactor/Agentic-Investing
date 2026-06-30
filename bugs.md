@@ -366,3 +366,205 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 **Impact:** Any expected backend validation/service boundary is absent; safety validation must be duplicated in UI and DAG code unless an API layer is added.
 
 **Suggested direction:** Either document Streamlit-direct architecture and centralize validation libraries, or introduce an authenticated backend API boundary.
+
+## Second-pass additions
+
+The following findings were added after a second adversarial pass focused on gaps in data/storage/backtesting, portfolio/risk/execution, and packaging/CI/docs.
+
+## P0 / Critical second-pass findings
+
+### BUG-036: Package builds are blocked by an invalid PEP 517 backend
+
+**Severity:** P0 / packaging blocker
+
+**Evidence:** `pyproject.toml` declares `build-backend = "setuptools.backends.legacy:build"`, but the current environment cannot import that backend; `pip wheel . --no-deps --no-build-isolation` fails with `Cannot import 'setuptools.backends.legacy'`. The same metadata references `README.md`, which is not present at the repository root.
+
+**Impact:** CI, Docker builds, deployments, and downstream consumers that build a wheel can fail before the project is installable.
+
+**Suggested direction:** Use a valid backend such as `setuptools.build_meta` or `setuptools.build_meta:__legacy__`, restore/update the referenced README, and add a wheel-build CI check.
+
+## P1 / High second-pass findings
+
+### BUG-037: Same-date corporate actions overwrite each other
+
+**Severity:** P1 / data correctness
+
+**Evidence:** Corporate-action adjustment factors are stored in a dict keyed only by `ex_date`; split and dividend actions on the same date assign to the same key. The schema permits multiple actions for the same ticker/date when `action_type` differs.
+
+**Impact:** A same-day split plus dividend can drop one adjustment, materially corrupting adjusted historical prices, backtests, and signal returns.
+
+**Suggested direction:** Accumulate all action multipliers per ex-date and multiply them together, or key by `(ex_date, action_type)` before aggregating.
+
+### BUG-038: Snapshot versions are mutable because date-only object keys are overwritten
+
+**Severity:** P1 / reproducibility
+
+**Evidence:** Snapshot writes use keys based on `{data_type}/{snapshot_date}/data.parquet`; pinning scripts and manifests use the caller-provided snapshot date as the version. Re-running the same snapshot date overwrites the same object path.
+
+**Impact:** Prior backtests/manifests that point to a snapshot date can later resolve to different bytes, breaking reproducibility.
+
+**Suggested direction:** Make snapshot paths content-addressed or run-id-addressed, refuse overwrite by default, and store/verify content hashes in manifests.
+
+### BUG-039: Object-store errors become `FileNotFoundError`, causing corporate-action fail-open behavior
+
+**Severity:** P1 / backtest correctness
+
+**Evidence:** Snapshot loading converts any `S3Error` to `FileNotFoundError`; the backtest loader treats missing `corporate_actions` as optional and substitutes an empty DataFrame.
+
+**Impact:** Auth, timeout, bucket-policy, or transient object-store failures can silently produce unadjusted backtest prices.
+
+**Suggested direction:** Convert only true no-such-key/object-not-found errors to `FileNotFoundError`; re-raise other object-store failures and consider requiring corporate-action snapshots for production backtests.
+
+### BUG-040: Wash-sale guard checks the wrong order direction
+
+**Severity:** P1 / compliance correctness
+
+**Evidence:** The trade journal finds recent loss-realizing SELL fills, but compliance stores them under a misleading `recent_loss_buys` key and `_check_wash_sale()` immediately allows every non-SELL order, blocking only later SELLs.
+
+**Impact:** Replacement BUYs after a loss sale can pass, while unrelated later SELLs can be blocked. The control misses the likely wash-sale exposure and creates false positives.
+
+**Suggested direction:** Rename the context to loss-sale history and evaluate replacement BUYs inside the wash-sale window, with tests for both false-negative and false-positive cases.
+
+### BUG-041: Sector concentration is computed but never breach-checked
+
+**Severity:** P1 / risk monitoring
+
+**Evidence:** `RiskSnapshot` exposes `max_sector_concentration`, and the monitor computes sector weights, but breach detection checks only drawdown, VaR, beta, and single-name concentration.
+
+**Impact:** A portfolio can be highly concentrated in one sector without tripping any sector risk breach or circuit-breaker path.
+
+**Suggested direction:** Add configurable sector concentration thresholds and include sector breaches in the circuit-breaker decision.
+
+### BUG-042: IBKR order-ID timeout can leave a live broker order untracked locally
+
+**Severity:** P1 / trading safety
+
+**Evidence:** `IBKRBroker.submit_order()` calls `placeOrder()` before waiting for a nonzero order ID. If the ID is not assigned within the timeout, it raises while warning that the order may still be live. Callers can then mark the order rejected/failed or omit the broker ID from artifacts.
+
+**Impact:** The broker can have a working order while local OMS/artifacts show failure, encouraging duplicate retry/manual action and leaving exposure unmanaged.
+
+**Suggested direction:** Treat post-placement ID timeouts as an indeterminate state requiring broker reconciliation; capture any available local trade/client metadata and fail closed before retrying.
+
+### BUG-043: Non-isolated test collection fails through MLflow/pkg_resources dependency drift
+
+**Severity:** P1 / CI reliability
+
+**Evidence:** `backtesting.experiment_tracking.mlflow_logger` imports `mlflow` at module import time. The requirements pin `mlflow==2.10.2` but do not constrain or include a compatible `pkg_resources` provider; `python -m pytest --collect-only -q` fails with `ModuleNotFoundError: No module named 'pkg_resources'` in the current environment.
+
+**Impact:** CI/test collection can fail before tests run, depending on setuptools/pkg_resources availability.
+
+**Suggested direction:** Pin/add a compatible setuptools/pkg_resources provider, upgrade MLflow, or lazily import MLflow inside logger methods to avoid unrelated collection failures.
+
+### BUG-044: Package discovery excludes operational modules used by DAGs/tests/runbooks
+
+**Severity:** P1 / packaging completeness
+
+**Evidence:** Setuptools package discovery includes first-party domain packages but excludes `airflow*`, `scripts*`, and `config*`. DAGs import `scripts.*` and `config.universe_loader`, and tests import `scripts` directly.
+
+**Impact:** A wheel install can omit operational modules that the source-tree runbooks and DAGs require, making installed deployments differ from source-checkout behavior.
+
+**Suggested direction:** Decide whether the project is installable or source-tree-only. If installable, package operational modules or move them under a first-party namespace with console entry points.
+
+### BUG-045: Local Airflow stubs shadow real Apache Airflow imports
+
+**Severity:** P1 / test validity
+
+**Evidence:** The repo contains a top-level `airflow` package described as a minimal local testing stub, including simplified `DAG` and `PythonOperator` implementations under the same import path as Apache Airflow.
+
+**Impact:** Commands run from the repo root can test against stubs rather than real Airflow, masking real DAG parse/runtime incompatibilities.
+
+**Suggested direction:** Move stubs under a test-only namespace or inject them via fixtures, and add a real-Airflow DAG import smoke test in an environment where the stubs are absent from `PYTHONPATH`.
+
+## P2 / Medium second-pass findings
+
+### BUG-046: Market-data backfill can mark partially loaded tickers complete
+
+**Severity:** P2 / ingestion completeness
+
+**Evidence:** The resume helper treats a ticker as done if it has at least one row in the first 31 calendar days of the requested window. The yfinance backfill then skips those tickers entirely.
+
+**Impact:** An interrupted run that wrote a few early rows can permanently skip the remaining requested history, leaving sparse coverage that downstream snapshots/signals inherit.
+
+**Suggested direction:** Validate coverage across the full requested range using latest date, expected row-count thresholds, and/or an exchange calendar.
+
+### BUG-047: Data-quality flag deduplication has no conflict key
+
+**Severity:** P2 / data-quality table correctness
+
+**Evidence:** The writer uses `ON CONFLICT DO NOTHING` for quality flags, but the migration creates only a surrogate primary key and non-unique indexes; there is no unique constraint over the logical duplicate fields.
+
+**Impact:** Repeated data-quality checks can insert duplicate flags indefinitely, bloating dashboards and overstating unresolved issues.
+
+**Suggested direction:** Add an appropriate unique constraint/index, such as `(ticker, date, flag_type, message)` or `(ticker, date, flag_type)`, and report actual inserted rows.
+
+### BUG-048: `trade_fills` dedup guard allows duplicate cumulative fills with different timestamps
+
+**Severity:** P2 / trade journal correctness
+
+**Evidence:** The migration comment says the unique constraint rejects re-recording the same order/cumulative quantity, but the actual unique constraint includes `fill_timestamp`.
+
+**Impact:** The same cumulative fill can be inserted again with a slightly different timestamp, corrupting FIFO P&L, wash-sale history, and position reconstruction.
+
+**Suggested direction:** Enforce broker execution IDs or `(order_id, cumulative_filled_quantity)` idempotency in a table/constraint that can represent the true invariant.
+
+### BUG-049: Optimizer fallbacks can return portfolios that violate configured caps
+
+**Severity:** P2 / portfolio construction
+
+**Evidence:** MVO infeasible paths return equal weights without re-checking max-position or sector caps. Risk parity accepts constraints but does not enforce sector caps in the solver and only applies a post-hoc single-name cap.
+
+**Impact:** A target portfolio can be labeled optimized while violating configured position/sector constraints.
+
+**Suggested direction:** Re-validate every fallback output against all constraints and fail rather than returning an invalid portfolio when no feasible solution exists.
+
+### BUG-050: NaN-heavy return series can suppress VaR/CVaR breaches
+
+**Severity:** P2 / risk monitoring
+
+**Evidence:** VaR/CVaR helpers check raw series length before dropping NaNs, and breach checks compare values directly. NaN values do not satisfy threshold comparisons.
+
+**Impact:** Sparse or broken return streams can produce NaN risk metrics and fail open instead of triggering a data-quality/circuit-breaker breach.
+
+**Suggested direction:** Require a minimum number of finite observations after `dropna()`, reject non-finite VaR/CVaR, and fail closed on insufficient risk data.
+
+### BUG-051: Step 7 CLI can submit old but checksum-valid blotters
+
+**Severity:** P2 / trading freshness
+
+**Evidence:** Step 6 records generation/target/snapshot dates, but Step 7 validates schema and checksums without enforcing artifact age, target date, snapshot freshness, or re-running current account/risk checks.
+
+**Impact:** A stale blotter can be submitted against stale prices, cash, positions, and target weights as long as checksums match.
+
+**Suggested direction:** Enforce maximum artifact age and trading-date freshness at Step 7, and require current broker/account/risk checks immediately before submission.
+
+### BUG-052: Airflow fire-drill runbook contradicts DAG timezone semantics
+
+**Severity:** P2 / operational docs
+
+**Evidence:** The data DAG is documented/configured for `20:00 America/New_York`, but the fire-drill runbook says the cron fires at `20:00 UTC`.
+
+**Impact:** Operators can expect or diagnose runs at the wrong wall-clock time, especially around DST.
+
+**Suggested direction:** Update the runbook to state actual Airflow scheduling semantics and provide UTC examples for standard/daylight time.
+
+### BUG-053: `make check` mutates the working tree
+
+**Severity:** P2 / CI hygiene
+
+**Evidence:** The `check` target depends on `fmt`, and `fmt` runs `ruff format .`, which can rewrite files before lint/typecheck/tests run.
+
+**Impact:** A validation command can silently change files and pass locally, leaving dirty-tree formatting changes unnoticed.
+
+**Suggested direction:** Add a non-mutating `fmt-check` target using `ruff format --check .` and make `check` depend on that instead of `fmt`.
+
+## P3 / Low second-pass findings
+
+### BUG-054: Fundamentals backfill skip logic can leave partially ingested tickers stale forever
+
+**Severity:** P3 / ingestion completeness
+
+**Evidence:** The fundamentals backfill considers a ticker already ingested if it has any row in `financial_statements`, and skips it unless `--force` is used.
+
+**Impact:** Interrupted or partial fundamentals ingestion can leave concept/period coverage incomplete while the script reports the ticker as already ingested.
+
+**Suggested direction:** Track completeness by ticker, source version, concept set, and latest filing date; skip only when the expected coverage contract is satisfied.
