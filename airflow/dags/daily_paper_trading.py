@@ -1156,7 +1156,11 @@ with DAG(
     t_submit = PythonOperator(
         task_id="submit_orders",
         python_callable=_submit_orders,
-        retries=1,
+        # retries=0: broker submission must never auto-retry. The reconciliation
+        # artifact guards against duplicate submissions on manual re-runs, but
+        # Airflow's automated retry can fire before _on_progress writes the
+        # artifact, leaving a broker order untracked locally (BUG-030).
+        retries=0,
         execution_timeout=timedelta(minutes=10),
     )
 

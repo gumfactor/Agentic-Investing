@@ -18,7 +18,7 @@ Run this before promoting to a live trading environment.
 ### 1. Trigger a manual run
 
 Open the Airflow UI at `http://localhost:8080`.  
-Go to **DAGs → daily_data_pipeline → Trigger DAG ▶**.
+Go to **DAGs → daily_signal_pipeline → Trigger DAG ▶**.
 
 Wait until `fetch_ohlcv` starts (it takes ~30 s) — you want to interrupt during the longest task.
 
@@ -41,7 +41,7 @@ reschedules them automatically within ~30–60 seconds.
 
 ### 4. Watch recovery in the UI
 
-Return to **DAGs → daily_data_pipeline → (the triggered run) → Graph view**.
+Return to **DAGs → daily_signal_pipeline → (the triggered run) → Graph view**.
 
 Expected behaviour:
 - Interrupted tasks are retried automatically (up to 3 attempts each, per DAG config)
@@ -90,8 +90,12 @@ don't change.
 
 ## Scheduling notes (Windows Docker Desktop)
 
-- The scheduler runs inside the container on UTC time
-- The DAG schedule `0 20 * * 1-5` fires at 20:00 UTC (weekdays)
+- The Airflow scheduler uses **UTC** for all cron expressions (default Airflow behaviour;
+  no `default_timezone` override is configured). Do not interpret cron fields as local time.
+- **`daily_signal_pipeline`** — `30 21 * * 1-5` → fires at **21:30 UTC** weekdays
+  (5:30 PM EDT / 4:30 PM EST)
+- **`daily_paper_trading`** — `0 23 * * 1-5` → fires at **23:00 UTC** weekdays
+  (7:00 PM EDT / 6:00 PM EST); 90-minute gap gives the signal pipeline time to complete
 - Docker Desktop on Windows suspends containers when the laptop sleeps; the scheduler
   catches up automatically on wake by running any missed intervals
 - To confirm catch-up worked: check the DAG grid for backfilled runs marked `success`

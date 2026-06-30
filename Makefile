@@ -1,7 +1,7 @@
 # RQIS — Developer convenience targets
 # Usage: make <target>
 
-.PHONY: up down clean logs shell-db migrate backfill test lint typecheck fmt
+.PHONY: up down clean logs shell-db migrate backfill test lint typecheck fmt fmt-check check
 
 # ─── Infrastructure ───────────────────────────────────────────────────────────
 
@@ -72,8 +72,13 @@ lint:
 fmt:
 	ruff format .
 
+fmt-check:
+	ruff format --check .
+
 typecheck:
 	mypy data signals portfolio execution risk backtesting reporting
 
-check: fmt lint typecheck test
+# check uses fmt-check (read-only) not fmt (mutating) so the working tree is
+# never silently modified by a validation command (BUG-053).
+check: fmt-check lint typecheck test
 	@echo "All checks passed."

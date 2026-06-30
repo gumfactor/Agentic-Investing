@@ -100,6 +100,64 @@ unrelated to these changes).
 
 ---
 
+### Session 55 — BUG-030, BUG-051, BUG-052, BUG-053 Fixed
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** see below
+
+**What was done:**
+
+Four bugs fixed in preparation for the 4-week automated paper-trading qualification.
+All are fully verifiable in this remote environment (no Docker or IBKR required).
+
+- **BUG-030 (P2): Airflow retries on broker submission task.**
+  Changed `submit_orders` task from `retries=1` to `retries=0` in
+  `airflow/dags/daily_paper_trading.py`. Airflow's automated retry can fire
+  before `_on_progress` writes the reconciliation artifact, leaving a broker order
+  accepted but untracked locally. Retry decisions for broker submissions must be
+  made by a human, not by the orchestrator.
+
+- **BUG-051 (P2): Step 7 CLI could submit stale but checksum-valid blotters.**
+  Added `_validate_blotter_freshness()` to `scripts/paper_submit_reconcile_check.py`.
+  Parses `generated_at_utc` from the blotter and rejects artifacts older than
+  `--max-blotter-age-days` calendar days (default 1). Added `--max-blotter-age-days`
+  CLI argument. Wired the check immediately after `validate_blotter()` so it runs
+  on every invocation (dry-run and submission). Updated `_write_blotter()` in the
+  test fixture to default `generated_at_utc` to `datetime.now(UTC)` so existing
+  tests remain valid. Added 5 new freshness tests (23 total, all passing).
+
+- **BUG-052 (P2): Fire-drill runbook contradicted DAG timezone semantics.**
+  Updated `docs/runbooks/airflow_fire_drill.md`:
+  - Updated both DAG name references from `daily_data_pipeline` (no longer exists)
+    to `daily_signal_pipeline`.
+  - Rewrote the "Scheduling notes" section to explicitly state Airflow uses UTC
+    for cron scheduling (no `default_timezone` override is configured), and listed
+    the correct UTC schedules for both DAGs with their EDT/EST equivalents:
+    - `daily_signal_pipeline`: `30 21 * * 1-5` = 21:30 UTC (5:30 PM EDT / 4:30 PM EST)
+    - `daily_paper_trading`: `0 23 * * 1-5` = 23:00 UTC (7:00 PM EDT / 6:00 PM EST)
+  - Also corrected the schedule comment in `daily_signal_pipeline.py` from
+    `# 9:30 PM ET weekdays` (wrong) to `# 21:30 UTC weekdays (5:30 PM EDT / 4:30 PM EST)`.
+
+- **BUG-053 (P2): `make check` silently mutated working tree before linting.**
+  Makefile `check` target previously depended on `fmt` (which runs `ruff format .`,
+  modifying files). Changed `check` to depend on `fmt-check` (new target: `ruff
+  format --check .`, read-only). `make fmt` still exists for developer use.
+  A validation command that modifies files can make the tree pass locally on the
+  first run while leaving unnoticed reformatting.
+
+**[DECISION] freshness default of 1 calendar day (BUG-051)**
+The paper workflow generates the blotter after market close and typically submits
+it the same evening or next morning (before market open). A 1-day default allows
+that window while preventing stale blotters from prior sessions being accidentally
+submitted. The `--max-blotter-age-days` override exists for the Airflow path where
+the blotter and submission run in the same pipeline; in that case, freshness is
+guaranteed by the pipeline structure rather than a CLI check.
+
+**Test results:** 23 submit/reconcile tests passing (was 18 — added 5 freshness tests).
+
+---
+
 ### Session 54 — Adversarial Review Follow-up: 9 Findings Fixed
 
 **Operator:** mshane@thecanadalist.ca

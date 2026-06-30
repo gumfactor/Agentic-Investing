@@ -91,6 +91,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow replacing the reconciliation output artifact. Default is fail-closed.",
     )
+    parser.add_argument(
+        "--max-blotter-age-days",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Reject blotters whose generated_at_utc is older than N calendar days "
+            "(default 1). Prevents submitting a stale-but-valid-checksum blotter "
+            "against outdated prices and positions."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -264,6 +275,31 @@ def validate_blotter(path: Path) -> dict[str, Any]:
         raise RuntimeError("Blotter artifact_sha256 mismatch")
     _validate_provenance(artifact)
     return artifact
+
+
+def _validate_blotter_freshness(artifact: Mapping[str, Any], max_age_days: int) -> None:
+    """Reject blotters older than max_age_days calendar days (BUG-051).
+
+    A stale blotter has valid checksums but references outdated prices, positions,
+    and target weights. This check prevents accidentally re-submitting yesterday's
+    (or older) blotter via the CLI.
+    """
+    generated_str = artifact.get("generated_at_utc")
+    if not isinstance(generated_str, str):
+        raise RuntimeError("Blotter generated_at_utc is missing or not a string")
+    try:
+        generated_dt = datetime.fromisoformat(generated_str.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError(f"Blotter generated_at_utc is not a valid ISO timestamp: {generated_str!r}") from exc
+    today_utc = datetime.now(UTC).date()
+    generated_date = generated_dt.astimezone(UTC).date()
+    age_days = (today_utc - generated_date).days
+    if age_days > max_age_days:
+        raise RuntimeError(
+            f"Blotter is {age_days} calendar day(s) old (generated {generated_date}); "
+            f"max allowed is {max_age_days}. Regenerate the blotter with fresh prices, "
+            "positions, and target weights before submitting."
+        )
 
 
 def _display_orders(rows: Sequence[Mapping[str, Any]], recorder: CheckRecorder) -> None:
@@ -488,6 +524,7 @@ def run(
         env_ok = _paper_env_is_valid(env_map, recorder)
         client_id = _resolve_client_id(env_map)
         blotter = validate_blotter(args.blotter)
+        _validate_blotter_freshness(blotter, args.max_blotter_age_days)
         rows = blotter["candidate_rows"]
         _display_orders(rows, recorder)
         _display_review_hashes(args.blotter, blotter, recorder)

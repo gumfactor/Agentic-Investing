@@ -492,7 +492,7 @@ with DAG(
     dag_id="daily_signal_pipeline",
     default_args=_default_args,
     description="Daily factor scoring and composite alpha computation",
-    schedule_interval="30 21 * * 1-5",   # 9:30 PM ET weekdays
+    schedule_interval="30 21 * * 1-5",   # 21:30 UTC weekdays (5:30 PM EDT / 4:30 PM EST)
     start_date=_DAG_START_DATE,
     catchup=False,
     max_active_runs=1,

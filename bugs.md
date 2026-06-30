@@ -80,7 +80,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-027 | Dashboard/API | P2 | F2 | Open | Approval UI can crash on malformed/null quantities. |
 | BUG-028 | Dashboard/API | P2 | F2 | Open | Artifact scanning lacks strong containment checks. |
 | BUG-029 | Trading Safety | P2 | F2 | Open | Live-clearance env var names differ across components. |
-| BUG-030 | Trading Safety | P2 | F2 | Open | Airflow retries are risky for broker submission actions. |
+| BUG-030 | Trading Safety | P2 | F2 | Fixed | Airflow retries are risky for broker submission actions. |
 | BUG-031 | Research/Signals | P2 | F2 | Open | Fundamental growth uses daily-row shifts after forward-fill. |
 | BUG-032 | Data/Storage | P2 | F2 | Open | `pivot_table()` silently averages duplicate records. |
 | BUG-033 | Infra/Deploy | P2 | F2 | Open | Prometheus scrape target is not backed by Compose service. |
@@ -89,9 +89,9 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-048 | Trading Safety | P2 | F2 | Open | Trade-fill dedupe allows duplicate cumulative fills. |
 | BUG-049 | Portfolio | P2 | F2 | Open | Optimizer fallbacks can violate configured caps. |
 | BUG-050 | Risk | P2 | F2 | Open | NaN-heavy return series can suppress VaR/CVaR breaches. |
-| BUG-051 | Trading Safety | P2 | F2 | Open | Step 7 CLI can submit old checksum-valid blotters. |
-| BUG-052 | Docs/Process | P2 | F2 | Open | Fire-drill runbook contradicts DAG timezone semantics. |
-| BUG-053 | Packaging/CI | P2 | F2 | Open | `make check` mutates the working tree. |
+| BUG-051 | Trading Safety | P2 | F2 | Fixed | Step 7 CLI can submit old checksum-valid blotters. |
+| BUG-052 | Docs/Process | P2 | F2 | Fixed | Fire-drill runbook contradicts DAG timezone semantics. |
+| BUG-053 | Packaging/CI | P2 | F2 | Fixed | `make check` mutates the working tree. |
 
 #### Long-term / lower-risk backlog
 
