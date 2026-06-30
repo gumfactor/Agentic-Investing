@@ -1,13 +1,12 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "rqis"
 version = "0.1.0"
 description = "Robust Quant Investment System"
 requires-python = ">=3.12"
-readme = "README.md"
 
 [tool.setuptools.packages.find]
 where = ["."]

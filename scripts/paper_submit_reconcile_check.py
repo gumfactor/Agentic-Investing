@@ -288,9 +288,14 @@ def _display_review_hashes(blotter_path: Path, blotter: Mapping[str, Any], recor
 
 
 def _validate_api_submittable_quantities(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Validate that every row's submitted quantity is a whole positive number.
+
+    Uses 'quantity' when present (set by operator overrides or the Airflow submit
+    path), falling back to 'estimated_shares' for unmodified blotter rows.
+    """
     fractional: list[str] = []
     for row in rows:
-        shares = float(row["estimated_shares"])
+        shares = float(row.get("quantity", row["estimated_shares"]))
         if abs(shares - round(shares)) > 1e-9:
             fractional.append(f"{row['sequence']} {row['ticker']} {shares:.6f}")
     if fractional:

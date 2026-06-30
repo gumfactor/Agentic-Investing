@@ -98,17 +98,17 @@ class OrderManager:
         staged = [o for o in self._orders.values() if o.status == OrderStatus.STAGED]
 
         # Auto-inject wash-sale context from trade journal if available and not
-        # already provided by caller.  Populates ctx['recent_loss_buys'] so the
-        # previously-stubbed _check_wash_sale compliance check fires correctly.
-        if self._trade_journal is not None and "recent_loss_buys" not in context:
-            sell_tickers = [o.ticker for o in staged if o.side == OrderSide.SELL]
-            if sell_tickers:
+        # already provided by caller.  Populates ctx['recent_loss_sells'] so
+        # _check_wash_sale can block replacement BUYs after a loss-realizing SELL.
+        if self._trade_journal is not None and "recent_loss_sells" not in context:
+            buy_tickers = [o.ticker for o in staged if o.side == OrderSide.BUY]
+            if buy_tickers:
                 as_of = context.get("as_of_date")
                 try:
                     context = {
                         **context,
-                        "recent_loss_buys": self._trade_journal.wash_sale_context(
-                            sell_tickers, as_of=as_of
+                        "recent_loss_sells": self._trade_journal.wash_sale_context(
+                            buy_tickers, as_of=as_of
                         ),
                     }
                 except Exception as exc:

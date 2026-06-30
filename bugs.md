@@ -34,9 +34,9 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-002 | Infra/Deploy | P0 | F0 | Open | Airflow image omits runtime dependencies used by DAGs. |
 | BUG-003 | Infra/Deploy | P0 | F0 | Open | Paper artifacts are written to an unmounted container path. |
 | BUG-004 | Infra/Deploy | P0 | F0 | Open | IBKR host defaults to container-local localhost. |
-| BUG-005 | Trading Safety | P0 | F0 | Open | Approval quantity overrides can be tampered upward. |
-| BUG-006 | Trading Safety | P0 | F0 | Open | Corrupt reconciliation artifacts can cause duplicate orders. |
-| BUG-007 | Risk | P0 | F0 | Open | Risk dashboard can report zero/incorrect risk from schema mismatch. |
+| BUG-005 | Trading Safety | P0 | F0 | Fixed | Approval quantity overrides can be tampered upward. |
+| BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
+| BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
 | BUG-008 | Research/Signals | P0 | F0 | Open | Current-membership universe creates survivorship leakage. |
 | BUG-009 | Research/Signals | P0 | F0 | Open | Same-close signal/return timing can introduce lookahead. |
 | BUG-010 | Research/Signals | P0 | F0 | Open | `pct_change()` defaults can distort many indicators. |
@@ -46,12 +46,12 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-014 | Security/Auth | P1 | F1 | Open | Dashboard approval identity is spoofable/unknown. |
 | BUG-015 | Dashboard/API | P1 | F1 | Open | Blotter UI can approve the wrong pending run. |
 | BUG-016 | Dashboard/API | P1 | F1 | Open | Blotter UI does not validate full schema before approval. |
-| BUG-017 | Trading Safety | P1 | F1 | Open | Quantity reduction updates one field while validation checks another. |
-| BUG-036 | Packaging/CI | P0 | F0 | Open | Invalid PEP 517 backend blocks package builds. |
+| BUG-017 | Trading Safety | P1 | F1 | Fixed | Quantity reduction updates one field while validation checks another. |
+| BUG-036 | Packaging/CI | P0 | F0 | Fixed | Invalid PEP 517 backend blocks package builds. |
 | BUG-037 | Data/Storage | P1 | F1 | Open | Same-date corporate actions overwrite one another. |
 | BUG-038 | Data/Storage | P1 | F1 | Open | Snapshot version paths are mutable. |
 | BUG-039 | Backtesting | P1 | F1 | Open | Object-store failures can become unadjusted backtests. |
-| BUG-040 | Trading Safety | P1 | F1 | Open | Wash-sale guard checks the wrong order direction. |
+| BUG-040 | Trading Safety | P1 | F1 | Fixed | Wash-sale guard checks the wrong order direction. |
 | BUG-041 | Risk | P1 | F1 | Open | Sector concentration is computed but not breach-checked. |
 | BUG-042 | Trading Safety | P1 | F1 | Open | IBKR order-ID timeout can leave live order untracked. |
 | BUG-043 | Packaging/CI | P1 | F1 | Open | Test collection can fail through MLflow/pkg_resources drift. |

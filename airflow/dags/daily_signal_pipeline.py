@@ -268,6 +268,152 @@ def _combine_scores(**context: Any) -> None:
     )
 
 
+def _write_simulation(**context: Any) -> dict:
+    """Forward-simulate each strategy using today's alpha scores and daily_prices.
+
+    For each strategy registered in the strategies table, takes the top-N alpha
+    scores (N = 20 by default), computes a daily equal-weight portfolio return
+    using the close-to-close return from daily_prices, and upserts one row into
+    strategy_simulations.  Non-blocking: a missing price or score for a strategy
+    is logged and skipped; it does not abort the pipeline.
+
+    The simulated NAV chain starts at 1_000_000 and compounds daily.  Each day's
+    row carries the NAV implied by the previous row in the table plus today's
+    simulated return.
+    """
+    import os
+    import uuid as _uuid
+    from datetime import UTC, datetime as _datetime
+
+    import pandas as pd
+    from sqlalchemy import create_engine, text
+
+    ti = context["ti"]
+    score_date_str: str | None = ti.xcom_pull(key="score_date", task_ids="load_prices")
+    alpha_json: str | None = ti.xcom_pull(key="alpha_scores_json", task_ids="combine_scores")
+    prices_json: str | None = ti.xcom_pull(key="prices_json", task_ids="load_prices")
+
+    if not score_date_str or not alpha_json or alpha_json == "[]":
+        return {"simulations_written": 0, "reason": "no alpha scores"}
+
+    sim_date = date.fromisoformat(score_date_str)
+    alpha_df = pd.read_json(alpha_json, orient="records", convert_dates=False)
+    if "score_date" in alpha_df.columns:
+        alpha_df["score_date"] = pd.to_datetime(alpha_df["score_date"]).dt.date
+
+    prices_df = pd.read_json(prices_json, orient="records", convert_dates=False)
+    prices_df["date"] = pd.to_datetime(prices_df["date"]).dt.date
+
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        return {"simulations_written": 0, "reason": "DATABASE_URL not set"}
+
+    engine = create_engine(database_url)
+    computed_at = _datetime.now(UTC).isoformat()
+    written = 0
+
+    try:
+        with engine.connect() as conn:
+            strategy_rows = conn.execute(
+                text("SELECT strategy_id FROM strategies")
+            ).fetchall()
+        strategy_ids = [r[0] for r in strategy_rows]
+        if not strategy_ids:
+            strategy_ids = [_DEFAULT_STRATEGY_ID]
+    except Exception:
+        strategy_ids = [_DEFAULT_STRATEGY_ID]
+
+    # Compute close-to-close daily returns from prices for sim_date
+    today_closes = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+    prev_day_closes: pd.Series = pd.Series(dtype=float)
+    prior_dates = prices_df[prices_df["date"] < sim_date]["date"]
+    if not prior_dates.empty:
+        prev_date = prior_dates.max()
+        prev_day_closes = (
+            prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+        )
+
+    for strategy_id in strategy_ids:
+        try:
+            strat_scores = alpha_df[alpha_df["strategy_id"] == strategy_id].copy()
+            if strat_scores.empty:
+                continue
+
+            n_long = 20
+            top_n = strat_scores.nsmallest(n_long, "rank")
+            tickers = top_n["ticker"].tolist()
+            weight = 1.0 / len(tickers) if tickers else 0.0
+            target_weights = {t: weight for t in tickers}
+
+            # Compute equal-weight portfolio return for sim_date
+            returns = []
+            for ticker in tickers:
+                if ticker in today_closes.index and ticker in prev_day_closes.index:
+                    c_today = float(today_closes[ticker])
+                    c_prev = float(prev_day_closes[ticker])
+                    if c_prev > 0:
+                        returns.append((c_today - c_prev) / c_prev)
+            simulated_return = float(sum(returns) / len(returns)) if returns else 0.0
+
+            # Compound NAV from prior row, starting at 1_000_000
+            with engine.connect() as conn:
+                prior = conn.execute(
+                    text(
+                        "SELECT simulated_nav FROM strategy_simulations "
+                        "WHERE strategy_id = :sid AND sim_date < :d "
+                        "ORDER BY sim_date DESC LIMIT 1"
+                    ),
+                    {"sid": strategy_id, "d": sim_date},
+                ).fetchone()
+            prior_nav = float(prior[0]) if prior else 1_000_000.0
+            simulated_nav = prior_nav * (1.0 + simulated_return)
+
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO strategy_simulations
+                            (id, strategy_id, sim_date, target_weights,
+                             simulated_return, simulated_nav,
+                             universe_size, n_positions, computed_at_utc)
+                        VALUES
+                            (:id, :strategy_id, :sim_date, CAST(:target_weights AS jsonb),
+                             :simulated_return, :simulated_nav,
+                             :universe_size, :n_positions, :computed_at_utc)
+                        ON CONFLICT (strategy_id, sim_date)
+                        DO UPDATE SET
+                            target_weights    = EXCLUDED.target_weights,
+                            simulated_return  = EXCLUDED.simulated_return,
+                            simulated_nav     = EXCLUDED.simulated_nav,
+                            universe_size     = EXCLUDED.universe_size,
+                            n_positions       = EXCLUDED.n_positions,
+                            computed_at_utc   = EXCLUDED.computed_at_utc
+                    """),
+                    {
+                        "id": str(_uuid.uuid4()),
+                        "strategy_id": strategy_id,
+                        "sim_date": sim_date,
+                        "target_weights": __import__("json").dumps(target_weights),
+                        "simulated_return": round(simulated_return, 8),
+                        "simulated_nav": round(simulated_nav, 6),
+                        "universe_size": len(strat_scores),
+                        "n_positions": len(tickers),
+                        "computed_at_utc": computed_at,
+                    },
+                )
+            written += 1
+        except Exception as exc:
+            import structlog as _sl
+            _sl.get_logger("rqis.airflow").warning(
+                "strategy_simulation_failed",
+                strategy_id=strategy_id,
+                sim_date=str(sim_date),
+                error=str(exc),
+            )
+
+    engine.dispose()
+    return {"simulations_written": written}
+
+
 def _write_scores(**context: Any) -> dict:
     """Persist factor_scores and alpha_scores to TimescaleDB."""
     import pandas as pd
@@ -384,7 +530,13 @@ with DAG(
         python_callable=_write_scores,
     )
 
+    t_simulate = PythonOperator(
+        task_id="write_simulations",
+        python_callable=_write_simulation,
+        trigger_rule="none_failed",
+    )
+
     # ── Task dependency graph ─────────────────────────────────────────────────
     t_load_prices >> [t_momentum, t_lowvol, t_value, t_quality]
     [t_momentum, t_lowvol, t_value, t_quality] >> t_combine
-    t_combine >> t_write
+    t_combine >> t_write >> t_simulate

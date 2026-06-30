@@ -11,6 +11,95 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-30
+
+### Session 53 — Bug Remediation: BUG-005/006/007/017/036/040 + strategy_simulations producer
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** bug fixes for BUG-005, BUG-006, BUG-007, BUG-017, BUG-036, BUG-040; strategy_simulations producer wired
+
+**What was done:**
+
+Fixed 6 bugs from `bugs.md` and wired the outstanding `strategy_simulations` producer task.
+
+- **BUG-036 (P0): pyproject.toml invalid PEP 517 backend.**
+  Changed `setuptools.backends.legacy:build` → `setuptools.build_meta`. Removed the
+  `readme = "README.md"` reference since that file does not exist.
+
+- **BUG-007 (P0): Risk dashboard price field mismatch — already fixed.**
+  Confirmed fixed by commit 273519b: `_fetch_ibkr_snapshot` translates `price` →
+  `current_price` before the DB write. Dashboard reads `current_price`. Marked Fixed
+  in bugs.md; no new code required.
+
+- **BUG-040 (P1): Wash-sale guard checked wrong order direction.**
+  `_check_wash_sale` was blocking SELLs (wrong — the triggering event) while allowing
+  BUYs (wrong — replacement purchases are what the IRS disallows).
+  Fixed in `execution/oms/compliance.py`:
+  - Check only BUY orders; SELLs pass through immediately.
+  - Use context key `recent_loss_sells` instead of `recent_loss_buys`.
+  Fixed in `execution/oms/order_manager.py`:
+  - Collect `buy_tickers` (not `sell_tickers`) for the journal query.
+  - Use context key `recent_loss_sells`.
+  Updated docstring in `execution/oms/trade_history.py`.
+  Updated 3 tests in `execution/tests/test_oms.py` to encode correct behavior.
+  All 27 OMS tests pass.
+
+- **BUG-017 (P1): Quantity validation checked `estimated_shares` after override applied `quantity`.**
+  Fixed `_validate_api_submittable_quantities` in `scripts/paper_submit_reconcile_check.py`
+  to use `row.get("quantity", row["estimated_shares"])`, so post-override quantities
+  are validated rather than the original blotter values.
+
+- **BUG-005 (P0): Approval quantity overrides could be tampered upward.**
+  Added server-side validation of each `quantity_overrides` entry in `_submit_orders`
+  in the Airflow DAG, immediately before applying the override:
+  - Must be a Python `int`
+  - Must be positive and finite
+  - Must be ≤ original `estimated_shares` from the blotter row
+  - Must reference a sequence that exists in `rows_to_submit`
+  Raises `AirflowException` on any violation.
+
+- **BUG-006 (P0): Corrupt reconciliation artifact failed open, allowing duplicate orders on retry.**
+  Changed the exception handler in the partial-retry detection block of `_submit_orders`
+  from a warning + continue to a hard `AirflowException`. A corrupt or unreadable
+  partial artifact now stops the task and requires manual broker reconciliation
+  before retrying.
+
+- **strategy_simulations producer (M5.8 outstanding backend task).**
+  Added `_write_simulation` task to `daily_signal_pipeline.py` after `write_scores`.
+  The task: takes the top-20 alpha scores for each registered strategy, computes an
+  equal-weight portfolio return using close-to-close daily_prices, compounds a
+  simulated NAV chain starting at 1,000,000, and upserts into `strategy_simulations`
+  via `ON CONFLICT (strategy_id, sim_date)`. Non-blocking per-strategy: exceptions
+  are logged and skipped, the pipeline continues.
+  Updated `ExternalTaskSensor` in `daily_paper_trading.py` to wait on
+  `write_simulations` (the new terminal task of the signal pipeline).
+
+**[DECISION] Fail closed on corrupt reconciliation artifacts (BUG-006)**
+The original code logged a warning and proceeded with an empty `already_submitted_seqs`
+set, which could silently resubmit already-accepted broker orders on retry. The safer
+choice is to always fail closed: a corrupt artifact is indeterminate state and requires
+operator/manual broker reconciliation. The AirflowException exposes this explicitly
+rather than hiding it behind a log line.
+
+**[DECISION] Server-side override validation is duplicative with dashboard cap but necessary (BUG-005)**
+The dashboard already caps quantities before writing to the DB. The Airflow validation
+is redundant for honest callers but necessary because the Airflow process must not
+trust the DB as a security boundary — any actor with DB write access could craft a
+tampered row. The validation adds one O(N) scan before submission.
+
+**Test results:** 81 execution tests passing (27 OMS + 54 trade history).
+4 IBKR broker tests fail in this environment due to missing `ib_insync` (pre-existing,
+unrelated to these changes).
+
+**Next steps (local environment required):**
+1. Fix BUG-001–004 in `docker-compose.yml` and `infra/docker/Dockerfile.airflow`
+2. Smoke-test Docker stack and DAG imports
+3. Run Streamlit dashboard and complete manual verification checklist
+4. Start 4-week automated paper-trading qualification
+
+---
+
 ## 2026-06-29
 
 ### Session 52 — Dashboard Documentation Refresh After Schema Alignment Review
