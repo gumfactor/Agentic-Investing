@@ -116,6 +116,63 @@ def _alert_operator(context: Any) -> None:
     )
 
 
+def _persist_snapshot_to_db(
+    *,
+    database_url: str,
+    snapshot_date: str,
+    strategy_id: str,
+    dag_run_id: str,
+    cash_usd: float,
+    positions: list[dict[str, Any]],
+    nav_usd: float,
+) -> None:
+    """Upsert the nightly IBKR snapshot into portfolio_snapshots for dashboard reads.
+
+    Uses ON CONFLICT upsert so a DAG retry on the same trading date overwrites
+    the prior row rather than raising a unique-constraint violation. Called after
+    the JSON artifact is written; callers must catch and log exceptions so a DB
+    failure does not block the rest of the pipeline.
+    """
+    import uuid as _uuid
+    from datetime import UTC, datetime as _datetime
+
+    row_id = str(_uuid.uuid4())
+    fetched_at = _datetime.now(UTC).isoformat()
+
+    engine = create_engine(database_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO portfolio_snapshots
+                        (id, snapshot_date, strategy_id, dag_run_id, fetched_at_utc,
+                         cash_usd, positions, nav_usd, source)
+                    VALUES
+                        (:id, :snapshot_date, :strategy_id, :dag_run_id, :fetched_at_utc,
+                         :cash_usd, :positions, :nav_usd, 'ibkr_paper')
+                    ON CONFLICT (snapshot_date, strategy_id)
+                    DO UPDATE SET
+                        cash_usd      = EXCLUDED.cash_usd,
+                        positions     = EXCLUDED.positions,
+                        nav_usd       = EXCLUDED.nav_usd,
+                        fetched_at_utc = EXCLUDED.fetched_at_utc,
+                        dag_run_id    = EXCLUDED.dag_run_id
+                """),
+                {
+                    "id": row_id,
+                    "snapshot_date": snapshot_date,
+                    "strategy_id": strategy_id,
+                    "dag_run_id": dag_run_id,
+                    "fetched_at_utc": fetched_at,
+                    "cash_usd": cash_usd,
+                    "positions": json.dumps(positions),
+                    "nav_usd": nav_usd,
+                },
+            )
+    finally:
+        engine.dispose()
+
+
 # ── Default task args (defined after _alert_operator to allow callable ref) ───
 
 _default_args: dict[str, Any] = {
@@ -219,7 +276,9 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
 
     Replaces the operator-maintained local/paper_portfolio_snapshot.json.
     Writes the snapshot to a per-run artifact directory and pushes the path
-    to XCom for downstream tasks.
+    to XCom for downstream tasks. Also persists the snapshot to the
+    portfolio_snapshots DB table for the Streamlit dashboard; a DB failure
+    is logged but does not abort the pipeline (the JSON artifact is durable).
     """
     import sys
     from pathlib import Path as _Path
@@ -227,9 +286,17 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
     _require_paper_env(dict(os.environ))
     sys.path.insert(0, str(_Path(__file__).parent.parent.parent))
 
+    ti = context["ti"]
+    run_id: str = context["run_id"]
+
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise AirflowException("DATABASE_URL not set.")
+
+    strategy_id: str = (
+        ti.xcom_pull(key="strategy_id", task_ids="verify_inputs")
+        or _DEFAULT_STRATEGY_ID
+    )
 
     trading_date = date.today()
 
@@ -319,11 +386,39 @@ def _fetch_ibkr_snapshot(**context: Any) -> None:
         "positions": position_list,
     }
 
-    run_id: str = context["run_id"]
     artifact_path = _artifact_dir(run_id) / "portfolio_snapshot.json"
     artifact_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
 
-    ti = context["ti"]
+    # Persist to DB so the Streamlit dashboard can read current portfolio state.
+    # Non-blocking: the JSON artifact above is the durable record; the DB write
+    # is a secondary read path for the dashboard and must not abort the pipeline.
+    #
+    # The DB payload uses dashboard field names (current_price) rather than the
+    # pipeline artifact field names (price/price_date).  The artifact is left
+    # unchanged so downstream pipeline tasks are unaffected.
+    _db_positions = [
+        {"ticker": p["ticker"], "quantity": p["quantity"], "current_price": p["price"]}
+        for p in position_list
+    ]
+    try:
+        _persist_snapshot_to_db(
+            database_url=database_url,
+            snapshot_date=str(trading_date),
+            strategy_id=strategy_id,
+            dag_run_id=run_id,
+            cash_usd=round(cash_usd, 2),
+            positions=_db_positions,
+            nav_usd=round(nav_usd, 2),
+        )
+    except Exception as _exc:
+        import structlog as _sl
+        _sl.get_logger("rqis.airflow").warning(
+            "portfolio_snapshot_db_persist_failed",
+            error=str(_exc),
+            trading_date=str(trading_date),
+            strategy_id=strategy_id,
+        )
+
     ti.xcom_push(key="snapshot_path", value=str(artifact_path))
     ti.xcom_push(key="trading_date", value=str(trading_date))
 
