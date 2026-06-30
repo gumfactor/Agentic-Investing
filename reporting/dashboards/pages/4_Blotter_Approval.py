@@ -173,7 +173,7 @@ else:
             "selected": True,
             "sequence": seq,
             "ticker": row.get("ticker", ""),
-            "side": row.get("side", ""),
+            "side": row.get("direction", row.get("side", "")),
             "quantity": int(qty),
             "limit_price": round(limit_price, 2),
             "est_notional": round(est_notional, 2),

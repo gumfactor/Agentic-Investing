@@ -102,8 +102,8 @@ def insert_blotter_approval(
                 dashboard_session_id, quantity_overrides, notes
             ) VALUES (
                 :run_id, :local_path, :blotter_sha256,
-                :selected_ids::jsonb, :approved_by, :confirmed_hash,
-                :session_id, :overrides::jsonb, NULL
+                CAST(:selected_ids AS jsonb), :approved_by, :confirmed_hash,
+                :session_id, CAST(:overrides AS jsonb), NULL
             )
         """)
     else:
