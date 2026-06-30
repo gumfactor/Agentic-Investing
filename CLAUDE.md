@@ -29,6 +29,7 @@ It is built to eventually trade real capital. Every decision you make must treat
 
 **Full requirements:** See `PRD.md`.  
 **Engineering history:** See `Worklog.md` — read recent entries first.
+**Known remediation queue:** See `bugs.md`. It is the canonical running tally of all known fixes that need to happen, organized by category, severity, implementation priority, and short/medium/long-term remediation horizon. Treat `bugs.md` as living operational documentation: add newly discovered defects there, update statuses when fixes land, and do not silently remove fixed items without an audit reference.
 
 ---
 
@@ -154,6 +155,18 @@ The confirmed priority sequence for Phase 5 is:
    limits, C8 + C9 clearance required).
 
 ---
+
+## Known bugs and remediation planning
+
+`bugs.md` is now the canonical remediation ledger for this repository. It tracks open defects and weaknesses as numbered `BUG-XXX` items with:
+
+- subsystem category / owner area,
+- severity (`P0`–`P3`),
+- fix implementation priority (`F0`–`F3`),
+- short-, medium-, or long-term remediation horizon,
+- current status.
+
+Before starting a substantial feature, paper-trading hardening task, or live-capital readiness task, check `bugs.md` for related open items. If you discover another flaw while working, add it to `bugs.md` rather than leaving it only in chat, PR comments, or `Worklog.md`. If you fix one, update its status/notes in `bugs.md` with the fixing commit or PR.
 
 ## Critical safety rules — read every session
 
