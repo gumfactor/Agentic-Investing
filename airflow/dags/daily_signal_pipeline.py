@@ -338,7 +338,24 @@ def _write_simulation(**context: Any) -> dict:
 
     for strategy_id in strategy_ids:
         try:
-            strat_scores = alpha_df[alpha_df["strategy_id"] == strategy_id].copy()
+            # Use XCom scores for the current run's strategy; for other registered
+            # strategies query the DB directly so every strategy gets a simulation
+            # row on the same sim_date even when only one strategy ran today.
+            if not alpha_df.empty and (alpha_df["strategy_id"] == strategy_id).any():
+                strat_scores = alpha_df[alpha_df["strategy_id"] == strategy_id].copy()
+            else:
+                with engine.connect() as conn:
+                    rows = conn.execute(
+                        text(
+                            "SELECT ticker, rank, alpha_score FROM alpha_scores "
+                            "WHERE strategy_id = :sid AND score_date = :d"
+                        ),
+                        {"sid": strategy_id, "d": sim_date},
+                    ).fetchall()
+                if not rows:
+                    continue
+                strat_scores = pd.DataFrame(rows, columns=["ticker", "rank", "alpha_score"])
+
             if strat_scores.empty:
                 continue
 
@@ -349,9 +366,10 @@ def _write_simulation(**context: Any) -> dict:
             target_weights = {t: weight for t in tickers}
 
             # Compute equal-weight portfolio return for sim_date.
-            # Divide by n_long (declared portfolio size), not len(returns), so
-            # tickers with missing prior-day prices contribute 0% to the average
-            # rather than inflating it.
+            # Divide by len(tickers) — the number of selected positions — so the
+            # weights sum to 100% regardless of whether the universe is smaller than
+            # n_long.  Tickers with missing prior-day prices contribute 0% to the
+            # average (cash-equivalent treatment).
             returns = []
             for ticker in tickers:
                 if ticker in today_closes.index and ticker in prev_day_closes.index:
@@ -359,7 +377,7 @@ def _write_simulation(**context: Any) -> dict:
                     c_prev = float(prev_day_closes[ticker])
                     if c_prev > 0:
                         returns.append((c_today - c_prev) / c_prev)
-            simulated_return = float(sum(returns) / n_long) if returns else 0.0
+            simulated_return = float(sum(returns) / len(tickers)) if returns else 0.0
 
             # Compound NAV from prior row, starting at 1_000_000
             with engine.connect() as conn:
@@ -492,7 +510,7 @@ with DAG(
     dag_id="daily_signal_pipeline",
     default_args=_default_args,
     description="Daily factor scoring and composite alpha computation",
-    schedule_interval="30 21 * * 1-5",   # 21:30 UTC weekdays (5:30 PM EDT / 4:30 PM EST)
+    schedule_interval="30 21 * * 1-5",   # 21:30 ET weekdays (01:30 UTC in EDT / 02:30 UTC in EST)
     start_date=_DAG_START_DATE,
     catchup=False,
     max_active_runs=1,

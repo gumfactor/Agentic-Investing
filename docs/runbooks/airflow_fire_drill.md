@@ -90,12 +90,15 @@ don't change.
 
 ## Scheduling notes (Windows Docker Desktop)
 
-- The Airflow scheduler uses **UTC** for all cron expressions (default Airflow behaviour;
-  no `default_timezone` override is configured). Do not interpret cron fields as local time.
-- **`daily_signal_pipeline`** — `30 21 * * 1-5` → fires at **21:30 UTC** weekdays
-  (5:30 PM EDT / 4:30 PM EST)
-- **`daily_paper_trading`** — `0 23 * * 1-5` → fires at **23:00 UTC** weekdays
-  (7:00 PM EDT / 6:00 PM EST); 90-minute gap gives the signal pipeline time to complete
+- Both DAGs set a timezone-aware `start_date` using `America/New_York`. When
+  `start_date` is timezone-aware, Airflow evaluates the cron schedule in that
+  timezone before converting execution instants to UTC internally.  Do **not**
+  interpret cron fields as UTC.
+- **`daily_signal_pipeline`** — `30 21 * * 1-5` → fires at **21:30 ET** weekdays
+  (01:30 UTC next day during EDT / 02:30 UTC next day during EST)
+- **`daily_paper_trading`** — `0 23 * * 1-5` → fires at **23:00 ET** weekdays
+  (03:00 UTC next day during EDT / 04:00 UTC next day during EST); 90-minute gap
+  gives the signal pipeline time to complete
 - Docker Desktop on Windows suspends containers when the laptop sleeps; the scheduler
   catches up automatically on wake by running any missed intervals
 - To confirm catch-up worked: check the DAG grid for backfilled runs marked `success`

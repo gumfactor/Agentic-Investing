@@ -100,6 +100,56 @@ unrelated to these changes).
 
 ---
 
+### Session 57 — Address 3 Codex PR #31 review comments (BUG-064, BUG-065, BUG-052 scope extension)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** address Codex PR #31 comments
+
+**What was done:**
+
+Three P2 review comments from the `chatgpt-codex-connector` reviewer on PR #31 investigated,
+fixed in code, replied to on GitHub, and recorded in bugs.md.
+
+- **BUG-064 (new, Fixed): Multi-strategy simulation gap in `_write_simulation`.**
+  `alpha_df` from XCom only contains scores for the single `params['strategy_id']` of the
+  current DAG run. The `for strategy_id in strategy_ids` loop filtered `alpha_df` directly,
+  so every other registered strategy produced an empty frame and was skipped. Shadow
+  strategies never received rows in `strategy_simulations`. Fix: added an XCom vs DB path.
+  When the `strategy_id` appears in `alpha_df`, use the in-memory data (fast path). When it
+  doesn't, query `alpha_scores` from the DB for that `strategy_id` and `score_date`. All
+  registered strategies now get a simulation row on every pipeline run.
+  (`airflow/dags/daily_signal_pipeline.py`)
+
+- **BUG-065 (new, Fixed): `simulated_return` denominator wrong for sub-n_long universe.**
+  `target_weights` assigns `1/len(tickers)` to each selected position (weights sum to 100%
+  always). When `len(tickers) < n_long=20`, dividing `sum(returns)` by `n_long` understates
+  the return. A 10-name universe where all names return 1% would record only 0.5%, corrupting
+  the compounded NAV chain. Fix: changed denominator from `n_long` to `len(tickers)`. When
+  the universe has ≥ 20 names, `len(tickers) == n_long` and result is unchanged. Tickers
+  with missing prior-day prices continue to contribute 0% (cash-equivalent treatment), since
+  only tickers with both today and prior-day closes enter `returns`.
+  (`airflow/dags/daily_signal_pipeline.py`)
+
+- **BUG-052 scope extension (Fixed): `schedule_interval` inline comment in `daily_signal_pipeline.py` said "21:30 UTC".**
+  The Session 55 fix updated the runbook but missed the inline comment `# 21:30 UTC weekdays
+  (5:30 PM EDT / 4:30 PM EST)` on the `schedule_interval` definition. Both DAGs use
+  `pendulum.datetime(..., tz=pendulum.timezone("America/New_York"))` for `start_date`,
+  making Airflow evaluate cron in ET, not UTC. Corrected to
+  `# 21:30 ET weekdays (01:30 UTC in EDT / 02:30 UTC in EST)`.
+  (`airflow/dags/daily_signal_pipeline.py`, `docs/runbooks/airflow_fire_drill.md`)
+
+[DECISION] The multi-strategy DB query path (BUG-064 fix) is intentionally separate from the
+XCom path rather than always querying from DB. This preserves the existing behavior that the
+current run's just-computed scores are used without an extra DB round-trip, while shadow
+strategies are populated from stored scores. If a shadow strategy has no scores for `sim_date`
+(not yet scored), it is skipped cleanly with `continue`.
+
+**bugs.md:** BUG-064 and BUG-065 added as Fixed. BUG-052 description updated to reference
+the inline comment fix as well.
+
+---
+
 ### Session 56 — Adversarial Review of Session 55: 6 Findings Fixed
 
 **Operator:** mshane@thecanadalist.ca

@@ -90,8 +90,10 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-049 | Portfolio | P2 | F2 | Open | Optimizer fallbacks can violate configured caps. |
 | BUG-050 | Risk | P2 | F2 | Open | NaN-heavy return series can suppress VaR/CVaR breaches. |
 | BUG-051 | Trading Safety | P2 | F2 | Fixed | Step 7 CLI can submit old checksum-valid blotters. |
-| BUG-052 | Docs/Process | P2 | F2 | Fixed | Fire-drill runbook contradicts DAG timezone semantics. |
+| BUG-052 | Docs/Process | P2 | F2 | Fixed | Fire-drill runbook contradicts DAG timezone semantics; inline schedule_interval comment also wrong. |
 | BUG-053 | Packaging/CI | P2 | F2 | Fixed | `make check` mutates the working tree. |
+| BUG-064 | Research/Signals | P2 | F2 | Fixed | `_write_simulation` only processes current-run strategy from XCom; shadow strategies are skipped. |
+| BUG-065 | Research/Signals | P2 | F2 | Fixed | `simulated_return` divides by n_long when universe < n_long, understating returns for small strategies. |
 
 #### Long-term / lower-risk backlog
 
@@ -641,11 +643,11 @@ The following findings were added after a second adversarial pass focused on gap
 
 **Severity:** P2 / operational docs
 
-**Evidence:** The data DAG is documented/configured for `20:00 America/New_York`, but the fire-drill runbook says the cron fires at `20:00 UTC`.
+**Evidence:** The data DAG is documented/configured for `20:00 America/New_York`, but the fire-drill runbook says the cron fires at `20:00 UTC`.  A secondary instance of the same confusion existed as the inline `# 21:30 UTC weekdays` comment on the `schedule_interval` line of `daily_signal_pipeline.py`.
 
 **Impact:** Operators can expect or diagnose runs at the wrong wall-clock time, especially around DST.
 
-**Suggested direction:** Update the runbook to state actual Airflow scheduling semantics and provide UTC examples for standard/daylight time.
+**Fix (Session 56 + Session 57):** Runbook scheduling notes rewritten to say ET; UTC equivalents provided for EDT and EST separately.  Inline DAG comment corrected to `# 21:30 ET weekdays (01:30 UTC in EDT / 02:30 UTC in EST)`.
 
 ### BUG-053: `make check` mutates the working tree
 
@@ -668,3 +670,23 @@ The following findings were added after a second adversarial pass focused on gap
 **Impact:** Interrupted or partial fundamentals ingestion can leave concept/period coverage incomplete while the script reports the ticker as already ingested.
 
 **Suggested direction:** Track completeness by ticker, source version, concept set, and latest filing date; skip only when the expected coverage contract is satisfied.
+
+### BUG-064: `_write_simulation` skips shadow strategies because XCom alpha_df only covers the current run's strategy
+
+**Severity:** P2 / multi-strategy simulation correctness
+
+**Evidence:** `alpha_df` in `_write_simulation` comes from `ti.xcom_pull(key="alpha_scores_json", task_ids="combine_scores")`, which only contains scores for the single `params['strategy_id']` of the current DAG run. The loop `alpha_df[alpha_df["strategy_id"] == strategy_id]` returns an empty frame for every other registered strategy and `continue`s, leaving the `strategy_simulations` table unpopulated for shadow strategies.
+
+**Impact:** The multi-strategy comparison panel in the Performance dashboard (which reads `strategy_simulations`) never receives rows for any strategy except the one that ran today, defeating the purpose of the table.
+
+**Fix (Session 57, PR #31 Codex comment #1):** The loop now checks whether the current `strategy_id` appears in the XCom data. If yes, it uses the in-memory frame (fast path). If no, it queries `alpha_scores` from the DB for that `strategy_id` and `score_date`. All registered strategies receive a simulation row on every pipeline run.
+
+### BUG-065: `simulated_return` denominator uses n_long instead of len(tickers), understating returns when universe < n_long
+
+**Severity:** P2 / simulated NAV correctness
+
+**Evidence:** `target_weights` assigns `1/len(tickers)` to each selected position (weights sum to 100% regardless of universe size). When `len(tickers) < n_long`, dividing `sum(returns)` by `n_long=20` rather than `len(tickers)` understates the portfolio return. For example, a 10-name universe where all names return 1% records only 0.5%, corrupting the compounded NAV chain.
+
+**Impact:** Simulated NAV for small-universe strategies is systematically biased downward; strategy comparison panels understate their performance vs. larger strategies.
+
+**Fix (Session 57, PR #31 Codex comment #2):** Changed denominator from `n_long` to `len(tickers)`. When the universe has ≥ n_long names, `len(tickers) == n_long` and the result is identical. For smaller universes, the correct portfolio return is now computed. Tickers with missing prior-day prices continue to contribute 0% (cash-equivalent treatment).
