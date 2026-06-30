@@ -756,6 +756,36 @@ def _submit_orders(**context: Any) -> None:
         )
 
     if quantity_overrides:
+        # BUG-005: validate each override server-side before applying it.
+        # The dashboard caps overrides before writing to the DB, but the Airflow
+        # process must re-validate so a tampered or erroneous DB row cannot cause
+        # an oversized order to bypass the dashboard cap.
+        import math as _math
+        for seq_str, override_qty in quantity_overrides.items():
+            seq_int = int(seq_str)
+            original_row = next(
+                (r for r in rows_to_submit if int(r["sequence"]) == seq_int), None
+            )
+            if original_row is None:
+                raise AirflowException(
+                    f"quantity_overrides references sequence {seq_str!r} which is not in "
+                    "the approved rows. This may indicate a tampered approval record."
+                )
+            original_qty = float(original_row.get("quantity", original_row.get("estimated_shares", 0)))
+            override_qty_f = float(override_qty)
+            if (
+                not isinstance(override_qty, int)
+                or isinstance(override_qty, bool)  # bool is int subclass; reject True/False
+                or override_qty_f <= 0
+                or not _math.isfinite(override_qty_f)
+                or override_qty_f > original_qty + 1e-6
+            ):
+                raise AirflowException(
+                    f"quantity_overrides[{seq_str!r}] = {override_qty!r} is invalid: "
+                    f"must be a positive integer ≤ original approved quantity "
+                    f"({original_qty:.0f}). Aborting to prevent oversized submission."
+                )
+
         for i, row in enumerate(rows_to_submit):
             override_qty = quantity_overrides.get(str(row["sequence"]))
             if override_qty is not None:
@@ -769,6 +799,8 @@ def _submit_orders(**context: Any) -> None:
 
     # Partial retry detection: if the reconciliation artifact already exists,
     # extract broker_order_ids that were successfully recorded and skip them.
+    # BUG-006: fail closed on corrupt artifacts — a partial write or tampering
+    # must not allow silent resubmission of already-accepted orders.
     already_submitted_seqs: set[int] = set()
     if reconciliation_path.exists():
         try:
@@ -777,12 +809,11 @@ def _submit_orders(**context: Any) -> None:
                 if resp.get("broker_order_id"):
                     already_submitted_seqs.add(int(resp["sequence"]))
         except Exception as _exc:
-            import structlog as _structlog
-            _structlog.get_logger("rqis.airflow").warning(
-                "partial_artifact_corrupt_resubmitting_all",
-                path=str(reconciliation_path),
-                error=str(_exc),
-            )
+            raise AirflowException(
+                f"Partial reconciliation artifact at {reconciliation_path} is corrupt or "
+                f"unreadable: {_exc}. Cannot safely determine which orders were already "
+                "submitted — manual broker reconciliation required before retrying."
+            ) from _exc
 
     if already_submitted_seqs:
         rows_to_submit = [
@@ -824,8 +855,14 @@ def _submit_orders(**context: Any) -> None:
         try:
             prev = json.loads(reconciliation_path.read_text(encoding="utf-8"))
             previous_responses = list(prev.get("broker_responses", []))
-        except Exception:
-            previous_responses = []
+        except Exception as _exc2:
+            # The first read already succeeded (deduplication is safe), but we
+            # must not silently drop prior responses from the audit trail.
+            raise AirflowException(
+                f"Reconciliation artifact at {reconciliation_path} was readable for "
+                f"deduplication but failed on second read for audit assembly: {_exc2}. "
+                "Manual reconciliation required."
+            ) from _exc2
 
     def _on_progress(
         responses: list[dict[str, Any]],
@@ -1035,7 +1072,7 @@ with DAG(
     t_signal_done = ExternalTaskSensor(
         task_id="wait_for_signal_pipeline",
         external_dag_id="daily_signal_pipeline",
-        external_task_id="write_scores",
+        external_task_id="write_simulations",
         execution_delta=timedelta(hours=1, minutes=30),
         timeout=3600,
         poke_interval=120,
@@ -1119,7 +1156,11 @@ with DAG(
     t_submit = PythonOperator(
         task_id="submit_orders",
         python_callable=_submit_orders,
-        retries=1,
+        # retries=0: broker submission must never auto-retry. The reconciliation
+        # artifact guards against duplicate submissions on manual re-runs, but
+        # Airflow's automated retry can fire before _on_progress writes the
+        # artifact, leaving a broker order untracked locally (BUG-030).
+        retries=0,
         execution_timeout=timedelta(minutes=10),
     )
 
@@ -1136,12 +1177,20 @@ with DAG(
     t_reconcile = PythonOperator(
         task_id="durable_reconcile",
         python_callable=_durable_reconcile,
+        # retries=0: connects to IBKR to query fills; auto-retry is inconsistent
+        # with the BUG-030 principle and can produce confusing duplicate audit artifacts.
+        retries=0,
         execution_timeout=timedelta(minutes=10),
     )
 
     t_ledger = PythonOperator(
         task_id="write_ledger",
         python_callable=_write_ledger,
+        # retries=0: writes a fail-closed no-clobber audit artifact and appends to
+        # the operational ledger. Auto-retry would hit the "artifact already exists"
+        # error from the first successful write and raise a misleading AirflowException,
+        # exhausting retries without ever writing the ledger.
+        retries=0,
     )
 
     # ── Dependency graph ─────────────────────────────────────────────────────

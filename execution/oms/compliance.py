@@ -28,27 +28,29 @@ CheckFn = Callable[[Order, dict], tuple[bool, str]]
 
 
 def _check_wash_sale(order: Order, ctx: dict) -> tuple[bool, str]:
-    """Reject sells within 30 days of a loss-realizing buy of the same ticker.
+    """Reject replacement BUYs within 30 days of a loss-realizing SELL of the same ticker.
 
-    STUB — Phase 5: ctx["recent_loss_buys"] is never populated in live contexts
-    because trade-history tracking (execution/oms/trade_history.py) has not been
-    built yet.  The check fires correctly when populated (used in tests), but
-    provides no protection in production until the fill-history store exists.
-    See docs/deferred_items.md.
+    IRS wash-sale rule: if you sell a security at a loss and buy the same (or
+    substantially identical) security within 30 days before or after the sale,
+    the loss is disallowed.  This check blocks the replacement BUY.
+
+    ctx["recent_loss_sells"] must be a {ticker: last_loss_sell_date} dict,
+    populated via TradeJournal.wash_sale_context() for the BUY-side tickers in
+    the pending order batch.
     """
-    if order.side != OrderSide.SELL:
+    if order.side != OrderSide.BUY:
         return True, ""
-    recent_buys: dict[str, date] = ctx.get("recent_loss_buys", {})
-    buy_date = recent_buys.get(order.ticker)
-    if buy_date is None:
+    recent_sells: dict[str, date] = ctx.get("recent_loss_sells", {})
+    sell_date = recent_sells.get(order.ticker)
+    if sell_date is None:
         return True, ""
     as_of: date | None = ctx.get("as_of_date")
     if as_of is None:
-        # recent_loss_buys is populated but as_of_date is missing — fail safe rather than
+        # recent_loss_sells is populated but as_of_date is missing — fail safe rather than
         # silently passing, which would disable the check when the caller has partial context.
-        return False, f"wash-sale: as_of_date missing with recent_loss_buys populated; rejecting {order.ticker} sell (safe default)"
-    if (as_of - buy_date).days < 30:
-        reason = f"wash-sale: {order.ticker} bought at loss {buy_date}; 30-day lock"
+        return False, f"wash-sale: as_of_date missing with recent_loss_sells populated; rejecting {order.ticker} buy (safe default)"
+    if (as_of - sell_date).days < 30:
+        reason = f"wash-sale: {order.ticker} sold at loss {sell_date}; replacement buy within 30-day window"
         return False, reason
     return True, ""
 

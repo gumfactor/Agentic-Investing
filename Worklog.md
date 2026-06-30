@@ -11,6 +11,349 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-06-30
+
+### Session 53 — Bug Remediation: BUG-005/006/007/017/036/040 + strategy_simulations producer
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** bug fixes for BUG-005, BUG-006, BUG-007, BUG-017, BUG-036, BUG-040; strategy_simulations producer wired
+
+**What was done:**
+
+Fixed 6 bugs from `bugs.md` and wired the outstanding `strategy_simulations` producer task.
+
+- **BUG-036 (P0): pyproject.toml invalid PEP 517 backend.**
+  Changed `setuptools.backends.legacy:build` → `setuptools.build_meta`. Removed the
+  `readme = "README.md"` reference since that file does not exist.
+
+- **BUG-007 (P0): Risk dashboard price field mismatch — already fixed.**
+  Confirmed fixed by commit 273519b: `_fetch_ibkr_snapshot` translates `price` →
+  `current_price` before the DB write. Dashboard reads `current_price`. Marked Fixed
+  in bugs.md; no new code required.
+
+- **BUG-040 (P1): Wash-sale guard checked wrong order direction.**
+  `_check_wash_sale` was blocking SELLs (wrong — the triggering event) while allowing
+  BUYs (wrong — replacement purchases are what the IRS disallows).
+  Fixed in `execution/oms/compliance.py`:
+  - Check only BUY orders; SELLs pass through immediately.
+  - Use context key `recent_loss_sells` instead of `recent_loss_buys`.
+  Fixed in `execution/oms/order_manager.py`:
+  - Collect `buy_tickers` (not `sell_tickers`) for the journal query.
+  - Use context key `recent_loss_sells`.
+  Updated docstring in `execution/oms/trade_history.py`.
+  Updated 3 tests in `execution/tests/test_oms.py` to encode correct behavior.
+  All 27 OMS tests pass.
+
+- **BUG-017 (P1): Quantity validation checked `estimated_shares` after override applied `quantity`.**
+  Fixed `_validate_api_submittable_quantities` in `scripts/paper_submit_reconcile_check.py`
+  to use `row.get("quantity", row["estimated_shares"])`, so post-override quantities
+  are validated rather than the original blotter values.
+
+- **BUG-005 (P0): Approval quantity overrides could be tampered upward.**
+  Added server-side validation of each `quantity_overrides` entry in `_submit_orders`
+  in the Airflow DAG, immediately before applying the override:
+  - Must be a Python `int`
+  - Must be positive and finite
+  - Must be ≤ original `estimated_shares` from the blotter row
+  - Must reference a sequence that exists in `rows_to_submit`
+  Raises `AirflowException` on any violation.
+
+- **BUG-006 (P0): Corrupt reconciliation artifact failed open, allowing duplicate orders on retry.**
+  Changed the exception handler in the partial-retry detection block of `_submit_orders`
+  from a warning + continue to a hard `AirflowException`. A corrupt or unreadable
+  partial artifact now stops the task and requires manual broker reconciliation
+  before retrying.
+
+- **strategy_simulations producer (M5.8 outstanding backend task).**
+  Added `_write_simulation` task to `daily_signal_pipeline.py` after `write_scores`.
+  The task: takes the top-20 alpha scores for each registered strategy, computes an
+  equal-weight portfolio return using close-to-close daily_prices, compounds a
+  simulated NAV chain starting at 1,000,000, and upserts into `strategy_simulations`
+  via `ON CONFLICT (strategy_id, sim_date)`. Non-blocking per-strategy: exceptions
+  are logged and skipped, the pipeline continues.
+  Updated `ExternalTaskSensor` in `daily_paper_trading.py` to wait on
+  `write_simulations` (the new terminal task of the signal pipeline).
+
+**[DECISION] Fail closed on corrupt reconciliation artifacts (BUG-006)**
+The original code logged a warning and proceeded with an empty `already_submitted_seqs`
+set, which could silently resubmit already-accepted broker orders on retry. The safer
+choice is to always fail closed: a corrupt artifact is indeterminate state and requires
+operator/manual broker reconciliation. The AirflowException exposes this explicitly
+rather than hiding it behind a log line.
+
+**[DECISION] Server-side override validation is duplicative with dashboard cap but necessary (BUG-005)**
+The dashboard already caps quantities before writing to the DB. The Airflow validation
+is redundant for honest callers but necessary because the Airflow process must not
+trust the DB as a security boundary — any actor with DB write access could craft a
+tampered row. The validation adds one O(N) scan before submission.
+
+**Test results:** 81 execution tests passing (27 OMS + 54 trade history).
+4 IBKR broker tests fail in this environment due to missing `ib_insync` (pre-existing,
+unrelated to these changes).
+
+**Next steps (local environment required):**
+1. Fix BUG-001–004 in `docker-compose.yml` and `infra/docker/Dockerfile.airflow`
+2. Smoke-test Docker stack and DAG imports
+3. Run Streamlit dashboard and complete manual verification checklist
+4. Start 4-week automated paper-trading qualification
+
+---
+
+### Session 57 — Address 3 Codex PR #31 review comments (BUG-064, BUG-065, BUG-052 scope extension)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** address Codex PR #31 comments
+
+**What was done:**
+
+Three P2 review comments from the `chatgpt-codex-connector` reviewer on PR #31 investigated,
+fixed in code, replied to on GitHub, and recorded in bugs.md.
+
+- **BUG-064 (new, Fixed): Multi-strategy simulation gap in `_write_simulation`.**
+  `alpha_df` from XCom only contains scores for the single `params['strategy_id']` of the
+  current DAG run. The `for strategy_id in strategy_ids` loop filtered `alpha_df` directly,
+  so every other registered strategy produced an empty frame and was skipped. Shadow
+  strategies never received rows in `strategy_simulations`. Fix: added an XCom vs DB path.
+  When the `strategy_id` appears in `alpha_df`, use the in-memory data (fast path). When it
+  doesn't, query `alpha_scores` from the DB for that `strategy_id` and `score_date`. All
+  registered strategies now get a simulation row on every pipeline run.
+  (`airflow/dags/daily_signal_pipeline.py`)
+
+- **BUG-065 (new, Fixed): `simulated_return` denominator wrong for sub-n_long universe.**
+  `target_weights` assigns `1/len(tickers)` to each selected position (weights sum to 100%
+  always). When `len(tickers) < n_long=20`, dividing `sum(returns)` by `n_long` understates
+  the return. A 10-name universe where all names return 1% would record only 0.5%, corrupting
+  the compounded NAV chain. Fix: changed denominator from `n_long` to `len(tickers)`. When
+  the universe has ≥ 20 names, `len(tickers) == n_long` and result is unchanged. Tickers
+  with missing prior-day prices continue to contribute 0% (cash-equivalent treatment), since
+  only tickers with both today and prior-day closes enter `returns`.
+  (`airflow/dags/daily_signal_pipeline.py`)
+
+- **BUG-052 scope extension (Fixed): `schedule_interval` inline comment in `daily_signal_pipeline.py` said "21:30 UTC".**
+  The Session 55 fix updated the runbook but missed the inline comment `# 21:30 UTC weekdays
+  (5:30 PM EDT / 4:30 PM EST)` on the `schedule_interval` definition. Both DAGs use
+  `pendulum.datetime(..., tz=pendulum.timezone("America/New_York"))` for `start_date`,
+  making Airflow evaluate cron in ET, not UTC. Corrected to
+  `# 21:30 ET weekdays (01:30 UTC in EDT / 02:30 UTC in EST)`.
+  (`airflow/dags/daily_signal_pipeline.py`, `docs/runbooks/airflow_fire_drill.md`)
+
+[DECISION] The multi-strategy DB query path (BUG-064 fix) is intentionally separate from the
+XCom path rather than always querying from DB. This preserves the existing behavior that the
+current run's just-computed scores are used without an extra DB round-trip, while shadow
+strategies are populated from stored scores. If a shadow strategy has no scores for `sim_date`
+(not yet scored), it is skipped cleanly with `continue`.
+
+**bugs.md:** BUG-064 and BUG-065 added as Fixed. BUG-052 description updated to reference
+the inline comment fix as well.
+
+---
+
+### Session 56 — Adversarial Review of Session 55: 6 Findings Fixed
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** see below
+
+**What was done:**
+
+Adversarial review of Session 55 changes found 8 findings (2 High, 3 Medium, 3 Low).
+All fixable findings addressed:
+
+- **Finding 1 (High): Runbook referenced `fetch_ohlcv` which doesn't exist in `daily_signal_pipeline`.**
+  `fetch_ohlcv` lives in `daily_data_pipeline` (the old name). The signal pipeline's
+  longest task is `load_prices`. Updated `airflow_fire_drill.md` to say `load_prices`
+  with an accurate description of why it's the right interrupt target.
+
+- **Finding 4a (High): `write_ledger` inherited `retries=3` from `_default_args`.**
+  On Airflow retry, `audit_run` hits the fail-closed no-clobber guard from the first
+  successful attempt and raises "artifact already exists", causing the task to exhaust
+  retries with a misleading error and never write the ledger. Set `retries=0`.
+
+- **Finding 4b (Medium): `durable_reconcile` inherited `retries=3` from `_default_args`.**
+  `durable_reconcile` connects to IBKR to query fill status. Auto-retrying a broker
+  query 3 times is inconsistent with the BUG-030 principle applied to `submit_orders`
+  and `wait_for_fills`. Set `retries=0`.
+
+- **Finding 2 (Medium): `_validate_blotter_freshness` blocked order display on dry-run.**
+  The check was called before `_display_orders`, so a stale blotter caused dry-run to
+  exit 1 without ever showing the operator the order list. Operators have a legitimate
+  need to inspect a stale blotter via dry-run (e.g. to understand what would have been
+  submitted). Moved the freshness check to after `_display_orders` and
+  `_display_review_hashes` so the order list always prints. Freshness still exits 1
+  on both dry-run and submission, but the orders are visible first.
+
+- **Finding 5/6 (Medium/Low): Freshness tests omitted `broker_factory=`.**
+  Default `_default_broker_factory` uses a lazy import, so dry-run tests don't actually
+  trigger an IBKR import — but the omission is fragile to future reorganization.
+  Added `broker_factory=lambda: FakeBroker()` to all five freshness tests. Also added
+  assertions that orders are displayed even when freshness fails (verifying the fix
+  to Finding 2).
+
+- **Finding 3 (Low): `--max-blotter-age-days` help text and docstring said "older than"
+  but the implementation is strictly-greater-than (age=N passes, age=N+1 fails).**
+  Updated `--help` text to "more than N calendar days old" with an explicit example
+  ("today (age 0) and yesterday (age 1) both pass; age 2+ is rejected") and updated
+  the docstring to match.
+
+**Not fixed (acknowledged):**
+- Finding 7 (Low): `check` target runs `fmt-check` before `lint`; if both fail, lint
+  errors are never shown. This is standard Make fail-fast behavior, not a correctness
+  bug. No change warranted.
+- Finding 8 (Review note): `ExternalTaskSensor` `execution_delta` correctly lines up
+  signal pipeline (21:30 UTC) with paper trading (23:00 UTC). Confirmed correct; no change.
+
+**Test results:** 23 submit/reconcile tests passing (all pass).
+
+---
+
+### Session 55 — BUG-030, BUG-051, BUG-052, BUG-053 Fixed
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** see below
+
+**What was done:**
+
+Four bugs fixed in preparation for the 4-week automated paper-trading qualification.
+All are fully verifiable in this remote environment (no Docker or IBKR required).
+
+- **BUG-030 (P2): Airflow retries on broker submission task.**
+  Changed `submit_orders` task from `retries=1` to `retries=0` in
+  `airflow/dags/daily_paper_trading.py`. Airflow's automated retry can fire
+  before `_on_progress` writes the reconciliation artifact, leaving a broker order
+  accepted but untracked locally. Retry decisions for broker submissions must be
+  made by a human, not by the orchestrator.
+
+- **BUG-051 (P2): Step 7 CLI could submit stale but checksum-valid blotters.**
+  Added `_validate_blotter_freshness()` to `scripts/paper_submit_reconcile_check.py`.
+  Parses `generated_at_utc` from the blotter and rejects artifacts older than
+  `--max-blotter-age-days` calendar days (default 1). Added `--max-blotter-age-days`
+  CLI argument. Wired the check immediately after `validate_blotter()` so it runs
+  on every invocation (dry-run and submission). Updated `_write_blotter()` in the
+  test fixture to default `generated_at_utc` to `datetime.now(UTC)` so existing
+  tests remain valid. Added 5 new freshness tests (23 total, all passing).
+
+- **BUG-052 (P2): Fire-drill runbook contradicted DAG timezone semantics.**
+  Updated `docs/runbooks/airflow_fire_drill.md`:
+  - Updated both DAG name references from `daily_data_pipeline` (no longer exists)
+    to `daily_signal_pipeline`.
+  - Rewrote the "Scheduling notes" section to explicitly state Airflow uses UTC
+    for cron scheduling (no `default_timezone` override is configured), and listed
+    the correct UTC schedules for both DAGs with their EDT/EST equivalents:
+    - `daily_signal_pipeline`: `30 21 * * 1-5` = 21:30 UTC (5:30 PM EDT / 4:30 PM EST)
+    - `daily_paper_trading`: `0 23 * * 1-5` = 23:00 UTC (7:00 PM EDT / 6:00 PM EST)
+  - Also corrected the schedule comment in `daily_signal_pipeline.py` from
+    `# 9:30 PM ET weekdays` (wrong) to `# 21:30 UTC weekdays (5:30 PM EDT / 4:30 PM EST)`.
+
+- **BUG-053 (P2): `make check` silently mutated working tree before linting.**
+  Makefile `check` target previously depended on `fmt` (which runs `ruff format .`,
+  modifying files). Changed `check` to depend on `fmt-check` (new target: `ruff
+  format --check .`, read-only). `make fmt` still exists for developer use.
+  A validation command that modifies files can make the tree pass locally on the
+  first run while leaving unnoticed reformatting.
+
+**[DECISION] freshness default of 1 calendar day (BUG-051)**
+The paper workflow generates the blotter after market close and typically submits
+it the same evening or next morning (before market open). A 1-day default allows
+that window while preventing stale blotters from prior sessions being accidentally
+submitted. The `--max-blotter-age-days` override exists for the Airflow path where
+the blotter and submission run in the same pipeline; in that case, freshness is
+guaranteed by the pipeline structure rather than a CLI check.
+
+**Test results:** 23 submit/reconcile tests passing (was 18 — added 5 freshness tests).
+
+---
+
+### Session 54 — Adversarial Review Follow-up: 9 Findings Fixed
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `claude/project-status-priorities-mhxc1a`
+**Commits:** `065278a` — Fix 9 adversarial-review findings (Sessions 53-54)
+
+**What was done:**
+
+Ran a second adversarial review of the Session 53 fixes. The review found 9 issues.
+All 9 were fixed in this session (BUG-055 through BUG-063 now marked Fixed in bugs.md).
+
+- **BUG-055 (P0/Critical): prices_json=None crashed _write_simulation before per-strategy error handler.**
+  The new `write_simulations` task became the terminal node of the signal pipeline and thus
+  the `ExternalTaskSensor` target for the paper trading DAG. A None `prices_json` XCom
+  (e.g. when no price data for the day) was passed directly to `pd.read_json()`, crashing
+  the task with an uncaught TypeError before the per-strategy try/except, blocking the
+  entire paper pipeline. Fix: added a `not prices_json` early-exit guard immediately after
+  the existing `alpha_json` guard.
+
+- **BUG-056 (P1/High): wash_sale_context docstring said "SELL-side tickers".**
+  After BUG-040 renamed the context key and flipped the guard to block BUYs, the
+  `wash_sale_context()` docstring still described the input as "SELL-side tickers."
+  Fixed: now says "BUY-side tickers (the candidate replacement buys)."
+
+- **BUG-057 (P1/Medium): bool subclass passed isinstance(override_qty, int) in BUG-005 fix.**
+  In Python, `isinstance(True, int) == True`. A tampered DB row with `true` (JSON bool)
+  as an override quantity would pass the type check and submit 1 share silently.
+  Fix: added `isinstance(override_qty, bool)` guard (bool is a subclass of int, so this
+  must be checked separately). Also fixed the cap comparison to use
+  `original_row.get("quantity", original_row.get("estimated_shares", 0))` so the cap
+  is consistent with what actually gets submitted (finding #8, BUG-062).
+
+- **BUG-058 (P1/Medium): Second reconciliation artifact read swallowed exceptions.**
+  The BUG-006 fix correctly fail-closed the first read (deduplication safety). However,
+  the second read — used to populate `previous_responses` for the final audit artifact —
+  had a bare `except Exception: previous_responses = []`. On any I/O error between the
+  two reads, the audit trail would be silently truncated.
+  Fix: the second read now also raises AirflowException on failure, preserving the full
+  audit trail. The error message notes that deduplication was already safe (first read
+  succeeded).
+
+- **BUG-059 (P1/Medium): simulated_return divided by len(returns) not n_long.**
+  When some top-20 tickers lack prior-day prices, `len(returns) < n_long`. The original
+  code computed `sum(returns) / len(returns)`, the average over data-available tickers,
+  which overstates the equal-weight return versus the true portfolio (missing tickers
+  implicitly hold cash at 0% return). Fix: divide by `n_long` (20), matching true
+  equal-weight portfolio semantics.
+
+- **BUG-060 (P1/Medium): No test for fail-safe BUY rejection when as_of_date absent.**
+  BUG-040 added a deliberate fail-safe: if `recent_loss_sells` is populated but
+  `as_of_date` is missing from the context, the check rejects the BUY order (safe
+  default). No existing test covered this path. Added
+  `test_wash_sale_rejects_buy_when_as_of_date_missing` to `execution/tests/test_oms.py`.
+  28 OMS tests now pass.
+
+- **BUG-061 (P3/Low): deferred_items.md RESOLVED entry used stale key name.**
+  The RESOLVED entry for the wash-sale compliance fix still said
+  `ctx["recent_loss_buys"]`. Fixed: now says `recent_loss_sells` with an explanatory
+  note.
+
+- **BUG-062 (P3/Low): Override cap inconsistency between validation and submission fields.**
+  The BUG-005 validation read the cap from `estimated_shares`, while submission uses
+  `quantity` when present (set by the override apply loop). Addressed inline in BUG-057
+  fix — `original_qty` now uses `quantity` when set.
+
+- **BUG-063 (P3/Low): __import__("json").dumps() antipattern in _write_simulation.**
+  `json` was not imported at the top of the function; the developer used `__import__`
+  to work around the missing import. Fixed: added `import json` to the function's local
+  import block, used normally.
+
+**[DECISION] prices_json guard returns silently instead of raising (BUG-055)**
+A None prices_json means the load_prices task produced no data (rare, e.g. early run
+before price data arrives). This is not a code error — it is a data availability
+condition. Returning `{"simulations_written": 0, "reason": "no prices data"}` with
+`trigger_rule="none_failed"` means the downstream ExternalTaskSensor sees success
+(task completed with non-exception return), consistent with how the existing alpha_json
+guard handles "no data yet" cases.
+
+**Test results:** 28 OMS tests passing (was 27 — added missing fail-safe test).
+
+**Next steps (local environment required — same as Session 53):**
+1. Fix BUG-001–004 in `docker-compose.yml` and `infra/docker/Dockerfile.airflow`
+2. Smoke-test Docker stack and DAG imports
+3. Run Streamlit dashboard and complete manual verification checklist
+4. Start 4-week automated paper-trading qualification
+
+---
+
 ## 2026-06-29
 
 ### Session 52 — Dashboard Documentation Refresh After Schema Alignment Review

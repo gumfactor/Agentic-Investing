@@ -34,9 +34,9 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-002 | Infra/Deploy | P0 | F0 | Open | Airflow image omits runtime dependencies used by DAGs. |
 | BUG-003 | Infra/Deploy | P0 | F0 | Open | Paper artifacts are written to an unmounted container path. |
 | BUG-004 | Infra/Deploy | P0 | F0 | Open | IBKR host defaults to container-local localhost. |
-| BUG-005 | Trading Safety | P0 | F0 | Open | Approval quantity overrides can be tampered upward. |
-| BUG-006 | Trading Safety | P0 | F0 | Open | Corrupt reconciliation artifacts can cause duplicate orders. |
-| BUG-007 | Risk | P0 | F0 | Open | Risk dashboard can report zero/incorrect risk from schema mismatch. |
+| BUG-005 | Trading Safety | P0 | F0 | Fixed | Approval quantity overrides can be tampered upward. |
+| BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
+| BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
 | BUG-008 | Research/Signals | P0 | F0 | Open | Current-membership universe creates survivorship leakage. |
 | BUG-009 | Research/Signals | P0 | F0 | Open | Same-close signal/return timing can introduce lookahead. |
 | BUG-010 | Research/Signals | P0 | F0 | Open | `pct_change()` defaults can distort many indicators. |
@@ -46,12 +46,18 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-014 | Security/Auth | P1 | F1 | Open | Dashboard approval identity is spoofable/unknown. |
 | BUG-015 | Dashboard/API | P1 | F1 | Open | Blotter UI can approve the wrong pending run. |
 | BUG-016 | Dashboard/API | P1 | F1 | Open | Blotter UI does not validate full schema before approval. |
-| BUG-017 | Trading Safety | P1 | F1 | Open | Quantity reduction updates one field while validation checks another. |
-| BUG-036 | Packaging/CI | P0 | F0 | Open | Invalid PEP 517 backend blocks package builds. |
+| BUG-017 | Trading Safety | P1 | F1 | Fixed | Quantity reduction updates one field while validation checks another. |
+| BUG-036 | Packaging/CI | P0 | F0 | Fixed | Invalid PEP 517 backend blocks package builds. |
 | BUG-037 | Data/Storage | P1 | F1 | Open | Same-date corporate actions overwrite one another. |
 | BUG-038 | Data/Storage | P1 | F1 | Open | Snapshot version paths are mutable. |
 | BUG-039 | Backtesting | P1 | F1 | Open | Object-store failures can become unadjusted backtests. |
-| BUG-040 | Trading Safety | P1 | F1 | Open | Wash-sale guard checks the wrong order direction. |
+| BUG-040 | Trading Safety | P1 | F1 | Fixed | Wash-sale guard checks the wrong order direction. |
+| BUG-055 | Trading Safety | P0 | F0 | Fixed | prices_json=None crashes _write_simulation before error handler, blocking ExternalTaskSensor. |
+| BUG-056 | Docs/Process | P1 | F1 | Fixed | wash_sale_context docstring says "SELL-side tickers" after BUG-040 fix renamed to BUY-side. |
+| BUG-057 | Trading Safety | P1 | F1 | Fixed | bool is int subclass; True passes isinstance(override_qty, int) and submits 1 share silently. |
+| BUG-058 | Trading Safety | P1 | F1 | Fixed | Second reconciliation artifact read swallows exceptions, truncating audit trail on retry. |
+| BUG-059 | Research/Signals | P1 | F1 | Fixed | simulated_return divides by len(returns) not n_long, overstating NAV when tickers lack prior-day data. |
+| BUG-060 | Trading Safety | P1 | F1 | Fixed | No test for fail-safe BUY rejection when recent_loss_sells set but as_of_date absent. |
 | BUG-041 | Risk | P1 | F1 | Open | Sector concentration is computed but not breach-checked. |
 | BUG-042 | Trading Safety | P1 | F1 | Open | IBKR order-ID timeout can leave live order untracked. |
 | BUG-043 | Packaging/CI | P1 | F1 | Open | Test collection can fail through MLflow/pkg_resources drift. |
@@ -74,7 +80,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-027 | Dashboard/API | P2 | F2 | Open | Approval UI can crash on malformed/null quantities. |
 | BUG-028 | Dashboard/API | P2 | F2 | Open | Artifact scanning lacks strong containment checks. |
 | BUG-029 | Trading Safety | P2 | F2 | Open | Live-clearance env var names differ across components. |
-| BUG-030 | Trading Safety | P2 | F2 | Open | Airflow retries are risky for broker submission actions. |
+| BUG-030 | Trading Safety | P2 | F2 | Fixed | Airflow retries are risky for broker submission/reconcile/ledger tasks. |
 | BUG-031 | Research/Signals | P2 | F2 | Open | Fundamental growth uses daily-row shifts after forward-fill. |
 | BUG-032 | Data/Storage | P2 | F2 | Open | `pivot_table()` silently averages duplicate records. |
 | BUG-033 | Infra/Deploy | P2 | F2 | Open | Prometheus scrape target is not backed by Compose service. |
@@ -83,9 +89,11 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-048 | Trading Safety | P2 | F2 | Open | Trade-fill dedupe allows duplicate cumulative fills. |
 | BUG-049 | Portfolio | P2 | F2 | Open | Optimizer fallbacks can violate configured caps. |
 | BUG-050 | Risk | P2 | F2 | Open | NaN-heavy return series can suppress VaR/CVaR breaches. |
-| BUG-051 | Trading Safety | P2 | F2 | Open | Step 7 CLI can submit old checksum-valid blotters. |
-| BUG-052 | Docs/Process | P2 | F2 | Open | Fire-drill runbook contradicts DAG timezone semantics. |
-| BUG-053 | Packaging/CI | P2 | F2 | Open | `make check` mutates the working tree. |
+| BUG-051 | Trading Safety | P2 | F2 | Fixed | Step 7 CLI can submit old checksum-valid blotters. |
+| BUG-052 | Docs/Process | P2 | F2 | Fixed | Fire-drill runbook contradicts DAG timezone semantics; inline schedule_interval comment also wrong. |
+| BUG-053 | Packaging/CI | P2 | F2 | Fixed | `make check` mutates the working tree. |
+| BUG-064 | Research/Signals | P2 | F2 | Fixed | `_write_simulation` only processes current-run strategy from XCom; shadow strategies are skipped. |
+| BUG-065 | Research/Signals | P2 | F2 | Fixed | `simulated_return` divides by n_long when universe < n_long, understating returns for small strategies. |
 
 #### Long-term / lower-risk backlog
 
@@ -94,6 +102,9 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-034 | Dashboard/API | P3 | F3 | Open | Performance table formats decimal returns as percentages incorrectly. |
 | BUG-035 | Dashboard/API | P3 | F3 | Open | No FastAPI/API route layer exists despite service-boundary expectations. |
 | BUG-054 | Data/Storage | P3 | F3 | Open | Fundamentals backfill skip logic can leave partial ingestions stale. |
+| BUG-061 | Docs/Process | P3 | F3 | Fixed | deferred_items.md RESOLVED entry used stale recent_loss_buys key after BUG-040 rename. |
+| BUG-062 | Trading Safety | P3 | F3 | Fixed | Override cap validated against estimated_shares while submission uses quantity field (inconsistent). |
+| BUG-063 | Packaging/CI | P3 | F3 | Fixed | __import__("json").dumps() antipattern in _write_simulation; replaced with proper import json. |
 
 ## Startup / repository state
 
@@ -632,11 +643,11 @@ The following findings were added after a second adversarial pass focused on gap
 
 **Severity:** P2 / operational docs
 
-**Evidence:** The data DAG is documented/configured for `20:00 America/New_York`, but the fire-drill runbook says the cron fires at `20:00 UTC`.
+**Evidence:** The data DAG is documented/configured for `20:00 America/New_York`, but the fire-drill runbook says the cron fires at `20:00 UTC`.  A secondary instance of the same confusion existed as the inline `# 21:30 UTC weekdays` comment on the `schedule_interval` line of `daily_signal_pipeline.py`.
 
 **Impact:** Operators can expect or diagnose runs at the wrong wall-clock time, especially around DST.
 
-**Suggested direction:** Update the runbook to state actual Airflow scheduling semantics and provide UTC examples for standard/daylight time.
+**Fix (Session 56 + Session 57):** Runbook scheduling notes rewritten to say ET; UTC equivalents provided for EDT and EST separately.  Inline DAG comment corrected to `# 21:30 ET weekdays (01:30 UTC in EDT / 02:30 UTC in EST)`.
 
 ### BUG-053: `make check` mutates the working tree
 
@@ -659,3 +670,23 @@ The following findings were added after a second adversarial pass focused on gap
 **Impact:** Interrupted or partial fundamentals ingestion can leave concept/period coverage incomplete while the script reports the ticker as already ingested.
 
 **Suggested direction:** Track completeness by ticker, source version, concept set, and latest filing date; skip only when the expected coverage contract is satisfied.
+
+### BUG-064: `_write_simulation` skips shadow strategies because XCom alpha_df only covers the current run's strategy
+
+**Severity:** P2 / multi-strategy simulation correctness
+
+**Evidence:** `alpha_df` in `_write_simulation` comes from `ti.xcom_pull(key="alpha_scores_json", task_ids="combine_scores")`, which only contains scores for the single `params['strategy_id']` of the current DAG run. The loop `alpha_df[alpha_df["strategy_id"] == strategy_id]` returns an empty frame for every other registered strategy and `continue`s, leaving the `strategy_simulations` table unpopulated for shadow strategies.
+
+**Impact:** The multi-strategy comparison panel in the Performance dashboard (which reads `strategy_simulations`) never receives rows for any strategy except the one that ran today, defeating the purpose of the table.
+
+**Fix (Session 57, PR #31 Codex comment #1):** The loop now checks whether the current `strategy_id` appears in the XCom data. If yes, it uses the in-memory frame (fast path). If no, it queries `alpha_scores` from the DB for that `strategy_id` and `score_date`. All registered strategies receive a simulation row on every pipeline run.
+
+### BUG-065: `simulated_return` denominator uses n_long instead of len(tickers), understating returns when universe < n_long
+
+**Severity:** P2 / simulated NAV correctness
+
+**Evidence:** `target_weights` assigns `1/len(tickers)` to each selected position (weights sum to 100% regardless of universe size). When `len(tickers) < n_long`, dividing `sum(returns)` by `n_long=20` rather than `len(tickers)` understates the portfolio return. For example, a 10-name universe where all names return 1% records only 0.5%, corrupting the compounded NAV chain.
+
+**Impact:** Simulated NAV for small-universe strategies is systematically biased downward; strategy comparison panels understate their performance vs. larger strategies.
+
+**Fix (Session 57, PR #31 Codex comment #2):** Changed denominator from `n_long` to `len(tickers)`. When the universe has ≥ n_long names, `len(tickers) == n_long` and the result is identical. For smaller universes, the correct portfolio return is now computed. Tickers with missing prior-day prices continue to contribute 0% (cash-equivalent treatment).

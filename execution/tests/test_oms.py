@@ -96,28 +96,44 @@ class TestComplianceEngine:
         assert not passed
         assert "concentration" in reason
 
-    def test_wash_sale_blocks_sell(self):
+    def test_wash_sale_blocks_replacement_buy(self):
+        """Replacement BUY within 30 days of a loss SELL must be rejected."""
         engine = ComplianceEngine()
         ctx = {
             "circuit_breaker_open": False,
-            "recent_loss_buys": {"AAPL": date(2024, 1, 1)},
+            "recent_loss_sells": {"AAPL": date(2024, 1, 1)},
             "as_of_date": date(2024, 1, 15),
         }
-        o = self._order(side=OrderSide.SELL)
+        o = self._order(side=OrderSide.BUY)
         passed, reason = engine.check(o, ctx)
         assert not passed
         assert "wash-sale" in reason
 
-    def test_wash_sale_allows_buy(self):
+    def test_wash_sale_allows_unrelated_sell(self):
+        """A SELL is never blocked by the wash-sale guard (it is the triggering event, not the replacement)."""
         engine = ComplianceEngine()
         ctx = {
             "circuit_breaker_open": False,
-            "recent_loss_buys": {"AAPL": date(2024, 1, 1)},
+            "recent_loss_sells": {"AAPL": date(2024, 1, 1)},
             "as_of_date": date(2024, 1, 15),
         }
-        o = self._order(side=OrderSide.BUY)
+        o = self._order(side=OrderSide.SELL)
         passed, _ = engine.check(o, ctx)
         assert passed
+
+    def test_wash_sale_rejects_buy_when_as_of_date_missing(self):
+        """Fail-safe: BUY must be rejected when recent_loss_sells is populated but as_of_date is absent."""
+        engine = ComplianceEngine()
+        ctx = {
+            "circuit_breaker_open": False,
+            "recent_loss_sells": {"AAPL": date(2024, 1, 1)},
+            # as_of_date deliberately absent — compliance must fail closed
+        }
+        o = self._order(side=OrderSide.BUY)
+        passed, reason = engine.check(o, ctx)
+        assert not passed
+        assert "wash-sale" in reason
+        assert "as_of_date missing" in reason
 
     def test_min_notional_rejected(self):
         engine = ComplianceEngine()
@@ -313,8 +329,8 @@ class TestOrderManagerJournalIntegration:
         assert fills[0].side == "BUY"
         assert fills[0].filled_quantity == pytest.approx(100.0)
 
-    def test_compliance_wash_sale_populated_from_journal(self):
-        """Wash-sale context from a real journal unblocks _check_wash_sale."""
+    def test_compliance_wash_sale_blocks_replacement_buy_from_journal(self):
+        """OrderManager auto-injects wash-sale context; replacement BUY after a loss SELL is blocked."""
         journal = self._make_journal()
 
         # Record a loss-realizing SELL fill directly into the journal
@@ -338,15 +354,14 @@ class TestOrderManagerJournalIntegration:
         sell_order.updated_at = datetime.now(timezone.utc)
         journal.record_fill(sell_order)
 
-        # Now stage a new SELL for the same ticker and run compliance
+        # Now stage a replacement BUY for the same ticker within the 30-day window
         om = OrderManager(trade_journal=journal)
-        new_sell = Order(
-            ticker="AAPL", side=OrderSide.SELL, quantity=50, limit_price=95.0,
+        replacement_buy = Order(
+            ticker="AAPL", side=OrderSide.BUY, quantity=50, limit_price=95.0,
             strategy_id="s1",
         )
-        om.stage(new_sell)
+        om.stage(replacement_buy)
 
-        # Pass as_of_date so the wash-sale check has a reference date
         ctx = {
             "circuit_breaker_open": False,
             "min_order_notional": 0.0,
@@ -354,6 +369,6 @@ class TestOrderManagerJournalIntegration:
         }
         approved, rejected = om.run_compliance(ctx)
 
-        # The loss SELL is within 30 days → wash-sale check should block the new SELL
+        # Loss SELL is within 30 days → replacement BUY must be blocked
         assert len(rejected) == 1
         assert "wash-sale" in rejected[0].rejection_reason

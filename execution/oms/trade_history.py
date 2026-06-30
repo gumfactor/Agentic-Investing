@@ -1,7 +1,7 @@
 """Trade journal — append-only fill store with FIFO P&L and wash-sale history.
 
 Phase 5, M5.2.  Unblocks:
-  - ComplianceEngine._check_wash_sale() (previously a stub — ctx['recent_loss_buys']
+  - ComplianceEngine._check_wash_sale() (previously a stub — ctx['recent_loss_sells']
     was never populated because this module did not exist)
   - Realized P&L tracking for performance attribution
   - Open-position cost-basis reconstruction for tearsheets
@@ -350,16 +350,15 @@ class TradeJournal:
         """Return {ticker: last_loss_sell_date} for tickers with a loss-realizing
         SELL fill within ``window_days`` of ``as_of``.
 
-        This populates ``ctx['recent_loss_buys']`` for
-        ``ComplianceEngine._check_wash_sale()``, which blocks SELL orders on
-        tickers that recently realised a loss (preventing rapid-cycling strategies
-        from compounding wash-sale disallowances).
+        This populates ``ctx['recent_loss_sells']`` for
+        ``ComplianceEngine._check_wash_sale()``, which blocks replacement BUY
+        orders within 30 days of a loss-realizing SELL of the same ticker.
 
         Parameters
         ----------
         tickers:
-            Tickers to query.  Typically the SELL-side tickers in the pending
-            order batch.
+            Tickers to query.  Typically the BUY-side tickers in the pending
+            order batch (the candidate replacement buys).
         window_days:
             Look-back window in calendar days (default 30 matches the IRS
             wash-sale window).

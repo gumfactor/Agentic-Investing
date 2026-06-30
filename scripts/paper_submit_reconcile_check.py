@@ -91,6 +91,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow replacing the reconciliation output artifact. Default is fail-closed.",
     )
+    parser.add_argument(
+        "--max-blotter-age-days",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Reject blotters more than N calendar days old (default 1). A blotter "
+            "generated today or yesterday (age 0 or 1) passes; age 2+ is rejected. "
+            "Prevents submitting a stale-but-valid-checksum blotter against outdated "
+            "prices and positions."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -266,6 +278,34 @@ def validate_blotter(path: Path) -> dict[str, Any]:
     return artifact
 
 
+def _validate_blotter_freshness(artifact: Mapping[str, Any], max_age_days: int) -> None:
+    """Reject blotters more than max_age_days calendar days old (BUG-051).
+
+    A blotter aged exactly max_age_days is allowed (strictly greater than is rejected).
+    With the default of 1: today (age 0) and yesterday (age 1) both pass; age 2+ fails.
+
+    A stale blotter has valid checksums but references outdated prices, positions,
+    and target weights. This check prevents accidentally re-submitting a prior session's
+    blotter via the CLI.
+    """
+    generated_str = artifact.get("generated_at_utc")
+    if not isinstance(generated_str, str):
+        raise RuntimeError("Blotter generated_at_utc is missing or not a string")
+    try:
+        generated_dt = datetime.fromisoformat(generated_str.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError(f"Blotter generated_at_utc is not a valid ISO timestamp: {generated_str!r}") from exc
+    today_utc = datetime.now(UTC).date()
+    generated_date = generated_dt.astimezone(UTC).date()
+    age_days = (today_utc - generated_date).days
+    if age_days > max_age_days:
+        raise RuntimeError(
+            f"Blotter is {age_days} calendar day(s) old (generated {generated_date}); "
+            f"max allowed is {max_age_days}. Regenerate the blotter with fresh prices, "
+            "positions, and target weights before submitting."
+        )
+
+
 def _display_orders(rows: Sequence[Mapping[str, Any]], recorder: CheckRecorder) -> None:
     recorder.info("Full paper order list for operator review")
     if not rows:
@@ -288,9 +328,14 @@ def _display_review_hashes(blotter_path: Path, blotter: Mapping[str, Any], recor
 
 
 def _validate_api_submittable_quantities(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Validate that every row's submitted quantity is a whole positive number.
+
+    Uses 'quantity' when present (set by operator overrides or the Airflow submit
+    path), falling back to 'estimated_shares' for unmodified blotter rows.
+    """
     fractional: list[str] = []
     for row in rows:
-        shares = float(row["estimated_shares"])
+        shares = float(row.get("quantity", row["estimated_shares"]))
         if abs(shares - round(shares)) > 1e-9:
             fractional.append(f"{row['sequence']} {row['ticker']} {shares:.6f}")
     if fractional:
@@ -484,10 +529,16 @@ def run(
         client_id = _resolve_client_id(env_map)
         blotter = validate_blotter(args.blotter)
         rows = blotter["candidate_rows"]
+        # Display orders before freshness check so operators can always inspect
+        # what is in a blotter, even a stale one, via dry-run.
         _display_orders(rows, recorder)
         _display_review_hashes(args.blotter, blotter, recorder)
         if not env_ok:
             raise RuntimeError("Paper environment gates failed")
+        # Freshness check runs after display so the order list is always shown.
+        # A stale blotter exits nonzero on both dry-run and submission, but
+        # the operator has already seen the orders for inspection purposes.
+        _validate_blotter_freshness(blotter, args.max_blotter_age_days)
         if args.confirm != "YES":
             if args.confirm is not None:
                 recorder.fail('Submission confirmation must be the literal string "YES"')
