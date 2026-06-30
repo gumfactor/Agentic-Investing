@@ -38,6 +38,7 @@ from typing import Any
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from sqlalchemy import create_engine, text
 
 _MARKET_TIMEZONE = pendulum.timezone("America/New_York")
 _DAG_START_DATE = pendulum.datetime(2026, 6, 9, 21, 30, tz=_MARKET_TIMEZONE)
@@ -334,6 +335,194 @@ def _write_scores(**context: Any) -> dict:
     return {"factor_rows": factor_count, "alpha_rows": alpha_count}
 
 
+def _simulate_strategies(**context: Any) -> dict:
+    """Forward-simulate every active strategy and upsert one strategy_simulations row.
+
+    Runs after write_scores so today's alpha_scores are already committed.
+    For each strategy in status 'backtesting' or 'paper':
+      1. Pull top-N alpha_scores by score_date.
+      2. Build equal-weight target (weight capped at portfolio.max_position_weight
+         from the strategy's stored config JSONB).
+      3. Compute the weighted daily return using the last two closes in daily_prices.
+      4. Chain simulated_nav = prev_nav * (1 + return); 1 000 000 on first run.
+      5. UPSERT into strategy_simulations (idempotent on DAG retry).
+
+    Per-strategy failures are logged and skipped so other strategies still write.
+    A missing or empty strategies table is treated as a graceful skip, not an error,
+    so this task never blocks the signal pipeline when the registry is empty.
+    """
+    import json as _json
+    import os
+    import uuid as _uuid
+    from collections import defaultdict
+    from datetime import UTC, datetime as _dt
+    from sqlalchemy import exc as _sa_exc
+
+    score_date_str: str = context["ti"].xcom_pull(key="score_date", task_ids="load_prices")
+    if not score_date_str:
+        return {"strategies_simulated": 0, "strategies_skipped": 0}
+    from datetime import date as _date
+    score_date = _date.fromisoformat(score_date_str)
+
+    database_url = os.environ["DATABASE_URL"]
+    engine = create_engine(database_url)
+    try:
+        try:
+            with engine.connect() as conn:
+                registry_rows = conn.execute(text("""
+                    SELECT s.strategy_id, sd.config
+                    FROM strategies s
+                    JOIN strategy_definitions sd
+                        ON s.strategy_id = sd.strategy_id
+                        AND s.canonical_config_hash = sd.config_hash
+                    WHERE s.status IN ('backtesting', 'paper')
+                """)).fetchall()
+        except (_sa_exc.OperationalError, _sa_exc.ProgrammingError):
+            return {"strategies_simulated": 0, "strategies_skipped": 0}
+    finally:
+        engine.dispose()
+
+    if not registry_rows:
+        return {"strategies_simulated": 0, "strategies_skipped": 0}
+
+    simulated = 0
+    skipped = 0
+
+    for reg_row in registry_rows:
+        strategy_id: str = reg_row.strategy_id
+        config: dict = reg_row.config or {}
+        try:
+            portfolio_cfg = config.get("portfolio", {})
+            n_long: int = int(portfolio_cfg.get("n_long", 50))
+            max_weight: float = float(portfolio_cfg.get("max_position_weight", 1.0))
+
+            engine = create_engine(database_url)
+            try:
+                with engine.connect() as conn:
+                    score_rows = conn.execute(
+                        text("""
+                            SELECT ticker, alpha_score, universe_size
+                            FROM alpha_scores
+                            WHERE strategy_id = :sid AND score_date = :dt
+                            ORDER BY alpha_score DESC
+                            LIMIT :n
+                        """),
+                        {"sid": strategy_id, "dt": score_date, "n": n_long},
+                    ).fetchall()
+
+                    if not score_rows:
+                        raise ValueError(
+                            f"No alpha_scores for {strategy_id!r} on {score_date}"
+                        )
+
+                    tickers = [r.ticker for r in score_rows]
+                    universe_size: int = int(score_rows[0].universe_size)
+                    raw_w = 1.0 / len(tickers)
+                    weight = min(raw_w, max_weight)
+
+                    # Last 2 closes per ticker via window function
+                    price_rows = conn.execute(
+                        text("""
+                            SELECT ticker, date, close::float AS close
+                            FROM (
+                                SELECT ticker, date, close,
+                                       ROW_NUMBER() OVER (
+                                           PARTITION BY ticker ORDER BY date DESC
+                                       ) AS rn
+                                FROM daily_prices
+                                WHERE ticker = ANY(:tickers) AND date <= :dt
+                            ) ranked
+                            WHERE rn <= 2
+                        """),
+                        {"tickers": tickers, "dt": score_date},
+                    ).fetchall()
+
+                    closes_by_ticker: dict[str, list[tuple]] = defaultdict(list)
+                    for pr in price_rows:
+                        closes_by_ticker[pr.ticker].append((pr.date, float(pr.close)))
+
+                    weighted_return = 0.0
+                    n_priced = 0
+                    for ticker in tickers:
+                        pairs = sorted(closes_by_ticker.get(ticker, []), key=lambda x: x[0])
+                        if len(pairs) < 2:
+                            continue
+                        prev_close = pairs[-2][1]
+                        last_close = pairs[-1][1]
+                        if prev_close > 0:
+                            weighted_return += weight * (last_close - prev_close) / prev_close
+                            n_priced += 1
+
+                    if n_priced == 0:
+                        raise ValueError(
+                            f"No two-day price pairs available for {strategy_id!r}"
+                        )
+
+                    prev_row = conn.execute(
+                        text("""
+                            SELECT simulated_nav
+                            FROM strategy_simulations
+                            WHERE strategy_id = :sid AND sim_date < :dt
+                            ORDER BY sim_date DESC
+                            LIMIT 1
+                        """),
+                        {"sid": strategy_id, "dt": score_date},
+                    ).fetchone()
+
+                prev_nav = float(prev_row.simulated_nav) if prev_row else 1_000_000.0
+                new_nav = prev_nav * (1.0 + weighted_return)
+                target_weights = {t: weight for t in tickers}
+
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("""
+                            INSERT INTO strategy_simulations
+                                (id, strategy_id, sim_date, target_weights,
+                                 simulated_return, simulated_nav,
+                                 universe_size, n_positions, computed_at_utc)
+                            VALUES
+                                (:id, :strategy_id, :sim_date, :target_weights::jsonb,
+                                 :simulated_return, :simulated_nav,
+                                 :universe_size, :n_positions, :computed_at_utc)
+                            ON CONFLICT (strategy_id, sim_date)
+                            DO UPDATE SET
+                                target_weights   = EXCLUDED.target_weights,
+                                simulated_return = EXCLUDED.simulated_return,
+                                simulated_nav    = EXCLUDED.simulated_nav,
+                                universe_size    = EXCLUDED.universe_size,
+                                n_positions      = EXCLUDED.n_positions,
+                                computed_at_utc  = EXCLUDED.computed_at_utc
+                        """),
+                        {
+                            "id": str(_uuid.uuid4()),
+                            "strategy_id": strategy_id,
+                            "sim_date": str(score_date),
+                            "target_weights": _json.dumps(target_weights),
+                            "simulated_return": round(weighted_return, 8),
+                            "simulated_nav": round(new_nav, 6),
+                            "universe_size": universe_size,
+                            "n_positions": n_priced,
+                            "computed_at_utc": _dt.now(UTC).isoformat(),
+                        },
+                    )
+            finally:
+                engine.dispose()
+
+            simulated += 1
+
+        except Exception as _exc:
+            import structlog as _sl
+            _sl.get_logger("rqis.airflow").warning(
+                "simulate_strategy_failed",
+                strategy_id=strategy_id,
+                error=str(_exc),
+                score_date=str(score_date),
+            )
+            skipped += 1
+
+    return {"strategies_simulated": simulated, "strategies_skipped": skipped}
+
+
 # ─── DAG definition ──────────────────────────────────────────────────────────
 
 with DAG(
@@ -384,7 +573,12 @@ with DAG(
         python_callable=_write_scores,
     )
 
+    t_simulate = PythonOperator(
+        task_id="simulate_strategies",
+        python_callable=_simulate_strategies,
+    )
+
     # ── Task dependency graph ─────────────────────────────────────────────────
     t_load_prices >> [t_momentum, t_lowvol, t_value, t_quality]
     [t_momentum, t_lowvol, t_value, t_quality] >> t_combine
-    t_combine >> t_write
+    t_combine >> t_write >> t_simulate
