@@ -11,6 +11,41 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-07-12
+
+### Session 58 - Current-State Roadmap Rebuilt
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `main`
+**Commits:** uncommitted planning documentation
+
+---
+
+#### What was done
+
+[DECISION] Rebuilt `Roadmap.md` after synchronizing the repository to current
+`main` and removing the obsolete earlier roadmap. The new roadmap is based on
+the current implementation, the active bug ledger, and fresh independent
+reviews of execution/operations, strategy/research validation, and the
+dashboard/operator surface.
+
+#### Current conclusion
+
+- Major Phase 5 delivery work exists: strategy registry, trade journal,
+  tearsheets, paper-trading DAG, dashboard, signal library, and validation
+  tooling.
+- The immediate blockers are Compose deployment readiness, point-in-time and
+  timing-correct research, authoritative shared safety state, and secure
+  DAG-bound approval—not absence of feature scaffolding.
+- No automated-paper qualification or live-capital work may begin until the
+  rebuilt roadmap's deployment, safety-control, runtime-proof, and evidence
+  gates have passed.
+
+#### Next action
+
+Start Gate 01 with the linked bug evidence: make the Compose paper runtime
+executable and repair the research-validity baseline in parallel.
+
 ## 2026-06-30
 
 ### Session 53 — Bug Remediation: BUG-005/006/007/017/036/040 + strategy_simulations producer
