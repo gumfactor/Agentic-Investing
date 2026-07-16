@@ -8,19 +8,19 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import structlog
-from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore
+from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore, daily_return
 
 logger = structlog.get_logger(__name__)
 
 _WINDOW = 63
-_MIN_PERIODS = 44
+_MIN_PERIODS = 63  # full window (BUG-010)
 
 
 def compute_sharpe_ratio_63d_scores(prices: pd.DataFrame) -> pd.DataFrame:
     """Cross-sectional z-score of 63-day Sharpe ratio. Higher = better risk-adjusted return."""
     validate_prices(prices)
     wide = to_wide(prices)
-    daily_ret = wide.pct_change()
+    daily_ret = daily_return(wide)
     ann_ret = daily_ret.rolling(_WINDOW, min_periods=_MIN_PERIODS).mean() * 252
     ann_vol = daily_ret.rolling(_WINDOW, min_periods=_MIN_PERIODS).std() * np.sqrt(252)
     sharpe = ann_ret / ann_vol.where(ann_vol > 0)

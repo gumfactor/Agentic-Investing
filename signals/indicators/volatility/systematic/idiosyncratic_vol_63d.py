@@ -11,13 +11,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import structlog
-from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore
+from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore, daily_return
 from signals.indicators._market_utils import rolling_beta
 
 logger = structlog.get_logger(__name__)
 
 _WINDOW = 63
-_MIN_PERIODS = 44
+_MIN_PERIODS = 63  # full window (BUG-010): a gap anywhere in the trailing 63 returns suppresses the value
 _BENCHMARK = "SPY"
 
 
@@ -27,7 +27,7 @@ def compute_idiosyncratic_vol_63d_scores(prices: pd.DataFrame) -> pd.DataFrame:
     wide = to_wide(prices)
     if _BENCHMARK not in wide.columns:
         raise ValueError("idiosyncratic_vol_63d requires 'SPY' to be present in prices")
-    daily_ret = wide.pct_change()
+    daily_ret = daily_return(wide)
     beta = rolling_beta(daily_ret, _BENCHMARK, _WINDOW, _MIN_PERIODS)
     spy_ret = daily_ret[_BENCHMARK]
     market_contribution = beta.multiply(spy_ret, axis=0)
