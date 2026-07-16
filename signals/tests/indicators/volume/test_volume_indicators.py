@@ -179,3 +179,78 @@ def test_price_volume_trend_21d_uptrend_scores_higher():
         compute_price_volume_trend_21d_scores(prices, volumes), "price_volume_trend_21d_score"
     )
     assert scores["UP"] > scores["DOWN"]
+
+
+# ─── BUG-010 missing-data acceptance tests ───────────────────────────────────
+#
+# These cover indicators whose gap-tolerance is not automatic from raising
+# min_periods alone (mask-multiply / cumsum-based), per the 01B-1 inventory.
+
+def _prices_with_gap(n_days: int = 100, gap_index: int = 50) -> tuple[pd.DataFrame, "pd.Timestamp"]:
+    """GAPPY is missing one session; KEEPALIVE trades every session so the gap
+    date still exists as a row in the pivoted wide matrix (a NaN cell for
+    GAPPY, not a vanished date) — matching how a real multi-ticker universe
+    keeps a trading date live even when a single ticker halts for a day.
+    """
+    import numpy as np
+
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    rows = []
+    # Both tickers oscillate (both up and down days), with a slight positive
+    # drift for GAPPY, so up/down-volume ratios are always finite for both —
+    # keeping the cross-sectional z-score well-defined even on dates where
+    # GAPPY's own value is suppressed by the gap.
+    keepalive = 50.0 + 5.0 * np.sin(np.arange(n_days) * 0.7)
+    gappy = 100.0 + 0.05 * np.arange(n_days) + 6.0 * np.sin(np.arange(n_days) * 0.9)
+    for i, d in enumerate(dates):
+        rows.append({"date": d, "ticker": "KEEPALIVE", "close": float(keepalive[i])})
+        if i == gap_index:
+            continue
+        rows.append({"date": d, "ticker": "GAPPY", "close": float(gappy[i])})
+    return pd.DataFrame(rows), dates[gap_index]
+
+
+def _volumes_for(prices: pd.DataFrame) -> pd.DataFrame:
+    rows = [
+        {"date": d, "ticker": t, "volume": 1_000_000.0}
+        for d, t in prices[["date", "ticker"]].itertuples(index=False)
+    ]
+    return pd.DataFrame(rows)
+
+
+def test_volume_up_down_ratio_21d_gap_suppresses_value():
+    """A gap inside the trailing 21-day window suppresses the ratio entirely,
+    instead of silently computing from whichever days had a classifiable
+    return (BUG-010: a missing return must never be treated as a non-event
+    that a rolling sum quietly absorbs as zero)."""
+    prices, gap_date = _prices_with_gap()
+    volumes = _volumes_for(prices)
+    result = compute_volume_up_down_ratio_21d_scores(prices, volumes)
+    scored = result[result["ticker"] == "GAPPY"]
+    scored_dates = set(scored["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=100)
+    gap_pos = list(all_dates).index(gap_date)
+    # Every date whose trailing 21-day window touches the gap date must be
+    # absent from the (NaN-dropping) long-format output for GAPPY.
+    window_dates = all_dates[gap_pos : gap_pos + 21]
+    for d in window_dates:
+        assert d not in scored_dates, f"{d} should be suppressed by the gap at {gap_date}"
+    # And GAPPY recovers once a full 21-day gap-free window is available again.
+    assert all_dates[-1] in scored_dates
+
+
+def test_obv_momentum_21d_gap_suppresses_value():
+    """A gap inside the trailing lookback window suppresses OBV momentum,
+    even though OBV itself is a cumulative sum that would otherwise stay
+    numeric across the gap (cumsum treats NaN as a zero contribution)."""
+    prices, gap_date = _prices_with_gap()
+    volumes = _volumes_for(prices)
+    result = compute_obv_momentum_21d_scores(prices, volumes)
+    scored = result[result["ticker"] == "GAPPY"]
+    scored_dates = set(scored["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=100)
+    gap_pos = list(all_dates).index(gap_date)
+    window_dates = all_dates[gap_pos : gap_pos + 21]
+    for d in window_dates:
+        assert d not in scored_dates, f"{d} should be suppressed by the gap at {gap_date}"
+    assert all_dates[-1] in scored_dates
