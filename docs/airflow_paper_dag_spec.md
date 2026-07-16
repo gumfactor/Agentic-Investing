@@ -1,9 +1,38 @@
 # Airflow DAG Spec — `daily_paper_trading` (M5.4)
 
-**Status:** Draft — awaiting implementation  
-**Branch:** `claude/airflow-dag-spec-brqadk`  
-**Milestone:** M5.4 (Phase 5 — Automated Paper Trading)  
-**Depends on:** M5.1 (Strategy Registry), M5.2 (Trade Journal), M5.3 (Tearsheets)
+> **SUPERSEDED — artifact storage design.** This document's MinIO artifact
+> layout (Section 9 and every `*_minio_path`/"Writes to MinIO" reference
+> throughout) describes the pre-implementation design and does **not** match
+> what was built. As recorded in `Worklog.md` (M5.4 completion, "Decisions"):
+>
+> > [DECISION] Artifact storage uses local filesystem
+> > (`RQIS_PAPER_ARTIFACT_DIR`), not MinIO as the spec originally suggested.
+> > Rationale: single-machine Docker Compose deployment means all tasks share
+> > the same volume; MinIO adds complexity with no benefit at this stage.
+>
+> The authoritative artifact-storage design is: every task writes to
+> `{RQIS_PAPER_ARTIFACT_DIR}/{safe_dag_run_id}/<artifact>.json` on a shared
+> filesystem path (see `airflow/dags/daily_paper_trading.py` module
+> docstring and `_artifact_dir()`). Gate 01A
+> (`docs/plans/01a-compose-paper-runtime-checklist.md`, BUG-003) wires that
+> path to an identical Docker Compose bind mount across every Airflow
+> service, documented in `.env.example`
+> (`RQIS_PAPER_ARTIFACT_HOST_DIR`/`RQIS_PAPER_ARTIFACT_DIR`) and
+> `docker-compose.yml` (`x-airflow-common`). For the current
+> environment-variable contract, DAG task graph, and operational runbook,
+> treat `airflow/dags/daily_paper_trading.py`,
+> `docs/runbooks/daily_paper_trading.md`, and
+> `docs/plans/01a-compose-paper-runtime-checklist.md` as authoritative over
+> this file. The pipeline task ordering, C1 approval-gate mechanics, and
+> compliance/risk-gate descriptions below otherwise still reflect the
+> implementation.
+>
+> **Status:** Implemented (M5.4, 2026-06-25) with the artifact-storage
+> substitution above — no longer "awaiting implementation."  
+> **Branch:** `claude/airflow-dag-spec-brqadk` (spec) → implemented on
+> `main`; Gate 01A Compose runtime work on `dev/R2-01A-compose-runtime`.  
+> **Milestone:** M5.4 (Phase 5 — Automated Paper Trading)  
+> **Depends on:** M5.1 (Strategy Registry), M5.2 (Trade Journal), M5.3 (Tearsheets)
 
 ---
 

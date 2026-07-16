@@ -23,6 +23,39 @@ x-airflow-common: &airflow-common
     MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
     MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
     POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+    # ── Paper-trading runtime contract (BUG-001, BUG-004) ─────────────────────
+    # RQIS_RUNTIME_CONTEXT marks this as a bridged-network container so
+    # execution/brokers/ibkr.py._validate_bridged_broker_host() rejects a
+    # loopback IBKR_HOST instead of silently trying to reach the container
+    # itself. Never set this on a host-side script invocation.
+    RQIS_RUNTIME_CONTEXT: compose_bridged
+    # PAPER_TRADING and IBKR_PORT are HARD-CODED, not .env-substituted
+    # (adversarial fix round P2-4): this compose file is a paper-only stack,
+    # so a stale host .env carrying PAPER_TRADING=false / IBKR_PORT=7496 must
+    # never be able to render live-trading values into the Airflow services.
+    # A live deployment requires its own reviewed compose file (C8/C9).
+    PAPER_TRADING: "true"
+    # IBKR_HOST_AIRFLOW is intentionally distinct from the host-side IBKR_HOST
+    # in .env: host-side operator CLI scripts run natively on the machine
+    # hosting TWS/IB Gateway, where 127.0.0.1 is correct; this container is on
+    # the bridged `rqis` Docker network, where 127.0.0.1 means the container
+    # itself. Default targets Windows/Mac Docker Desktop; see .env.example and
+    # docs/runbooks/airflow_fire_drill.md for the Linux gateway-IP alternative.
+    IBKR_HOST: ${IBKR_HOST_AIRFLOW:-host.docker.internal}
+    IBKR_PORT: "7497"
+    IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
+    # Fixed container-internal path shared by every Airflow service (BUG-003).
+    # The identical host path is bind-mounted at this same location below; see
+    # RQIS_PAPER_ARTIFACT_HOST_DIR in .env.example for the host-visible path
+    # used by the host-side Streamlit dashboard/approval tooling.
+    RQIS_PAPER_ARTIFACT_DIR: /opt/airflow/rqis_paper
+  extra_hosts:
+    # Portable host-gateway mapping (Docker Engine >=20.10 / Compose 3.x+).
+    # Reinforces host.docker.internal on Windows/Mac Docker Desktop (where it
+    # already resolves) and is the documented way to make the same name
+    # resolve on Linux Docker Engine. Verify on your Compose version before
+    # relying on it in production; the fallback is an explicit gateway IP.
+    - "host.docker.internal:host-gateway"
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/plugins:/opt/airflow/plugins
@@ -36,6 +69,15 @@ x-airflow-common: &airflow-common
     - ./reporting:/opt/airflow/rqis/reporting:ro
     - ./backtesting:/opt/airflow/rqis/backtesting:ro
     - airflow_logs:/opt/airflow/logs
+    # BUG-003: shared paper-trading artifact storage. Mounted at the identical
+    # in-container path (/opt/airflow/rqis_paper, matching RQIS_PAPER_ARTIFACT_DIR
+    # above) on every Airflow service. There is no Compose dashboard service
+    # (the Streamlit dashboard runs host-side via `streamlit run
+    # reporting/dashboards/app.py`), so the consumer surface is this same host
+    # directory read directly from Windows/host Python -- see
+    # RQIS_PAPER_ARTIFACT_HOST_DIR in .env.example for the operator-facing
+    # host path and how to point the dashboard at it.
+    - ${RQIS_PAPER_ARTIFACT_HOST_DIR:-./local/paper_artifacts}:/opt/airflow/rqis_paper
   depends_on:
     timescaledb:
       condition: service_healthy
@@ -159,7 +201,16 @@ services:
     command:
       - bash
       - -c
-      - "airflow db migrate && airflow users create --username admin --firstname Admin --lastname User --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-admin@rqis.local} --password ${AIRFLOW_ADMIN_PASSWORD}"
+      # BUG-003: verify the shared artifact bind mount exists and is
+      # container-writable before Airflow even starts. mkdir -p is a no-op if
+      # the host directory (and its Compose bind mount) already exists; the
+      # touch/rm proves write access without leaving a stray file behind.
+      # $$ escapes Compose's own variable interpolation (which would otherwise
+      # try to substitute RQIS_PAPER_ARTIFACT_DIR from the host .env at
+      # `docker compose config` time and silently render an empty path,
+      # since that var is only ever set in the environment: block above) so
+      # bash expands it at container runtime instead.
+      - "mkdir -p \"$$RQIS_PAPER_ARTIFACT_DIR\" && touch \"$$RQIS_PAPER_ARTIFACT_DIR/.rqis_write_check\" && rm \"$$RQIS_PAPER_ARTIFACT_DIR/.rqis_write_check\" && airflow db migrate && airflow users create --username admin --firstname Admin --lastname User --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-admin@rqis.local} --password ${AIRFLOW_ADMIN_PASSWORD}"
     restart: "no"
 
   airflow-webserver:

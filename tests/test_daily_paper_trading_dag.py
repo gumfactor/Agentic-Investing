@@ -80,36 +80,57 @@ class TestDagStructure:
         assert dag.max_active_runs == 1
 
 
+_PAPER_ENV_BASE = {
+    "RQIS_RUNTIME_CONTEXT": "compose_bridged",
+    "PAPER_TRADING": "true",
+    "IBKR_PORT": "7497",
+}
+
+
 class TestRequirePaperEnv:
     def test_passes_with_valid_env(self):
         from airflow.dags.daily_paper_trading import _require_paper_env
 
-        _require_paper_env({"PAPER_TRADING": "true", "IBKR_PORT": "7497"})
+        _require_paper_env(dict(_PAPER_ENV_BASE))
 
     def test_fails_if_paper_trading_false(self):
         from airflow.dags.daily_paper_trading import _require_paper_env
         from airflow.exceptions import AirflowException
 
         with pytest.raises(AirflowException, match="PAPER_TRADING"):
-            _require_paper_env({"PAPER_TRADING": "false", "IBKR_PORT": "7497"})
+            _require_paper_env({**_PAPER_ENV_BASE, "PAPER_TRADING": "false"})
 
     def test_fails_if_port_not_7497(self):
         from airflow.dags.daily_paper_trading import _require_paper_env
         from airflow.exceptions import AirflowException
 
         with pytest.raises(AirflowException, match="IBKR_PORT"):
-            _require_paper_env({"PAPER_TRADING": "true", "IBKR_PORT": "7496"})
+            _require_paper_env({**_PAPER_ENV_BASE, "IBKR_PORT": "7496"})
 
     def test_fails_if_paper_run_cleared_set(self):
         from airflow.dags.daily_paper_trading import _require_paper_env
         from airflow.exceptions import AirflowException
 
         with pytest.raises(AirflowException, match="PAPER_RUN_CLEARED"):
-            _require_paper_env({
-                "PAPER_TRADING": "true",
-                "IBKR_PORT": "7497",
-                "PAPER_RUN_CLEARED": "true",
-            })
+            _require_paper_env({**_PAPER_ENV_BASE, "PAPER_RUN_CLEARED": "true"})
+
+    def test_fails_if_runtime_context_marker_missing(self):
+        """P1-1 (adversarial fix round): a runtime that did not come through
+        the reviewed Compose contract (no RQIS_RUNTIME_CONTEXT marker) must
+        fail closed at the first task, because the marker is what arms the
+        loopback-IBKR_HOST guard in execution/brokers/ibkr.py (BUG-004)."""
+        from airflow.dags.daily_paper_trading import _require_paper_env
+        from airflow.exceptions import AirflowException
+
+        with pytest.raises(AirflowException, match="RQIS_RUNTIME_CONTEXT"):
+            _require_paper_env({"PAPER_TRADING": "true", "IBKR_PORT": "7497"})
+
+    def test_fails_if_runtime_context_marker_is_wrong_value(self):
+        from airflow.dags.daily_paper_trading import _require_paper_env
+        from airflow.exceptions import AirflowException
+
+        with pytest.raises(AirflowException, match="RQIS_RUNTIME_CONTEXT"):
+            _require_paper_env({**_PAPER_ENV_BASE, "RQIS_RUNTIME_CONTEXT": "compose-bridged"})
 
 
 class TestSafeRunId:
@@ -131,6 +152,8 @@ class TestFetchIbkrSnapshot:
         """fetch_ibkr_snapshot writes a valid portfolio snapshot file."""
         monkeypatch.setenv("PAPER_TRADING", "true")
         monkeypatch.setenv("IBKR_PORT", "7497")
+        # P1-1: task-level env gate now requires the Compose runtime marker
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
         monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
 
@@ -182,6 +205,7 @@ class TestFetchIbkrSnapshot:
         assert tickers == {"AAPL", "MSFT"}
 
     def test_raises_if_not_paper_mode(self, monkeypatch):
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         monkeypatch.setenv("PAPER_TRADING", "false")
         monkeypatch.setenv("IBKR_PORT", "7496")
 
@@ -194,6 +218,8 @@ class TestFetchIbkrSnapshot:
     def test_raises_if_nav_not_positive(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PAPER_TRADING", "true")
         monkeypatch.setenv("IBKR_PORT", "7497")
+        # P1-1: task-level env gate now requires the Compose runtime marker
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
         monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
 

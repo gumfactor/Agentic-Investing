@@ -5,6 +5,9 @@ pytest==8.0.1
 pytest-cov==4.1.0
 pytest-mock==3.12.0
 freezegun==1.4.0          # freeze datetime.now() in tests
+pendulum==3.0.0            # required to import airflow/dags/daily_paper_trading.py
+                            # locally; pinned to the Airflow 2.8.1/py3.11
+                            # constraints pin (infra/docker/Dockerfile.airflow)
 
 # ─── Linting / formatting ────────────────────────────────────────────────────
 ruff==0.2.2

@@ -11,6 +11,127 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-07-16
+
+### Session — Gate 01A: Make Compose paper runtime executable (BUG-001..BUG-004)
+
+**Operator:** mshane@thecanadalist.ca
+**Branch:** `dev/R2-01A-compose-runtime` (based on `dev/R2-phase1`)
+**Commits:** four phase commits, one per BUG area (see branch log); not yet merged/PR'd — PM reviews first per instructions.
+
+#### What was done
+
+Implemented `docs/plans/01a-compose-paper-runtime-checklist.md` end to end
+except the live-broker operator steps (explicitly out of agent scope per the
+plan's guardrails: no IBKR/TWS connection, no DAG trigger, no order
+submission was performed at any point in this session).
+
+- **Phase 1 (BUG-001, BUG-004 wiring):** `docker-compose.yml`
+  `x-airflow-common.environment` now passes `PAPER_TRADING`, `IBKR_HOST`,
+  `IBKR_PORT`, `IBKR_CLIENT_ID`, `RQIS_PAPER_ARTIFACT_DIR`, and a new
+  `RQIS_RUNTIME_CONTEXT=compose_bridged` marker into every Airflow service.
+  Added `IBKR_HOST_AIRFLOW` as a distinct `.env` variable from the host-side
+  `IBKR_HOST` (127.0.0.1 is correct for host CLI scripts, wrong for a
+  bridged container). Added `execution/brokers/ibkr.py._validate_bridged_broker_host()`,
+  a production fail-closed guard called from `IBKRBroker.__init__` and
+  `connect()`.
+- **Phase 2 (BUG-002):** rewrote `infra/docker/Dockerfile.airflow` with a
+  documented Python-version decision (Airflow 2.8.1 has no Python 3.12
+  image/constraints — verified against Docker Hub tags and
+  `constraints-2.8.1/constraints-3.12.txt` returning 404 — stayed on 3.11)
+  and a documented dependency decision (a hard `--constraint` install fails
+  with a genuine `ResolutionImpossible` between yfinance's `curl_cffi`
+  requiring `cffi>=2.0` and Airflow's constraints pinning `cffi==1.16.0` for
+  the unused snowflake provider; used an unconstrained install instead,
+  guarded by a build-time verification step that fails the build on any
+  Airflow-critical package drift or unexpected `pip check` conflict). Added
+  `infra/docker/smoke_test_dag_imports.py` and
+  `tests/infra/test_airflow_image_smoke.py`.
+- **Phase 3 (BUG-003):** bind-mounted
+  `${RQIS_PAPER_ARTIFACT_HOST_DIR:-./local/paper_artifacts}` at the
+  identical in-container path `/opt/airflow/rqis_paper` across all three
+  Airflow services (confirmed no Compose dashboard service exists — the
+  Streamlit dashboard runs host-side); added a write-permission check to
+  `airflow-init`'s startup command; added
+  `tests/infra/test_paper_artifact_shared_storage.py`.
+- **Phase 4 (BUG-004 failure paths + docs closeout):** added
+  `execution/tests/test_ibkr_broker_endpoint_fail_closed.py` covering
+  live-port-7496 rejection and an unresolvable-host `connect()` failure
+  propagating out of `_fetch_ibkr_snapshot` (the DAG's first
+  broker-touching task) rather than being swallowed. Fixed
+  `docs/runbooks/airflow_fire_drill.md` (`airflow-worker` does not exist
+  under `LocalExecutor`; noted the drill is separate from Gate 01A).
+  Marked `docs/airflow_paper_dag_spec.md`'s MinIO artifact design
+  superseded, pointing to the implemented `RQIS_PAPER_ARTIFACT_DIR` design.
+  Added `docs/runbooks/01a_compose_paper_runtime_verification.md`, the
+  operator-run checklist for the remaining live TWS/IB Gateway steps.
+  Updated the BUG-001..BUG-004 rows and detail sections in `bugs.md` to
+  `Implemented — pending operator verification`, with resolution notes
+  citing this branch and the automated evidence collected.
+
+Evidence collected locally (Docker Desktop 29.6.1 / Compose v5.2.0, this
+session): `docker compose config` renders the five paper vars identically on
+`airflow-init`/`airflow-webserver`/`airflow-scheduler`; `docker build -f
+infra/docker/Dockerfile.airflow .` succeeds with the build-time gate
+passing; the container smoke test imports all 20 target modules and
+confirms `airflow.__file__` resolves to the installed package; a
+container-write/host-read sentinel round trip matched SHA-256 on both
+surfaces. No evidence artifacts were retained outside this Worklog entry and
+the test suite itself (no `.env` contents, credentials, or account data were
+generated or logged at any point).
+
+Also pinned `pendulum==3.0.0` in `requirements-dev.txt` — the pre-existing
+dev venv could not even import `airflow/dags/daily_paper_trading.py` for
+`tests/test_daily_paper_trading_dag.py` without it (unrelated to Gate 01A,
+but blocking its own test suite).
+
+Full test suite: 500 tests passing locally (`tests/`, `execution/tests/`,
+including the Docker-dependent smoke/artifact/build tests, which ran for
+real in this session rather than being skipped).
+
+#### [DECISION] Airflow image stays on Python 3.11, not the project's 3.12 minimum
+
+See `infra/docker/Dockerfile.airflow` header comment for the full verification
+trail. This is a known, documented gap against `pyproject.toml`
+`requires-python>=3.12`, not an oversight — revisit only after confirming a
+target Airflow release's own constraints file supports 3.12.
+
+#### [DECISION] Paper artifact storage uses a host bind mount, not a named Docker volume
+
+Confirmed the Streamlit dashboard has no Compose service (host-side `streamlit
+run` only), so `RQIS_PAPER_ARTIFACT_HOST_DIR` is a host filesystem path
+consumed directly by both the Airflow bind mount and the operator's own
+`streamlit run` invocation, rather than a container-only named volume the
+host process could not read.
+
+#### [SAFETY]
+
+No broker connection, DAG trigger, or order action of any kind was performed
+in this session — every IBKR-facing behavior added or exercised used a fake
+`IB`/`IBKRBroker` object or asserted a failure path. `PAPER_TRADING=true`
+and `IBKR_PORT=7497` were used in every fixture and manual `docker run`
+invocation in this session.
+
+#### [BLOCKER]
+
+None for the code/test scope. The live TWS/IB Gateway reachability
+preflight, DAG-visibility check against a running stack, and
+restart-persistence check in
+`docs/runbooks/01a_compose_paper_runtime_verification.md` are outstanding
+operator steps before Gate 01A can be marked fully `Fixed` in `bugs.md`.
+
+#### Next steps
+
+1. Operator runs `docs/runbooks/01a_compose_paper_runtime_verification.md`
+   against a live TWS/IB Gateway paper session and updates `bugs.md`
+   BUG-001..BUG-004 to `Fixed` once every checkbox passes.
+2. PM/operator reviews the four-phase branch before opening a PR (per this
+   session's instructions, no PR was opened).
+3. Gate 02A (a no-submit DAG run proving migrations + DAG imports + shared
+   artifacts + IBKR reachability together) remains separate future work.
+
+---
+
 ## 2026-07-12
 
 ### Session 58 - Current-State Roadmap Rebuilt
