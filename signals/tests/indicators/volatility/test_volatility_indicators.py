@@ -302,17 +302,30 @@ def test_vol_trend_slope_63d_gap_tolerance():
     """Documented exception (see docs/plans/01b1-pct-change-inventory.md):
     the outer 63-point OLS trend fit tolerates gaps in the underlying vol_21
     series down to its own internal mask.sum() >= 20 threshold, rather than
-    requiring the full 63-point window. A single missing return (which only
-    knocks out a handful of vol_21 values around the gap, well above 20
-    remaining valid points in any 63-window that reaches this far past
-    warm-up) must NOT suppress the slope the way the default full-window
-    policy would for other indicators."""
+    requiring the full 63-point window (PR #32 Codex P2).
+
+    A single missing bar NaNs two returns, so the full-window inner vol_21
+    is NaN for ~22 consecutive sessions; a 63-point outer window spanning
+    that run still holds ~41 valid vol_21 points — well above the 20-point
+    tolerance — so the slope must be DEFINED once the current session's own
+    vol_21 is valid again, even while the outer window still contains the
+    gap. It must also stay defined after the gap fully ages out."""
     n_days, gap_index = 220, 100
     prices, gap_date = _prices_with_gap(n_days=n_days, gap_index=gap_index)
     result = compute_vol_trend_slope_63d_scores(prices)
     scored_dates = set(result[result["ticker"] == "GAPPY"]["date"])
     all_dates = pd.bdate_range("2020-01-01", periods=n_days)
-    # Well after the gap has aged out of both the 21d and 63d windows, the
-    # slope must be defined again (proving the gap doesn't propagate forever
-    # the way require_full_window's default suppression would).
+    # vol_21 (min_periods=21) is NaN for positions gap_index..gap_index+21
+    # (every window touching either NaN return); it is valid again at
+    # gap_index+22. The final norm-by-current-vol step suppresses emission
+    # while vol_21 itself is NaN, so the first defined slope after the gap
+    # is at gap_index+22 — at which point the 63-point outer window STILL
+    # spans the NaN run. That date being scored is exactly the documented
+    # robust-tolerance behavior the full-window default would forbid.
+    first_recovery = all_dates[gap_index + 22]
+    assert first_recovery in scored_dates, (
+        "slope must be defined while the outer window still spans the gap "
+        "(internal 20-point tolerance)"
+    )
+    # And well after the gap has aged out of both windows.
     assert all_dates[-1] in scored_dates

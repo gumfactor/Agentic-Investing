@@ -96,10 +96,18 @@ One documented, intentional exception to the full-window default:
   noisy derived (volatility) series, not an oversight — a trend slope
   legitimately tolerates non-contiguous points in a way a raw return
   average/variance should not. The *inner* `vol_21` computation still uses
-  the full-window default (`rolling(21, min_periods=21)`). Kept as documented
+  the full-window default (`rolling(21, min_periods=21)`). Because that
+  full-window inner setting NaNs ~22 consecutive `vol_21` values around a
+  single missing bar (two NaN returns × 21-window), the outer rolling
+  `min_periods` (`_OUTER_MIN`) is set to the same 20-point threshold
+  `_vol_slope` itself enforces — the pre-01B-1 value of 44 would have
+  starved the documented tolerance and suppressed the slope around
+  ordinary one-day gaps (PR #32 Codex P2 finding). Kept as documented
   per §3.2 step 4 ("Record any intentional lower threshold in the inventory
   and unit test it"); see `test_vol_trend_slope_63d_gap_tolerance` in
-  `signals/tests/indicators/volatility/test_volatility_indicators.py`.
+  `signals/tests/indicators/volatility/test_volatility_indicators.py`,
+  which asserts the slope is defined while the outer window still spans
+  the gap.
 - **Volume-only normalization windows** (`_NORM_WINDOW = 63` in the
   `volume/price_volume/*` and `volume/volume_trend/*` modules, used for
   `mean_vol = vol_wide.rolling(63, min_periods=44).mean()`) are left at their
@@ -145,7 +153,7 @@ call uses `_price_utils.daily_return` (signals/indicators only) or a direct
 | `signals/indicators/volatility/systematic/beta_stability_63d.py` | 21 (inner beta); 63 (outer std of beta) | 15/44 → 21/63 | `beta_stability_63d_score` | `daily_return` |
 | `signals/indicators/volatility/systematic/beta_63d.py` | 63 | 44 → 63 | `beta_63d_score` | `daily_return` |
 | `signals/indicators/volatility/systematic/beta_252d.py` | 252 | 126 → 252 | `beta_252d_score` | `daily_return` |
-| `signals/indicators/volatility/regime/vol_trend_slope_63d.py` | 21 (inner vol); 63 (outer slope, **documented exception**) | inner 15→21; outer 44 unchanged (internal `mask.sum()>=20` gate) | `vol_trend_slope_63d_score` | `daily_return` |
+| `signals/indicators/volatility/regime/vol_trend_slope_63d.py` | 21 (inner vol); 63 (outer slope, **documented exception**) | inner 15→21; outer 44→20 to match `_vol_slope`'s internal `mask.sum()>=20` gate (PR #32 Codex P2) | `vol_trend_slope_63d_score` | `daily_return` |
 | `signals/indicators/volatility/regime/vol_ratio_21d_63d.py` | 21, 63 | 15/44 → 21/63 | `vol_ratio_21d_63d_score` | `daily_return` |
 | `signals/indicators/volatility/regime/vol_ratio_21d_252d.py` | 21, 252 | 15/126 → 21/252 | `vol_ratio_21d_252d_score` | `daily_return` |
 | `signals/indicators/volatility/regime/vol_percentile_252d.py` | 21 (inner vol); 252 (outer percentile rank) | 15/126 → 21/252 | `vol_percentile_252d_score` | `daily_return` |

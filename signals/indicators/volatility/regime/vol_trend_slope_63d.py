@@ -22,10 +22,14 @@ _OUTER = 63
 # limited number of missing/NaN points via its own internal
 # mask.sum() >= 20 threshold inside _vol_slope, rather than requiring the
 # full 63-point window to be present. min_periods governs only whether
-# _vol_slope is *invoked* at all (needs >= _OUTER_MIN non-NaN points in the
-# window before pandas calls the function); the function's own mask handles
-# the rest. See test_vol_trend_slope_63d_gap_tolerance for coverage.
-_OUTER_MIN = 44
+# _vol_slope is *invoked* at all, so it is set to the same 20-point
+# threshold the function itself enforces — a single missing bar NaNs two
+# returns and therefore ~22 consecutive vol_21 values, leaving ~41 valid
+# points in an affected 63-point outer window; a higher min_periods (the
+# pre-01B-1 44) would starve the documented tolerance and suppress the
+# slope around ordinary one-day gaps (PR #32 Codex P2).
+# See test_vol_trend_slope_63d_gap_tolerance for coverage.
+_OUTER_MIN = 20
 
 
 def _vol_slope(x: np.ndarray) -> float:
