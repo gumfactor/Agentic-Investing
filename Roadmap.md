@@ -27,9 +27,9 @@ This is the task-selection plan, not a second bug tracker. `bugs.md` remains the
 | No | Fail closed on unsupported strategy configuration | P0 | 02B — Semantic proof | Strategy Correctness | L | Blocked | Repair research-validity baseline | [v2 strategy config](config/strategy/v2_mvo_momentum.yaml) | Implement declared MVO/risk-parity/constraint semantics in the backtester or reject unsupported fields; add a consumed-field conformance test for every strategy config key. | 2026-07-12 | |
 | No | Make research data immutable and PIT-complete | P0 | 03 — Reproducible research | Data / Research | XL | Blocked | Repair research-validity baseline | [BUG-037 to BUG-039](bugs.md) | Add effective-dated universe and eligibility data, immutable content-addressed snapshots, corporate-action preservation, and fail-closed object-store handling. | 2026-07-12 | |
 | No | Establish a real strategy-selection protocol | P1 | 04 — Research qualification | Strategy Validation | XL | Blocked | Make research data immutable and PIT-complete; Fail closed on unsupported strategy configuration | [Backtesting validation](backtesting/validation) | Record hypotheses and trials, select only inside training windows, freeze configuration, test out of sample, retain a final holdout, and capture all variants for multiple-testing analysis. | 2026-07-12 | |
-| No | Persist one authoritative safety state | P0 | 05A — Shared control plane | Risk / Execution | XL | Blocked | Prove the Compose no-submit workflow | [BUG-012](bugs.md) | Persist circuit-breaker events, alerts, acknowledgements, qualification state, and operational exceptions; dashboard and Airflow must read the same state and fail closed when unavailable. | 2026-07-12 | |
-| No | Secure and bind approval to the exact DAG run | P0 | 05B — Shared control plane | Security / Operator UI | XL | Blocked | Persist one authoritative safety state | [BUG-011 to BUG-016](bugs.md) | Authenticate approvers, enforce approval/reset roles, publish explicit approval requests per DAG run, bind the canonical artifact/hash/expiry, and reuse submission-side schema validation. | 2026-07-12 | |
-| No | Handle indeterminate orders and duplicate fills | P0 | 06A — Recovery correctness | Execution | XL | Blocked | Secure and bind approval to the exact DAG run | [BUG-042 and BUG-048](bugs.md) | Persist broker correlation identity, classify post-placement timeout as indeterminate, require broker reconciliation before retry, and deduplicate fills by true execution identity or cumulative-fill semantics. | 2026-07-12 | |
+| No | Persist one authoritative safety state | P0 | 05A — Shared control plane | Risk / Execution | XL | Blocked | Prove the Compose no-submit workflow | [BUG-007, BUG-012](bugs.md) | Persist circuit-breaker events, alerts, acknowledgements, qualification state, and operational exceptions; dashboard and Airflow must read the same state and fail closed when unavailable. | 2026-07-12 | |
+| No | Secure and bind approval to the exact DAG run | P0 | 05B — Shared control plane | Security / Operator UI | XL | Blocked | Persist one authoritative safety state | [BUG-005, BUG-011 to BUG-016](bugs.md) | Authenticate approvers, enforce approval/reset roles, publish explicit approval requests per DAG run, bind the canonical artifact/hash/expiry, and reuse submission-side schema validation. | 2026-07-12 | |
+| No | Handle indeterminate orders and duplicate fills | P0 | 06A — Recovery correctness | Execution | XL | Blocked | Secure and bind approval to the exact DAG run | [BUG-006, BUG-042 and BUG-048](bugs.md) | Persist broker correlation identity, classify post-placement timeout as indeterminate, require broker reconciliation before retry, and deduplicate fills by true execution identity or cumulative-fill semantics. | 2026-07-12 | |
 | No | Complete risk and compliance enforcement | P0 | 06B — Recovery correctness | Risk / Compliance | L | Blocked | Persist one authoritative safety state | [BUG-041 and BUG-050](bugs.md) | Enforce sector concentration breaches, fail closed for insufficient/NaN risk data, and ensure real wash-sale, position, and sector context reaches the DAG pre-submit gate. | 2026-07-12 | |
 | No | Build the operator exception and lineage workflow | P1 | 07A — Operator readiness | Operator UI | XL | Blocked | Handle indeterminate orders and duplicate fills; Complete risk and compliance enforcement | [Dashboard specification](docs/streamlit_dashboard_spec.md) | Show run state from approval through reconciliation, an owned exception queue, full approval overrides, broker outcomes, lineage, freshness, and explicit `empty` versus `error` states. | 2026-07-12 | |
 | No | Correct dashboard freshness and status semantics | P1 | 07B — Operator readiness | Operator UI | L | Blocked | Persist one authoritative safety state | [Dashboard query layer](reporting/dashboards/queries.py) | Make every safety-relevant panel strategy/run-specific; show source, observation time, producer time, SLA, age, and clear unavailable/misconfigured/error states. | 2026-07-12 | |
@@ -46,3 +46,33 @@ This is the task-selection plan, not a second bug tracker. `bugs.md` remains the
 Do not begin the four-week automated paper clock and do not treat current
 backtest results as strategy-selection evidence. The immediate work is Gate 01:
 make the deployed paper system runnable and repair research validity in parallel.
+
+## Delivery execution log (R2 round)
+
+Managed by the project-manager session. Integration branch: `dev/R2-phase1`.
+Task branches are named `dev/R2-<order>-<slug>`. Each phased slice is one
+commit; each roadmap job (or sub-job below) is one PR into `dev/R2-phase1`.
+Token figures are reported as `<agent/effort>: <tokens>`.
+
+**PM decisions (2026-07-16):**
+
+- **01B is delivered as three PRs**, in this order, because a single XL
+  research-validity PR would be unreviewable: **01B-1** missing-data return
+  policy (BUG-010, plan §3), **01B-2** point-in-time universe contract
+  (BUG-008, plan §1), **01B-3** signal-timing/corporate-action contract plus
+  versioned research identity (BUG-009, plan §§2, 4). The design plan at
+  [docs/plans/01b-research-validity-design.md](docs/plans/01b-research-validity-design.md)
+  remains the single spec.
+- BUG-005, BUG-006, and BUG-007 are now explicitly cited by rows 05B, 06A, and
+  05A respectively so no critical trading-safety finding is outside the plan.
+- 01A runtime evidence that requires a live TWS/IB Gateway session (broker
+  preflight, readiness check from container context) is delivered as an
+  operator-runnable checklist plus fail-closed tests; the operator executes the
+  live steps before 01A is marked delivered.
+
+| Order | Branch | PR | Status | Builder Tokens | PM Tokens |
+|---|---|---|---|---|---|
+| 01A | `dev/R2-01A-compose-runtime` | — | In progress | — | — |
+| 01B-1 | `dev/R2-01B1-missing-data` | — | In progress | — | — |
+| 01B-2 | `dev/R2-01B2-pit-universe` | — | Queued | — | — |
+| 01B-3 | `dev/R2-01B3-timing-contract` | — | Queued | — | — |
