@@ -11,13 +11,13 @@ Requires ohlcv DataFrame with columns [date, ticker, open, high, low, close, vol
 from __future__ import annotations
 import pandas as pd
 import structlog
-from signals.indicators._price_utils import to_long, cross_sectional_zscore
+from signals.indicators._price_utils import to_long, cross_sectional_zscore, require_full_window
 from signals.indicators._ohlc_utils import validate_ohlcv, ohlc_wide
 
 logger = structlog.get_logger(__name__)
 
 _LOOKBACK = 21
-_NORM_WINDOW = 63
+_NORM_WINDOW = 63  # volume-only normalization window; not a flow statistic (see 01B-1 inventory)
 
 
 def compute_ad_line_momentum_21d_scores(ohlcv: pd.DataFrame) -> pd.DataFrame:
@@ -29,9 +29,17 @@ def compute_ad_line_momentum_21d_scores(ohlcv: pd.DataFrame) -> pd.DataFrame:
     vol = ohlc_wide(ohlcv, "volume")
     hl = high - low
     clv = (2 * close - high - low) / hl.where(hl > 0)
-    ad_line = (clv * vol).cumsum()
+    flow = clv * vol
+    # ad_line is a cumulative sum: cumsum() treats NaN as a 0 contribution
+    # (skipna=True), so a missing session's flow does not itself turn the
+    # A/D line into NaN and the LOOKBACK-day delta would silently recover
+    # as if the gap never happened. Gate the delta on the trailing
+    # `_LOOKBACK` flow inputs being gap-free (BUG-010) — same treatment as
+    # OBV/PVT. See docs/plans/01b1-pct-change-inventory.md.
+    ad_line = flow.cumsum()
     mean_vol = vol.rolling(_NORM_WINDOW, min_periods=44).mean()
     ad_mom = (ad_line - ad_line.shift(_LOOKBACK)) / mean_vol.where(mean_vol > 0)
+    ad_mom = require_full_window(ad_mom, flow, _LOOKBACK)
     z = cross_sectional_zscore(ad_mom)
     result = to_long(z, "ad_line_momentum_21d_score")
     logger.info("ad_line_momentum_21d_scores_computed", dates=result["date"].nunique(), tickers=result["ticker"].nunique())

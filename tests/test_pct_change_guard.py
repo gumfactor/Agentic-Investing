@@ -9,13 +9,13 @@ BUG-010 in bugs.md and fixed by roadmap item 01B-1 (see
 docs/plans/01b1-pct-change-inventory.md for the full call-site inventory and
 migration record).
 
-Scope: every production price-return path identified in the 01B-1 inventory —
-``signals/``, ``signals/research/``, ``backtesting/``, ``portfolio/``,
-``reporting/`` — excluding test directories, this guard file itself, and any
-call site explicitly listed in ``_DOCUMENTED_EXCEPTIONS`` below with a
-recorded, reviewed rationale (none exist as of 01B-1; the inventory doc
-records why every current call site is a real price/NAV return, not an
-exception).
+Scope: every production Python directory that could plausibly hold a
+price/NAV return calculation — ``signals/``, ``backtesting/``,
+``portfolio/``, ``reporting/``, ``execution/``, ``risk/``, ``airflow/``,
+``scripts/``, ``data/`` — excluding test directories and any call site
+explicitly listed in ``_DOCUMENTED_EXCEPTIONS`` below with a recorded,
+reviewed rationale (none exist as of 01B-1; the inventory doc records why
+every current call site is a real price/NAV return, not an exception).
 """
 from __future__ import annotations
 
@@ -26,12 +26,22 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Directories scanned for production price-return code. Deliberately narrow —
-# this mirrors the 01B-1 inventory's scope (signals, backtesting, portfolio,
-# reporting) rather than the whole repository, so unrelated modules (e.g.
-# execution/, risk/, airflow/) that happen to use pandas are not swept in
-# unless/until they grow a price-return call site and are added here.
-_SCAN_DIRS = ["signals", "backtesting", "portfolio", "reporting"]
+# Directories scanned for production price-return code. Covers every
+# production directory that could plausibly grow a price/NAV return
+# calculation — including ones with zero current call sites (execution,
+# risk, airflow, scripts, data) so a new unguarded call added there is
+# caught immediately rather than requiring a scope update first.
+_SCAN_DIRS = [
+    "signals",
+    "backtesting",
+    "portfolio",
+    "reporting",
+    "execution",
+    "risk",
+    "airflow",
+    "scripts",
+    "data",
+]
 
 # Any directory component matching one of these is skipped entirely (tests,
 # caches, etc. are not "production" code paths for this guard).
@@ -52,12 +62,6 @@ _DOCUMENTED_EXCEPTIONS: dict[tuple[str, int], str] = {}
 # one line over weakening this guard.
 _PCT_CHANGE_RE = re.compile(r"\.pct_change\(")
 _COMPLIANT_RE = re.compile(r"\.pct_change\([^)]*fill_method\s*=\s*None")
-
-# The helper module itself is the one place allowed to reference
-# `pct_change(` inside its own docstring/implementation without the literal
-# substring match tripping the guard on doc text; its actual call already
-# uses fill_method=None and is covered like any other file.
-_HELPER_MODULE = "signals/indicators/_price_utils.py"
 
 
 def _iter_python_files() -> list[Path]:

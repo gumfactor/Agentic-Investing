@@ -236,3 +236,109 @@ genuinely justified new exception must be added to the test's
 `_DOCUMENTED_EXCEPTIONS` dict with a file/line/reason, not silenced by
 loosening the regex. As of the end of Phase 4 (full migration), this test
 passes with zero violations across the 33 call sites inventoried above.
+
+## Non-`pct_change` fabrication sweep (adversarial-review fix round, 2026-07-16)
+
+The adversarial review of the first four phases confirmed that the BUG-010
+fabrication class is not regex-visible through `pct_change(` alone: EWM
+smoothing, cumulative sums, and conditional zero-fills can all silently
+absorb a missing session. A deliberate sweep of `signals/indicators/**` was
+run for `.diff(`, `.ewm(`, `.cumsum(`, `.cumprod(`, `.fillna(0`,
+`np.nan_to_num`, and `.where(..., 0` on price/return-derived series. Every
+hit is either fixed or documented below. (`.cumprod(` and `np.nan_to_num`
+and `.fillna(0`: zero hits.)
+
+### Fixed — flow/return-derived EWM staleness (frozen duplicate emission)
+
+pandas EWM with the default `ignore_na=False` *decays through* a NaN input:
+on a session whose diff/flow input is missing, `y_t = y_{t-1}` — the
+indicator emits an exact duplicate of the prior value, violating the
+"never a silently retained prior value" invariant. Because `wide.diff()`
+NaNs both the gap day and the following day (its diff spans the gap), the
+frozen value appears on at least two sessions. Gate: suppress the output
+wherever the trailing *nominal window* of inputs (the Wilder period / EMA
+span, matching each estimator's `min_periods` warm-up) contains a gap,
+via `require_full_window`. After the gate window passes, the EWM resumes
+with pre-gap state decayed per the standard time-decay convention — the
+gate bounds staleness, it does not reset the estimator (documented choice;
+a reset would change the estimator on all post-gap history).
+
+| Module | Input gated on | Gate window |
+|---|---|---|
+| `oscillators/momentum/rsi_14.py` | `delta = wide.diff()` | 14 |
+| `oscillators/momentum/rsi_14_raw.py` | `delta` | 14 |
+| `oscillators/momentum/rsi_28.py` | `delta` | 28 |
+| `oscillators/momentum/stoch_rsi_14.py` | `delta` (base RSI); `_MIN_PERIODS` on the stoch min/max window also raised 10 → 14 | 14 |
+| `volume/accumulation/ease_of_movement_14d.py` | `eom_norm` (midpoint-change flow) | 14 |
+| `volume/price_volume/force_index_13d.py` | `daily_ret` | 13 |
+
+`force_index_13d` was previously recorded in this inventory as a documented
+EWM exception; that entry is superseded — the frozen-duplicate reproduction
+applies to it identically, so it is now gated like the RSI family.
+
+### Fixed — ungated cumulative sums (identical to the OBV/PVT defect)
+
+`cumsum()` treats NaN as a zero contribution (skipna=True), so the A/D line
+stays numeric across a gap and any windowed delta of it recovers
+bit-identical to the gap-free series one day after the gap.
+
+| Module | Gate |
+|---|---|
+| `volume/accumulation/ad_line_momentum_21d.py` | `require_full_window(ad_mom, clv*vol flow, 21)` |
+| `volume/accumulation/chaikin_oscillator.py` | `require_full_window(osc_norm, clv*vol flow, 10)` — window = the slower EMA span; the EWMs layered on the cumsum inherit the same gate |
+
+### Fixed — conditional zero-fill (fabricated zero flow)
+
+| Module | Defect | Fix |
+|---|---|---|
+| `volume/accumulation/money_flow_index_14d.py` | NaN `tp_change` compares False to both `> 0` and `< 0`, so `.where(..., 0.0)` fabricates a zero flow on the gap day and the day after; the rolling sums never see a NaN, so `min_periods` cannot catch it | `require_full_window(mfi, tp_change, 14)`; `_MIN_PERIODS` also raised 10 → 14 |
+| `volume/accumulation/chaikin_money_flow_21d.py` | Partial-window CMF from 20-of-21 flow values (its rolling sums DO see the NaN cells, so this is a plain threshold issue) | `_MIN_PERIODS` raised 15 → 21 |
+
+### Fixed — price-level EMA emitting on a bar-less session
+
+| Module | Defect | Fix |
+|---|---|---|
+| `oscillators/macd/ppo_12_26.py` | PPO's formula never references the current price, so on a session with no bar the price EMAs carry forward unchanged and PPO emits an exact duplicate of the prior value | `ppo.where(wide.notna())` — suppress emission on bar-less sessions only |
+
+### Documented — price-level smoothing/rolling family (no fix required)
+
+These indicators smooth or window the *price level* (not a diff/flow), and
+their final formula references the current session's price, so a bar-less
+session yields NaN naturally and no return/flow is fabricated:
+
+- `oscillators/macd/macd_histogram_12_26_9.py`, `macd_signal_line_12_26_9.py`,
+  `moving_averages/crossovers/ema_cross_12_26.py`,
+  `moving_averages/price_vs_ma/price_vs_ema_{12,26,50,200}.py`: EMAs of
+  price divided by (or compared against) the current price `wide`, which is
+  NaN on a gap day → emission suppressed. Post-gap values are EMAs of
+  observed prices under the standard time-decay convention (same convention
+  retained post-gate for the fixed EWM family above).
+- `oscillators/momentum/stoch_k_14.py`, `stoch_d_14.py`, `williams_r_14.py`,
+  `cci_20.py`, `oscillators/bollinger/*`, `oscillators/mean_reversion/
+  rolling_zscore_{63d,252d,252d_raw}.py`, `price_vs_vwap_21d.py`: rolling
+  min/max/mean/std over price levels; final formulas reference the current
+  price (`close - roll_min`, `(wide - mean)/std`, `price/vwap`) → gap-day
+  emission suppressed naturally. Partial-window price-level statistics
+  (e.g. a 20-day SMA computed from 19 prices) are defined estimators and
+  are not return fabrication; tightening their `min_periods` is a
+  policy question deferred to the 01B follow-up (see BUG-066 in bugs.md
+  for the related cross-sectional eligibility gate).
+- `oscillators/momentum/roc_10.py`, `roc_21.py`: `wide / wide.shift(n) - 1`
+  — a shifted-price ratio; either endpoint missing → NaN. Correct by
+  construction (same class as `_price_utils.price_return`).
+- `_price_utils.compute_ema` itself: shared helper for the price-level EMA
+  family above; callers own the gap policy per this section.
+
+### Guard-test scope broadened
+
+`tests/test_pct_change_guard.py` now scans `execution/`, `risk/`,
+`airflow/`, `scripts/`, and `data/` in addition to the original four
+directories (all currently zero call sites), so a new unguarded
+`pct_change()` anywhere in production code fails the guard immediately.
+The unused `_HELPER_MODULE` constant was removed. Note the guard remains
+`pct_change`-specific by design; the non-regex-visible classes in this
+section are protected by the per-indicator gap regression tests added in
+`signals/tests/indicators/oscillators/test_oscillator_indicators.py` and
+`signals/tests/indicators/volume/test_volume_indicators.py`, plus
+`backtesting/tests/test_benchmark_returns_gap.py` for the DataHandler
+benchmark series.

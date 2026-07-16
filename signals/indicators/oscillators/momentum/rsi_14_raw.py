@@ -15,7 +15,7 @@ from __future__ import annotations
 import pandas as pd
 import structlog
 
-from signals.indicators._price_utils import validate_prices, to_wide, to_long
+from signals.indicators._price_utils import validate_prices, to_wide, to_long, require_full_window
 
 logger = structlog.get_logger(__name__)
 
@@ -33,7 +33,11 @@ def _rsi(wide: pd.DataFrame, period: int) -> pd.DataFrame:
     # Pure uptrend (avg_loss=0, past warmup): avg_gain / NaN → NaN → fill with 100
     pure_uptrend = avg_gain.notna() & (avg_loss == 0)
     rsi = rsi.where(~pure_uptrend, other=100.0)
-    return rsi
+    # BUG-010 EWM gate: EWM (ignore_na=False) decays through a missing
+    # session's delta and would emit a frozen duplicate RSI on/after a gap.
+    # Suppress wherever the trailing `period` deltas contain a gap.
+    # See docs/plans/01b1-pct-change-inventory.md.
+    return require_full_window(rsi, delta, period)
 
 
 def compute_rsi_14_raw_scores(prices: pd.DataFrame) -> pd.DataFrame:

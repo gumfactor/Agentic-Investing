@@ -21,6 +21,14 @@ def compute_ppo_12_26_scores(prices: pd.DataFrame) -> pd.DataFrame:
     ema_fast = compute_ema(wide, span=12)
     ema_slow = compute_ema(wide, span=26)
     ppo = (ema_fast - ema_slow) / ema_slow.where(ema_slow > 0)
+    # BUG-010 gap-day mask: unlike the other MACD-family scores, PPO's
+    # formula never references the current price, so on a session where the
+    # ticker has no bar the price EMAs are carried forward unchanged and PPO
+    # would emit an exact duplicate of the prior day's value. Suppress the
+    # emission on sessions with no price; post-gap values are EMAs of
+    # observed prices under the standard time-decay convention and are kept
+    # (see docs/plans/01b1-pct-change-inventory.md).
+    ppo = ppo.where(wide.notna())
     z = cross_sectional_zscore(ppo)
     result = to_long(z, "ppo_12_26_score")
     logger.info("ppo_12_26_scores_computed", dates=result["date"].nunique(), tickers=result["ticker"].nunique())

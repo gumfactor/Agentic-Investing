@@ -8,13 +8,13 @@ Range 0–1. Higher = RSI near top of its 14-period range = strong momentum.
 from __future__ import annotations
 import pandas as pd
 import structlog
-from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore
+from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore, require_full_window
 
 logger = structlog.get_logger(__name__)
 
 _RSI_PERIOD = 14
 _STOCH_WINDOW = 14
-_MIN_PERIODS = 10
+_MIN_PERIODS = 14  # full window (BUG-010): the stoch range needs 14 valid RSI values
 
 
 def _rsi(wide: pd.DataFrame, period: int) -> pd.DataFrame:
@@ -24,7 +24,12 @@ def _rsi(wide: pd.DataFrame, period: int) -> pd.DataFrame:
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.where(avg_loss > 0)
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    # BUG-010 EWM gate: EWM (ignore_na=False) decays through a missing
+    # session's delta and would emit a frozen duplicate RSI on/after a gap.
+    # Suppress wherever the trailing `period` deltas contain a gap.
+    # See docs/plans/01b1-pct-change-inventory.md.
+    return require_full_window(rsi, delta, period)
 
 
 def compute_stoch_rsi_14_scores(prices: pd.DataFrame) -> pd.DataFrame:
