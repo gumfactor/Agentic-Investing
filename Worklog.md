@@ -13,6 +13,62 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-07-16
 
+### Session — R2 round project management: roadmap review, 01A + 01B-1 delivered and merged
+
+**Operator:** mshane@thecanadalist.ca
+**Role:** PM session (Claude Fable 5) orchestrating Sonnet 5 builder/adversarial subagents
+**Branch:** `dev/R2-phase1` (integration branch for the R2 round; PRs merged by operator only)
+
+#### What was done
+
+- Reviewed the delivery roadmap; kept priorities intact. Fixed three gaps:
+  cited BUG-005/006/007 in rows 05B/06A/05A, split 01B into three PRs
+  (01B-1/2/3), added the "Delivery execution log" (branch/PR/status/token
+  tracking) to `Roadmap.md`.
+- **01A (BUG-001..004)** built by a Sonnet 5 agent on
+  `dev/R2-01A-compose-runtime`, adversarially reviewed (2 confirmed P1:
+  opt-in runtime-marker guard; unconsumed `IBKR_CLIENT_ID`), fixed, PR #33
+  opened, one Codex round fixed, **merged as `3e37bb5`**. Operator live
+  verification per `docs/runbooks/01a_compose_paper_runtime_verification.md`
+  remains before BUG-001..004 close.
+- **01B-1 (BUG-010)** built on `dev/R2-01B1-missing-data`, adversarially
+  reviewed (2 confirmed P1: RSI-family EWM gap staleness; ungated
+  A/D-line/Chaikin cumsum), fixed incl. a full non-`pct_change` fabrication
+  sweep, PR #32 opened, one Codex round fixed, **merged as `65e1b72`**.
+  BUG-066 filed (missing cross-sectional minimum-eligible-count gate).
+- **01B-2 (BUG-008, PIT universe)** builder launched on
+  `dev/R2-01B2-pit-universe` after the #32 merge, per the operator's rule
+  that dependent work waits for overlapping PRs to merge.
+
+#### Decisions
+
+- `[DECISION]` 01B split into three PRs for reviewability; single design doc
+  (`docs/plans/01b-research-validity-design.md`) remains the spec.
+- `[DECISION]` 01B-2 initial historical-constituents source: Wikipedia
+  S&P 500 page revision history (revision timestamps as `known_at`,
+  conservative next-session availability rule), provider-agnostic schema so
+  a commercial source can replace the import at Gate 03. Operator was
+  offered Polygon as a paid alternative and has not requested it.
+- `[DECISION]` Builders commit each phased slice; one PR per roadmap job;
+  PR babysitting must poll all three GitHub comment surfaces (inline review
+  comments, reviews, issue comments) for Codex/Copilot/human feedback —
+  earlier sessions watched the wrong API level.
+
+#### Safety
+
+- `[SAFETY]` No IBKR/TWS connection, DAG trigger, or order action occurred
+  in any agent session; all broker behavior tested with fakes;
+  `PAPER_TRADING=true` / `IBKR_PORT=7497` in every fixture.
+
+#### Next steps
+
+- 01B-2 PM review → adversarial review → PR; then 01B-3
+  (timing/corporate-action contract + versioned research identity).
+- Operator: run the 01A live verification checklist; then flip BUG-001..004
+  to Fixed.
+
+---
+
 ### Session — Gate 01A: Make Compose paper runtime executable (BUG-001..BUG-004)
 
 **Operator:** mshane@thecanadalist.ca

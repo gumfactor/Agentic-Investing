@@ -72,7 +72,7 @@ Token figures are reported as `<agent/effort>: <tokens>`.
 
 | Order | Branch | PR | Status | Builder Tokens | PM Tokens |
 |---|---|---|---|---|---|
-| 01A | `dev/R2-01A-compose-runtime` | [#33](https://github.com/gumfactor/Agentic-Investing/pull/33) | **Ready for operator review/merge** — review rounds clean, 538 tests + real Docker smoke green on tip `ef9ba83`; operator-only live verification checklist remains post-merge | Sonnet 5 medium: 284K (builder incl. fix + review rounds) + 122K (adversarial reviewer) | Fable 5: ~45K |
+| 01A | `dev/R2-01A-compose-runtime` | [#33](https://github.com/gumfactor/Agentic-Investing/pull/33) | **Merged 2026-07-16** (`3e37bb5`) — operator live-verification checklist (docs/runbooks/01a_compose_paper_runtime_verification.md) still pending before BUG-001..004 close | Sonnet 5 medium: 284K (builder incl. fix + review rounds) + 122K (adversarial reviewer) | Fable 5: ~45K |
 | 01B-1 | `dev/R2-01B1-missing-data` | [#32](https://github.com/gumfactor/Agentic-Investing/pull/32) | **Merged 2026-07-16** (`65e1b72`) | Sonnet 5 medium: 342K (builder incl. fix + review rounds) + 124K (adversarial reviewer) | Fable 5: ~45K |
 | 01B-2 | `dev/R2-01B2-pit-universe` | — | In progress | — | — |
 | 01B-3 | `dev/R2-01B3-timing-contract` | — | Queued (blocked on 01B-2) | — | — |
