@@ -11,6 +11,11 @@ Safety rules enforced here:
       PAPER_RUN_CLEARED)
 - C9: the live vs. paper switch is governed entirely by IBKR_PORT +
       PAPER_TRADING env vars; never hardcoded.
+- BUG-004: in a bridged Docker Compose runtime (RQIS_RUNTIME_CONTEXT=
+      compose_bridged), an unset/empty/loopback IBKR_HOST is a configuration
+      error and is rejected before a connection is attempted - "127.0.0.1"
+      inside a bridged container resolves to the container itself, not the
+      Docker host running TWS/IB Gateway. See _validate_bridged_broker_host().
 """
 
 from __future__ import annotations
@@ -40,6 +45,54 @@ _ORDER_ID_POLL_INTERVAL = 0.05
 _FX_RATE_TIMEOUT_SECONDS = 5.0
 _FX_RATE_POLL_INTERVAL = 0.1
 _CONFIGURED_FX_RATE_MAX_AGE_DAYS = 1
+
+# BUG-004: hosts that only resolve inside the calling process's own network
+# namespace. Legitimate when a script runs directly on the same host as
+# TWS/IB Gateway; unsafe when the caller is a container on a bridged Docker
+# Compose network, because "127.0.0.1"/"localhost" then means the container
+# itself rather than the Docker host.
+_LOOPBACK_BROKER_HOSTS = frozenset({"", "127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
+# Set on every Airflow Compose service (see docker-compose.yml x-airflow-common)
+# so this module can distinguish "running inside a bridged container" from
+# "running as a host-side script" without guessing from the network stack.
+_BRIDGED_RUNTIME_CONTEXT = "compose_bridged"
+
+
+def _validate_bridged_broker_host(host: str | None) -> None:
+    """Fail closed (BUG-004) if IBKR_HOST is a loopback value inside a bridged
+    Docker Compose runtime.
+
+    This check is a no-op outside a declared bridged-runtime context (for
+    example, host-side operator CLI scripts, where 127.0.0.1 is the correct
+    address for TWS/IB Gateway running on the same machine). It only enforces
+    the Docker-safe host requirement when RQIS_RUNTIME_CONTEXT=compose_bridged,
+    which is set on every Airflow Compose service.
+
+    The loopback exception is granted only when RQIS_RUNTIME_NETWORK_MODE=host
+    is also explicitly set, declaring (and presumably tested against) Docker
+    host networking rather than the default bridge network.
+    """
+    runtime_context = os.environ.get("RQIS_RUNTIME_CONTEXT", "").strip().lower()
+    if runtime_context != _BRIDGED_RUNTIME_CONTEXT:
+        return
+
+    network_mode = os.environ.get("RQIS_RUNTIME_NETWORK_MODE", "").strip().lower()
+    if network_mode == "host":
+        return
+
+    normalized = (host or "").strip().lower()
+    if normalized in _LOOPBACK_BROKER_HOSTS:
+        raise OSError(
+            f"IBKR_HOST={host!r} is not reachable from a bridged Docker Compose "
+            "network (RQIS_RUNTIME_CONTEXT=compose_bridged): a loopback address "
+            "resolves to the container itself, not the Docker host running "
+            "TWS/IB Gateway (BUG-004). Set IBKR_HOST to 'host.docker.internal' "
+            "on Windows/Mac Docker Desktop, or an explicit gateway address on "
+            "Linux Docker Engine. If this container deliberately uses Docker "
+            "host networking, set RQIS_RUNTIME_NETWORK_MODE=host to declare "
+            "and test that exception explicitly."
+        )
 
 
 class IBKRBroker(BaseBroker):
@@ -75,6 +128,7 @@ class IBKRBroker(BaseBroker):
         self._ib: IB | None = None
         self._submitted: dict[str, object] = {}  # broker_order_id -> ib Trade
 
+        _validate_bridged_broker_host(self._host)
         self._validate_paper_trading_flag()
 
     def _validate_paper_trading_flag(self) -> None:
@@ -112,6 +166,7 @@ class IBKRBroker(BaseBroker):
 
     def connect(self) -> None:
         # Re-validate env vars at connection time; they may have changed since __init__
+        _validate_bridged_broker_host(self._host)
         self._validate_paper_trading_flag()
         if self._ib is not None and self._ib.isConnected():
             logger.warning("ibkr_already_connected", host=self._host, port=self._port)
