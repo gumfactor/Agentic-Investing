@@ -73,8 +73,8 @@ Token figures are reported as `<agent/effort>: <tokens>`.
 | Order | Branch | PR | Status | Builder Tokens | PM Tokens |
 |---|---|---|---|---|---|
 | 01A | `dev/R2-01A-compose-runtime` | [#33](https://github.com/gumfactor/Agentic-Investing/pull/33) | PR open — babysitting review | Sonnet 5 medium: 260K (builder incl. fix round) + 122K (adversarial reviewer) | Fable 5: ~35K |
-| 01B-1 | `dev/R2-01B1-missing-data` | [#32](https://github.com/gumfactor/Agentic-Investing/pull/32) | **Ready for operator review/merge** — review rounds clean, 778 signals + 249 backtesting/portfolio tests green on tip `309539d` | Sonnet 5 medium: 342K (builder incl. fix + review rounds) + 124K (adversarial reviewer) | Fable 5: ~45K |
-| 01B-2 | `dev/R2-01B2-pit-universe` | — | Queued (blocked on PR #32 merge — overlapping research paths) | — | — |
+| 01B-1 | `dev/R2-01B1-missing-data` | [#32](https://github.com/gumfactor/Agentic-Investing/pull/32) | **Merged 2026-07-16** (`65e1b72`) | Sonnet 5 medium: 342K (builder incl. fix + review rounds) + 124K (adversarial reviewer) | Fable 5: ~45K |
+| 01B-2 | `dev/R2-01B2-pit-universe` | — | In progress | — | — |
 | 01B-3 | `dev/R2-01B3-timing-contract` | — | Queued (blocked on 01B-2) | — | — |
 
 Both adversarial reviews returned APPROVE-WITH-FIXES with confirmed findings
