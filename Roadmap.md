@@ -72,7 +72,14 @@ Token figures are reported as `<agent/effort>: <tokens>`.
 
 | Order | Branch | PR | Status | Builder Tokens | PM Tokens |
 |---|---|---|---|---|---|
-| 01A | `dev/R2-01A-compose-runtime` | — | In progress | — | — |
-| 01B-1 | `dev/R2-01B1-missing-data` | — | In progress | — | — |
-| 01B-2 | `dev/R2-01B2-pit-universe` | — | Queued | — | — |
-| 01B-3 | `dev/R2-01B3-timing-contract` | — | Queued | — | — |
+| 01A | `dev/R2-01A-compose-runtime` | [#33](https://github.com/gumfactor/Agentic-Investing/pull/33) | PR open — babysitting review | Sonnet 5 medium: 260K (builder incl. fix round) + 122K (adversarial reviewer) | Fable 5: ~35K |
+| 01B-1 | `dev/R2-01B1-missing-data` | [#32](https://github.com/gumfactor/Agentic-Investing/pull/32) | PR open — babysitting review | Sonnet 5 medium: 252K+ (builder, fix round in progress) + 124K (adversarial reviewer) | Fable 5: ~35K |
+| 01B-2 | `dev/R2-01B2-pit-universe` | — | Queued (blocked on PR #32 merge — overlapping research paths) | — | — |
+| 01B-3 | `dev/R2-01B3-timing-contract` | — | Queued (blocked on 01B-2) | — | — |
+
+Both adversarial reviews returned APPROVE-WITH-FIXES with confirmed findings
+(01B-1: RSI-family EWM gap staleness and ungated A/D-line/Chaikin cumsum —
+the BUG-010 defect class in non-`pct_change` form; 01A: opt-in runtime-marker
+guard and unconsumed `IBKR_CLIENT_ID`); all findings were routed back to the
+builders and fixed before the PRs opened. PM token figures are estimates of
+the Fable 5 orchestration share attributable to each row.
