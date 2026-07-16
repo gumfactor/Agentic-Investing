@@ -89,7 +89,26 @@ def _artifact_dir(run_id: str) -> Path:
 
 
 def _require_paper_env(env: dict[str, str]) -> None:
-    """Fail fast if not in paper-trading mode."""
+    """Fail fast if not in paper-trading mode.
+
+    BUG-004 (adversarial fix round): also require the declared runtime-context
+    marker. docker-compose.yml sets RQIS_RUNTIME_CONTEXT=compose_bridged on
+    every Airflow service; that marker is what arms the loopback-host guard in
+    execution/brokers/ibkr.py. If this DAG executes in any environment that
+    did NOT come through the reviewed Compose contract (a hand-rolled
+    `docker run`, a forked compose file, a future k8s deployment, an
+    env-override that dropped the marker), the guard would otherwise silently
+    deactivate -- so the first task of every run fails closed here instead.
+    """
+    runtime_context = env.get("RQIS_RUNTIME_CONTEXT", "").strip().lower()
+    if runtime_context != "compose_bridged":
+        raise AirflowException(
+            f"RQIS_RUNTIME_CONTEXT={runtime_context!r} but the paper-trading "
+            "pipeline requires 'compose_bridged'. This marker is set by "
+            "docker-compose.yml on every Airflow service and arms the "
+            "loopback-IBKR_HOST guard (BUG-004); a runtime without it has not "
+            "been reviewed for containerized broker connectivity. Refusing to run."
+        )
     if env.get("PAPER_TRADING", "").strip().lower() != "true":
         raise AirflowException("PAPER_TRADING must be 'true' for the paper-trading pipeline.")
     if env.get("IBKR_PORT", "").strip() != "7497":

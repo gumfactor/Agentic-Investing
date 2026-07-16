@@ -132,6 +132,15 @@ Verified with `docker compose config` against `.env.example` placeholders:
 `RQIS_PAPER_ARTIFACT_DIR=/opt/airflow/rqis_paper` on all three services.
 `tests/infra/test_compose_paper_runtime.py` asserts this both statically and
 (when Docker is available) via a real `docker compose config` render.
+Adversarial fix round (same branch): `PAPER_TRADING` and `IBKR_PORT` are
+now HARD-CODED to paper values in `x-airflow-common` rather than
+`.env`-substituted (a stale live-side `.env` can no longer render
+`PAPER_TRADING=false`/`IBKR_PORT=7496` into the Airflow services — P2-4,
+with a rendering regression test), `IBKR_CLIENT_ID` is now actually consumed
+by `IBKRBroker.__init__` via a validated env default instead of being
+declared-but-ignored (P1-2), and `_require_paper_env` in the DAG now also
+requires `RQIS_RUNTIME_CONTEXT=compose_bridged` so a runtime that bypassed
+the reviewed Compose contract fails closed at the first task (P1-1).
 Status: implemented and locally verified; pending the operator running the
 live TWS/IB Gateway steps in
 `docs/runbooks/01a_compose_paper_runtime_verification.md` before this can be
@@ -173,7 +182,13 @@ through the C1 approval gate inside the built image and asserts
 `docker build` + smoke-run into pytest (skips without Docker). Verified
 locally end-to-end with Docker Desktop 29.6.1 / Compose v5.2.0: build
 succeeds, `airflow version` reports `2.8.1`, and all 20 target modules
-import with exit 0. Status: implemented and locally verified; see
+import with exit 0. Adversarial fix round (same branch): the build-time
+`pip check` gate now also fails on an abnormal pip exit code or unexpected
+stderr output (previously a pip internal error with empty stdout would have
+passed silently — P2-1), and the allowlist anchors the full expected
+snowflake/cffi complaint text rather than a bare package-name prefix
+(P3). Status: implemented and locally verified (image rebuilt and smoke
+re-run after the gate change); see
 `docs/runbooks/01a_compose_paper_runtime_verification.md` for the remaining
 operator sign-off steps before this can be marked `Fixed`.
 
@@ -200,7 +215,11 @@ write-permission check before `airflow db migrate`.
 `tests/infra/test_paper_artifact_shared_storage.py` proves a container
 write (as uid 50000, the base image's non-root `airflow` user) is
 host-readable with a matching SHA-256, and that all three Airflow services
-mount the same path from the same env-configurable source. Status:
+mount the same path from the same env-configurable source. Adversarial fix
+round (same branch): the Docker smoke test's mount list is now derived from
+`docker-compose.yml` `x-airflow-common.volumes` instead of being duplicated
+by hand, with a consistency test that fails if a compose mount the DAG
+runtime needs is removed (P2-3). Status:
 implemented and locally verified; restart-persistence and the host-side
 dashboard cross-check are operator steps in
 `docs/runbooks/01a_compose_paper_runtime_verification.md` before this can
@@ -235,7 +254,12 @@ and `execution/tests/test_ibkr_broker_endpoint_fail_closed.py` cover
 unset/empty/loopback rejection, the live-port-7496 failure path, and an
 unresolvable-host `connect()` failure propagating out of the DAG's
 `_fetch_ibkr_snapshot` task (the first broker-touching task) without being
-swallowed. Status: implemented and locally verified with fakes; the live
+swallowed. Adversarial fix round (same branch): the guard now treats ANY
+non-empty `RQIS_RUNTIME_CONTEXT` value as containerized fail-closed (a typo
+like `compose-bridged` can no longer silently deactivate enforcement —
+P2-2), and the DAG's `_require_paper_env` requires the marker outright so
+the guard cannot be bypassed by omitting it (P1-1).
+Status: implemented and locally verified with fakes; the live
 TWS/IB Gateway reachability preflight from inside the Airflow container is
 an operator step in
 `docs/runbooks/01a_compose_paper_runtime_verification.md` before this can

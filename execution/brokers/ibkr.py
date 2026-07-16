@@ -63,18 +63,21 @@ def _validate_bridged_broker_host(host: str | None) -> None:
     """Fail closed (BUG-004) if IBKR_HOST is a loopback value inside a bridged
     Docker Compose runtime.
 
-    This check is a no-op outside a declared bridged-runtime context (for
-    example, host-side operator CLI scripts, where 127.0.0.1 is the correct
-    address for TWS/IB Gateway running on the same machine). It only enforces
-    the Docker-safe host requirement when RQIS_RUNTIME_CONTEXT=compose_bridged,
-    which is set on every Airflow Compose service.
+    This check is a no-op only when RQIS_RUNTIME_CONTEXT is entirely unset or
+    empty (host-side operator CLI scripts, where 127.0.0.1 is the correct
+    address for TWS/IB Gateway running on the same machine). ANY non-empty
+    value arms the guard: "compose_bridged" is the reviewed value set on
+    every Airflow Compose service, and any other non-empty value (a typo
+    like "compose-bridged", an unreviewed future deployment label) is
+    treated fail-closed as containerized rather than silently deactivating
+    enforcement (adversarial fix round P2-2).
 
     The loopback exception is granted only when RQIS_RUNTIME_NETWORK_MODE=host
     is also explicitly set, declaring (and presumably tested against) Docker
     host networking rather than the default bridge network.
     """
     runtime_context = os.environ.get("RQIS_RUNTIME_CONTEXT", "").strip().lower()
-    if runtime_context != _BRIDGED_RUNTIME_CONTEXT:
+    if not runtime_context:
         return
 
     network_mode = os.environ.get("RQIS_RUNTIME_NETWORK_MODE", "").strip().lower()
@@ -83,16 +86,52 @@ def _validate_bridged_broker_host(host: str | None) -> None:
 
     normalized = (host or "").strip().lower()
     if normalized in _LOOPBACK_BROKER_HOSTS:
-        raise OSError(
-            f"IBKR_HOST={host!r} is not reachable from a bridged Docker Compose "
-            "network (RQIS_RUNTIME_CONTEXT=compose_bridged): a loopback address "
-            "resolves to the container itself, not the Docker host running "
-            "TWS/IB Gateway (BUG-004). Set IBKR_HOST to 'host.docker.internal' "
-            "on Windows/Mac Docker Desktop, or an explicit gateway address on "
-            "Linux Docker Engine. If this container deliberately uses Docker "
-            "host networking, set RQIS_RUNTIME_NETWORK_MODE=host to declare "
-            "and test that exception explicitly."
+        context_note = (
+            "RQIS_RUNTIME_CONTEXT=compose_bridged"
+            if runtime_context == _BRIDGED_RUNTIME_CONTEXT
+            else (
+                f"RQIS_RUNTIME_CONTEXT={runtime_context!r} is an unrecognized "
+                "non-empty runtime context, enforced fail-closed as containerized"
+            )
         )
+        raise OSError(
+            f"IBKR_HOST={host!r} is not reachable from a containerized runtime "
+            f"({context_note}): a loopback address resolves to the container "
+            "itself, not the Docker host running TWS/IB Gateway (BUG-004). Set "
+            "IBKR_HOST to 'host.docker.internal' on Windows/Mac Docker Desktop, "
+            "or an explicit gateway address on Linux Docker Engine. If this "
+            "container deliberately uses Docker host networking, set "
+            "RQIS_RUNTIME_NETWORK_MODE=host to declare and test that exception "
+            "explicitly."
+        )
+
+
+def _client_id_from_env() -> int:
+    """Resolve the default IBKR client id from IBKR_CLIENT_ID (BUG-001/P1-2).
+
+    docker-compose.yml passes IBKR_CLIENT_ID into every Airflow service, and
+    the DAG constructs IBKRBroker() bare -- so the env var must actually be
+    consumed here, not just declared. Falls back to 1 only when the variable
+    is unset or empty; a set-but-invalid value (non-integer, zero/negative)
+    is a configuration error and fails closed rather than silently becoming 1.
+    """
+    raw = os.environ.get("IBKR_CLIENT_ID", "").strip()
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        raise OSError(
+            f"IBKR_CLIENT_ID={raw!r} is not a valid integer. Set it to a "
+            "positive integer (each concurrent IBKR API session needs a "
+            "distinct client id) or unset it to use the default of 1."
+        ) from None
+    if value < 0:
+        raise OSError(
+            f"IBKR_CLIENT_ID={value} must be a non-negative integer "
+            "(IBKR client ids are >= 0)."
+        )
+    return value
 
 
 class IBKRBroker(BaseBroker):
@@ -105,7 +144,8 @@ class IBKRBroker(BaseBroker):
     port:
         7497 = paper, 7496 = live.  Defaults to IBKR_PORT env var.
     client_id:
-        Unique client ID for this connection (default 1).
+        Unique client ID for this connection. Defaults to the IBKR_CLIENT_ID
+        env var when set (validated integer), else 1.
     timeout:
         Connection timeout in seconds.
     """
@@ -114,7 +154,7 @@ class IBKRBroker(BaseBroker):
         self,
         host: str | None = None,
         port: int | None = None,
-        client_id: int = 1,
+        client_id: int | None = None,
         timeout: int = 10,
     ) -> None:
         if not _IB_AVAILABLE:
@@ -123,7 +163,7 @@ class IBKRBroker(BaseBroker):
         self._host = host or os.environ.get("IBKR_HOST", "127.0.0.1")
         raw_port = port or int(os.environ.get("IBKR_PORT", "7497"))
         self._port = raw_port
-        self._client_id = client_id
+        self._client_id = client_id if client_id is not None else _client_id_from_env()
         self._timeout = timeout
         self._ib: IB | None = None
         self._submitted: dict[str, object] = {}  # broker_order_id -> ib Trade

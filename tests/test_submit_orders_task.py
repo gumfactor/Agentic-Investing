@@ -90,6 +90,8 @@ def _make_context(tmp_path: Path, blotter_path: Path, run_id: str = "test-run-1"
 def paper_env(monkeypatch):
     monkeypatch.setenv("PAPER_TRADING", "true")
     monkeypatch.setenv("IBKR_PORT", "7497")
+    # P1-1: task-level env gate now requires the Compose runtime marker
+    monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
 
 
 class TestSubmitOrdersHappyPath:

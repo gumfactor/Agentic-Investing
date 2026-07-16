@@ -112,6 +112,8 @@ class TestUnresolvableHostFailsClosedBeforeSubmission:
         Airflow to skip every downstream task including submit_orders."""
         monkeypatch.setenv("PAPER_TRADING", "true")
         monkeypatch.setenv("IBKR_PORT", "7497")
+        # P1-1: the task-level env gate requires the Compose runtime marker
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         monkeypatch.setenv("IBKR_HOST", "this-host-does-not-resolve.invalid")
         monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
 

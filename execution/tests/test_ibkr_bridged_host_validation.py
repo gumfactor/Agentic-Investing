@@ -30,7 +30,7 @@ class TestValidateBridgedBrokerHostDirect:
     @pytest.mark.parametrize("host", ["", "127.0.0.1", "localhost", "::1", "0.0.0.0", None])
     def test_rejects_loopback_hosts_in_bridged_context(self, monkeypatch, host):
         monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
-        with pytest.raises(OSError, match="not reachable from a bridged Docker Compose network"):
+        with pytest.raises(OSError, match="not reachable from a containerized runtime"):
             _validate_bridged_broker_host(host)
 
     @pytest.mark.parametrize("host", ["", "127.0.0.1", "localhost", None])
@@ -55,6 +55,21 @@ class TestValidateBridgedBrokerHostDirect:
         monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "Compose_Bridged")
         with pytest.raises(OSError):
             _validate_bridged_broker_host("127.0.0.1")
+
+    @pytest.mark.parametrize(
+        "context", ["compose-bridged", "kubernetes", "docker", "COMPOSE BRIDGED", "x"]
+    )
+    def test_unknown_nonempty_context_values_enforce_fail_closed(self, monkeypatch, context):
+        """P2-2 (adversarial fix round): a typo or unreviewed deployment label
+        must arm the guard, not silently deactivate it. Only an entirely
+        unset/empty RQIS_RUNTIME_CONTEXT (host-side script) is a no-op."""
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", context)
+        with pytest.raises(OSError, match="BUG-004"):
+            _validate_bridged_broker_host("127.0.0.1")
+
+    def test_unknown_context_still_allows_non_loopback_host(self, monkeypatch):
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose-bridged")
+        _validate_bridged_broker_host("host.docker.internal")  # must not raise
 
 
 class TestIBKRBrokerConstructionFailsClosed:
@@ -114,3 +129,41 @@ class TestIBKRBrokerConstructionFailsClosed:
         monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         with pytest.raises(OSError, match="BUG-004"):
             broker.connect()
+
+
+class TestClientIdFromEnv:
+    """P1-2 (adversarial fix round): IBKR_CLIENT_ID is part of the Compose
+    contract and must actually be consumed by IBKRBroker, not just declared
+    in docker-compose.yml. Invalid values fail closed instead of silently
+    becoming client id 1."""
+
+    def test_client_id_defaults_to_1_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("IBKR_CLIENT_ID", raising=False)
+        monkeypatch.setenv("IBKR_HOST", "127.0.0.1")
+        broker = IBKRBroker()
+        assert broker._client_id == 1
+
+    def test_client_id_read_from_env(self, monkeypatch):
+        monkeypatch.setenv("IBKR_CLIENT_ID", "7")
+        monkeypatch.setenv("IBKR_HOST", "127.0.0.1")
+        broker = IBKRBroker()
+        assert broker._client_id == 7
+
+    def test_explicit_constructor_arg_beats_env(self, monkeypatch):
+        monkeypatch.setenv("IBKR_CLIENT_ID", "7")
+        monkeypatch.setenv("IBKR_HOST", "127.0.0.1")
+        broker = IBKRBroker(client_id=3)
+        assert broker._client_id == 3
+
+    @pytest.mark.parametrize("raw", ["abc", "1.5", "-2", " 7x "])
+    def test_invalid_env_client_id_fails_closed(self, monkeypatch, raw):
+        monkeypatch.setenv("IBKR_CLIENT_ID", raw)
+        monkeypatch.setenv("IBKR_HOST", "127.0.0.1")
+        with pytest.raises(OSError, match="IBKR_CLIENT_ID"):
+            IBKRBroker()
+
+    def test_empty_env_client_id_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("IBKR_CLIENT_ID", "")
+        monkeypatch.setenv("IBKR_HOST", "127.0.0.1")
+        broker = IBKRBroker()
+        assert broker._client_id == 1

@@ -120,8 +120,20 @@ check = subprocess.run(
     [sys.executable, "-m", "pip", "check"], capture_output=True, text=True,
 )
 output_lines = [ln for ln in check.stdout.splitlines() if ln.strip()]
+# pip's self-upgrade advisory ("[notice] A new release of pip is available")
+# goes to stderr and is not an error; everything else on stderr is.
+stderr_lines = [
+    ln for ln in check.stderr.splitlines()
+    if ln.strip() and not ln.lstrip().startswith("[notice]")
+]
+
+# Adversarial fix round P3: anchor the full expected complaint (all but the
+# trailing installed-cffi version, which legitimately drifts with releases),
+# not just the package name -- a bare name prefix would mask any FUTURE,
+# different complaint from the same package.
 ALLOWED_PIP_CHECK_PREFIXES = (
-    "snowflake-connector-python ",  # documented cffi<2.0 vs >=2.0 mismatch; unused provider
+    # documented cffi<2.0 vs >=2.0 mismatch; snowflake provider unused by RQIS
+    "snowflake-connector-python 3.6.0 has requirement cffi<2.0.0,>=1.9, but you have cffi ",
 )
 unexpected = [
     ln for ln in output_lines if not ln.startswith(ALLOWED_PIP_CHECK_PREFIXES)
@@ -129,8 +141,33 @@ unexpected = [
 print("pip check output:")
 for ln in output_lines:
     print(f"  {ln}")
+
+failed = False
 if unexpected:
     print("RQIS BUG-002 GATE FAILED: unexpected pip check conflicts (see above).")
+    failed = True
+
+# Adversarial fix round P2-1: `pip check` exits 1 when it reports conflicts
+# (the allowlisted line above accounts for that), but any OTHER nonzero exit
+# (e.g. rc=2 pip internal error with an empty stdout) or any stderr output
+# means the check itself malfunctioned -- fail the build rather than passing
+# on a check that never actually ran.
+if check.returncode != 0 and not output_lines:
+    print(
+        f"RQIS BUG-002 GATE FAILED: pip check exited {check.returncode} "
+        "without reporting any conflict lines -- the check itself failed to run."
+    )
+    failed = True
+if check.returncode not in (0, 1):
+    print(f"RQIS BUG-002 GATE FAILED: pip check exited {check.returncode} (expected 0 or 1).")
+    failed = True
+if stderr_lines:
+    print("RQIS BUG-002 GATE FAILED: pip check wrote to stderr:")
+    for ln in stderr_lines:
+        print(f"  {ln}")
+    failed = True
+
+if failed:
     sys.exit(1)
 
 print("RQIS BUG-002 gate: pip check has no unexpected broken requirements.")

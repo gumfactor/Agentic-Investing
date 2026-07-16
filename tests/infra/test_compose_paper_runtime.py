@@ -69,20 +69,25 @@ class TestComposeRawYamlContract:
         assert not missing, f"{service} is missing paper-runtime env keys: {missing}"
 
     @pytest.mark.parametrize("service", _AIRFLOW_SERVICES)
-    def test_paper_trading_defaults_to_true(self, service):
+    def test_paper_trading_is_hardcoded_true(self, service):
+        """P2-4 (adversarial fix round): this compose file is a paper-only
+        stack. PAPER_TRADING must be the literal string "true" -- NOT an
+        `${...}` substitution -- so a stale host .env carrying
+        PAPER_TRADING=false can never render live values into the Airflow
+        services."""
         doc = _load_compose_doc()
         env = _service_environment(doc, service)
-        # Raw (pre-interpolation) value must default paper mode to true, e.g.
-        # "${PAPER_TRADING:-true}" or a literal "true" -- never a live default.
-        assert "true" in env["PAPER_TRADING"]
-        assert "false" not in env["PAPER_TRADING"]
+        assert env["PAPER_TRADING"] == "true"
+        assert "${" not in env["PAPER_TRADING"]
 
     @pytest.mark.parametrize("service", _AIRFLOW_SERVICES)
-    def test_ibkr_port_defaults_to_paper_port(self, service):
+    def test_ibkr_port_is_hardcoded_paper_port(self, service):
+        """P2-4: IBKR_PORT must be the literal paper port "7497", never an
+        `${IBKR_PORT...}` substitution a stale .env could flip to 7496."""
         doc = _load_compose_doc()
         env = _service_environment(doc, service)
-        assert "7497" in env["IBKR_PORT"]
-        assert "7496" not in env["IBKR_PORT"]
+        assert env["IBKR_PORT"] == "7497"
+        assert "${" not in env["IBKR_PORT"]
 
     @pytest.mark.parametrize("service", _AIRFLOW_SERVICES)
     def test_ibkr_host_default_is_not_a_loopback_literal(self, service):
@@ -151,3 +156,29 @@ class TestComposeConfigRendering:
             assert env["IBKR_CLIENT_ID"] == "1"
             assert env["RQIS_PAPER_ARTIFACT_DIR"] == "/opt/airflow/rqis_paper"
             assert env["RQIS_RUNTIME_CONTEXT"] == "compose_bridged"
+
+    def test_stale_live_env_file_cannot_flip_rendered_stack_to_live(self, tmp_path):
+        """P2-4 regression: even a host .env explicitly carrying live values
+        (PAPER_TRADING=false, IBKR_PORT=7496) must render paper values into
+        every Airflow service, because the compose file hard-codes them."""
+        env_file = tmp_path / "stale_live.env"
+        base = _ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        base = base.replace("PAPER_TRADING=true", "PAPER_TRADING=false")
+        base = base.replace("IBKR_PORT=7497", "IBKR_PORT=7496")
+        env_file.write_text(base, encoding="utf-8")
+
+        result = subprocess.run(
+            ["docker", "compose", "--env-file", str(env_file), "config"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"docker compose config unavailable in this environment: {result.stderr[:500]}")
+
+        rendered = yaml.safe_load(result.stdout)
+        for service in _AIRFLOW_SERVICES:
+            env = _service_environment(rendered, service)
+            assert env["PAPER_TRADING"] == "true", f"{service} rendered a live PAPER_TRADING"
+            assert env["IBKR_PORT"] == "7497", f"{service} rendered the live IBKR port"

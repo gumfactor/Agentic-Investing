@@ -185,6 +185,7 @@ class TestFetchSnapshotDbPersistNonBlocking:
         and pushes both XCom keys — the pipeline is not aborted."""
         monkeypatch.setenv("PAPER_TRADING", "true")
         monkeypatch.setenv("IBKR_PORT", "7497")
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
         monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
 
@@ -229,6 +230,7 @@ class TestFetchSnapshotDbPersistNonBlocking:
 
         monkeypatch.setenv("PAPER_TRADING", "true")
         monkeypatch.setenv("IBKR_PORT", "7497")
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
         monkeypatch.setenv("RQIS_PAPER_ARTIFACT_DIR", str(tmp_path))
 

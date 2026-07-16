@@ -29,7 +29,12 @@ x-airflow-common: &airflow-common
     # loopback IBKR_HOST instead of silently trying to reach the container
     # itself. Never set this on a host-side script invocation.
     RQIS_RUNTIME_CONTEXT: compose_bridged
-    PAPER_TRADING: ${PAPER_TRADING:-true}
+    # PAPER_TRADING and IBKR_PORT are HARD-CODED, not .env-substituted
+    # (adversarial fix round P2-4): this compose file is a paper-only stack,
+    # so a stale host .env carrying PAPER_TRADING=false / IBKR_PORT=7496 must
+    # never be able to render live-trading values into the Airflow services.
+    # A live deployment requires its own reviewed compose file (C8/C9).
+    PAPER_TRADING: "true"
     # IBKR_HOST_AIRFLOW is intentionally distinct from the host-side IBKR_HOST
     # in .env: host-side operator CLI scripts run natively on the machine
     # hosting TWS/IB Gateway, where 127.0.0.1 is correct; this container is on
@@ -37,7 +42,7 @@ x-airflow-common: &airflow-common
     # itself. Default targets Windows/Mac Docker Desktop; see .env.example and
     # docs/runbooks/airflow_fire_drill.md for the Linux gateway-IP alternative.
     IBKR_HOST: ${IBKR_HOST_AIRFLOW:-host.docker.internal}
-    IBKR_PORT: ${IBKR_PORT:-7497}
+    IBKR_PORT: "7497"
     IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
     # Fixed container-internal path shared by every Airflow service (BUG-003).
     # The identical host path is bind-mounted at this same location below; see
