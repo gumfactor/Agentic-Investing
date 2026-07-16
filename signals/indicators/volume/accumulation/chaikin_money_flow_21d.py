@@ -16,7 +16,9 @@ from signals.indicators._ohlc_utils import validate_ohlcv, ohlc_wide
 logger = structlog.get_logger(__name__)
 
 _WINDOW = 21
-_MIN_PERIODS = 15
+# full window (BUG-010): a missing bar yields NaN flow/volume cells, which
+# reduce the rolling non-NaN count below _WINDOW and suppress the value.
+_MIN_PERIODS = 21
 
 
 def compute_chaikin_money_flow_21d_scores(ohlcv: pd.DataFrame) -> pd.DataFrame:

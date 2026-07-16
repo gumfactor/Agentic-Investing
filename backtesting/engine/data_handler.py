@@ -103,7 +103,13 @@ class DataHandler:
         return float(curr_close / prev_close - 1.0)
 
     def get_benchmark_returns_series(self, start: date, end: date) -> pd.Series:
-        """Daily benchmark returns for [start, end]. Index = date."""
+        """Daily benchmark returns for [start, end]. Index = date.
+
+        Uses fill_method=None (BUG-010) so a missing benchmark session
+        produces NaN — dropped by the trailing .dropna() — rather than being
+        forward-filled into a fabricated zero return that could distort
+        downstream Sharpe/beta comparisons.
+        """
         bm = (
             self._benchmark[
                 (self._benchmark["date"] >= start) & (self._benchmark["date"] <= end)
@@ -111,7 +117,7 @@ class DataHandler:
             .sort_values("date")
             .set_index("date")["close"]
         )
-        return bm.pct_change().dropna()
+        return bm.pct_change(fill_method=None).dropna()
 
     # ------------------------------------------------------------------
     # Date utilities

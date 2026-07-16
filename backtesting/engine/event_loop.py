@@ -231,7 +231,9 @@ class BacktestEngine:
             index=[d for d, _ in nav_records],
             name="nav",
         )
-        returns = nav_series.pct_change().dropna()
+        # fill_method=None (BUG-010): a NAV recording gap must never be
+        # forward-filled into a fabricated zero return.
+        returns = nav_series.pct_change(fill_method=None).dropna()
         bm_returns = data_handler.get_benchmark_returns_series(start, end)
 
         trades_df = _fills_to_df(all_fills)

@@ -39,7 +39,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
 | BUG-008 | Research/Signals | P0 | F0 | Open | Current-membership universe creates survivorship leakage. |
 | BUG-009 | Research/Signals | P0 | F0 | Open | Same-close signal/return timing can introduce lookahead. |
-| BUG-010 | Research/Signals | P0 | F0 | Open | `pct_change()` defaults can distort many indicators. |
+| BUG-010 | Research/Signals | P0 | F0 | Implemented — pending review/merge (dev/R2-01B1-missing-data) | `pct_change()` defaults can distort many indicators. |
 | BUG-011 | Security/Auth | P1 | F1 | Open | Approval gate trusts any matching DB row. |
 | BUG-012 | Trading Safety | P1 | F1 | Open | Circuit breaker is UI-local and not enforced by Airflow submission. |
 | BUG-013 | Security/Auth | P1 | F1 | Open | Host-published services and weak auth create compromise paths. |
@@ -94,6 +94,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-053 | Packaging/CI | P2 | F2 | Fixed | `make check` mutates the working tree. |
 | BUG-064 | Research/Signals | P2 | F2 | Fixed | `_write_simulation` only processes current-run strategy from XCom; shadow strategies are skipped. |
 | BUG-065 | Research/Signals | P2 | F2 | Fixed | `simulated_return` divides by n_long when universe < n_long, understating returns for small strategies. |
+| BUG-066 | Research/Signals | P2 | F2 | Open | Cross-sectional scoring has no minimum-eligible-count gate; full-window suppression increases silent cross-section shrinkage. |
 
 #### Long-term / lower-risk backlog
 
@@ -207,11 +208,44 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 
 **Severity:** P0 / signal correctness
 
+**Status:** Implemented — pending review/merge. Branch `dev/R2-01B1-missing-data`
+(roadmap item 01B-1, scoped to `docs/plans/01b-research-validity-design.md` §3).
+
 **Evidence:** Multiple indicators call `pct_change()` without `fill_method=None` on wide data containing NaNs.
 
 **Impact:** Pandas can forward-fill missing prices before return calculations, creating artificial zero returns, suppressed volatility/beta, and distorted volume-price signs.
 
 **Suggested direction:** Use `pct_change(fill_method=None)` consistently and require sufficient non-null observations per ticker/window.
+
+**Fix summary:** Inventoried and migrated all 33 production `pct_change()` call sites
+(`docs/plans/01b1-pct-change-inventory.md`) across `signals/indicators/*` (momentum,
+volume, volatility), `backtesting/engine/{data_handler,event_loop}.py`,
+`portfolio/risk_model/covariance.py`, and `reporting/dashboards/{queries.py,
+pages/5_Performance.py}`. Added `signals.indicators._price_utils.daily_return`
+(`pct_change(fill_method=None)` + positive-finite price validation),
+`rolling_valid_count`/`require_full_window` for cumsum/mask-based indicators that
+don't propagate NaN through arithmetic (`volume_up_down_ratio_21d`,
+`obv_momentum_21d/63d`, `price_volume_trend_21d`), and raised every return-derived
+rolling `min_periods` to its full window so a gap suppresses the value by default
+(one documented exception: `vol_trend_slope_63d`'s outer OLS trend fit, which keeps
+its existing internal robust-minimum tolerance). Added
+`tests/test_pct_change_guard.py`, a repo-wide regression guard that fails on any new
+unguarded `pct_change()` call in a production price-return path. 768 signals tests,
+218 backtesting tests, 30 portfolio tests, and 100 reporting/dashboard tests pass.
+
+**Adversarial-review fix round:** the same fabrication class survives in indicators
+that never call `pct_change()`. Fixed: RSI family (`rsi_14`, `rsi_14_raw`, `rsi_28`,
+`stoch_rsi_14`) and `ease_of_movement_14d`/`force_index_13d`, where EWM with pandas'
+default `ignore_na=False` decays through a missing session's diff/flow input and
+emits a frozen duplicate value on/after a gap — now gated with `require_full_window`
+over the estimator's nominal span; `ad_line_momentum_21d` and `chaikin_oscillator`
+(ungated `cumsum` flow, identical to the OBV/PVT defect) — now gated on the trailing
+flow window; `money_flow_index_14d` (`.where(tp_change > 0, 0.0)` fabricates a zero
+flow on gap days) — gated on trailing `tp_change` validity; `chaikin_money_flow_21d`
+`min_periods` raised to full window; `ppo_12_26` masked so it cannot emit a
+duplicate value on a session with no price bar. Guard scan broadened to
+`execution/`, `risk/`, `airflow/`, `scripts/`, `data/`. See the "non-pct_change
+fabrication sweep" section of `docs/plans/01b1-pct-change-inventory.md`.
 
 ## P1 / High findings
 
@@ -690,3 +724,31 @@ The following findings were added after a second adversarial pass focused on gap
 **Impact:** Simulated NAV for small-universe strategies is systematically biased downward; strategy comparison panels understate their performance vs. larger strategies.
 
 **Fix (Session 57, PR #31 Codex comment #2):** Changed denominator from `n_long` to `len(tickers)`. When the universe has ≥ n_long names, `len(tickers) == n_long` and the result is identical. For smaller universes, the correct portfolio return is now computed. Tickers with missing prior-day prices continue to contribute 0% (cash-equivalent treatment).
+
+### BUG-066: Cross-sectional scoring has no minimum-eligible-count enforcement
+
+**Severity:** P2 / research validity
+
+**Evidence:** The 01B design plan (`docs/plans/01b-research-validity-design.md` §3.1)
+requires that cross-sectional scoring "report the resulting eligible count and fail
+when the configured minimum cross-section is not met." Neither
+`signals/scoring/scorer.py` nor the indicator-level
+`cross_sectional_zscore`/`to_long` pipeline enforces any minimum: a date whose
+cross-section has shrunk to a handful of tickers (or even one) still produces
+z-scores and downstream alpha scores with no warning or failure.
+
+**Impact:** Scores computed from a silently shrunken cross-section are statistically
+meaningless but indistinguishable from healthy ones downstream. The BUG-010 fix
+(01B-1) makes this more visible: raising rolling `min_periods` to full windows and
+gating gapped windows correctly suppresses more per-ticker values, which *increases*
+the frequency of shrunken cross-sections — correct per-ticker behavior, but the
+missing aggregate gate means the shrinkage stays silent.
+
+**Suggested direction:** Belongs to the 01B research-validity follow-up work (with
+BUG-008/BUG-009): add a configurable minimum eligible count to the scorer, log the
+per-date eligible count, and fail closed (or mark the date ineligible) when the
+cross-section is below the configured minimum rather than imputing or silently
+scoring a tiny universe.
+
+**Origin:** Confirmed during the 01B-1 (BUG-010) adversarial review, 2026-07-16;
+out of scope for that fix round.

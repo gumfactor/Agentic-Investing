@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import structlog
-from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore
+from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore, daily_return
 
 logger = structlog.get_logger(__name__)
 
@@ -19,9 +19,10 @@ def compute_vol_percentile_252d_scores(prices: pd.DataFrame) -> pd.DataFrame:
     """Cross-sectional z-score of percentile rank of current 21d vol in its 252d history."""
     validate_prices(prices)
     wide = to_wide(prices)
-    daily_ret = wide.pct_change()
-    vol_21 = daily_ret.rolling(21, min_periods=15).std() * np.sqrt(252)
-    pct_rank = vol_21.rolling(252, min_periods=126).rank(pct=True)
+    daily_ret = daily_return(wide)
+    # full window (BUG-010): vol_21 requires 21 contiguous returns; the 252d rank window requires 252 contiguous vol_21 values
+    vol_21 = daily_ret.rolling(21, min_periods=21).std() * np.sqrt(252)
+    pct_rank = vol_21.rolling(252, min_periods=252).rank(pct=True)
     z = cross_sectional_zscore(pct_rank)
     result = to_long(z, "vol_percentile_252d_score")
     logger.info("vol_percentile_252d_scores_computed", dates=result["date"].nunique(), tickers=result["ticker"].nunique())

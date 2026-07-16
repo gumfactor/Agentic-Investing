@@ -9,19 +9,19 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import structlog
-from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore
+from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore, daily_return
 
 logger = structlog.get_logger(__name__)
 
 _WINDOW = 63
-_MIN_PERIODS = 44
+_MIN_PERIODS = 63  # full window (BUG-010)
 
 
 def compute_upside_deviation_63d_scores(prices: pd.DataFrame) -> pd.DataFrame:
     """Cross-sectional z-score of 63-day annualized upside deviation."""
     validate_prices(prices)
     wide = to_wide(prices)
-    daily_ret = wide.pct_change()
+    daily_ret = daily_return(wide)
     pos_ret = daily_ret.clip(lower=0)
     upside = (pos_ret ** 2).rolling(_WINDOW, min_periods=_MIN_PERIODS).mean().pow(0.5) * np.sqrt(252)
     z = cross_sectional_zscore(upside)

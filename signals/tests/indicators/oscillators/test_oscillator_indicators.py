@@ -296,3 +296,85 @@ def test_rolling_zscore_252d_raw_not_cross_sectionally_normalized(prices_400d):
     # (though it may be close by coincidence). The key test is that values reflect
     # individual stocks — check that std is non-trivially positive.
     assert latest.std() > 0.01
+
+
+# ─── BUG-010 missing-data acceptance tests (adversarial-review fix round) ────
+#
+# EWM-based oscillators decay through a missing session's input
+# (ignore_na=False), so without an explicit gate they emit a frozen
+# duplicate value on/after a gap. See docs/plans/01b1-pct-change-inventory.md.
+
+def _gap_prices(n_days: int = 120, gap_index: int = 60) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """GAPPY is missing one session; KEEPALIVE trades every session so the gap
+    date still exists as a row in the pivoted wide matrix."""
+    import numpy as np
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    rows = []
+    price = 100.0
+    for i, d in enumerate(dates):
+        price = max(price * (1 + rng.normal(0.0005, 0.012)), 1.0)
+        rows.append({"date": d, "ticker": "KEEPALIVE", "close": 80.0 + 3.0 * np.sin(i * 0.5)})
+        if i == gap_index:
+            continue
+        rows.append({"date": d, "ticker": "GAPPY", "close": price})
+    return pd.DataFrame(rows), dates[gap_index]
+
+
+def test_rsi_14_raw_gap_suppresses_frozen_value():
+    """A missing session must not let Wilder's EWM emit a frozen duplicate
+    RSI on the gap day / the days whose trailing 14 deltas span the gap."""
+    prices, gap_date = _gap_prices()
+    result = compute_rsi_14_raw_scores(prices)
+    scored = result[result["ticker"] == "GAPPY"]
+    scored_dates = set(scored["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=120)
+    gap_pos = list(all_dates).index(gap_date)
+    # The gap day and every subsequent day whose trailing 14 deltas include
+    # the gap (the gap knocks out the diff on the gap day AND the next day)
+    # must be suppressed.
+    for d in all_dates[gap_pos : gap_pos + 15]:
+        assert d not in scored_dates, f"{d} should be suppressed by the gap at {gap_date}"
+    # Recovers once 14 valid deltas exist again.
+    assert all_dates[-1] in scored_dates
+
+
+def test_rsi_14_gap_suppresses_frozen_value():
+    prices, gap_date = _gap_prices()
+    result = compute_rsi_14_scores(prices)
+    scored_dates = set(result[result["ticker"] == "GAPPY"]["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=120)
+    gap_pos = list(all_dates).index(gap_date)
+    for d in all_dates[gap_pos : gap_pos + 15]:
+        assert d not in scored_dates, f"{d} should be suppressed by the gap at {gap_date}"
+    assert all_dates[-1] in scored_dates
+
+
+def test_stoch_rsi_14_gap_suppresses_value():
+    """StochRSI layers a rolling min/max over the gated RSI; a gap suppresses
+    both the RSI values and the downstream stoch range windows touching them."""
+    prices, gap_date = _gap_prices(n_days=150, gap_index=60)
+    result = compute_stoch_rsi_14_scores(prices)
+    scored_dates = set(result[result["ticker"] == "GAPPY"]["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=150)
+    gap_pos = list(all_dates).index(gap_date)
+    for d in all_dates[gap_pos : gap_pos + 15]:
+        assert d not in scored_dates, f"{d} should be suppressed by the gap at {gap_date}"
+    assert all_dates[-1] in scored_dates
+
+
+def test_ppo_12_26_gap_day_not_emitted():
+    """PPO's formula never references the current price, so without the
+    gap-day mask it would emit an exact duplicate of the prior value on a
+    session where the ticker has no bar. The mask suppresses only that
+    session; the post-gap EMA (time-decay over observed prices) is kept."""
+    prices, gap_date = _gap_prices()
+    result = compute_ppo_12_26_scores(prices)
+    scored = result[result["ticker"] == "GAPPY"]
+    scored_dates = set(scored["date"])
+    assert gap_date not in scored_dates
+    all_dates = pd.bdate_range("2020-01-01", periods=120)
+    gap_pos = list(all_dates).index(gap_date)
+    # The next session HAS a price, so PPO resumes immediately (documented
+    # time-decay convention for price-level EMAs).
+    assert all_dates[gap_pos + 1] in scored_dates

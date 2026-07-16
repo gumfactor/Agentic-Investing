@@ -242,3 +242,90 @@ def test_beta_63d_high_beta_scores_higher():
     prices = pd.DataFrame(rows)
     scores = _latest_scores(compute_beta_63d_scores(prices), "beta_63d_score")
     assert scores["HIGHBETA"] > scores["LOWBETA"]
+
+
+# ─── BUG-010 missing-data acceptance tests ───────────────────────────────────
+
+def _prices_with_gap(n_days: int = 150, gap_index: int = 90) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """GAPPY is missing one session; KEEPALIVE trades every session so the gap
+    date still exists as a row in the pivoted wide matrix (a NaN cell for
+    GAPPY's price, not a vanished date)."""
+    import numpy as np
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    rows = []
+    price = 100.0
+    for i, d in enumerate(dates):
+        price = max(price * (1 + rng.normal(0.0003, 0.01)), 1.0)
+        rows.append({"date": d, "ticker": "KEEPALIVE", "close": 80.0 + i * 0.05})
+        if i == gap_index:
+            continue
+        rows.append({"date": d, "ticker": "GAPPY", "close": price})
+    return pd.DataFrame(rows), dates[gap_index]
+
+
+def test_realized_vol_21d_gap_suppresses_value_not_zero():
+    """A gap inside the trailing 21-day return window suppresses the vol
+    score for every date whose window touches the gap, rather than computing
+    a (biased) value from a non-contiguous subset of returns (BUG-010)."""
+    prices, gap_date = _prices_with_gap()
+    result = compute_realized_vol_21d_scores(prices)
+    scored_dates = set(result[result["ticker"] == "GAPPY"]["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=150)
+    gap_pos = list(all_dates).index(gap_date)
+    window_dates = all_dates[gap_pos : gap_pos + 21]
+    for d in window_dates:
+        assert d not in scored_dates, f"{d} should be suppressed by the gap at {gap_date}"
+    # Recovers once a full 21-day gap-free window is available again.
+    assert all_dates[-1] in scored_dates
+
+
+def test_sharpe_ratio_63d_gap_suppresses_value():
+    """Same acceptance criterion applied to a two-sided (mean and std) ratio
+    statistic: a gap anywhere in the trailing 63-day window suppresses the
+    Sharpe ratio for that date. n_days is generous enough that the fixture
+    still has >= 63 gap-free sessions after the gap for recovery to be
+    possible within the window."""
+    n_days, gap_index = 220, 90
+    prices, gap_date = _prices_with_gap(n_days=n_days, gap_index=gap_index)
+    result = compute_sharpe_ratio_63d_scores(prices)
+    scored_dates = set(result[result["ticker"] == "GAPPY"]["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=n_days)
+    gap_pos = list(all_dates).index(gap_date)
+    window_dates = all_dates[gap_pos : gap_pos + 63]
+    for d in window_dates:
+        assert d not in scored_dates, f"{d} should be suppressed by the gap at {gap_date}"
+    assert all_dates[-1] in scored_dates
+
+
+def test_vol_trend_slope_63d_gap_tolerance():
+    """Documented exception (see docs/plans/01b1-pct-change-inventory.md):
+    the outer 63-point OLS trend fit tolerates gaps in the underlying vol_21
+    series down to its own internal mask.sum() >= 20 threshold, rather than
+    requiring the full 63-point window (PR #32 Codex P2).
+
+    A single missing bar NaNs two returns, so the full-window inner vol_21
+    is NaN for ~22 consecutive sessions; a 63-point outer window spanning
+    that run still holds ~41 valid vol_21 points — well above the 20-point
+    tolerance — so the slope must be DEFINED once the current session's own
+    vol_21 is valid again, even while the outer window still contains the
+    gap. It must also stay defined after the gap fully ages out."""
+    n_days, gap_index = 220, 100
+    prices, gap_date = _prices_with_gap(n_days=n_days, gap_index=gap_index)
+    result = compute_vol_trend_slope_63d_scores(prices)
+    scored_dates = set(result[result["ticker"] == "GAPPY"]["date"])
+    all_dates = pd.bdate_range("2020-01-01", periods=n_days)
+    # vol_21 (min_periods=21) is NaN for positions gap_index..gap_index+21
+    # (every window touching either NaN return); it is valid again at
+    # gap_index+22. The final norm-by-current-vol step suppresses emission
+    # while vol_21 itself is NaN, so the first defined slope after the gap
+    # is at gap_index+22 — at which point the 63-point outer window STILL
+    # spans the NaN run. That date being scored is exactly the documented
+    # robust-tolerance behavior the full-window default would forbid.
+    first_recovery = all_dates[gap_index + 22]
+    assert first_recovery in scored_dates, (
+        "slope must be defined while the outer window still spans the gap "
+        "(internal 20-point tolerance)"
+    )
+    # And well after the gap has aged out of both windows.
+    assert all_dates[-1] in scored_dates

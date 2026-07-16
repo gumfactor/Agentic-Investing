@@ -8,15 +8,15 @@ Requires SPY to be present in the prices DataFrame.
 from __future__ import annotations
 import pandas as pd
 import structlog
-from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore
+from signals.indicators._price_utils import validate_prices, to_wide, to_long, cross_sectional_zscore, daily_return
 from signals.indicators._market_utils import rolling_beta
 
 logger = structlog.get_logger(__name__)
 
 _SHORT_WINDOW = 21
-_SHORT_MIN = 15
+_SHORT_MIN = 21  # full window (BUG-010)
 _OUTER_WINDOW = 63
-_OUTER_MIN = 44
+_OUTER_MIN = 63  # full window (BUG-010): std(beta) requires 63 contiguous, non-gapped beta_21d values
 _BENCHMARK = "SPY"
 
 
@@ -26,7 +26,7 @@ def compute_beta_stability_63d_scores(prices: pd.DataFrame) -> pd.DataFrame:
     wide = to_wide(prices)
     if _BENCHMARK not in wide.columns:
         raise ValueError("beta_stability_63d requires 'SPY' to be present in prices")
-    daily_ret = wide.pct_change()
+    daily_ret = daily_return(wide)
     beta_21d = rolling_beta(daily_ret, _BENCHMARK, _SHORT_WINDOW, _SHORT_MIN)
     beta_21d = beta_21d.drop(columns=[_BENCHMARK], errors="ignore")
     beta_std = beta_21d.rolling(_OUTER_WINDOW, min_periods=_OUTER_MIN).std()
