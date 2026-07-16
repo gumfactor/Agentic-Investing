@@ -83,7 +83,10 @@ else:
     if len(nav_filtered) < 2:
         st.warning("Insufficient data for selected date range.")
     else:
-        returns = nav_filtered["nav_usd"].pct_change().dropna()
+        # fill_method=None (BUG-010): a missing NAV snapshot must yield NaN,
+        # not a forward-filled fabricated zero return in the displayed
+        # performance metrics.
+        returns = nav_filtered["nav_usd"].pct_change(fill_method=None).dropna()
 
         # Compute metrics
         try:

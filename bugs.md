@@ -39,7 +39,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
 | BUG-008 | Research/Signals | P0 | F0 | Open | Current-membership universe creates survivorship leakage. |
 | BUG-009 | Research/Signals | P0 | F0 | Open | Same-close signal/return timing can introduce lookahead. |
-| BUG-010 | Research/Signals | P0 | F0 | Open | `pct_change()` defaults can distort many indicators. |
+| BUG-010 | Research/Signals | P0 | F0 | Fixed (dev/R2-01B1-missing-data) | `pct_change()` defaults can distort many indicators. |
 | BUG-011 | Security/Auth | P1 | F1 | Open | Approval gate trusts any matching DB row. |
 | BUG-012 | Trading Safety | P1 | F1 | Open | Circuit breaker is UI-local and not enforced by Airflow submission. |
 | BUG-013 | Security/Auth | P1 | F1 | Open | Host-published services and weak auth create compromise paths. |
@@ -207,11 +207,31 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 
 **Severity:** P0 / signal correctness
 
+**Status:** Fixed on branch `dev/R2-01B1-missing-data` (roadmap item 01B-1, scoped to
+`docs/plans/01b-research-validity-design.md` §3). Pending PM/PR review before merge to
+`dev/R2-phase1`.
+
 **Evidence:** Multiple indicators call `pct_change()` without `fill_method=None` on wide data containing NaNs.
 
 **Impact:** Pandas can forward-fill missing prices before return calculations, creating artificial zero returns, suppressed volatility/beta, and distorted volume-price signs.
 
 **Suggested direction:** Use `pct_change(fill_method=None)` consistently and require sufficient non-null observations per ticker/window.
+
+**Fix summary:** Inventoried and migrated all 33 production `pct_change()` call sites
+(`docs/plans/01b1-pct-change-inventory.md`) across `signals/indicators/*` (momentum,
+volume, volatility), `backtesting/engine/{data_handler,event_loop}.py`,
+`portfolio/risk_model/covariance.py`, and `reporting/dashboards/{queries.py,
+pages/5_Performance.py}`. Added `signals.indicators._price_utils.daily_return`
+(`pct_change(fill_method=None)` + positive-finite price validation),
+`rolling_valid_count`/`require_full_window` for cumsum/mask-based indicators that
+don't propagate NaN through arithmetic (`volume_up_down_ratio_21d`,
+`obv_momentum_21d/63d`, `price_volume_trend_21d`), and raised every return-derived
+rolling `min_periods` to its full window so a gap suppresses the value by default
+(one documented exception: `vol_trend_slope_63d`'s outer OLS trend fit, which keeps
+its existing internal robust-minimum tolerance). Added
+`tests/test_pct_change_guard.py`, a repo-wide regression guard that fails on any new
+unguarded `pct_change()` call in a production price-return path. 768 signals tests,
+218 backtesting tests, 30 portfolio tests, and 100 reporting/dashboard tests pass.
 
 ## P1 / High findings
 

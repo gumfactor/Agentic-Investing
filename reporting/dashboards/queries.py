@@ -300,7 +300,11 @@ def daily_returns_for_tickers(
     if df.empty:
         return pd.DataFrame()
     pivot = df.pivot(index="price_date", columns="ticker", values="close")
-    return pivot.pct_change().dropna(how="all")
+    # fill_method=None (BUG-010): a ticker missing a session must show NaN for
+    # that cell, not a forward-filled fabricated zero return that would
+    # otherwise survive dropna(how="all") whenever another ticker has real
+    # data on the same date.
+    return pivot.pct_change(fill_method=None).dropna(how="all")
 
 
 def active_strategy_id(engine: "Engine") -> str | None:

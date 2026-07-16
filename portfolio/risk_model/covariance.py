@@ -131,7 +131,10 @@ def returns_from_prices(
     """
     mask = prices.index <= pd.Timestamp(as_of)
     window = prices.loc[mask].tail(lookback_days + 1)
-    returns = window.pct_change().iloc[1:]
+    # fill_method=None (BUG-010): a missing price session must yield NaN, not
+    # a forward-filled fabricated zero return. build_covariance already drops
+    # sparse columns (>20% NaN) and any remaining NaN rows before fitting.
+    returns = window.pct_change(fill_method=None).iloc[1:]
     # Replace inf values that arise from zero or near-zero prices (e.g., delisting)
     returns = returns.replace([float("inf"), float("-inf")], float("nan"))
     return returns
