@@ -1,8 +1,137 @@
+# RQIS Airflow runtime image (BUG-002).
+#
+# Python-version decision (Gate 01A, open decision 1 of 3): Apache Airflow
+# 2.8.1 does not publish a Python 3.12 image or constraints file --
+# https://raw.githubusercontent.com/apache/airflow/constraints-2.8.1/constraints-3.12.txt
+# returns 404, and Docker Hub lists only python3.8/3.9/3.10/3.11 tags for the
+# 2.8.1 release (verified 2026-07-16). The top-level project
+# (pyproject.toml `requires-python = ">=3.12"`) therefore does NOT apply
+# inside this image: it is intentionally pinned to Python 3.11, the newest
+# version Airflow 2.8.1 supports. This is a documented incompatibility, not a
+# masked one. Revisit when the project upgrades to an Airflow release with
+# Python 3.12 support (verify the target release's own constraints file
+# before upgrading, the same way this decision was verified).
+#
+# Dependency-pinning decision: DAG execution paths (see
+# airflow/dags/daily_paper_trading.py, airflow/dags/daily_signal_pipeline.py,
+# airflow/dags/daily_data_pipeline.py, and everything they import from
+# scripts/, execution/, backtesting/, reporting/, signals/, data/, config/)
+# need pandas, numpy, pyarrow, PyYAML, python-dotenv, psycopg2-binary,
+# requests, and lxml -- all of which the base apache/airflow:2.8.1-python3.11
+# image already ships (verified via `pip list` inside the base image; its
+# default extras include "pandas" and "postgres"). Those are deliberately NOT
+# reinstalled from requirements.txt: requirements.txt pins pandas==2.2.0,
+# numpy==1.26.4, pyarrow==15.0.0, SQLAlchemy==2.0.27 -- newer than Airflow
+# 2.8.1's own constraints (pandas==2.1.4, numpy==1.24.4, pyarrow==14.0.2,
+# SQLAlchemy==1.4.51) -- an unconstrained `pip install -r requirements.txt`
+# would silently swap out packages Airflow's own core depends on.
+#
+# The packages genuinely missing from the base image are minio, structlog,
+# yfinance, and ib-insync (IBKR broker connectivity). Installing them with a
+# hard `--constraint <Airflow's constraints file>` was tried first and fails
+# outright (ResolutionImpossible): yfinance==1.4.1 depends on
+# `curl_cffi>=0.15`, which requires `cffi>=2.0.0`, while Airflow 2.8.1's
+# constraints pin `cffi==1.16.0` for the (RQIS-unused) snowflake-connector-
+# python provider baked into the base image. There is no version of cffi
+# that satisfies both, so a strict constraints file cannot be used for this
+# install. Instead, this Dockerfile installs unconstrained and then
+# explicitly verifies (see the final RUN step) that every Airflow-critical
+# package's version is unchanged from the base image, and that `pip check`
+# reports no unexpected broken requirement -- the one documented, reviewed
+# exception is the snowflake-connector-python/cffi mismatch, which is
+# provider-internal to a component RQIS never imports.
 FROM apache/airflow:2.8.1-python3.11
 
+# Airflow-critical package versions as shipped by apache/airflow:2.8.1-python3.11.
+# The verification step below fails the build if any of these drift, which
+# is how an unconstrained install below is still kept honest without hitting
+# the cffi ResolutionImpossible conflict described above.
+ENV RQIS_EXPECTED_APACHE_AIRFLOW=2.8.1 \
+    RQIS_EXPECTED_PANDAS=2.1.4 \
+    RQIS_EXPECTED_NUMPY=1.24.4 \
+    RQIS_EXPECTED_PYARROW=14.0.2 \
+    RQIS_EXPECTED_SQLALCHEMY=1.4.51 \
+    RQIS_EXPECTED_PSYCOPG2_BINARY=2.9.9 \
+    RQIS_EXPECTED_FLASK=2.2.5 \
+    RQIS_EXPECTED_CRYPTOGRAPHY=41.0.7
+
+# Packages the base image does not ship, pinned to the versions used
+# elsewhere in the project (requirements.txt) for minio/structlog/yfinance,
+# and to the ib-insync version requirements.txt pins for IBKR connectivity.
+# See the ResolutionImpossible note above for why this is not constrained
+# against Airflow's own constraints file.
 RUN pip install --no-cache-dir \
-    lxml \
+    ib-insync==0.9.86 \
     minio==7.2.3 \
-    python-dotenv==1.0.1 \
     structlog==24.1.0 \
     yfinance==1.4.1
+
+# Build-time verification (BUG-002 acceptance evidence):
+#   1. `airflow version` must still run (base install is not broken).
+#   2. Every RQIS_EXPECTED_* package above must be exactly the base-image
+#      version -- if the DAG-runtime install above silently upgraded/
+#      downgraded something Airflow itself depends on, fail the build.
+#   3. `pip check` must report no broken requirement other than the single
+#      documented snowflake-connector-python/cffi mismatch explained above.
+# Any other pip check failure, or any Airflow-critical package drift, fails
+# the build rather than shipping a silently broken runtime.
+RUN airflow version && python - <<'PYEOF'
+import os
+import subprocess
+import sys
+
+expected = {
+    "apache-airflow": os.environ["RQIS_EXPECTED_APACHE_AIRFLOW"],
+    "pandas": os.environ["RQIS_EXPECTED_PANDAS"],
+    "numpy": os.environ["RQIS_EXPECTED_NUMPY"],
+    "pyarrow": os.environ["RQIS_EXPECTED_PYARROW"],
+    "sqlalchemy": os.environ["RQIS_EXPECTED_SQLALCHEMY"],
+    "psycopg2-binary": os.environ["RQIS_EXPECTED_PSYCOPG2_BINARY"],
+    "flask": os.environ["RQIS_EXPECTED_FLASK"],
+    "cryptography": os.environ["RQIS_EXPECTED_CRYPTOGRAPHY"],
+}
+
+installed_raw = subprocess.run(
+    [sys.executable, "-m", "pip", "list", "--format=freeze"],
+    check=True, capture_output=True, text=True,
+).stdout
+installed = {}
+for line in installed_raw.splitlines():
+    if "==" not in line:
+        continue
+    name, _, version = line.partition("==")
+    installed[name.strip().lower()] = version.strip()
+
+drifted = []
+for name, want in expected.items():
+    got = installed.get(name.lower())
+    if got != want:
+        drifted.append(f"{name}: expected {want}, found {got!r}")
+
+if drifted:
+    print("RQIS BUG-002 GATE FAILED: Airflow-critical package drift detected:")
+    for line in drifted:
+        print(f"  - {line}")
+    sys.exit(1)
+
+print("RQIS BUG-002 gate: all Airflow-critical package versions unchanged from base image.")
+
+check = subprocess.run(
+    [sys.executable, "-m", "pip", "check"], capture_output=True, text=True,
+)
+output_lines = [ln for ln in check.stdout.splitlines() if ln.strip()]
+ALLOWED_PIP_CHECK_PREFIXES = (
+    "snowflake-connector-python ",  # documented cffi<2.0 vs >=2.0 mismatch; unused provider
+)
+unexpected = [
+    ln for ln in output_lines if not ln.startswith(ALLOWED_PIP_CHECK_PREFIXES)
+]
+print("pip check output:")
+for ln in output_lines:
+    print(f"  {ln}")
+if unexpected:
+    print("RQIS BUG-002 GATE FAILED: unexpected pip check conflicts (see above).")
+    sys.exit(1)
+
+print("RQIS BUG-002 gate: pip check has no unexpected broken requirements.")
+PYEOF
