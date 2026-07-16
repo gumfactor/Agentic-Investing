@@ -46,17 +46,56 @@ _FX_RATE_TIMEOUT_SECONDS = 5.0
 _FX_RATE_POLL_INTERVAL = 0.1
 _CONFIGURED_FX_RATE_MAX_AGE_DAYS = 1
 
-# BUG-004: hosts that only resolve inside the calling process's own network
-# namespace. Legitimate when a script runs directly on the same host as
-# TWS/IB Gateway; unsafe when the caller is a container on a bridged Docker
-# Compose network, because "127.0.0.1"/"localhost" then means the container
-# itself rather than the Docker host.
-_LOOPBACK_BROKER_HOSTS = frozenset({"", "127.0.0.1", "localhost", "::1", "0.0.0.0"})
+# BUG-004: hostnames that only resolve inside the calling process's own
+# network namespace. Legitimate when a script runs directly on the same host
+# as TWS/IB Gateway; unsafe when the caller is a container on a bridged
+# Docker Compose network, because loopback then means the container itself
+# rather than the Docker host. Numeric loopback ALIASES (127.0.1.1, "127.1",
+# any other 127.0.0.0/8 spelling, "::1", the unspecified addresses) are
+# caught by _is_container_local_address() below via real IP parsing, not by
+# this name list (Codex review fix: an exact-string set missed 127/8 aliases).
+_LOOPBACK_BROKER_HOSTNAMES = frozenset({"", "localhost", "ip6-localhost", "ip6-loopback"})
 
 # Set on every Airflow Compose service (see docker-compose.yml x-airflow-common)
 # so this module can distinguish "running inside a bridged container" from
 # "running as a host-side script" without guessing from the network stack.
 _BRIDGED_RUNTIME_CONTEXT = "compose_bridged"
+
+
+def _is_container_local_address(host: str) -> bool:
+    """True if `host` denotes the caller's own loopback/unspecified address.
+
+    Handles hostname spellings (localhost variants), canonical IP literals
+    via `ipaddress` (the whole 127.0.0.0/8 range including aliases like
+    127.0.1.1, ::1, and the unspecified 0.0.0.0/::), and BSD-shorthand IPv4
+    forms such as "127.1" or "0x7f.0.0.1" via `socket.inet_aton` -- the same
+    parser the socket layer honors, so no spelling that would connect to the
+    container's own loopback can slip past as an unrecognized string.
+    Performs no DNS resolution: non-numeric names other than the known
+    localhost spellings return False.
+    """
+    import ipaddress
+    import socket
+
+    normalized = host.strip().lower()
+    if normalized in _LOOPBACK_BROKER_HOSTNAMES:
+        return True
+
+    candidate = normalized
+    # Strip an IPv6 zone index ("::1%eth0"), which ipaddress will not parse.
+    if "%" in candidate:
+        candidate = candidate.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(candidate)
+    except ValueError:
+        # Not a canonical literal -- try BSD-shorthand IPv4 ("127.1",
+        # hex/octal quads), which inet_aton accepts and connect() would honor.
+        try:
+            packed = socket.inet_aton(normalized)
+        except OSError:
+            return False  # a real hostname; not loopback by spelling
+        addr = ipaddress.ip_address(packed)
+    return addr.is_loopback or addr.is_unspecified
 
 
 def _validate_bridged_broker_host(host: str | None) -> None:
@@ -84,8 +123,7 @@ def _validate_bridged_broker_host(host: str | None) -> None:
     if network_mode == "host":
         return
 
-    normalized = (host or "").strip().lower()
-    if normalized in _LOOPBACK_BROKER_HOSTS:
+    if _is_container_local_address(host or ""):
         context_note = (
             "RQIS_RUNTIME_CONTEXT=compose_bridged"
             if runtime_context == _BRIDGED_RUNTIME_CONTEXT

@@ -153,3 +153,30 @@ class TestMountContractConsistency:
     def test_derived_mount_sources_exist_in_repo(self):
         for source, _target in _compose_airflow_bind_mounts():
             assert source.exists(), f"compose bind-mount source missing on disk: {source}"
+
+
+class TestDockerfilePipCheckGate:
+    """Codex review fix regression: the build-time pip-check gate must treat a
+    CLEAN `pip check` (rc 0, "No broken requirements found." banner on
+    stdout) as success -- e.g. a future base image where the snowflake/cffi
+    conflict is resolved -- and only classify stdout lines as conflicts when
+    pip check actually reported conflicts (rc 1)."""
+
+    def test_gate_only_classifies_conflicts_on_nonzero_returncode(self):
+        text = _DOCKERFILE.read_text(encoding="utf-8")
+        # The rc==0 short-circuit must appear before the conflict comprehension.
+        assert "if check.returncode == 0:" in text, (
+            "Dockerfile pip-check gate lost its clean-success (rc 0) branch -- "
+            "a healthy image with no conflicts would fail the build on the "
+            "success banner"
+        )
+        idx_success = text.index("if check.returncode == 0:")
+        idx_classify = text.index("ALLOWED_PIP_CHECK_PREFIXES)")
+        assert idx_success < idx_classify
+
+    def test_gate_still_anchors_full_snowflake_complaint(self):
+        text = _DOCKERFILE.read_text(encoding="utf-8")
+        assert (
+            "snowflake-connector-python 3.6.0 has requirement cffi<2.0.0,>=1.9, but you have cffi "
+            in text
+        )

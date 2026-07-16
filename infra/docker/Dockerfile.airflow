@@ -135,9 +135,18 @@ ALLOWED_PIP_CHECK_PREFIXES = (
     # documented cffi<2.0 vs >=2.0 mismatch; snowflake provider unused by RQIS
     "snowflake-connector-python 3.6.0 has requirement cffi<2.0.0,>=1.9, but you have cffi ",
 )
-unexpected = [
-    ln for ln in output_lines if not ln.startswith(ALLOWED_PIP_CHECK_PREFIXES)
-]
+# Codex review fix: `pip check` exiting 0 prints a success banner
+# ("No broken requirements found.") on stdout -- that is a HEALTHIER outcome
+# than the allowlisted conflict (e.g. the snowflake/cffi mismatch resolved in
+# a future base image) and must pass, not be misread as an unexpected
+# conflict line. Stdout lines are only classified as conflicts when pip
+# check actually reported conflicts (returncode 1).
+if check.returncode == 0:
+    unexpected = []
+else:
+    unexpected = [
+        ln for ln in output_lines if not ln.startswith(ALLOWED_PIP_CHECK_PREFIXES)
+    ]
 print("pip check output:")
 for ln in output_lines:
     print(f"  {ln}")

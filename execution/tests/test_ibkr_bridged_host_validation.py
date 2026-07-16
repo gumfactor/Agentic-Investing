@@ -27,7 +27,17 @@ def _paper_env(monkeypatch):
 class TestValidateBridgedBrokerHostDirect:
     """Unit tests against the guard function itself."""
 
-    @pytest.mark.parametrize("host", ["", "127.0.0.1", "localhost", "::1", "0.0.0.0", None])
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "", "127.0.0.1", "localhost", "::1", "0.0.0.0", None,
+            # Codex review fix: loopback ALIASES across the whole 127.0.0.0/8
+            # range and shorthand spellings must also fail closed, not just
+            # the canonical strings above.
+            "127.0.1.1", "127.1.2.3", "127.255.255.254", "127.1",
+            "::", "::1%eth0", "LOCALHOST", " 127.0.0.1 ",
+        ],
+    )
     def test_rejects_loopback_hosts_in_bridged_context(self, monkeypatch, host):
         monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         with pytest.raises(OSError, match="not reachable from a containerized runtime"):
@@ -92,6 +102,16 @@ class TestIBKRBrokerConstructionFailsClosed:
     def test_localhost_ibkr_host_env_fails_closed_in_bridged_context(self, monkeypatch):
         monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
         monkeypatch.setenv("IBKR_HOST", "localhost")
+        with pytest.raises(OSError, match="BUG-004"):
+            IBKRBroker()
+
+    @pytest.mark.parametrize("host", ["127.0.1.1", "127.1"])
+    def test_loopback_alias_ibkr_host_env_fails_closed_in_bridged_context(self, monkeypatch, host):
+        """Codex review fix: 127/8 aliases the socket layer would happily
+        connect to (the container's own loopback) must be rejected the same
+        way as canonical 127.0.0.1."""
+        monkeypatch.setenv("RQIS_RUNTIME_CONTEXT", "compose_bridged")
+        monkeypatch.setenv("IBKR_HOST", host)
         with pytest.raises(OSError, match="BUG-004"):
             IBKRBroker()
 
