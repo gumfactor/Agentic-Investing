@@ -64,6 +64,15 @@ x-airflow-common: &airflow-common
     - ./reporting:/opt/airflow/rqis/reporting:ro
     - ./backtesting:/opt/airflow/rqis/backtesting:ro
     - airflow_logs:/opt/airflow/logs
+    # BUG-003: shared paper-trading artifact storage. Mounted at the identical
+    # in-container path (/opt/airflow/rqis_paper, matching RQIS_PAPER_ARTIFACT_DIR
+    # above) on every Airflow service. There is no Compose dashboard service
+    # (the Streamlit dashboard runs host-side via `streamlit run
+    # reporting/dashboards/app.py`), so the consumer surface is this same host
+    # directory read directly from Windows/host Python -- see
+    # RQIS_PAPER_ARTIFACT_HOST_DIR in .env.example for the operator-facing
+    # host path and how to point the dashboard at it.
+    - ${RQIS_PAPER_ARTIFACT_HOST_DIR:-./local/paper_artifacts}:/opt/airflow/rqis_paper
   depends_on:
     timescaledb:
       condition: service_healthy
@@ -187,7 +196,16 @@ services:
     command:
       - bash
       - -c
-      - "airflow db migrate && airflow users create --username admin --firstname Admin --lastname User --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-admin@rqis.local} --password ${AIRFLOW_ADMIN_PASSWORD}"
+      # BUG-003: verify the shared artifact bind mount exists and is
+      # container-writable before Airflow even starts. mkdir -p is a no-op if
+      # the host directory (and its Compose bind mount) already exists; the
+      # touch/rm proves write access without leaving a stray file behind.
+      # $$ escapes Compose's own variable interpolation (which would otherwise
+      # try to substitute RQIS_PAPER_ARTIFACT_DIR from the host .env at
+      # `docker compose config` time and silently render an empty path,
+      # since that var is only ever set in the environment: block above) so
+      # bash expands it at container runtime instead.
+      - "mkdir -p \"$$RQIS_PAPER_ARTIFACT_DIR\" && touch \"$$RQIS_PAPER_ARTIFACT_DIR/.rqis_write_check\" && rm \"$$RQIS_PAPER_ARTIFACT_DIR/.rqis_write_check\" && airflow db migrate && airflow users create --username admin --firstname Admin --lastname User --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-admin@rqis.local} --password ${AIRFLOW_ADMIN_PASSWORD}"
     restart: "no"
 
   airflow-webserver:
