@@ -3,6 +3,13 @@
 Validates that the daily pipeline recovers cleanly when Airflow is interrupted mid-run.
 Run this before promoting to a live trading environment.
 
+> **Scope note:** this drill exercises crash recovery of `daily_signal_pipeline`
+> under `LocalExecutor`. It is a separate exercise from Gate 01A (making the
+> Compose paper runtime executable -- BUG-001 through BUG-004; see
+> `docs/plans/01a-compose-paper-runtime-checklist.md`). Passing Gate 01A does
+> not imply this drill has been run, and vice versa; run both before any live
+> trading go-live decision.
+
 ---
 
 ## Prerequisites
@@ -22,10 +29,16 @@ Go to **DAGs → daily_signal_pipeline → Trigger DAG ▶**.
 
 Wait until `load_prices` starts (it fetches ~2 years of OHLCV — the longest task in the pipeline) — you want to interrupt during an active task.
 
-### 2. Kill the scheduler and worker mid-run
+### 2. Kill the scheduler mid-run
+
+This stack runs `AIRFLOW__CORE__EXECUTOR: LocalExecutor` (see `docker-compose.yml`
+x-airflow-common), which executes tasks as subprocesses of the scheduler
+itself -- there is **no separate `airflow-worker` Compose service** to stop
+(that only exists under `CeleryExecutor`). Killing `airflow-scheduler` kills
+the running task subprocesses with it.
 
 ```powershell
-docker compose stop airflow-scheduler airflow-worker
+docker compose stop airflow-scheduler
 ```
 
 You should see the running tasks freeze in the Airflow UI (tasks stay in "running" state).
@@ -33,7 +46,7 @@ You should see the running tasks freeze in the Airflow UI (tasks stay in "runnin
 ### 3. Wait 15 seconds, then restart
 
 ```powershell
-docker compose start airflow-scheduler airflow-worker
+docker compose start airflow-scheduler
 ```
 
 Airflow 2.x detects "zombie" tasks (tasks that were running when the process died) and

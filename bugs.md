@@ -22,7 +22,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | Severity | `P0`, `P1`, `P2`, `P3` | User/system impact if unfixed. `P0` blocks safe operation or invalidates core results; `P1` is high impact; `P2` is medium impact; `P3` is low impact. |
 | Fix priority | `F0`, `F1`, `F2`, `F3` | Implementation ordering. `F0` is immediate stop-the-line work; `F1` should be next-sprint hardening; `F2` is planned medium-term work; `F3` is backlog/cleanup. |
 | Horizon | `Short`, `Medium`, `Long` | Short-term fixes should happen before the next serious paper/live operational expansion; medium-term fixes belong in the next hardening phase; long-term fixes are lower-risk backlog items. |
-| Status | `Open`, `In Progress`, `Fixed`, `Deferred`, `Won't Fix` | Current remediation state. New entries default to `Open`. |
+| Status | `Open`, `In Progress`, `Implemented — pending operator verification`, `Fixed`, `Deferred`, `Won't Fix` | Current remediation state. New entries default to `Open`. `Implemented — pending operator verification` means the code/test change is complete and merged to the working branch, but a step requiring a live external dependency (e.g. a real TWS/IB Gateway session) that an automated agent session must not perform is still outstanding before the item can be marked `Fixed`. |
 
 ### Fix implementation roadmap
 
@@ -30,10 +30,10 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 
 | Bug | Category | Severity | Fix priority | Status | Short rationale |
 |-----|----------|----------|--------------|--------|-----------------|
-| BUG-001 | Infra/Deploy | P0 | F0 | Open | Airflow paper DAG cannot pass its own env gate in Compose. |
-| BUG-002 | Infra/Deploy | P0 | F0 | Open | Airflow image omits runtime dependencies used by DAGs. |
-| BUG-003 | Infra/Deploy | P0 | F0 | Open | Paper artifacts are written to an unmounted container path. |
-| BUG-004 | Infra/Deploy | P0 | F0 | Open | IBKR host defaults to container-local localhost. |
+| BUG-001 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | Airflow paper DAG cannot pass its own env gate in Compose. |
+| BUG-002 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | Airflow image omits runtime dependencies used by DAGs. |
+| BUG-003 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | Paper artifacts are written to an unmounted container path. |
+| BUG-004 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | IBKR host defaults to container-local localhost. |
 | BUG-005 | Trading Safety | P0 | F0 | Fixed | Approval quantity overrides can be tampered upward. |
 | BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
@@ -123,6 +123,20 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 
 **Suggested direction:** Pass the IBKR/paper env vars into all Airflow containers, and add a deployment smoke test that imports the DAG and runs `_require_paper_env()` against the container environment.
 
+**Resolution (Gate 01A, branch `dev/R2-01A-compose-runtime`):** `PAPER_TRADING`,
+`IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, and `RQIS_PAPER_ARTIFACT_DIR` are
+now set in `docker-compose.yml` `x-airflow-common.environment`, reaching
+`airflow-init`, `airflow-webserver`, and `airflow-scheduler` identically.
+Verified with `docker compose config` against `.env.example` placeholders:
+`PAPER_TRADING=true`, `IBKR_PORT=7497`,
+`RQIS_PAPER_ARTIFACT_DIR=/opt/airflow/rqis_paper` on all three services.
+`tests/infra/test_compose_paper_runtime.py` asserts this both statically and
+(when Docker is available) via a real `docker compose config` render.
+Status: implemented and locally verified; pending the operator running the
+live TWS/IB Gateway steps in
+`docs/runbooks/01a_compose_paper_runtime_verification.md` before this can be
+marked `Fixed`.
+
 ### BUG-002: Airflow image omits runtime dependencies used by DAG execution paths
 
 **Severity:** P0 / deployment blocker
@@ -132,6 +146,36 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 **Impact:** The built Airflow runtime is likely to fail at task runtime with `ModuleNotFoundError`, especially for Parquet/MinIO and IBKR paper-trading paths.
 
 **Suggested direction:** Install the project package and/or `requirements.txt` in the Airflow image, then test DAG imports inside the built image.
+
+**Resolution (Gate 01A, branch `dev/R2-01A-compose-runtime`):**
+`infra/docker/Dockerfile.airflow` now documents and installs only what is
+actually missing (`ib-insync`, `minio`, `structlog`, `yfinance` -- pandas,
+numpy, pyarrow, PyYAML, python-dotenv, psycopg2-binary, requests, and lxml
+already ship in the base image at Airflow's own constraints versions) and
+adds a build-time gate that fails the build if any Airflow-critical package
+drifts from the base image or if `pip check` reports anything beyond one
+documented, unused-provider mismatch (`snowflake-connector-python`
+vs. `cffi`). A full `pip install --constraint <Airflow constraints>` was
+tried first and rejected because it produces a genuine
+`ResolutionImpossible` (yfinance's `curl_cffi` needs `cffi>=2.0`; Airflow's
+constraints pin `cffi==1.16.0` for the unused snowflake provider) -- this is
+recorded in the Dockerfile comments rather than masked. Python version
+decision: Airflow 2.8.1 has no Python 3.12 image or constraints file
+(verified directly against Docker Hub and
+`constraints-2.8.1/constraints-3.12.txt`, which 404s), so the image stays on
+Python 3.11; this is a documented, known gap against the project's
+`requires-python>=3.12`, not an oversight.
+`infra/docker/smoke_test_dag_imports.py` imports `daily_paper_trading`,
+`daily_signal_pipeline`, `daily_data_pipeline`, and every module reached
+through the C1 approval gate inside the built image and asserts
+`airflow.__file__` resolves to the installed package, not this repo's
+`airflow/` test-stub. `tests/infra/test_airflow_image_smoke.py` wires a full
+`docker build` + smoke-run into pytest (skips without Docker). Verified
+locally end-to-end with Docker Desktop 29.6.1 / Compose v5.2.0: build
+succeeds, `airflow version` reports `2.8.1`, and all 20 target modules
+import with exit 0. Status: implemented and locally verified; see
+`docs/runbooks/01a_compose_paper_runtime_verification.md` for the remaining
+operator sign-off steps before this can be marked `Fixed`.
 
 ### BUG-003: Paper-trading artifacts are written to an unmounted container path
 
@@ -143,6 +187,25 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 
 **Suggested direction:** Add a named volume or host bind mount for `RQIS_PAPER_ARTIFACT_DIR` shared by Airflow and the dashboard/approval tooling.
 
+**Resolution (Gate 01A, branch `dev/R2-01A-compose-runtime`):** confirmed
+there is no Compose dashboard service (the Streamlit dashboard is launched
+host-side via `streamlit run reporting/dashboards/app.py`), so
+`docker-compose.yml` now bind-mounts
+`${RQIS_PAPER_ARTIFACT_HOST_DIR:-./local/paper_artifacts}` at the identical
+in-container path `/opt/airflow/rqis_paper` on every Airflow service, and
+`.env.example` documents the corresponding host-side
+`RQIS_PAPER_ARTIFACT_DIR` value the dashboard process should export. The
+`airflow-init` startup command now creates the directory and performs a
+write-permission check before `airflow db migrate`.
+`tests/infra/test_paper_artifact_shared_storage.py` proves a container
+write (as uid 50000, the base image's non-root `airflow` user) is
+host-readable with a matching SHA-256, and that all three Airflow services
+mount the same path from the same env-configurable source. Status:
+implemented and locally verified; restart-persistence and the host-side
+dashboard cross-check are operator steps in
+`docs/runbooks/01a_compose_paper_runtime_verification.md` before this can
+be marked `Fixed`.
+
 ### BUG-004: IBKR connectivity defaults to container-local localhost
 
 **Severity:** P0 / broker connectivity blocker
@@ -152,6 +215,31 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 **Impact:** Even with env vars passed, containerized paper trading will usually fail to reach the broker socket.
 
 **Suggested direction:** Document and configure a Docker-safe host (`host.docker.internal` plus Linux `extra_hosts`, host networking, or explicit gateway IP), and require a connectivity preflight in containerized runs.
+
+**Resolution (Gate 01A, branch `dev/R2-01A-compose-runtime`):** added a
+distinct `IBKR_HOST_AIRFLOW` `.env` variable (default `host.docker.internal`)
+feeding the Airflow containers' `IBKR_HOST`, kept separate from the
+host-side `IBKR_HOST=127.0.0.1` used by operator CLI scripts, plus a
+portable `extra_hosts: ["host.docker.internal:host-gateway"]` mapping for
+Linux Docker Engine compatibility (Windows Docker Desktop targeted now per
+the plan's open decision 3; Linux untested). More importantly, added a
+production (not test-only) fail-closed guard,
+`execution/brokers/ibkr.py._validate_bridged_broker_host()`, called from
+both `IBKRBroker.__init__` and `connect()`: when
+`RQIS_RUNTIME_CONTEXT=compose_bridged` is set (every Airflow Compose
+service sets it), an unset/empty/`localhost`/`127.0.0.1`/`::1`/`0.0.0.0`
+`IBKR_HOST` raises `OSError` before any connection attempt, with a declared
+`RQIS_RUNTIME_NETWORK_MODE=host` escape hatch for a genuinely
+host-networked deployment. `execution/tests/test_ibkr_bridged_host_validation.py`
+and `execution/tests/test_ibkr_broker_endpoint_fail_closed.py` cover
+unset/empty/loopback rejection, the live-port-7496 failure path, and an
+unresolvable-host `connect()` failure propagating out of the DAG's
+`_fetch_ibkr_snapshot` task (the first broker-touching task) without being
+swallowed. Status: implemented and locally verified with fakes; the live
+TWS/IB Gateway reachability preflight from inside the Airflow container is
+an operator step in
+`docs/runbooks/01a_compose_paper_runtime_verification.md` before this can
+be marked `Fixed`.
 
 ### BUG-005: Approval quantity overrides can be tampered upward and bypass validation
 

@@ -4,6 +4,18 @@ Operator checklist for the Phase 4 daily IBKR paper-trading workflow. This runbo
 is for paper trading only. It does not authorize live capital, live broker config,
 bulk order cancellation, or unattended submission.
 
+> **Scope note:** this runbook covers the manual, host-side CLI workflow
+> (Steps 1-8, `python -m scripts...`), which writes artifacts under `.\local\`
+> on the operator's own machine and connects to IBKR via `IBKR_HOST=127.0.0.1`
+> directly from the host. The separate Compose-managed `daily_paper_trading`
+> Airflow DAG runs the same pipeline logic inside containers on the bridged
+> `rqis` Docker network, writes artifacts to `RQIS_PAPER_ARTIFACT_DIR`
+> (bind-mounted per `docker-compose.yml`), and connects to IBKR via
+> `IBKR_HOST_AIRFLOW`/`host.docker.internal` -- see
+> `docs/plans/01a-compose-paper-runtime-checklist.md` and its operator
+> verification checklist for that runtime contract. Do not mix the two
+> `IBKR_HOST` values: 127.0.0.1 is correct here, never inside a container.
+
 ## Safety Rules
 
 | Gate | Owner | Action |
