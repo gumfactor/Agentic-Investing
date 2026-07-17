@@ -690,3 +690,159 @@ class TestReimportAdvancesCoverage:
         assert report.by_date.iloc[0]["n_members"] == 8
         # Symbol history was not duplicated by the second publish.
         assert report.n_symbol_history_rows == 1
+
+
+# ─── Codex PR #34 round 3: price-date normalization + announcement passthrough ─
+
+
+class TestCoverageReportPriceDateNormalization:
+    """Codex P2: pd.read_sql-style Timestamp date columns must reconcile
+    against the report's datetime.date keys instead of reporting every
+    member as unpriced."""
+
+    def test_timestamp_price_dates_join_members(self, engine, tmp_path: Path) -> None:
+        import pandas as pd
+
+        run_import(
+            FixtureSP500Provider(),
+            engine=engine,
+            artifact_root=tmp_path,
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        prices = pd.DataFrame(
+            {
+                "ticker": ["AAA", "GGG"],
+                # Timestamps, as produced by pd.read_sql / read_json.
+                "date": [pd.Timestamp("2022-06-01"), pd.Timestamp("2022-06-01")],
+            }
+        )
+        report = coverage_report(
+            engine, FIXTURE_UNIVERSE_ID, dates=[date(2022, 6, 1)], prices=prices
+        )
+        row = report.by_date.iloc[0]
+        assert row["n_priced_members"] == 2
+        assert row["n_unpriced_members"] == row["n_members"] - 2
+
+
+class TestAnnouncementTimestampsPreserved:
+    """Codex P2: provider-supplied ChangeEvent.announced_at must survive
+    staging so the future_announced validation and known_at derivation can
+    act on it."""
+
+    def _parsed(self, add_announced=None, remove_announced=None):
+        return ParsedConstituentData(
+            universe_id="sp500_fixture",
+            current_rows=[
+                CurrentConstituentRow(
+                    ticker="AAA",
+                    security_name="Anchor",
+                    effective_start=date(2019, 1, 2),
+                    source_record_id="current-AAA",
+                ),
+            ],
+            change_events=[
+                ChangeEvent(
+                    effective_date=date(2020, 2, 3),
+                    added_ticker="TTT",
+                    added_security_name="Tango",
+                    removed_ticker=None,
+                    removed_security_name=None,
+                    reason="Index add.",
+                    source_record_id="chg-add",
+                    announced_at=add_announced,
+                ),
+                ChangeEvent(
+                    effective_date=date(2020, 8, 3),
+                    added_ticker=None,
+                    added_security_name=None,
+                    removed_ticker="TTT",
+                    removed_security_name="Tango",
+                    reason="Index remove.",
+                    source_record_id="chg-remove",
+                    announced_at=remove_announced,
+                ),
+            ],
+        )
+
+    def test_candidate_carries_both_announcements(self) -> None:
+        add_at = datetime(2020, 1, 30, 21, 0, tzinfo=timezone.utc)
+        rem_at = datetime(2020, 7, 30, 21, 0, tzinfo=timezone.utc)
+        bundle = build_staging_records(
+            self._parsed(add_at, rem_at),
+            coverage_start=date(2019, 1, 2),
+            source="fixture_sp500",
+            source_version="v1",
+        )
+        ttt = next(r for r in bundle.membership if r.ticker == "TTT")
+        assert ttt.announced_at == add_at
+        assert ttt.end_announced_at == rem_at
+
+    def test_future_announced_removal_rejected(self) -> None:
+        rem_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        bundle = build_staging_records(
+            self._parsed(None, rem_at),
+            coverage_start=date(2019, 1, 2),
+            source="fixture_sp500",
+            source_version="v1",
+        )
+        issues = validate_staging(
+            bundle,
+            coverage_end=date(2021, 1, 4),
+            ingested_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        )
+        assert any("future_announced" in i and "end_announced_at" in i for i in issues)
+
+    def test_removal_announced_after_effective_date_extends_eligibility(
+        self, tmp_path: Path
+    ) -> None:
+        # Removal effective 2020-08-03 but only announced 2020-08-10:
+        # end_known_at must honor the later announcement, keeping the ticker
+        # eligible until then.
+        rem_at = datetime(2020, 8, 10, 21, 0, tzinfo=timezone.utc)
+        bundle = build_staging_records(
+            self._parsed(None, rem_at),
+            coverage_start=date(2019, 1, 2),
+            source="fixture_sp500",
+            source_version="v1",
+        )
+        bundle = derive_known_at(bundle)
+        ttt = next(r for r in bundle.membership if r.ticker == "TTT")
+        assert ttt.end_known_at == rem_at
+
+        from data.universe.runtime import PITUniverseLookup
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'ann.db'}", future=True)
+        publish(
+            bundle,
+            engine=eng,
+            provider_name="fixture_sp500",
+            source_version="v1",
+            raw_artifact_path="x",
+            raw_checksum_sha256="a" * 64,
+            retrieved_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            coverage_start=date(2019, 1, 2),
+            coverage_end=date(2021, 1, 4),
+        )
+        lookup = PITUniverseLookup(eng, "sp500_fixture")
+        # After the effective end but before the announcement: still eligible.
+        assert lookup.is_eligible("TTT", date(2020, 8, 5)) is True
+        # From the announcement onward: excluded.
+        assert lookup.is_eligible("TTT", date(2020, 8, 11)) is False
+
+    def test_early_announcement_never_beats_conservative_floor(self) -> None:
+        # An announcement BEFORE the effective date cannot make the change
+        # knowable earlier than the conservative next-session floor.
+        add_at = datetime(2020, 1, 15, 21, 0, tzinfo=timezone.utc)
+        rem_at = datetime(2020, 7, 15, 21, 0, tzinfo=timezone.utc)
+        bundle = build_staging_records(
+            self._parsed(add_at, rem_at),
+            coverage_start=date(2019, 1, 2),
+            source="fixture_sp500",
+            source_version="v1",
+        )
+        bundle = derive_known_at(bundle)
+        ttt = next(r for r in bundle.membership if r.ticker == "TTT")
+        from data.universe.calendar import conservative_known_at_for_date_only_source
+
+        assert ttt.known_at == conservative_known_at_for_date_only_source(date(2020, 2, 3))
+        assert ttt.end_known_at == conservative_known_at_for_date_only_source(date(2020, 8, 3))

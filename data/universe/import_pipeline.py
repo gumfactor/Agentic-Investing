@@ -71,6 +71,8 @@ class MembershipCandidate:
     reason: Optional[str]
     announced_at: Optional[datetime] = None
     known_at: Optional[datetime] = None
+    # Provider-supplied announcement of the REMOVAL closing this interval.
+    end_announced_at: Optional[datetime] = None
     end_known_at: Optional[datetime] = None
     left_censored: bool = False
 
@@ -208,11 +210,18 @@ def build_staging_records(
 
     current_by_ticker = {row.ticker: row for row in parsed.current_rows}
 
-    # Per-ticker atomic (kind, date, source_record_id, reason, security_name) events.
-    atomic: dict[str, list[tuple[str, date, str, Optional[str]]]] = {}
+    # Per-ticker atomic (kind, date, source_record_id, reason, announced_at) events.
+    atomic: dict[str, list[tuple[str, date, str, Optional[str], Optional[datetime]]]] = {}
 
-    def _add_atomic(ticker: str, kind: str, d: date, source_record_id: str, reason: Optional[str]) -> None:
-        atomic.setdefault(ticker, []).append((kind, d, source_record_id, reason))
+    def _add_atomic(
+        ticker: str,
+        kind: str,
+        d: date,
+        source_record_id: str,
+        reason: Optional[str],
+        announced_at: Optional[datetime],
+    ) -> None:
+        atomic.setdefault(ticker, []).append((kind, d, source_record_id, reason, announced_at))
 
     for event in parsed.change_events:
         if (
@@ -247,14 +256,14 @@ def build_staging_records(
             # A rename still closes the old ticker's interval and opens the
             # new ticker's interval, so daily_prices joins (keyed by the raw
             # vendor ticker active on each date) keep resolving correctly.
-            _add_atomic(event.removed_ticker, "removed", event.effective_date, event.source_record_id, event.reason)  # type: ignore[arg-type]
-            _add_atomic(event.added_ticker, "added", event.effective_date, event.source_record_id, event.reason)  # type: ignore[arg-type]
+            _add_atomic(event.removed_ticker, "removed", event.effective_date, event.source_record_id, event.reason, event.announced_at)  # type: ignore[arg-type]
+            _add_atomic(event.added_ticker, "added", event.effective_date, event.source_record_id, event.reason, event.announced_at)  # type: ignore[arg-type]
             continue
 
         if event.added_ticker:
-            _add_atomic(event.added_ticker, "added", event.effective_date, event.source_record_id, event.reason)
+            _add_atomic(event.added_ticker, "added", event.effective_date, event.source_record_id, event.reason, event.announced_at)
         if event.removed_ticker:
-            _add_atomic(event.removed_ticker, "removed", event.effective_date, event.source_record_id, event.reason)
+            _add_atomic(event.removed_ticker, "removed", event.effective_date, event.source_record_id, event.reason, event.announced_at)
 
     all_tickers = set(current_by_ticker) | set(atomic)
     for ticker in sorted(all_tickers):
@@ -278,8 +287,8 @@ def build_staging_records(
             events = [e for e in events if e[1] < current_row.effective_start]
 
         # Pair remaining events chronologically into closed intervals.
-        pending_start: Optional[tuple[date, str, Optional[str]]] = None
-        for kind, d, source_record_id, reason in events:
+        pending_start: Optional[tuple[date, str, Optional[str], Optional[datetime]]] = None
+        for kind, d, source_record_id, reason, announced_at in events:
             if kind == "added":
                 if pending_start is not None:
                     # Two "added" in a row with no intervening "removed":
@@ -289,7 +298,7 @@ def build_staging_records(
                         f"'removed'; keeping the earlier open date {pending_start[0]}."
                     )
                     continue
-                pending_start = (d, source_record_id, reason)
+                pending_start = (d, source_record_id, reason, announced_at)
             elif kind == "removed":
                 if pending_start is None:
                     if d <= coverage_start:
@@ -314,11 +323,12 @@ def build_staging_records(
                             source=source,
                             source_record_id=source_record_id,
                             reason="left_censored_pre_coverage_window",
+                            end_announced_at=announced_at,
                             left_censored=True,
                         )
                     )
                 else:
-                    start_date, start_record_id, _start_reason = pending_start
+                    start_date, start_record_id, _start_reason, start_announced_at = pending_start
                     bundle.membership.append(
                         MembershipCandidate(
                             ticker=ticker,
@@ -328,6 +338,8 @@ def build_staging_records(
                             source=source,
                             source_record_id=f"{start_record_id}->{source_record_id}",
                             reason=reason,
+                            announced_at=start_announced_at,
+                            end_announced_at=announced_at,
                         )
                     )
                     pending_start = None
@@ -337,7 +349,7 @@ def build_staging_records(
             # confirmation: the source is internally inconsistent (a still-
             # active ticker should appear in the current-constituents table).
             # Keep it open but flag it rather than silently dropping data.
-            start_date, start_record_id, _ = pending_start
+            start_date, start_record_id, _, start_announced_at = pending_start
             bundle.warnings.append(
                 f"{ticker}: 'added' at {start_date} has no matching 'removed' event and "
                 "is not present in the current-constituents table (inferred open interval)."
@@ -351,6 +363,7 @@ def build_staging_records(
                     source=source,
                     source_record_id=start_record_id,
                     reason="inferred_open_not_confirmed_by_current_table",
+                    announced_at=start_announced_at,
                 )
             )
 
@@ -400,6 +413,12 @@ def validate_staging(
             issues.append(
                 f"future_announced: {row.ticker} announced_at={row.announced_at} is after "
                 f"ingested_at={ingested_at} ({row.source_record_id})"
+            )
+
+        if row.end_announced_at is not None and row.end_announced_at > ingested_at:
+            issues.append(
+                f"future_announced: {row.ticker} end_announced_at={row.end_announced_at} is "
+                f"after ingested_at={ingested_at} ({row.source_record_id})"
             )
 
         end_for_sort = row.effective_end or date.max
@@ -481,7 +500,17 @@ def derive_known_at(bundle: StagingBundle) -> StagingBundle:
         # close. Runtime eligibility keeps the ticker in the universe until
         # then — the exit-side mirror of the entry known_at rule.
         if row.effective_end is not None:
-            row.end_known_at = conservative_known_at_for_date_only_source(row.effective_end)
+            end_fallback = conservative_known_at_for_date_only_source(row.effective_end)
+            # A provider-supplied removal announcement is preserved (Codex
+            # PR #34 P2) and, like the entry side, can only make the removal
+            # knowable LATER than the conservative date-only floor - a
+            # removal announced after its effective date keeps the ticker
+            # eligible until the announcement.
+            row.end_known_at = (
+                max(row.end_announced_at, end_fallback)
+                if row.end_announced_at
+                else end_fallback
+            )
         else:
             row.end_known_at = None
     for sh in bundle.symbol_history:
@@ -714,7 +743,12 @@ def coverage_report(
 
     priced_tickers_by_date: dict[date, set[str]] = {}
     if prices is not None and not prices.empty:
-        for d, group in prices.groupby("date"):
+        # Normalize to datetime.date before grouping (Codex PR #34 P2):
+        # pd.read_sql and similar loaders yield datetime64/Timestamp values,
+        # whose keys never compare equal to the datetime.date values in the
+        # `dates` argument — every member would silently report as unpriced.
+        price_dates = pd.to_datetime(prices["date"]).dt.date
+        for d, group in prices.groupby(price_dates):
             priced_tickers_by_date[d] = set(group["ticker"])
 
     report_rows = []
