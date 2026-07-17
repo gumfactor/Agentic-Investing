@@ -757,6 +757,10 @@ def test_backfill_passes_with_sufficient_history():
     mock_snaps.load_snapshot.return_value = prices_all
 
     # dry_run=True exits before DB writes; should not raise.
+    # provisional_no_universe=True: this test exercises the lookback guard
+    # only — PIT membership enforcement (BUG-008 / 01B-2, on by default) is
+    # deliberately bypassed because no universe import DB exists here; it is
+    # covered by data/tests/universe/test_acceptance_1_4.py.
     run(
         snapshot_date=date(2026, 6, 10),
         start=start,
@@ -765,6 +769,7 @@ def test_backfill_passes_with_sufficient_history():
         batch_size=20,
         dry_run=True,
         snapshots=mock_snaps,
+        provisional_no_universe=True,
     )
 
 

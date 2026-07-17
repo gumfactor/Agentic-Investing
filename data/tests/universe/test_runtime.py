@@ -142,7 +142,9 @@ class TestLoadUniverseAsOf:
             FIXTURE_UNIVERSE_ID, date(2022, 6, 1), engine=engine
         )
         assert isinstance(result, HistoricalUniverse)
-        assert sorted(result.eligible_tickers) == ["AAA", "CCC", "DDD", "FFF"]
+        assert sorted(result.eligible_tickers) == [
+            "AAA", "CCC", "DDD", "FFF", "GGG", "HHH", "III", "JJJ",
+        ]
         assert result.source == "fixture_sp500"
         assert result.import_batch_id >= 1
         assert result.coverage_start == FIXTURE_COVERAGE_START

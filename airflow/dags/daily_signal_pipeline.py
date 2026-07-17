@@ -207,6 +207,57 @@ def _compute_quality(**context: Any) -> None:
     )
 
 
+def _pit_membership_filter(df: Any, score_date: date) -> Any:
+    """Filter a factor-score DataFrame to knowable index members (BUG-008).
+
+    Uses the point-in-time universe when a published import covers
+    score_date. This DAG's same-day output is OPERATIONAL (it feeds the
+    paper pipeline), so a missing/stale universe import degrades to a loud
+    warning instead of failing the daily run — but the emitted scores are
+    then PROVISIONAL for research purposes, exactly like the pre-01B-2
+    behavior. Historical research callers (IC validation, backfills) use the
+    fail-closed path in data.universe.runtime directly.
+    """
+    import os
+
+    import structlog
+
+    log = structlog.get_logger("rqis.airflow")
+    try:
+        from data.universe.runtime import (
+            CoverageGapError,
+            NoPublishedImportError,
+            PITUniverseLookup,
+        )
+
+        lookup = PITUniverseLookup(os.environ["DATABASE_URL"], "sp500")
+        eligible = set(lookup.load_universe_as_of(score_date).eligible_tickers)
+    except (NoPublishedImportError, CoverageGapError) as exc:
+        log.warning(
+            "pit_universe_unavailable_scores_provisional",
+            score_date=str(score_date),
+            error=str(exc),
+            note=(
+                "daily scores emitted WITHOUT point-in-time membership filtering; "
+                "provisional for research (BUG-008). Run "
+                "scripts/import_universe_membership.py to advance coverage."
+            ),
+        )
+        return df
+    if df.empty:
+        return df
+    n_before = len(df)
+    filtered = df[df["ticker"].isin(eligible)].reset_index(drop=True)
+    if len(filtered) != n_before:
+        log.info(
+            "pit_membership_filter_applied",
+            score_date=str(score_date),
+            rows_before=n_before,
+            rows_after=len(filtered),
+        )
+    return filtered
+
+
 def _combine_scores(**context: Any) -> None:
     """Combine factor scores into composite alpha_scores."""
     import pandas as pd
@@ -225,7 +276,9 @@ def _combine_scores(**context: Any) -> None:
         df = pd.read_json(raw, orient="records", convert_dates=False)
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"]).dt.date
-        return df
+        # Point-in-time membership filter (BUG-008 / 01B-2); degrades to a
+        # warning when no published universe import covers score_date.
+        return _pit_membership_filter(df, score_date)
 
     factor_scores = {}
     score_col_map = {}

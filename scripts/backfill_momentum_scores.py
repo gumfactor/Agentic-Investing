@@ -17,6 +17,17 @@ prices enter any score.  The price snapshot must therefore cover at least
 the skip buffer).  The recommended practice is to load a snapshot that begins
 at least 18 months before --start.
 
+Point-in-time universe (BUG-008 / 01B-2)
+----------------------------------------
+This is a HISTORICAL caller: by default it requires a published point-in-time
+universe import (scripts/import_universe_membership.py) and filters every
+score date's cross-section to tickers with knowable index membership on that
+date.  It fails closed when no published import exists or when any score date
+falls outside the validated coverage window.  --provisional-no-universe
+skips the membership filter with a loud warning; the resulting scores are
+PROVISIONAL and must not be used for selection, promotion, or paper-trading
+qualification.
+
 Usage
 ------
     # Dry run — shows what would be written, writes nothing:
@@ -71,6 +82,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Compute and print summary statistics but do not write to DB.",
     )
+    p.add_argument(
+        "--universe-id",
+        default="sp500",
+        help="Point-in-time universe to filter membership against (default: sp500).",
+    )
+    p.add_argument(
+        "--provisional-no-universe",
+        action="store_true",
+        help="Skip point-in-time membership filtering (BUG-008). The resulting "
+        "scores are PROVISIONAL: not valid for selection, promotion, or "
+        "paper-trading qualification.",
+    )
     return p.parse_args()
 
 
@@ -82,6 +105,9 @@ def run(
     batch_size: int,
     dry_run: bool,
     snapshots=None,  # injectable for testing; None → construct from env vars
+    universe_id: str = "sp500",
+    provisional_no_universe: bool = False,
+    universe_lookup=None,  # injectable for testing; None → construct from DATABASE_URL
 ) -> None:
     from data.storage.timescale_writer import TimescaleWriter
     from signals.composites.momentum_score import compute_momentum_scores
@@ -123,6 +149,42 @@ def run(
     momentum_df["date"] = pd.to_datetime(momentum_df["date"]).dt.date
     mask = (momentum_df["date"] >= start) & (momentum_df["date"] <= end)
     momentum_df = momentum_df[mask].reset_index(drop=True)
+
+    # ── Point-in-time membership filter (BUG-008 / 01B-2) ─────────────────────
+    if provisional_no_universe:
+        logger.warning(
+            "backfill_without_pit_universe",
+            note=(
+                "membership filtering skipped (--provisional-no-universe); the "
+                "resulting scores are PROVISIONAL and must not be used for "
+                "selection, promotion, or paper-trading qualification (BUG-008)"
+            ),
+        )
+    else:
+        import os
+
+        from data.universe.runtime import PITUniverseLookup
+
+        if universe_lookup is None:
+            universe_lookup = PITUniverseLookup(os.environ["DATABASE_URL"], universe_id)
+        n_before = len(momentum_df)
+        eligible_by_date = {
+            d: set(universe_lookup.load_universe_as_of(d).eligible_tickers)
+            for d in momentum_df["date"].unique()
+        }
+        keep = [
+            row.ticker in eligible_by_date[row.date]
+            for row in momentum_df[["ticker", "date"]].itertuples(index=False)
+        ]
+        momentum_df = momentum_df[pd.Series(keep, index=momentum_df.index)].reset_index(drop=True)
+        logger.info(
+            "pit_membership_filter_applied",
+            universe_id=universe_lookup.universe_id,
+            import_batch_id=universe_lookup.import_batch_id,
+            rows_before=n_before,
+            rows_after=len(momentum_df),
+            rows_excluded=n_before - len(momentum_df),
+        )
 
     score_dates = sorted(momentum_df["date"].unique())
     logger.info(
@@ -215,6 +277,8 @@ def main() -> None:
         strategy_id=args.strategy_id,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        universe_id=args.universe_id,
+        provisional_no_universe=args.provisional_no_universe,
     )
 
 

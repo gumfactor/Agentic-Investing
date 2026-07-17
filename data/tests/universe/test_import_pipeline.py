@@ -376,12 +376,12 @@ class TestPublishAndRunImport:
             engine, FIXTURE_UNIVERSE_ID, dates=[date(2020, 3, 1), date(2020, 7, 1), date(2022, 6, 1)]
         )
         by_date = report.by_date.set_index("date")
-        # 2020-03-01: AAA, DDD (first stint), EEE are active.
-        assert by_date.loc[date(2020, 3, 1), "n_members"] == 3
-        # 2020-07-01: AAA, BBB, EEE active (DDD stint 1 closed 04-01).
-        assert by_date.loc[date(2020, 7, 1), "n_members"] == 3
-        # 2022-06-01: AAA, CCC, DDD (re-entry), FFF active.
-        assert by_date.loc[date(2022, 6, 1), "n_members"] == 4
+        # 2020-03-01: AAA, DDD (first stint), EEE + GGG/HHH/III/JJJ active.
+        assert by_date.loc[date(2020, 3, 1), "n_members"] == 7
+        # 2020-07-01: AAA, BBB, EEE + GGG/HHH/III/JJJ (DDD stint 1 closed 04-01).
+        assert by_date.loc[date(2020, 7, 1), "n_members"] == 7
+        # 2022-06-01: AAA, CCC, DDD (re-entry), FFF + GGG/HHH/III/JJJ active.
+        assert by_date.loc[date(2022, 6, 1), "n_members"] == 8
         assert report.n_symbol_history_rows == 1
 
     def test_coverage_report_joins_prices(self, engine, tmp_path: Path) -> None:
@@ -398,9 +398,9 @@ class TestPublishAndRunImport:
         )
         report = coverage_report(engine, FIXTURE_UNIVERSE_ID, dates=[date(2022, 6, 1)], prices=prices)
         row = report.by_date.iloc[0]
-        assert row["n_members"] == 4
+        assert row["n_members"] == 8
         assert row["n_priced_members"] == 2
-        assert row["n_unpriced_members"] == 2
+        assert row["n_unpriced_members"] == 6
 
     def test_record_rejected_batch_is_auditable(self, engine, tmp_path: Path) -> None:
         batch = record_rejected_batch(

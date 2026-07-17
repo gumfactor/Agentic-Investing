@@ -227,6 +227,18 @@ def main() -> int:
     parser.add_argument("--min-ic", type=float, default=0.03)
     parser.add_argument("--min-tstat", type=float, default=2.0)
     parser.add_argument("--persist", action="store_true")
+    parser.add_argument(
+        "--universe-id",
+        default="sp500",
+        help="Point-in-time universe for membership enforcement (default: sp500).",
+    )
+    parser.add_argument(
+        "--provisional-no-universe",
+        action="store_true",
+        help="Skip point-in-time membership enforcement (BUG-008). Results are "
+        "PROVISIONAL: not valid for selection, promotion, or paper-trading "
+        "qualification.",
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL")
@@ -240,6 +252,36 @@ def main() -> int:
     holdout_start = _holdout_start(dates, args.train_fraction)
     audit = audit_universe_survivorship(prices)
     fundamentals = None
+
+    # ── Point-in-time universe (BUG-008 / 01B-2) ─────────────────────────────
+    # This is a HISTORICAL caller: membership enforcement is required by
+    # default and fails closed when no published universe import exists or
+    # when any holdout date is outside validated coverage.
+    universe_lookup = None
+    if args.provisional_no_universe:
+        print(
+            "WARNING: --provisional-no-universe set. IC results are PROVISIONAL "
+            "(current-membership universe, BUG-008): not valid for selection, "
+            "promotion, or paper-trading qualification."
+        )
+    else:
+        from data.universe.runtime import NoPublishedImportError, PITUniverseLookup
+
+        try:
+            universe_lookup = PITUniverseLookup(engine, args.universe_id)
+        except NoPublishedImportError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            print(
+                "Run scripts/import_universe_membership.py first, or rerun with "
+                "--provisional-no-universe to accept provisional results.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"PIT universe: {args.universe_id} import batch "
+            f"{universe_lookup.import_batch_id}, coverage "
+            f"[{universe_lookup.coverage_start}, {universe_lookup.coverage_end}]"
+        )
 
     print(
         f"Live prices: {len(prices):,} rows, {prices['ticker'].nunique()} tickers, "
@@ -272,6 +314,7 @@ def main() -> int:
             prices,
             score_col=spec.score_col,
             horizons=args.horizons,
+            universe=universe_lookup,
         )
         summary = summarize_ic(
             ic_series,

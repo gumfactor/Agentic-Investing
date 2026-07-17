@@ -19,6 +19,9 @@ the 01B-2 acceptance tests in ``data/tests/universe/test_acceptance_1_4.py``):
 - ``EEE`` -> ``FFF``: a same-day ticker-symbol rename — the "ticker change"
   case, resolved via ``universe_symbol_history`` rather than a membership
   gap.
+- ``GGG``/``HHH``/``III``/``JJJ``: additional always-active members since
+  the coverage-window start, so IC acceptance tests can meet the
+  minimum-cross-section threshold (5 tickers) with members to spare.
 """
 
 from __future__ import annotations
@@ -57,6 +60,10 @@ class FixtureSP500Provider:
                 {"ticker": "CCC", "security_name": "Charlie Fixture Co", "effective_start": "2021-06-01"},
                 {"ticker": "DDD", "security_name": "Delta Fixture Co (re-entry)", "effective_start": "2022-01-01"},
                 {"ticker": "FFF", "security_name": "Foxtrot Fixture Co (renamed from EEE)", "effective_start": "2021-03-01"},
+                {"ticker": "GGG", "security_name": "Golf Fixture Co", "effective_start": "2020-01-01"},
+                {"ticker": "HHH", "security_name": "Hotel Fixture Co", "effective_start": "2020-01-01"},
+                {"ticker": "III", "security_name": "India Fixture Co", "effective_start": "2020-01-01"},
+                {"ticker": "JJJ", "security_name": "Juliett Fixture Co", "effective_start": "2020-01-01"},
             ],
             "change_events": [
                 # AAA's original addition duplicated in the changes table,

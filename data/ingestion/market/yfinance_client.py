@@ -443,6 +443,16 @@ def _backfill_cli() -> None:
 
     from data.normalization.quality_checks import run_quality_checks
     from data.storage.timescale_writer import TimescaleWriter
+
+    # OPERATIONAL CURRENT-UNIVERSE MODE (BUG-008 / 01B-2): this backfill
+    # decides which tickers to fetch price history for, using current S&P 500
+    # membership. The price ROWS it writes are usable by historical research,
+    # but historical ELIGIBILITY must always come from
+    # data.universe.runtime.PITUniverseLookup — tickers fetched here that were
+    # not members on a given historical date are excluded by that layer, and
+    # removed constituents this loader never fetches are precisely the
+    # survivorship gap the PIT universe contract documents (a commercial
+    # delisted-price source closes it at Gate 03).
     from config.universe_loader import load_universe
 
     end_date = date.today()
