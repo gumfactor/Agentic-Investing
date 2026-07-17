@@ -74,7 +74,7 @@ Token figures are reported as `<agent/effort>: <tokens>`.
 |---|---|---|---|---|---|
 | 01A | `dev/R2-01A-compose-runtime` | [#33](https://github.com/gumfactor/Agentic-Investing/pull/33) | **Merged 2026-07-16** (`3e37bb5`) — operator live-verification checklist (docs/runbooks/01a_compose_paper_runtime_verification.md) still pending before BUG-001..004 close | Sonnet 5 medium: 284K (builder incl. fix + review rounds) + 122K (adversarial reviewer) | Fable 5: ~45K |
 | 01B-1 | `dev/R2-01B1-missing-data` | [#32](https://github.com/gumfactor/Agentic-Investing/pull/32) | **Merged 2026-07-16** (`65e1b72`) | Sonnet 5 medium: 342K (builder incl. fix + review rounds) + 124K (adversarial reviewer) | Fable 5: ~45K |
-| 01B-2 | `dev/R2-01B2-pit-universe` | [#34](https://github.com/gumfactor/Agentic-Investing/pull/34) | **Ready for operator review/merge** — adversarial fix round + 2 Codex P1 fixes on tip `837d000`; clean rereview window; operator DB steps (migration 009 + universe import) post-merge | Sonnet 5 medium: 350K (builder incl. fix + review rounds) + 167K (adversarial reviewer) | Fable 5: ~40K |
+| 01B-2 | `dev/R2-01B2-pit-universe` | [#34](https://github.com/gumfactor/Agentic-Investing/pull/34) | PR open — Codex round 3 in progress (round-2 response arrived 2.5h after summon: 1 P1 + 2 P2; "ready" status at 7ae9beb was premature — babysit round-closure rule corrected to wait for Codex's actual review event) | Sonnet 5 medium: 350K+ (builder) + 167K (adversarial reviewer) | Fable 5: ~45K |
 | 01B-3 | `dev/R2-01B3-timing-contract` | — | Queued (blocked on 01B-2) | — | — |
 
 Both adversarial reviews returned APPROVE-WITH-FIXES with confirmed findings
