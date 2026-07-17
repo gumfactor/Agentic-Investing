@@ -80,7 +80,9 @@ class TestSnapshotFullImport:
         )
         assert batch.status == "published"
         assert batch.universe_id == "sp500"
-        assert batch.n_membership_rows == 890
+        # 891 (was 890 pre-Codex-fix): preserving the non-excluded side of
+        # AN/SUN/AGN change events restores replacement partners' intervals.
+        assert batch.n_membership_rows == 891
         assert batch.n_symbol_history_rows == 6
         assert batch.coverage_start == date(1976, 7, 1)
         assert batch.coverage_end == date(2026, 7, 17)
@@ -89,8 +91,27 @@ class TestSnapshotFullImport:
             engine, "sp500", dates=[date(2010, 1, 4), date(2023, 6, 1)]
         )
         by_date = report.by_date.set_index("date")
-        assert by_date.loc[date(2010, 1, 4), "n_members"] == 502
-        assert by_date.loc[date(2023, 6, 1), "n_members"] == 519
+        assert by_date.loc[date(2010, 1, 4), "n_members"] == 500
+        assert by_date.loc[date(2023, 6, 1), "n_members"] == 520
+        # Exclusion audit surfaced by the report (fix-round P1).
+        assert report.excluded_tickers["tickers"] == ["AGN", "AN", "SUN"]
+
+        # Codex P1 regression: PETM replaced the excluded SUN on 2012-10-10;
+        # its addition must survive the exclusion with the correct start
+        # date (previously the whole change row was dropped and PETM became
+        # left-censored at 1976-07-01).
+        from sqlalchemy import select
+        from sqlalchemy.orm import Session
+
+        from data.universe.models import UniverseMembership
+
+        with Session(engine) as session:
+            petm = session.execute(
+                select(UniverseMembership).where(UniverseMembership.ticker == "PETM")
+            ).scalars().all()
+        assert len(petm) == 1
+        assert petm[0].effective_start == date(2012, 10, 10)
+        assert petm[0].effective_end == date(2015, 3, 12)
 
 
 # ─── Fix round: header validation + snapshot tamper detection ─────────────────

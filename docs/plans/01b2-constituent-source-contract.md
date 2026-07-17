@@ -182,10 +182,14 @@ exclusions above:
   (sha256 `3395c346fba67789d1e0170d919c6d74e42922d66001755a50ad691cc647d170`,
   checked in with its `manifest.json` so the import is reproducible offline
   via `--snapshot`).
-- 503 current-constituent rows, 407 change events parsed; 890 membership
-  intervals, 6 symbol-history rows published; 245 left-censored intervals.
-- Coverage-report member counts: 417 (2000-01-03), 502 (2010-01-04),
-  522 (2020-01-02), 519 (2023-06-01), 518 (2026-06-30).
+- 503 current-constituent rows, 407 change events parsed; 891 membership
+  intervals, 6 symbol-history rows published; 241 left-censored intervals.
+  (Counts updated after the Codex PR #34 fix that preserves the
+  non-excluded side of AN/SUN/AGN change events; the pre-fix import
+  produced 890 intervals with 245 left-censored.)
+- Coverage-report member counts: 500 (2010-01-04), 520 (2023-06-01);
+  pre-fix values were 417 (2000-01-03), 502 (2010-01-04), 522 (2020-01-02),
+  519 (2023-06-01), 518 (2026-06-30).
 
 The count drift versus the true ~503-505 constituent count (under-counting in
 2000, over-counting ~3% in 2020+) is the expected artifact of Wikipedia's

@@ -539,7 +539,22 @@ def publish(
                     import_batch_id=batch.id,
                 )
             )
+        # Symbol history is a global append-only mapping (no batch scoping):
+        # a coverage-advancing re-import re-derives the same rename rows, so
+        # skip rows whose (universe_id, old_ticker, effective_date) key
+        # already exists instead of tripping the unique constraint
+        # (Codex PR #34 P1 fix — re-imports must succeed end to end).
+        existing_keys = {
+            (r.old_ticker, r.effective_date)
+            for r in session.execute(
+                select(SymbolHistory).where(
+                    SymbolHistory.universe_id == bundle.universe_id
+                )
+            ).scalars()
+        }
         for sh in bundle.symbol_history:
+            if (sh.old_ticker, sh.effective_date) in existing_keys:
+                continue
             session.add(
                 SymbolHistory(
                     universe_id=bundle.universe_id,
@@ -633,13 +648,6 @@ def coverage_report(
             price row.
     """
     with Session(engine) as session:
-        rows = session.execute(
-            select(UniverseMembership).where(UniverseMembership.universe_id == universe_id)
-        ).scalars().all()
-        n_left_censored = sum(1 for r in rows if r.reason == "left_censored_pre_coverage_window")
-        n_symbol_history = session.execute(
-            select(SymbolHistory).where(SymbolHistory.universe_id == universe_id)
-        ).scalars().all()
         latest_published = session.execute(
             select(UniverseImportBatch)
             .where(
@@ -651,6 +659,23 @@ def coverage_report(
         excluded: Optional[dict] = None
         if latest_published is not None and latest_published.excluded_tickers:
             excluded = json.loads(latest_published.excluded_tickers)
+
+        # Scope membership to the latest published batch — the same batch
+        # PITUniverseLookup serves. Each batch is a complete row set, so an
+        # unscoped read would double-count members after a re-import
+        # (Codex PR #34 P1 fix).
+        membership_query = select(UniverseMembership).where(
+            UniverseMembership.universe_id == universe_id
+        )
+        if latest_published is not None:
+            membership_query = membership_query.where(
+                UniverseMembership.import_batch_id == latest_published.id
+            )
+        rows = session.execute(membership_query).scalars().all()
+        n_left_censored = sum(1 for r in rows if r.reason == "left_censored_pre_coverage_window")
+        n_symbol_history = session.execute(
+            select(SymbolHistory).where(SymbolHistory.universe_id == universe_id)
+        ).scalars().all()
 
     priced_tickers_by_date: dict[date, set[str]] = {}
     if prices is not None and not prices.empty:
@@ -690,6 +715,47 @@ def coverage_report(
 
 
 # ─── Orchestration ─────────────────────────────────────────────────────────────
+
+
+def apply_exclusions(
+    parsed: ParsedConstituentData, excluded: set[str]
+) -> ParsedConstituentData:
+    """Remove excluded tickers from parsed source data, preserving the
+    non-excluded side of two-sided change events.
+
+    Codex PR #34 P1 fix: the previous predicate dropped an entire change row
+    whenever EITHER side was excluded, so a legitimate replacement partner
+    (e.g. PETM replacing the excluded SUN on 2012-10-10 in the real
+    Wikipedia data) lost its addition event and ended up missing or
+    left-censored with a wrong start date. Only the excluded ticker's side
+    of an event is now blanked; an event is dropped only when nothing
+    non-excluded remains.
+    """
+    import dataclasses
+
+    kept_events: list[ChangeEvent] = []
+    for e in parsed.change_events:
+        added_excluded = e.added_ticker in excluded if e.added_ticker else False
+        removed_excluded = e.removed_ticker in excluded if e.removed_ticker else False
+        if not added_excluded and not removed_excluded:
+            kept_events.append(e)
+            continue
+        replacement = dataclasses.replace(
+            e,
+            added_ticker=None if added_excluded else e.added_ticker,
+            added_security_name=None if added_excluded else e.added_security_name,
+            removed_ticker=None if removed_excluded else e.removed_ticker,
+            removed_security_name=None if removed_excluded else e.removed_security_name,
+        )
+        if replacement.added_ticker is None and replacement.removed_ticker is None:
+            continue  # nothing non-excluded remains
+        kept_events.append(replacement)
+
+    return ParsedConstituentData(
+        universe_id=parsed.universe_id,
+        current_rows=[r for r in parsed.current_rows if r.ticker not in excluded],
+        change_events=kept_events,
+    )
 
 
 def run_import(
@@ -735,15 +801,7 @@ def run_import(
             },
             sort_keys=True,
         )
-        parsed = ParsedConstituentData(
-            universe_id=parsed.universe_id,
-            current_rows=[r for r in parsed.current_rows if r.ticker not in excluded],
-            change_events=[
-                e
-                for e in parsed.change_events
-                if e.added_ticker not in excluded and e.removed_ticker not in excluded
-            ],
-        )
+        parsed = apply_exclusions(parsed, excluded)
         logger.warning(
             "universe_import_tickers_excluded",
             excluded=sorted(excluded),

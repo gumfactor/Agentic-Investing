@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from data.universe.import_pipeline import (
     ImportValidationError,
+    apply_exclusions,
     MembershipCandidate,
     StagingBundle,
     SymbolHistoryCandidate,
@@ -540,3 +541,120 @@ class TestLeftCensoredKnownAt:
         # current table) still follows the conservative next-session rule.
         assert lookup.is_eligible("AAA", date(2019, 1, 2)) is False
         assert lookup.is_eligible("AAA", date(2019, 1, 3)) is True
+
+
+# ─── Codex PR #34 P1 fixes: exclusion side-preservation + re-import ──────────
+
+
+class TestApplyExclusionsPreservesNonExcludedSide:
+    """Codex P1: excluding one side of a two-sided change event must not drop
+    the other side's legitimate add/remove."""
+
+    def _two_sided_event(self) -> ParsedConstituentData:
+        return ParsedConstituentData(
+            universe_id="sp500_fixture",
+            current_rows=[],
+            change_events=[
+                ChangeEvent(
+                    effective_date=date(2021, 10, 10),
+                    added_ticker="NEW",
+                    added_security_name="New Co",
+                    removed_ticker="EXCL",
+                    removed_security_name="Excluded Co",
+                    reason="NEW replaced EXCL.",
+                    source_record_id="chg-two-sided",
+                )
+            ],
+        )
+
+    def test_non_excluded_added_side_survives(self) -> None:
+        parsed = apply_exclusions(self._two_sided_event(), {"EXCL"})
+        assert len(parsed.change_events) == 1
+        evt = parsed.change_events[0]
+        assert evt.added_ticker == "NEW"
+        assert evt.removed_ticker is None
+        assert evt.removed_security_name is None
+
+    def test_non_excluded_removed_side_survives(self) -> None:
+        parsed = apply_exclusions(self._two_sided_event(), {"NEW"})
+        assert len(parsed.change_events) == 1
+        evt = parsed.change_events[0]
+        assert evt.added_ticker is None
+        assert evt.removed_ticker == "EXCL"
+
+    def test_fully_excluded_event_dropped(self) -> None:
+        parsed = apply_exclusions(self._two_sided_event(), {"NEW", "EXCL"})
+        assert parsed.change_events == []
+
+    def test_surviving_side_gets_correct_interval_start(self, tmp_path: Path) -> None:
+        # End-to-end: NEW's addition date must come from the change event,
+        # not degrade to a missing or left-censored interval.
+        base = self._two_sided_event()
+        parsed = ParsedConstituentData(
+            universe_id=base.universe_id,
+            current_rows=[
+                CurrentConstituentRow(
+                    ticker="AAA",
+                    security_name="Anchor",
+                    effective_start=date(2019, 1, 2),
+                    source_record_id="current-AAA",
+                ),
+                CurrentConstituentRow(
+                    ticker="NEW",
+                    security_name="New Co",
+                    effective_start=date(2021, 10, 10),
+                    source_record_id="current-NEW",
+                ),
+            ],
+            change_events=base.change_events,
+        )
+        filtered = apply_exclusions(parsed, {"EXCL"})
+        bundle = build_staging_records(
+            filtered, coverage_start=date(2019, 1, 2), source="fixture_sp500", source_version="v1"
+        )
+        new_rows = [r for r in bundle.membership if r.ticker == "NEW"]
+        assert len(new_rows) == 1
+        assert new_rows[0].effective_start == date(2021, 10, 10)
+        assert not any(r.ticker == "EXCL" for r in bundle.membership)
+
+
+class TestReimportAdvancesCoverage:
+    """Codex P1: a coverage-advancing re-import must succeed and not
+    double-count against the previous published batch."""
+
+    def test_second_import_publishes_and_scopes_reads(self, tmp_path: Path) -> None:
+        eng = create_engine(f"sqlite:///{tmp_path / 'reimport.db'}", future=True)
+
+        first = run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "a1",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        second = run_import(
+            FixtureSP500Provider(
+                retrieved_at=datetime(2024, 6, 3, tzinfo=timezone.utc)
+            ),
+            engine=eng,
+            artifact_root=tmp_path / "a2",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        assert second.status == "published"
+        assert second.id != first.id
+        assert second.coverage_end == date(2024, 6, 3)
+
+        # Lookup serves the newest batch and its advanced coverage.
+        from data.universe.runtime import PITUniverseLookup
+
+        lookup = PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID)
+        assert lookup.import_batch_id == second.id
+        assert lookup.coverage_end == date(2024, 6, 3)
+        # A date valid only under the new coverage works.
+        assert lookup.is_eligible("AAA", date(2024, 5, 1)) is True
+
+        # Coverage report is scoped to the newest batch: member counts do
+        # not double after the re-import.
+        report = coverage_report(eng, FIXTURE_UNIVERSE_ID, dates=[date(2022, 6, 1)])
+        assert report.by_date.iloc[0]["n_members"] == 8
+        # Symbol history was not duplicated by the second publish.
+        assert report.n_symbol_history_rows == 1
