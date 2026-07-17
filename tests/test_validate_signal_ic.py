@@ -67,3 +67,32 @@ def test_persist_summary_uses_signal_ic_upsert():
     assert "INSERT INTO signal_ic_stats" in sql
     assert "ON CONFLICT" in sql
     assert records[0]["factor_name"] == "momentum"
+    # Default is provisional=True (BUG-008 interim marker, migration 010).
+    assert records[0]["provisional"] is True
+    assert "provisional = EXCLUDED.provisional" in sql
+
+
+def test_persist_summary_stamps_certified_rows_non_provisional():
+    engine = MagicMock()
+    connection = engine.begin.return_value.__enter__.return_value
+    summary = pd.DataFrame(
+        [
+            {
+                "factor_name": "momentum",
+                "strategy_id": "v1",
+                "eval_date": date(2026, 5, 8),
+                "horizon_days": 21,
+                "ic": 0.09,
+                "rank_ic": 0.02,
+                "ic_tstat": 8.0,
+                "ic_ir": 0.4,
+                "ic_pvalue": 0.0,
+                "n_observations": 356,
+            }
+        ]
+    )
+
+    # PIT-enforced run (universe lookup active) stamps provisional=False.
+    assert _persist_summary(engine, summary, provisional=False) == 1
+    _, records = connection.execute.call_args.args
+    assert records[0]["provisional"] is False

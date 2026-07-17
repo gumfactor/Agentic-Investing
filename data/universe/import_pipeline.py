@@ -439,9 +439,23 @@ def derive_known_at(bundle: StagingBundle) -> StagingBundle:
     the conservative availability rule and is rejected by
     :func:`validate_staging` before this function is reached (missing dates
     are already flagged there).
+
+    Left-censored rows are the exception to the next-session rule
+    (adversarial-review fix, 01B-2): their ``effective_start`` is the
+    fabricated ``coverage_start`` boundary, not a real membership *change*
+    that had to become knowable — the security was already a member before
+    the window opened. Applying the next-session rule to the boundary would
+    wrongly exclude these members on day one of the certified window, so
+    they get ``known_at`` = the session close of ``effective_start`` itself
+    (still never earlier than any queryable cutoff for that date).
     """
+    from data.universe.calendar import session_close_cutoff
+
     for row in bundle.membership:
-        fallback = conservative_known_at_for_date_only_source(row.effective_start)
+        if row.left_censored:
+            fallback = session_close_cutoff(row.effective_start)
+        else:
+            fallback = conservative_known_at_for_date_only_source(row.effective_start)
         row.known_at = max(row.announced_at, fallback) if row.announced_at else fallback
     for sh in bundle.symbol_history:
         sh.known_at = conservative_known_at_for_date_only_source(sh.effective_date)
@@ -462,8 +476,13 @@ def publish(
     retrieved_at: datetime,
     coverage_start: date,
     coverage_end: date,
+    excluded_tickers_record: Optional[str] = None,
 ) -> UniverseImportBatch:
     """Publish a validated, known_at-derived staging bundle.
+
+    ``excluded_tickers_record`` is the JSON audit string
+    (``{"tickers": [...], "reason": "..."}``) for operator exclusions,
+    persisted on the batch row so exclusions are DB-queryable.
 
     Only a complete, validated import is ever published (§1.2 step 5): call
     :func:`validate_staging` first and raise :class:`ImportValidationError`
@@ -495,6 +514,7 @@ def publish(
             coverage_end=coverage_end,
             n_membership_rows=len(bundle.membership),
             n_symbol_history_rows=len(bundle.symbol_history),
+            excluded_tickers=excluded_tickers_record,
             created_at=now,
             published_at=now,
         )
@@ -594,6 +614,9 @@ class CoverageReport:
     by_date: pd.DataFrame
     n_left_censored_intervals: int
     n_symbol_history_rows: int
+    # Operator --exclude-tickers audit from the latest published batch
+    # ({"tickers": [...], "reason": "..."}); None when nothing was excluded.
+    excluded_tickers: Optional[dict] = None
 
 
 def coverage_report(
@@ -617,6 +640,17 @@ def coverage_report(
         n_symbol_history = session.execute(
             select(SymbolHistory).where(SymbolHistory.universe_id == universe_id)
         ).scalars().all()
+        latest_published = session.execute(
+            select(UniverseImportBatch)
+            .where(
+                UniverseImportBatch.universe_id == universe_id,
+                UniverseImportBatch.status == "published",
+            )
+            .order_by(UniverseImportBatch.published_at.desc())
+        ).scalars().first()
+        excluded: Optional[dict] = None
+        if latest_published is not None and latest_published.excluded_tickers:
+            excluded = json.loads(latest_published.excluded_tickers)
 
     priced_tickers_by_date: dict[date, set[str]] = {}
     if prices is not None and not prices.empty:
@@ -651,6 +685,7 @@ def coverage_report(
         by_date=pd.DataFrame(report_rows),
         n_left_censored_intervals=n_left_censored,
         n_symbol_history_rows=len(n_symbol_history),
+        excluded_tickers=excluded,
     )
 
 
@@ -665,6 +700,7 @@ def run_import(
     coverage_start: date,
     coverage_end: Optional[date] = None,
     exclude_tickers: Optional[set[str]] = None,
+    exclude_reason: Optional[str] = None,
 ) -> UniverseImportBatch:
     """Run the full import pipeline: fetch -> persist -> stage -> validate -> publish.
 
@@ -688,8 +724,17 @@ def run_import(
     coverage_end = coverage_end or raw.retrieved_at.date()
 
     parsed = provider.parse(raw)
+    excluded_tickers_record: Optional[str] = None
     if exclude_tickers:
         excluded = {t.upper() for t in exclude_tickers}
+        excluded_tickers_record = json.dumps(
+            {
+                "tickers": sorted(excluded),
+                "reason": exclude_reason
+                or "operator exclusion (see docs/plans/01b2-constituent-source-contract.md)",
+            },
+            sort_keys=True,
+        )
         parsed = ParsedConstituentData(
             universe_id=parsed.universe_id,
             current_rows=[r for r in parsed.current_rows if r.ticker not in excluded],
@@ -733,4 +778,5 @@ def run_import(
         retrieved_at=raw.retrieved_at,
         coverage_start=coverage_start,
         coverage_end=coverage_end,
+        excluded_tickers_record=excluded_tickers_record,
     )

@@ -76,6 +76,11 @@ def _parse_args() -> argparse.Namespace:
         "excluded tickers are never eligible historically — fail closed). Record "
         "every exclusion in docs/plans/01b2-constituent-source-contract.md.",
     )
+    p.add_argument(
+        "--exclude-reason",
+        default=None,
+        help="Reason recorded in the DB audit record alongside --exclude-tickers.",
+    )
     return p.parse_args()
 
 
@@ -103,6 +108,7 @@ def main() -> None:
             artifact_root=Path(args.artifact_root),
             coverage_start=coverage_start,
             exclude_tickers=exclude or None,
+            exclude_reason=args.exclude_reason,
         )
     except ImportValidationError as exc:
         print("Import REJECTED. Issues:")

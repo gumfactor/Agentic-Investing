@@ -70,6 +70,9 @@ class UniverseImportBatch(Base):
     n_membership_rows: Mapped[Optional[int]] = mapped_column(Integer)
     n_symbol_history_rows: Mapped[Optional[int]] = mapped_column(Integer)
     rejected_reason: Mapped[Optional[str]] = mapped_column(Text)
+    # JSON text: {"tickers": [...], "reason": "..."} — operator
+    # --exclude-tickers audit record (01B-2 fix round). NULL = no exclusions.
+    excluded_tickers: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     published_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
 

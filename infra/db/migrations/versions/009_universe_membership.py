@@ -5,6 +5,13 @@ BUG-008 (docs/plans/01b-research-validity-design.md §1). Introduces an
 effective-dated constituent model so historical research/backtest callers can
 stop assuming current S&P 500 membership was also historical membership.
 
+Amended during the 01B-2 adversarial-review fix round (before any release or
+non-scratch deployment of this revision, so amending in place rather than a
+follow-up migration is safe and was the recorded choice): adds
+``universe_import_batches.excluded_tickers`` — a JSON text audit record of
+operator ``--exclude-tickers`` exclusions (tickers + reason) so exclusions
+are DB-queryable rather than existing only in logs/docs.
+
 Revision ID: 009
 Revises: 008
 """
@@ -43,6 +50,9 @@ def upgrade() -> None:
         sa.Column("n_membership_rows", sa.Integer(), nullable=True),
         sa.Column("n_symbol_history_rows", sa.Integer(), nullable=True),
         sa.Column("rejected_reason", sa.Text(), nullable=True),
+        # JSON text: {"tickers": [...], "reason": "..."} — operator
+        # --exclude-tickers audit record (01B-2 fix round). NULL = none.
+        sa.Column("excluded_tickers", sa.Text(), nullable=True),
         sa.Column(
             "created_at",
             sa.TIMESTAMP(timezone=True),

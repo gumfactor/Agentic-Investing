@@ -209,15 +209,38 @@ class WikipediaSP500Provider:
 
     @staticmethod
     def _parse_changes_table(df: pd.DataFrame) -> list[ChangeEvent]:
-        # pandas.read_html returns a MultiIndex for this table
-        # (('Effective Date','Effective Date'), ('Added','Ticker'), ...).
+        # pandas.read_html returns a MultiIndex for this table:
+        # ('Effective Date','Effective Date'), ('Added','Ticker'),
+        # ('Added','Security'), ('Removed','Ticker'), ('Removed','Security'),
+        # ('Reason','Reason'). Validate the ACTUAL header text positionally
+        # before renaming (adversarial-review fix: a positional rename with a
+        # post-hoc check of the names we just assigned was tautological — a
+        # silently reordered page would have mis-assigned every column).
+        expected_multiindex = [
+            ("effective date", "effective date"),
+            ("added", "ticker"),
+            ("added", "security"),
+            ("removed", "ticker"),
+            ("removed", "security"),
+            ("reason", "reason"),
+        ]
         columns = df.columns
         if isinstance(columns, pd.MultiIndex):
+            actual = [
+                (str(a).strip().lower(), str(b).strip().lower()) for a, b in columns
+            ]
+            if actual != expected_multiindex:
+                raise ValueError(
+                    "Wikipedia 'Selected changes' table headers changed or were "
+                    f"reordered: expected {expected_multiindex}, found {actual}. "
+                    "Refusing to import until the parser is reviewed against the "
+                    "new page structure."
+                )
             df = df.copy()
             df.columns = [
                 "effective_date", "added_ticker", "added_security",
                 "removed_ticker", "removed_security", "reason",
-            ][: len(columns)]
+            ]
         else:
             rename_map = {
                 "Effective Date": "effective_date",
@@ -227,6 +250,14 @@ class WikipediaSP500Provider:
                 "Removed Security": "removed_security",
                 "Reason": "reason",
             }
+            unexpected = set(df.columns) - set(rename_map)
+            if unexpected:
+                raise ValueError(
+                    "Wikipedia 'Selected changes' table has unexpected flat "
+                    f"headers {sorted(unexpected)}; expected only "
+                    f"{sorted(rename_map)}. Refusing to import until the parser "
+                    "is reviewed against the new page structure."
+                )
             df = df.rename(columns=rename_map)
 
         required = {"effective_date", "added_ticker", "removed_ticker"}

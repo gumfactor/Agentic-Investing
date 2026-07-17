@@ -320,6 +320,20 @@ pass (`data/tests/universe/test_acceptance_1_4.py`). Historical outputs computed
 under the old current-membership universe remain provisional; recompute is 01B-3/§4
 scope. Residual data-quality limits tracked as BUG-068/BUG-069.
 
+Adversarial-review fix round (same branch): operator `--exclude-tickers`
+exclusions are now persisted as a JSON audit record on
+`universe_import_batches.excluded_tickers` (migration 009 amended pre-release)
+and surfaced by `coverage_report()`; migration 010 adds an interim
+`signal_ic_stats.provisional` boolean (existing rows default TRUE — all
+pre-01B-2 rows are provisional by definition; superseded by 01B-3's §4
+`research_run_id` identity) stamped by `scripts/validate_signal_ic.py`;
+the Wikipedia changes-table parser validates actual header text before its
+positional rename and fails closed on reordered/renamed headers; left-censored
+intervals get `known_at` at the coverage-start session close so pre-window
+members are eligible on day one of the certified window; the survivorship
+warning in `validate_signal_ic.py` is gated to provisional runs; snapshot
+checksum-tamper detection is now covered by tests.
+
 **Evidence:** The research universe is documented as current-membership S&P 500 and excludes removed constituents. The IC engine merges scores to forward returns on available ticker/date rows without enforcing point-in-time membership.
 
 **Impact:** Historical IC can be biased upward by excluding bankrupt, removed, or underperforming names that were in the investable universe at the time.
@@ -924,6 +938,11 @@ include a small number of non-members in older periods.
 point-in-time constituent feed at Gate 03; the schema and runtime API are already
 provider-agnostic (`source`/`source_version` columns, `ConstituentProvider`
 protocol).
+
+**Update (01B-2 fix round):** ticker-collision exclusions are now persisted as a
+DB-queryable JSON audit record on `universe_import_batches.excluded_tickers` and
+surfaced by `coverage_report()`, so the AN/SUN/AGN exclusions no longer live only
+in logs and this document's companion contract doc.
 
 ### BUG-069: Signal DAG degrades to unfiltered provisional scores when the PIT universe is stale
 

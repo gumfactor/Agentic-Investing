@@ -91,3 +91,106 @@ class TestSnapshotFullImport:
         by_date = report.by_date.set_index("date")
         assert by_date.loc[date(2010, 1, 4), "n_members"] == 502
         assert by_date.loc[date(2023, 6, 1), "n_members"] == 519
+
+
+# ─── Fix round: header validation + snapshot tamper detection ─────────────────
+
+
+class TestChangesTableHeaderValidation:
+    """Adversarial-review fix: the changes-table parser must validate the
+    ACTUAL header text before its positional rename, so a silently reordered
+    or renamed Wikipedia table fails closed instead of mis-assigning every
+    column."""
+
+    def _multiindex_df(self, top_pairs):
+        import pandas as pd
+
+        cols = pd.MultiIndex.from_tuples(top_pairs)
+        return pd.DataFrame(
+            [["June 30, 2026", "AAA", "Alpha", "BBB", "Bravo", "Reason text"]],
+            columns=cols,
+        )
+
+    def test_expected_headers_parse(self) -> None:
+        df = self._multiindex_df([
+            ("Effective Date", "Effective Date"),
+            ("Added", "Ticker"),
+            ("Added", "Security"),
+            ("Removed", "Ticker"),
+            ("Removed", "Security"),
+            ("Reason", "Reason"),
+        ])
+        events = WikipediaSP500Provider._parse_changes_table(df)
+        assert len(events) == 1
+        assert events[0].added_ticker == "AAA"
+        assert events[0].removed_ticker == "BBB"
+
+    def test_reordered_headers_fail_closed(self) -> None:
+        # Added and Removed groups swapped: positional renaming would have
+        # silently inverted every membership event.
+        df = self._multiindex_df([
+            ("Effective Date", "Effective Date"),
+            ("Removed", "Ticker"),
+            ("Removed", "Security"),
+            ("Added", "Ticker"),
+            ("Added", "Security"),
+            ("Reason", "Reason"),
+        ])
+        with pytest.raises(ValueError, match="reordered"):
+            WikipediaSP500Provider._parse_changes_table(df)
+
+    def test_renamed_header_fails_closed(self) -> None:
+        df = self._multiindex_df([
+            ("Announcement Date", "Announcement Date"),
+            ("Added", "Ticker"),
+            ("Added", "Security"),
+            ("Removed", "Ticker"),
+            ("Removed", "Security"),
+            ("Reason", "Reason"),
+        ])
+        with pytest.raises(ValueError, match="headers changed"):
+            WikipediaSP500Provider._parse_changes_table(df)
+
+    def test_unexpected_flat_headers_fail_closed(self) -> None:
+        import pandas as pd
+
+        df = pd.DataFrame(
+            [["June 30, 2026", "AAA", "BBB", "extra"]],
+            columns=["Effective Date", "Added Ticker", "Removed Ticker", "Bonus Column"],
+        )
+        with pytest.raises(ValueError, match="unexpected flat"):
+            WikipediaSP500Provider._parse_changes_table(df)
+
+
+class TestSnapshotTamperDetection:
+    """Adversarial-review fix: exercise the checksum-mismatch path the
+    snapshot loader docstring claims (fetch() must refuse a modified
+    artifact)."""
+
+    def test_tampered_snapshot_rejected(self, tmp_path: Path) -> None:
+        import shutil
+
+        day_dir = tmp_path / "snap"
+        day_dir.mkdir()
+        shutil.copy(_SNAPSHOT, day_dir / "raw.html")
+        shutil.copy(_SNAPSHOT.parent / "manifest.json", day_dir / "manifest.json")
+
+        # Corrupt one byte of the copied artifact.
+        raw = (day_dir / "raw.html").read_bytes()
+        (day_dir / "raw.html").write_bytes(raw[:100] + b"X" + raw[101:])
+
+        provider = WikipediaSP500Provider(snapshot_path=day_dir / "raw.html")
+        with pytest.raises(ValueError, match="checksum mismatch"):
+            provider.fetch()
+
+    def test_untampered_snapshot_accepted(self, tmp_path: Path) -> None:
+        import shutil
+
+        day_dir = tmp_path / "snap"
+        day_dir.mkdir()
+        shutil.copy(_SNAPSHOT, day_dir / "raw.html")
+        shutil.copy(_SNAPSHOT.parent / "manifest.json", day_dir / "manifest.json")
+
+        provider = WikipediaSP500Provider(snapshot_path=day_dir / "raw.html")
+        raw = provider.fetch()
+        assert len(raw.content) > 0

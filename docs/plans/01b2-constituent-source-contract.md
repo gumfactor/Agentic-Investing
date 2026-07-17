@@ -98,7 +98,7 @@ Attribution-ShareAlike). This project:
     date-only record can never qualify a ticker for membership on its own
     effective-start session — see the acceptance test for "after-close
     announcements applied on the same session" in
-    `data/tests/universe/test_runtime_acceptance.py`.
+    `data/tests/universe/test_acceptance_1_4.py`.
   - Rejects any staging row where the source supplies no parseable date at
     all (§1.2 step 4's "reject records that cannot meet the conservative
     availability rule").

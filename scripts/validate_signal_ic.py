@@ -108,7 +108,14 @@ def _add_gate_columns(
     return out
 
 
-def _persist_summary(engine, summary: pd.DataFrame) -> int:
+def _persist_summary(engine, summary: pd.DataFrame, provisional: bool = True) -> int:
+    """Persist IC summary rows.
+
+    ``provisional`` stamps each row (migration 010): True for runs without
+    PIT universe enforcement (--provisional-no-universe and all pre-01B-2
+    rows), False for PIT-enforced runs. Interim marker — superseded by the
+    01B-3 research-run identity (design plan §4).
+    """
     if summary.empty:
         return 0
 
@@ -126,18 +133,21 @@ def _persist_summary(engine, summary: pd.DataFrame) -> int:
             "n_observations",
         ]
     ].to_dict("records")
+    for record in records:
+        record["provisional"] = provisional
 
     statement = text(
         "INSERT INTO signal_ic_stats "
         "(factor_name, strategy_id, eval_date, horizon_days, ic, rank_ic, "
-        "ic_tstat, ic_ir, ic_pvalue, n_observations) "
+        "ic_tstat, ic_ir, ic_pvalue, n_observations, provisional) "
         "VALUES (:factor_name, :strategy_id, :eval_date, :horizon_days, :ic, "
-        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations) "
+        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations, :provisional) "
         "ON CONFLICT (factor_name, strategy_id, eval_date, horizon_days) "
         "DO UPDATE SET ic = EXCLUDED.ic, rank_ic = EXCLUDED.rank_ic, "
         "ic_tstat = EXCLUDED.ic_tstat, ic_ir = EXCLUDED.ic_ir, "
         "ic_pvalue = EXCLUDED.ic_pvalue, "
-        "n_observations = EXCLUDED.n_observations, computed_at = NOW()"
+        "n_observations = EXCLUDED.n_observations, "
+        "provisional = EXCLUDED.provisional, computed_at = NOW()"
     )
     with engine.begin() as connection:
         connection.execute(statement, records)
@@ -291,7 +301,10 @@ def main() -> int:
         f"Holdout: {holdout_start} onward "
         f"(final {(1.0 - args.train_fraction):.0%} of trading dates)"
     )
-    print(audit["warning"])
+    if universe_lookup is None:
+        # Survivorship warning applies only to provisional (non-PIT) runs;
+        # with membership enforcement active it would cry wolf.
+        print(audit["warning"])
 
     summaries: list[pd.DataFrame] = []
     for factor_name in args.factors:
@@ -336,7 +349,7 @@ def main() -> int:
     passed_tests = int(combined["passes_gate"].sum())
 
     if args.persist:
-        persisted = _persist_summary(engine, combined)
+        persisted = _persist_summary(engine, combined, provisional=universe_lookup is None)
         print(f"\nPersisted {persisted} rows to signal_ic_stats.")
 
     print(

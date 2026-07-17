@@ -415,3 +415,128 @@ class TestPublishAndRunImport:
         )
         assert batch.status == "rejected"
         assert "overlapping_intervals" in batch.rejected_reason
+
+
+# ─── Fix round: exclusion audit + left-censored known_at ─────────────────────
+
+
+class TestExclusionAudit:
+    """Adversarial-review fix: --exclude-tickers must leave a DB-queryable record."""
+
+    def test_exclusions_persisted_on_batch_row(self, engine, tmp_path: Path) -> None:
+        import json
+
+        provider = FixtureSP500Provider()
+        batch = run_import(
+            provider,
+            engine=engine,
+            artifact_root=tmp_path,
+            coverage_start=FIXTURE_COVERAGE_START,
+            exclude_tickers={"BBB"},
+            exclude_reason="test collision exclusion",
+        )
+        with Session(engine) as session:
+            stored = session.get(UniverseImportBatch, batch.id)
+            record = json.loads(stored.excluded_tickers)
+        assert record["tickers"] == ["BBB"]
+        assert record["reason"] == "test collision exclusion"
+        # And the excluded ticker really has no membership intervals.
+        with Session(engine) as session:
+            n_bbb = len(
+                session.execute(
+                    select(UniverseMembership).where(UniverseMembership.ticker == "BBB")
+                ).scalars().all()
+            )
+        assert n_bbb == 0
+
+    def test_coverage_report_surfaces_exclusions(self, engine, tmp_path: Path) -> None:
+        provider = FixtureSP500Provider()
+        run_import(
+            provider,
+            engine=engine,
+            artifact_root=tmp_path,
+            coverage_start=FIXTURE_COVERAGE_START,
+            exclude_tickers={"BBB"},
+            exclude_reason="test collision exclusion",
+        )
+        report = coverage_report(engine, FIXTURE_UNIVERSE_ID, dates=[date(2022, 6, 1)])
+        assert report.excluded_tickers == {
+            "tickers": ["BBB"],
+            "reason": "test collision exclusion",
+        }
+
+    def test_no_exclusions_leaves_null_record(self, engine, tmp_path: Path) -> None:
+        provider = FixtureSP500Provider()
+        batch = run_import(
+            provider, engine=engine, artifact_root=tmp_path, coverage_start=FIXTURE_COVERAGE_START
+        )
+        with Session(engine) as session:
+            stored = session.get(UniverseImportBatch, batch.id)
+        assert stored.excluded_tickers is None
+
+
+class TestLeftCensoredKnownAt:
+    """Adversarial-review fix: a left-censored member must be eligible on the
+    first day of the certified coverage window (its effective_start is the
+    fabricated coverage boundary, not a real change that had to become
+    knowable — the next-session rule must not apply)."""
+
+    def _left_censored_bundle(self):
+        parsed = ParsedConstituentData(
+            universe_id="sp500_fixture",
+            current_rows=[
+                CurrentConstituentRow(
+                    ticker="AAA",
+                    security_name="Alpha",
+                    effective_start=date(2019, 1, 2),
+                    source_record_id="current-AAA",
+                ),
+            ],
+            change_events=[
+                ChangeEvent(
+                    effective_date=date(2020, 3, 2),
+                    added_ticker=None,
+                    added_security_name=None,
+                    removed_ticker="ZZZ",
+                    removed_security_name="Zulu",
+                    reason="Market capitalization change.",
+                    source_record_id="chg-zzz",
+                )
+            ],
+        )
+        bundle = build_staging_records(
+            parsed, coverage_start=date(2019, 1, 2), source="fixture_sp500", source_version="v1"
+        )
+        return derive_known_at(bundle)
+
+    def test_left_censored_known_at_is_coverage_start_session_close(self) -> None:
+        from data.universe.calendar import session_close_cutoff
+
+        bundle = self._left_censored_bundle()
+        zzz = next(r for r in bundle.membership if r.ticker == "ZZZ")
+        assert zzz.left_censored is True
+        assert zzz.known_at == session_close_cutoff(date(2019, 1, 2))
+
+    def test_left_censored_member_eligible_exactly_at_coverage_start(self, tmp_path: Path) -> None:
+        from data.universe.runtime import PITUniverseLookup
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'lc.db'}", future=True)
+        bundle = self._left_censored_bundle()
+        publish(
+            bundle,
+            engine=eng,
+            provider_name="fixture_sp500",
+            source_version="v1",
+            raw_artifact_path="x",
+            raw_checksum_sha256="a" * 64,
+            retrieved_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            coverage_start=date(2019, 1, 2),
+            coverage_end=date(2021, 1, 4),
+        )
+        lookup = PITUniverseLookup(eng, "sp500_fixture")
+        # Day one of the certified window: the left-censored member is IN.
+        assert lookup.is_eligible("ZZZ", date(2019, 1, 2)) is True
+        # An ordinary entrant (AAA, effective_start == coverage_start via the
+        # current table) still follows the conservative next-session rule.
+        assert lookup.is_eligible("AAA", date(2019, 1, 2)) is False
+        assert lookup.is_eligible("AAA", date(2019, 1, 3)) is True
