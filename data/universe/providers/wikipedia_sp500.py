@@ -150,7 +150,11 @@ class WikipediaSP500Provider:
         )
 
     def parse(self, raw: RawSnapshot) -> ParsedConstituentData:
-        tables = pd.read_html(io.StringIO(raw.content.decode("utf-8")))
+        # flavor is pinned so parse behavior is deterministic across
+        # environments (Codex PR #34 P1: read_html's parser is an optional
+        # dependency — without declaring it, a clean install fails or falls
+        # back to a different parser). lxml is declared in requirements.txt.
+        tables = pd.read_html(io.StringIO(raw.content.decode("utf-8")), flavor="lxml")
         if len(tables) < 2:
             raise ValueError(
                 f"Expected at least 2 tables on the Wikipedia S&P 500 page, found {len(tables)}. "

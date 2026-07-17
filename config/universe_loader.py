@@ -113,7 +113,9 @@ def _fetch_sp500_from_wikipedia() -> list[str]:
         response.raise_for_status()
         # pandas 2.x requires io.StringIO for inline HTML strings;
         # passing a raw string is treated as a file path.
-        tables = pd.read_html(io.StringIO(response.text))
+        # flavor pinned for cross-environment determinism (lxml is a
+        # declared dependency in requirements.txt — see PR #34 review).
+        tables = pd.read_html(io.StringIO(response.text), flavor="lxml")
         # First table on the page has the current constituents
         df = tables[0]
         tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()

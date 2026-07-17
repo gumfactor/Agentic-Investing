@@ -102,6 +102,14 @@ Attribution-ShareAlike). This project:
   - Rejects any staging row where the source supplies no parseable date at
     all (§1.2 step 4's "reject records that cannot meet the conservative
     availability rule").
+  - Applies the same conservative rule to the REMOVAL side of a closed
+    interval (`end_known_at` = next-session close after `effective_end`,
+    Codex PR #34 review): a ticker remains eligible until its removal was
+    knowable, because excluding it earlier would leak future removal
+    information (removals correlate with declines, so early exclusion
+    biases research upward). Left-censored interval *starts* are the one
+    exception on the entry side (they are window boundaries, not real
+    changes); their removals follow the normal rule.
 
 ## Reconstruction algorithm (real data, no fabrication)
 

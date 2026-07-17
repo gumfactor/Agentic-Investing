@@ -71,6 +71,7 @@ class MembershipCandidate:
     reason: Optional[str]
     announced_at: Optional[datetime] = None
     known_at: Optional[datetime] = None
+    end_known_at: Optional[datetime] = None
     left_censored: bool = False
 
 
@@ -116,19 +117,37 @@ def is_ticker_rename_event(event: ChangeEvent) -> bool:
 def persist_raw_snapshot(raw: RawSnapshot, artifact_root: Path) -> tuple[Path, str]:
     """Save the raw source response with a checksum and source version.
 
-    Layout: ``<artifact_root>/<provider_name>/<retrieved_at date>/raw.<ext>``
+    Layout (Codex PR #34 P2 — unique per retrieval so a re-run can never
+    silently overwrite a prior import's raw evidence):
+    ``<artifact_root>/<provider_name>/<retrieved_at date>/<HHMMSSZ>-<checksum12>/raw.<ext>``
     plus a sibling ``manifest.json`` recording checksum, retrieval time,
     source version, origin URL, and (for CC BY-SA sources) an attribution
-    note.
+    note. Re-persisting byte-identical content to the same path is
+    idempotent; a pre-existing path with different bytes is refused
+    (fail closed) — with the checksum in the path this indicates tampering
+    or a hash collision, never a legitimate re-import.
     """
     ext = _CONTENT_TYPE_EXTENSIONS.get(raw.content_type, "bin")
-    day_dir = artifact_root / raw.provider_name / raw.retrieved_at.date().isoformat()
+    checksum = hashlib.sha256(raw.content).hexdigest()
+    stamp = raw.retrieved_at.strftime("%H%M%SZ")
+    day_dir = (
+        artifact_root
+        / raw.provider_name
+        / raw.retrieved_at.date().isoformat()
+        / f"{stamp}-{checksum[:12]}"
+    )
     day_dir.mkdir(parents=True, exist_ok=True)
 
     raw_path = day_dir / f"raw.{ext}"
+    if raw_path.exists():
+        existing = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+        if existing != checksum:
+            raise ValueError(
+                f"Raw artifact path {raw_path} already exists with different content "
+                f"(existing sha256 {existing}, new {checksum}). Refusing to overwrite "
+                "prior import evidence."
+            )
     raw_path.write_bytes(raw.content)
-
-    checksum = hashlib.sha256(raw.content).hexdigest()
     manifest = {
         "provider_name": raw.provider_name,
         "source_version": raw.source_version,
@@ -457,6 +476,14 @@ def derive_known_at(bundle: StagingBundle) -> StagingBundle:
         else:
             fallback = conservative_known_at_for_date_only_source(row.effective_start)
         row.known_at = max(row.announced_at, fallback) if row.announced_at else fallback
+        # Removal availability (Codex PR #34 P2): a date-only removal
+        # effective on session d is knowable only from the next session's
+        # close. Runtime eligibility keeps the ticker in the universe until
+        # then — the exit-side mirror of the entry known_at rule.
+        if row.effective_end is not None:
+            row.end_known_at = conservative_known_at_for_date_only_source(row.effective_end)
+        else:
+            row.end_known_at = None
     for sh in bundle.symbol_history:
         sh.known_at = conservative_known_at_for_date_only_source(sh.effective_date)
     return bundle
@@ -497,6 +524,13 @@ def publish(
         sh.known_at is None for sh in bundle.symbol_history
     ):
         raise ImportValidationError(["known_at_not_derived: call derive_known_at() before publish()"])
+    if any(
+        row.effective_end is not None and row.end_known_at is None
+        for row in bundle.membership
+    ):
+        raise ImportValidationError(
+            ["end_known_at_not_derived: call derive_known_at() before publish()"]
+        )
 
     Base.metadata.create_all(engine)
     now = datetime.now(tz=timezone.utc)
@@ -533,6 +567,7 @@ def publish(
                     source_record_id=row.source_record_id,
                     announced_at=row.announced_at,
                     known_at=row.known_at,
+                    end_known_at=row.end_known_at,
                     source_version=source_version,
                     ingested_at=now,
                     reason=row.reason,

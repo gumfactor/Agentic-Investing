@@ -215,3 +215,31 @@ class TestSnapshotTamperDetection:
         provider = WikipediaSP500Provider(snapshot_path=day_dir / "raw.html")
         raw = provider.fetch()
         assert len(raw.content) > 0
+
+
+class TestDeclaredHtmlParser:
+    """Codex PR #34 P1: pandas.read_html's parser is an optional dependency;
+    the provider must pin a declared flavor so parsing is deterministic and
+    a clean install from requirements.txt works."""
+
+    def test_lxml_is_importable(self) -> None:
+        import lxml  # noqa: F401  (declared in requirements.txt)
+
+    def test_lxml_declared_in_requirements(self) -> None:
+        req = Path(__file__).resolve().parents[3] / "requirements.txt"
+        assert "lxml==" in req.read_text()
+
+    def test_parse_pins_lxml_flavor(self, monkeypatch) -> None:
+        import pandas as pd
+
+        captured: dict = {}
+        real_read_html = pd.read_html
+
+        def capture(*args, **kwargs):
+            captured.update(kwargs)
+            return real_read_html(*args, **kwargs)
+
+        monkeypatch.setattr(pd, "read_html", capture)
+        provider = WikipediaSP500Provider(snapshot_path=_SNAPSHOT)
+        provider.parse(provider.fetch())
+        assert captured.get("flavor") == "lxml"

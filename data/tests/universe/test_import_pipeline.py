@@ -71,6 +71,38 @@ class TestPersistRawSnapshot:
         assert manifest["checksum_sha256"] == checksum
         assert manifest["provider_name"] == "fixture_sp500"
 
+    def test_paths_unique_per_retrieval(self, tmp_path: Path) -> None:
+        # Codex PR #34 P2: two retrievals (different content/time) must not
+        # share a path — a re-run can never overwrite prior raw evidence.
+        from datetime import datetime, timezone
+
+        p1 = FixtureSP500Provider(retrieved_at=datetime(2024, 1, 2, 10, 0, tzinfo=timezone.utc))
+        p2 = FixtureSP500Provider(retrieved_at=datetime(2024, 1, 2, 15, 30, tzinfo=timezone.utc))
+        path1, _ = persist_raw_snapshot(p1.fetch(), tmp_path)
+        path2, _ = persist_raw_snapshot(p2.fetch(), tmp_path)
+        assert path1 != path2
+        assert path1.exists() and path2.exists()
+        # Checksum is embedded in the directory name.
+        assert path1.parent.name.split("-")[-1] in path1.parent.name
+
+    def test_same_retrieval_is_idempotent(self, tmp_path: Path) -> None:
+        provider = FixtureSP500Provider()
+        raw = provider.fetch()
+        path1, c1 = persist_raw_snapshot(raw, tmp_path)
+        path2, c2 = persist_raw_snapshot(raw, tmp_path)
+        assert path1 == path2
+        assert c1 == c2
+
+    def test_conflicting_bytes_at_same_path_refused(self, tmp_path: Path) -> None:
+        provider = FixtureSP500Provider()
+        raw = provider.fetch()
+        path1, _ = persist_raw_snapshot(raw, tmp_path)
+        # Simulate tampering: replace the persisted artifact's bytes, then
+        # attempt to re-persist the original content to the same path.
+        path1.write_bytes(b"tampered")
+        with pytest.raises(ValueError, match="Refusing to overwrite"):
+            persist_raw_snapshot(raw, tmp_path)
+
 
 # ─── Step 2: staging normalization ────────────────────────────────────────────
 

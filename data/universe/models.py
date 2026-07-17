@@ -101,6 +101,11 @@ class UniverseMembership(Base):
             "length(universe_id) > 0 AND length(ticker) > 0",
             name="ck_universe_membership_nonempty_ids",
         ),
+        CheckConstraint(
+            "(effective_end IS NULL AND end_known_at IS NULL) "
+            "OR (effective_end IS NOT NULL AND end_known_at IS NOT NULL)",
+            name="ck_universe_membership_end_known_consistency",
+        ),
         Index("ix_universe_membership_universe_ticker", "universe_id", "ticker"),
         Index("ix_universe_membership_universe_start", "universe_id", "effective_start"),
     )
@@ -117,6 +122,8 @@ class UniverseMembership(Base):
     source_record_id: Mapped[str] = mapped_column(Text, nullable=False)
     announced_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     known_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    # Availability of the removal event closing this interval; NULL iff open.
+    end_known_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True))
     source_version: Mapped[str] = mapped_column(Text, nullable=False)
     ingested_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(Text)

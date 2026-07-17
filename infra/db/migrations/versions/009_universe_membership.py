@@ -93,6 +93,9 @@ def upgrade() -> None:
         sa.Column("source_record_id", sa.Text(), nullable=False),
         sa.Column("announced_at", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("known_at", sa.TIMESTAMP(timezone=True), nullable=False),
+        # Availability timestamp of the REMOVAL event closing this interval.
+        # NULL iff effective_end is NULL (open interval).
+        sa.Column("end_known_at", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("source_version", sa.Text(), nullable=False),
         sa.Column(
             "ingested_at",
@@ -116,6 +119,11 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "length(universe_id) > 0 AND length(ticker) > 0",
             name="ck_universe_membership_nonempty_ids",
+        ),
+        sa.CheckConstraint(
+            "(effective_end IS NULL AND end_known_at IS NULL) "
+            "OR (effective_end IS NOT NULL AND end_known_at IS NOT NULL)",
+            name="ck_universe_membership_end_known_consistency",
         ),
     )
     op.create_index(

@@ -8,6 +8,7 @@ pandas==2.2.0
 polars==0.20.6
 numpy==1.26.4
 pyarrow==15.0.0           # parquet read/write
+lxml==6.1.1               # pandas.read_html parser (PIT universe Wikipedia import; flavor pinned)
 
 # ─── Database ────────────────────────────────────────────────────────────────
 sqlalchemy==2.0.27

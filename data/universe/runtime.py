@@ -140,6 +140,8 @@ class _Interval:
     effective_start: date
     effective_end: Optional[date]
     known_at: datetime
+    # Availability of the removal event closing this interval; None if open.
+    end_known_at: Optional[datetime] = None
 
 
 class PITUniverseLookup:
@@ -191,12 +193,16 @@ class PITUniverseLookup:
                 if known_at.tzinfo is None:
                     # SQLite loses tz awareness; stored values are UTC.
                     known_at = known_at.replace(tzinfo=timezone.utc)
+                end_known_at = r.end_known_at
+                if end_known_at is not None and end_known_at.tzinfo is None:
+                    end_known_at = end_known_at.replace(tzinfo=timezone.utc)
                 self._intervals.setdefault(r.ticker, []).append(
                     _Interval(
                         ticker=r.ticker,
                         effective_start=r.effective_start,
                         effective_end=r.effective_end,
                         known_at=known_at,
+                        end_known_at=end_known_at,
                     )
                 )
 
@@ -245,14 +251,19 @@ class PITUniverseLookup:
 
         Per-ticker absence is valid non-membership, never an error; only an
         out-of-coverage date raises.
+
+        Removal gating (Codex PR #34 P2): an interval whose ``effective_end``
+        has passed still confers eligibility while the removal itself was
+        not yet knowable by ``observation_cutoff`` — with a date-only source
+        a removal effective on session ``d`` becomes knowable only at the
+        next session's close, and excluding the ticker earlier would leak
+        future removal information into the backtest (the exit-side
+        mirror-image of the entry ``known_at`` rule).
         """
         self._check_coverage(as_of_date)
         cutoff = observation_cutoff or session_close_cutoff(as_of_date)
         for iv in self._intervals.get(ticker, ()):
-            covers = iv.effective_start <= as_of_date and (
-                iv.effective_end is None or as_of_date < iv.effective_end
-            )
-            if covers and iv.known_at <= cutoff:
+            if _interval_confers_eligibility(iv, as_of_date, cutoff):
                 return True
         return False
 
@@ -280,11 +291,19 @@ class PITUniverseLookup:
         eligible: list[str] = []
         exclusions: list[UniverseExclusion] = []
         for ticker, intervals in self._intervals.items():
+            # Interval covers the date under the knowledge cutoff: either the
+            # date is inside [start, end), or the removal that would close it
+            # was not yet knowable by the cutoff (Codex PR #34 P2 — the
+            # exit-side mirror of the entry known_at rule).
             member_now = [
                 iv
                 for iv in intervals
                 if iv.effective_start <= as_of_date
-                and (iv.effective_end is None or as_of_date < iv.effective_end)
+                and (
+                    iv.effective_end is None
+                    or as_of_date < iv.effective_end
+                    or (iv.end_known_at is not None and iv.end_known_at > cutoff)
+                )
             ]
             if not member_now:
                 continue  # plain non-membership: not an exclusion event
@@ -332,6 +351,22 @@ class PITUniverseLookup:
             coverage_start=self._coverage_start,
             coverage_end=self._coverage_end,
         )
+
+
+def _interval_confers_eligibility(iv: _Interval, as_of_date: date, cutoff: datetime) -> bool:
+    """True if the interval makes its ticker eligible at (as_of_date, cutoff).
+
+    Entry side: the membership must have been knowable (``known_at <=
+    cutoff``). Exit side: the interval must cover the date, OR the removal
+    closing it must not yet have been knowable (``end_known_at > cutoff``).
+    """
+    if iv.effective_start > as_of_date:
+        return False
+    if iv.known_at > cutoff:
+        return False
+    if iv.effective_end is None or as_of_date < iv.effective_end:
+        return True
+    return iv.end_known_at is not None and iv.end_known_at > cutoff
 
 
 # ─── Module-level convenience (design plan §1.3 signature) ────────────────────

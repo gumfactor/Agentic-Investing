@@ -111,9 +111,26 @@ _MEMBERS_2022 = ["AAA", "CCC", "DDD", "FFF", "GGG", "HHH", "III", "JJJ"]
 
 class TestItem1RemovedAndEntrantBoundaries:
     def test_removed_constituent_included_before_excluded_on_and_after_end(self, lookup) -> None:
-        # BBB's effective_end is 2021-01-01 (exclusive interval end).
+        # BBB's effective_end is 2021-01-01 (exclusive interval end). The
+        # exclusion applies under the knowledge cutoff: with a date-only
+        # source the removal is knowable only from the next session's close
+        # (conservative rule, exit-side mirror of the entry known_at rule —
+        # Codex PR #34 P2), so "excluded on/after its effective end" holds
+        # from the first cutoff at which the removal was knowable.
         assert lookup.is_eligible("BBB", date(2020, 12, 31)) is True
-        assert lookup.is_eligible("BBB", date(2021, 1, 1)) is False  # on end
+        # On the end date itself the removal is not yet knowable under the
+        # default same-session cutoff: excluding it here would use future
+        # information (removals correlate with declines -> upward bias).
+        assert lookup.is_eligible("BBB", date(2021, 1, 1)) is True
+        # With a cutoff at/after the removal's availability, excluded on end:
+        assert (
+            lookup.is_eligible(
+                "BBB", date(2021, 1, 1),
+                observation_cutoff=datetime(2021, 1, 5, tzinfo=timezone.utc),
+            )
+            is False
+        )
+        assert lookup.is_eligible("BBB", date(2021, 1, 4)) is False  # next session
         assert lookup.is_eligible("BBB", date(2021, 3, 1)) is False  # after end
 
     def test_entrant_excluded_before_included_after_start(self, lookup) -> None:
@@ -314,3 +331,43 @@ class TestItem5CoverageReportAndCrossSection:
         scores = _make_scores(prices, dates[:5])
         with pytest.raises(InsufficientCrossSectionError):
             compute_ic_series(scores, prices, "test_score", horizons=[5], universe=lookup)
+
+
+# ─── Codex PR #34 round 2: removal known_at gating ────────────────────────────
+
+
+class TestRemovalKnownAtGating:
+    """A removal effective on session d (date-only source) is knowable only
+    from the next session's close; until then the ticker remains eligible.
+    Exit-side mirror of the entry known_at rule."""
+
+    def test_removal_not_applied_before_knowable(self, lookup) -> None:
+        # BBB removed effective 2021-01-01; next trading session 2021-01-04.
+        assert lookup.is_eligible("BBB", date(2021, 1, 1)) is True
+
+    def test_removal_applied_from_first_knowable_cutoff(self, lookup) -> None:
+        # Cutoff exactly at the removal's availability (2021-01-04 close):
+        # end_known_at > cutoff is False, so the removal applies.
+        from data.universe.calendar import next_trading_session
+
+        knowable_at = session_close_cutoff(next_trading_session(date(2021, 1, 1)))
+        assert (
+            lookup.is_eligible("BBB", date(2021, 1, 1), observation_cutoff=knowable_at)
+            is False
+        )
+
+    def test_load_universe_as_of_includes_pending_removal(self, lookup) -> None:
+        result = lookup.load_universe_as_of(date(2021, 1, 1))
+        assert "BBB" in result.eligible_tickers
+
+    def test_load_universe_as_of_excludes_once_knowable(self, lookup) -> None:
+        result = lookup.load_universe_as_of(
+            date(2021, 1, 1),
+            observation_cutoff=datetime(2021, 1, 5, tzinfo=timezone.utc),
+        )
+        assert "BBB" not in result.eligible_tickers
+
+    def test_entry_rule_still_enforced_alongside_exit_rule(self, lookup) -> None:
+        # CCC added effective 2021-06-01: still not eligible on its own
+        # effective-start session (entry known_at rule unchanged).
+        assert lookup.is_eligible("CCC", date(2021, 6, 1)) is False

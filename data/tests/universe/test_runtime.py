@@ -86,9 +86,21 @@ class TestFailClosed:
 
 class TestMembershipQueries:
     def test_removed_constituent_included_before_excluded_after(self, lookup) -> None:
-        # BBB removed effective 2021-01-01 (half-open: last member day 2020-12-31).
+        # BBB removed effective 2021-01-01 (half-open: last member day
+        # 2020-12-31). Under the date-only source's conservative rule the
+        # REMOVAL is knowable only from the next session's close
+        # (2021-01-04), so on the removal date itself, with the default
+        # same-session cutoff, BBB is still eligible — excluding it earlier
+        # would leak future removal information (Codex PR #34 P2 fix).
         assert lookup.is_eligible("BBB", date(2020, 12, 31)) is True
-        assert lookup.is_eligible("BBB", date(2021, 1, 1)) is False
+        assert lookup.is_eligible("BBB", date(2021, 1, 1)) is True  # removal not yet knowable
+        # Once the removal is knowable, the exclusion applies — both via a
+        # later explicit cutoff on the same date and on later dates.
+        from datetime import datetime, timezone
+
+        late_cutoff = datetime(2021, 1, 5, tzinfo=timezone.utc)
+        assert lookup.is_eligible("BBB", date(2021, 1, 1), observation_cutoff=late_cutoff) is False
+        assert lookup.is_eligible("BBB", date(2021, 1, 4)) is False
         assert lookup.is_eligible("BBB", date(2021, 6, 1)) is False
 
     def test_entrant_excluded_before_included_after(self, lookup) -> None:
