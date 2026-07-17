@@ -1,0 +1,5 @@
+# Raw vendor source snapshots are checksummed byte-for-byte (see
+# data/universe/import_pipeline.py::persist_raw_snapshot and each artifact's
+# manifest.json). Any line-ending normalization would silently break the
+# checksum verification, so treat them as binary.
+data/vendor/** -text

@@ -143,6 +143,61 @@ these into intervals as follows:
    still correct; only the exact historical `effective_start` value itself is
    approximate for these specific tickers.
 
+### Additional reconstruction rules discovered during real-data verification
+
+- **Same-symbol replacement:** a change row whose `Added` and `Removed`
+  tickers are identical (real example: 2011-12-12 "Nicor acquired by AGL,
+  which retained the GAS ticker") is treated as continuous membership under
+  that symbol — no interval boundary is created, and a warning is recorded.
+  Producing an add+remove pair would create an empty `[d, d)` interval.
+- **Removal on/before `coverage_start`:** gives no evidence of in-window
+  membership; no left-censored interval is created (a warning is recorded).
+
+### Recorded operator exclusions (2026-07-17 verification import)
+
+Three tickers are excluded via the importer's `--exclude-tickers` escape
+hatch because Wikipedia reuses the same symbol for two different companies in
+different eras, which a symbol-keyed reconstruction cannot disambiguate
+without fabricating an interval start:
+
+| Ticker | Collision |
+|---|---|
+| `AN` | Amoco (removed 1998-12-11) vs. AutoNation (removed 2017-08-08; no in-window addition row) |
+| `SUN` | SunAmerica (removed 1998-12-11) vs. Sunoco (removed 2012-10-10; no in-window addition row) |
+| `AGN` | Allergan v1 (removed 2015-03-23) vs. Allergan v2 (removed 2020-05-12; no in-window addition row) |
+
+Excluded tickers receive **no** membership intervals: for historical queries
+they are never eligible, which is the fail-closed direction (it can only
+shrink the historical universe, never inflate it with unverifiable
+membership). A commercial provider with entity-level identifiers can restore
+them at Gate 03.
+
+### Import verification (2026-07-17)
+
+The full pipeline (fetch → persist → stage → validate → publish) was run
+against the live page on 2026-07-17 and published cleanly with the three
+exclusions above:
+
+- Raw artifact: `data/vendor/wikipedia_sp500/2026-07-17/raw.html`
+  (sha256 `3395c346fba67789d1e0170d919c6d74e42922d66001755a50ad691cc647d170`,
+  checked in with its `manifest.json` so the import is reproducible offline
+  via `--snapshot`).
+- 503 current-constituent rows, 407 change events parsed; 890 membership
+  intervals, 6 symbol-history rows published; 245 left-censored intervals.
+- Coverage-report member counts: 417 (2000-01-03), 502 (2010-01-04),
+  522 (2020-01-02), 519 (2023-06-01), 518 (2026-06-30).
+
+The count drift versus the true ~503-505 constituent count (under-counting in
+2000, over-counting ~3% in 2020+) is the expected artifact of Wikipedia's
+"Selected changes" table being incomplete in earlier decades: left-censored
+intervals whose true start is later than `coverage_start` inflate later
+dates, and missing early change rows deflate earlier dates. This inaccuracy
+adds or retains names — it does not re-introduce the survivorship-bias
+direction (systematically excluding removed losers) that BUG-008 targets —
+and it is bounded and visible in the coverage report. The project's
+supported backtest window (2022-07-11 → 2024-12-31) sits in the
+best-covered recent era.
+
 ## Limitations (recorded per §1.2 and the operator directive to never overstate coverage)
 
 - **Community-maintained, not a licensed audit feed.** Wikipedia edits can
