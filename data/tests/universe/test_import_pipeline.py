@@ -846,3 +846,57 @@ class TestAnnouncementTimestampsPreserved:
 
         assert ttt.known_at == conservative_known_at_for_date_only_source(date(2020, 2, 3))
         assert ttt.end_known_at == conservative_known_at_for_date_only_source(date(2020, 8, 3))
+
+
+class TestCoverageReportKnowledgeGating:
+    """Codex PR #34 P2: coverage-report member counts must reconcile with
+    the knowledge-gated universe users actually query, including on
+    entrant/removal boundary dates."""
+
+    @pytest.fixture
+    def published(self, engine, tmp_path: Path):
+        from data.universe.runtime import PITUniverseLookup
+
+        run_import(
+            FixtureSP500Provider(),
+            engine=engine,
+            artifact_root=tmp_path,
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        return PITUniverseLookup(engine, FIXTURE_UNIVERSE_ID)
+
+    def test_entrant_effective_date_not_counted(self, engine, published) -> None:
+        # CCC effective 2021-06-01 but knowable only next session: the
+        # report must match load_universe_as_of and exclude it that day.
+        report = coverage_report(engine, FIXTURE_UNIVERSE_ID, dates=[date(2021, 6, 1)])
+        row = report.by_date.iloc[0]
+        runtime_members = set(published.load_universe_as_of(date(2021, 6, 1)).eligible_tickers)
+        assert "CCC" not in runtime_members
+        assert row["n_members"] == len(runtime_members)
+
+    def test_pending_removal_still_counted(self, engine, published) -> None:
+        # BBB removal effective 2021-01-01 but knowable only 2021-01-04:
+        # the report must still count it on 2021-01-01, like the runtime.
+        report = coverage_report(engine, FIXTURE_UNIVERSE_ID, dates=[date(2021, 1, 1)])
+        row = report.by_date.iloc[0]
+        runtime_members = set(published.load_universe_as_of(date(2021, 1, 1)).eligible_tickers)
+        assert "BBB" in runtime_members
+        assert row["n_members"] == len(runtime_members)
+
+    def test_out_of_coverage_date_flagged_not_raised(self, engine, published) -> None:
+        report = coverage_report(engine, FIXTURE_UNIVERSE_ID, dates=[date(2030, 1, 1)])
+        row = report.by_date.iloc[0]
+        assert row["in_coverage"] == False  # noqa: E712 - numpy bool
+        assert row["n_members"] is None
+
+    def test_every_reported_date_reconciles_with_runtime(self, engine, published) -> None:
+        probe_dates = [
+            date(2020, 3, 2),
+            date(2021, 1, 1),
+            date(2021, 6, 1),
+            date(2022, 6, 1),
+        ]
+        report = coverage_report(engine, FIXTURE_UNIVERSE_ID, dates=probe_dates)
+        for _, row in report.by_date.iterrows():
+            expected = len(published.load_universe_as_of(row["date"]).eligible_tickers)
+            assert row["n_members"] == expected

@@ -706,11 +706,23 @@ def coverage_report(
 ) -> CoverageReport:
     """Coverage report by date: constituent counts, price joins, exclusions.
 
+    Membership counts use the SAME knowledge-gated semantics users actually
+    query through ``load_universe_as_of`` (Codex PR #34 P2): each date's
+    member set is taken from ``PITUniverseLookup`` under the default
+    session-close cutoff, so an entrant on its effective date (not yet
+    knowable) is not counted, and a just-removed ticker whose removal is
+    not yet knowable still is. A raw half-open interval test would produce
+    boundary-date counts that never reconcile with the runtime universe.
+    Dates outside the published coverage window are reported with
+    ``in_coverage = False`` and null counts rather than raising, so the
+    report remains usable for auditing requested-vs-certified ranges.
+
     Args:
         prices: optional long-format DataFrame with ``ticker``, ``date``
             columns, used to report how many members have/lack a same-date
             price row.
     """
+    from data.universe.runtime import CoverageGapError, NoPublishedImportError, PITUniverseLookup
     with Session(engine) as session:
         latest_published = session.execute(
             select(UniverseImportBatch)
@@ -751,24 +763,39 @@ def coverage_report(
         for d, group in prices.groupby(price_dates):
             priced_tickers_by_date[d] = set(group["ticker"])
 
+    lookup: Optional[PITUniverseLookup]
+    try:
+        lookup = PITUniverseLookup(engine, universe_id)
+    except NoPublishedImportError:
+        lookup = None
+
     report_rows = []
     for d in dates:
-        members = {
-            r.ticker
-            for r in rows
-            if r.effective_start <= d < (r.effective_end or date.max)
-        }
-        n_members = len(members)
-        if prices is not None:
-            priced = priced_tickers_by_date.get(d, set())
-            n_priced = len(members & priced)
-            n_unpriced = n_members - n_priced
+        members: set[str] = set()
+        in_coverage = False
+        if lookup is not None:
+            try:
+                members = set(lookup.load_universe_as_of(d).eligible_tickers)
+                in_coverage = True
+            except CoverageGapError:
+                in_coverage = False
+        if in_coverage:
+            n_members: Optional[int] = len(members)
+            if prices is not None:
+                priced = priced_tickers_by_date.get(d, set())
+                n_priced = len(members & priced)
+                n_unpriced = n_members - n_priced
+            else:
+                n_priced = None
+                n_unpriced = None
         else:
+            n_members = None
             n_priced = None
             n_unpriced = None
         report_rows.append(
             {
                 "date": d,
+                "in_coverage": in_coverage,
                 "n_members": n_members,
                 "n_priced_members": n_priced,
                 "n_unpriced_members": n_unpriced,

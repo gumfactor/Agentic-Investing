@@ -139,18 +139,14 @@ def run(
             f"earlier start date or move --start later."
         )
 
-    # ── Compute momentum scores for all dates in one vectorised pass ──────────
-    logger.info("computing_momentum_scores", n_price_rows=len(prices))
-    prices["close"] = prices["close"].astype(float)
-    momentum_df = compute_momentum_scores(prices)  # returns (ticker, date, mom_*, momentum_score)
-
-    # Keep "date" column name — combine_factor_scores expects "date", not "score_date".
-    # The scorer renames the column internally when building the output DataFrames.
-    momentum_df["date"] = pd.to_datetime(momentum_df["date"]).dt.date
-    mask = (momentum_df["date"] >= start) & (momentum_df["date"] <= end)
-    momentum_df = momentum_df[mask].reset_index(drop=True)
-
-    # ── Point-in-time membership filter (BUG-008 / 01B-2) ─────────────────────
+    # ── Point-in-time scoring cross-section (BUG-008 / Codex PR #34 P1) ──────
+    # Membership must define the cross-section BEFORE z-scoring: filtering
+    # only the output rows would leave non-members contaminating each date's
+    # cross-sectional mean/std even though their rows are later dropped.
+    # Raw window returns still use every ticker's full price history, so
+    # lookbacks spanning a ticker's pre-membership period are unaffected.
+    eligibility_df = None
+    eligible_by_date: dict = {}
     if provisional_no_universe:
         logger.warning(
             "backfill_without_pit_universe",
@@ -167,20 +163,45 @@ def run(
 
         if universe_lookup is None:
             universe_lookup = PITUniverseLookup(os.environ["DATABASE_URL"], universe_id)
+        candidate_dates = sorted(
+            d for d in prices["date"].unique() if start <= d <= end
+        )
+        eligibility_rows: list[dict] = []
+        for d in candidate_dates:
+            eligible = set(universe_lookup.load_universe_as_of(d).eligible_tickers)
+            eligible_by_date[d] = eligible
+            eligibility_rows.extend({"ticker": t, "date": d} for t in eligible)
+        eligibility_df = pd.DataFrame(eligibility_rows, columns=["ticker", "date"])
+        logger.info(
+            "pit_scoring_cross_section_built",
+            universe_id=universe_lookup.universe_id,
+            import_batch_id=universe_lookup.import_batch_id,
+            n_score_dates=len(candidate_dates),
+        )
+
+    # ── Compute momentum scores for all dates in one vectorised pass ──────────
+    logger.info("computing_momentum_scores", n_price_rows=len(prices))
+    prices["close"] = prices["close"].astype(float)
+    momentum_df = compute_momentum_scores(prices, eligibility=eligibility_df)
+
+    # Keep "date" column name — combine_factor_scores expects "date", not "score_date".
+    # The scorer renames the column internally when building the output DataFrames.
+    momentum_df["date"] = pd.to_datetime(momentum_df["date"]).dt.date
+    mask = (momentum_df["date"] >= start) & (momentum_df["date"] <= end)
+    momentum_df = momentum_df[mask].reset_index(drop=True)
+
+    if eligibility_df is not None:
+        # Belt-and-braces output filter: with the pre-z-score mask this is a
+        # no-op for members, but it guarantees no ineligible (ticker, date)
+        # row can ever be persisted.
         n_before = len(momentum_df)
-        eligible_by_date = {
-            d: set(universe_lookup.load_universe_as_of(d).eligible_tickers)
-            for d in momentum_df["date"].unique()
-        }
         keep = [
-            row.ticker in eligible_by_date[row.date]
+            row.ticker in eligible_by_date.get(row.date, set())
             for row in momentum_df[["ticker", "date"]].itertuples(index=False)
         ]
         momentum_df = momentum_df[pd.Series(keep, index=momentum_df.index)].reset_index(drop=True)
         logger.info(
             "pit_membership_filter_applied",
-            universe_id=universe_lookup.universe_id,
-            import_batch_id=universe_lookup.import_batch_id,
             rows_before=n_before,
             rows_after=len(momentum_df),
             rows_excluded=n_before - len(momentum_df),
