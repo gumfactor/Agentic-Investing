@@ -108,6 +108,21 @@ def _add_gate_columns(
     return out
 
 
+def _build_eligibility_frame(universe_lookup, dates: list) -> pd.DataFrame:
+    """Long-format (ticker, date) PIT eligibility frame for factor scoring.
+
+    Built from the same PITUniverseLookup used for IC merging, so the
+    scoring cross-section and the IC membership filter are guaranteed to
+    agree. Fails closed (CoverageGapError propagates) when any requested
+    date is outside validated coverage.
+    """
+    rows: list[dict] = []
+    for d in dates:
+        eligible = universe_lookup.load_universe_as_of(d).eligible_tickers
+        rows.extend({"ticker": t, "date": d} for t in eligible)
+    return pd.DataFrame(rows, columns=["ticker", "date"])
+
+
 def _persist_summary(engine, summary: pd.DataFrame, provisional: bool = True) -> int:
     """Persist IC summary rows.
 
@@ -306,6 +321,15 @@ def main() -> int:
         # with membership enforcement active it would cry wolf.
         print(audit["warning"])
 
+    # ── PIT scoring cross-section (BUG-008 / Codex PR #34 P1) ────────────────
+    # Membership must define each factor's cross-section BEFORE its
+    # z-scoring: passing the lookup only to compute_ic_series would leave
+    # non-members contaminating the cross-sectional mean/std that member
+    # scores (persisted with provisional=false) are built from.
+    eligibility_df = None
+    if universe_lookup is not None:
+        eligibility_df = _build_eligibility_frame(universe_lookup, dates)
+
     summaries: list[pd.DataFrame] = []
     for factor_name in args.factors:
         spec = _FACTORS[factor_name]
@@ -317,9 +341,10 @@ def main() -> int:
                 fundamentals,
                 prices,
                 score_dates=holdout_dates,
+                eligibility=eligibility_df,
             )
         else:
-            scores = spec.compute(prices)
+            scores = spec.compute(prices, eligibility=eligibility_df)
         holdout_scores = scores[scores["date"] >= holdout_start].copy()
 
         ic_series = compute_ic_series(

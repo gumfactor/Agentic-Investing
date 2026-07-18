@@ -371,3 +371,38 @@ class TestRemovalKnownAtGating:
         # CCC added effective 2021-06-01: still not eligible on its own
         # effective-start session (entry known_at rule unchanged).
         assert lookup.is_eligible("CCC", date(2021, 6, 1)) is False
+
+
+# ─── Codex PR #34 round 5: date-dtype normalization at PIT boundaries ────────
+
+
+class TestTimestampDateNormalization:
+    """pandas Timestamp/datetime64 dates (read_sql/CSV/parquet loaders) must
+    work identically to plain datetime.date at every PIT boundary."""
+
+    def test_ic_with_timestamp_dates_equals_plain_dates(self, lookup) -> None:
+        dates = _trading_days(date(2022, 2, 1), 40)
+        prices = _make_prices(_MEMBERS_2022, dates)
+        scores = _make_scores(prices, dates[:5])
+
+        ic_plain = compute_ic_series(scores, prices, "test_score", horizons=[5], universe=lookup)
+
+        prices_ts = prices.copy()
+        prices_ts["date"] = pd.to_datetime(prices_ts["date"])
+        scores_ts = scores.copy()
+        scores_ts["date"] = pd.to_datetime(scores_ts["date"])
+        ic_ts = compute_ic_series(scores_ts, prices_ts, "test_score", horizons=[5], universe=lookup)
+
+        ic_ts_norm = ic_ts.copy()
+        ic_ts_norm["date"] = pd.to_datetime(ic_ts_norm["date"]).dt.date
+        pd.testing.assert_frame_equal(ic_plain, ic_ts_norm)
+
+    def test_runtime_accepts_timestamp_as_of(self, lookup) -> None:
+        plain = lookup.load_universe_as_of(date(2022, 6, 1))
+        via_ts = lookup.load_universe_as_of(pd.Timestamp("2022-06-01"))
+        assert via_ts.eligible_tickers == plain.eligible_tickers
+        assert lookup.is_eligible("AAA", pd.Timestamp("2022-06-01")) is True
+
+    def test_runtime_rejects_non_datelike(self, lookup) -> None:
+        with pytest.raises(TypeError):
+            lookup.load_universe_as_of("not-a-date-at-all!")

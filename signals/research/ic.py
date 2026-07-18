@@ -771,13 +771,24 @@ def _filter_by_membership(merged: pd.DataFrame, universe_lookup) -> pd.DataFrame
     outside the validated coverage window — historical IC fails closed
     rather than silently scoring uncertified dates.
     """
+    # Normalize to plain datetime.date before querying the PIT lookup
+    # (Codex PR #34 P2): callers commonly hold pandas Timestamp/datetime64
+    # dates from read_sql/CSV/parquet loads, which the coverage-window
+    # comparison rejects. The same normalized key is used for row filtering.
+    def _as_plain_date(value) -> date:
+        if isinstance(value, date) and not isinstance(value, pd.Timestamp):
+            return value
+        return pd.Timestamp(value).date()
+
     eligible_by_date: dict = {}
     for dt in merged["date"].unique():
-        result = universe_lookup.load_universe_as_of(dt)
-        eligible_by_date[dt] = set(result.eligible_tickers)
+        key = _as_plain_date(dt)
+        if key not in eligible_by_date:
+            result = universe_lookup.load_universe_as_of(key)
+            eligible_by_date[key] = set(result.eligible_tickers)
 
     mask = [
-        row.ticker in eligible_by_date[row.date]
+        row.ticker in eligible_by_date[_as_plain_date(row.date)]
         for row in merged[["ticker", "date"]].itertuples(index=False)
     ]
     filtered = merged[pd.Series(mask, index=merged.index)]

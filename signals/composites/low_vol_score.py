@@ -54,6 +54,7 @@ def compute_lowvol_scores(
     vol_windows: Optional[dict[str, int]] = None,
     beta_window: int = _BETA_WINDOW,
     min_obs_fraction: float = _MIN_OBS_FRACTION,
+    eligibility: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Compute cross-sectional low-volatility scores.
 
@@ -68,6 +69,14 @@ def compute_lowvol_scores(
         beta_window: Lookback for rolling beta computation (rows).
         min_obs_fraction: Minimum fraction of window rows that must have
             valid log-returns for a score to be assigned.
+        eligibility: optional long-format DataFrame with ``ticker``/``date``
+            columns listing the ELIGIBLE (ticker, date) pairs — the
+            point-in-time scoring cross-section (BUG-008). Rolling vols and
+            betas still use each ticker's full history; ineligible cells are
+            masked to NaN BEFORE cross-sectional z-scoring so a non-member
+            can never shift members' scores. Dates absent from the frame
+            are fully masked (fail closed). ``None`` keeps the legacy
+            (provisional) behavior. See signals/composites/_eligibility.py.
 
     Returns:
         Long-format DataFrame sorted by (date, ticker) with columns:
@@ -84,6 +93,12 @@ def compute_lowvol_scores(
     wide = _to_wide(prices)
     log_ret = np.log(wide / wide.shift(1))
 
+    eligible_mask = None
+    if eligibility is not None:
+        from signals.composites._eligibility import build_wide_eligibility_mask
+
+        eligible_mask = build_wide_eligibility_mask(eligibility, wide.index, wide.columns)
+
     long_frames: list[pd.DataFrame] = []
 
     for col_name, window in vol_windows.items():
@@ -92,6 +107,9 @@ def compute_lowvol_scores(
         rolling_std = log_ret.rolling(window=window, min_periods=min_obs).std()
         annualised_vol = rolling_std * np.sqrt(_TRADING_DAYS_PER_YEAR)
 
+        if eligible_mask is not None:
+            # PIT cross-section: mask BEFORE the z-score row statistics.
+            annualised_vol = annualised_vol.where(eligible_mask)
         z = _cross_sectional_zscore(annualised_vol)
 
         long_frames.append(
@@ -106,7 +124,9 @@ def compute_lowvol_scores(
         mkt_ret = np.log(mkt_wide / mkt_wide.shift(1))
         mkt_ret = mkt_ret.reindex(log_ret.index)
 
-        beta_z = _compute_beta(log_ret, mkt_ret, beta_window, min_obs_fraction)
+        beta_z = _compute_beta(
+            log_ret, mkt_ret, beta_window, min_obs_fraction, eligible_mask=eligible_mask
+        )
         long_frames.append(
             beta_z.reset_index()
             .melt(id_vars="date", var_name="ticker", value_name="beta_252d")
@@ -170,6 +190,7 @@ def _compute_beta(
     mkt_ret: pd.DataFrame,
     window: int,
     min_obs_fraction: float,
+    eligible_mask: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Rolling OLS beta for each ticker vs a single market return series."""
     min_obs = int(window * min_obs_fraction)
@@ -198,6 +219,12 @@ def _compute_beta(
         result_cols[ticker] = beta.reindex(stock_ret.index)
 
     beta_wide = pd.DataFrame(result_cols)
+    if eligible_mask is not None:
+        # PIT cross-section: mask BEFORE the z-score row statistics.
+        beta_wide = beta_wide.where(
+            eligible_mask.reindex(index=beta_wide.index, columns=beta_wide.columns)
+            .fillna(False)
+        )
     return _cross_sectional_zscore(beta_wide)
 
 

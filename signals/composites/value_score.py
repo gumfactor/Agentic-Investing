@@ -40,6 +40,7 @@ def compute_value_scores(
     prices: pd.DataFrame,
     score_dates: Optional[list] = None,
     min_tickers: int = 10,
+    eligibility: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Compute cross-sectional value scores at each score date.
 
@@ -52,6 +53,13 @@ def compute_value_scores(
             present in prices.
         min_tickers: Minimum number of tickers with valid fundamental data
             required to compute scores for a date.
+        eligibility: optional long-format DataFrame with ``ticker``/``date``
+            columns listing the ELIGIBLE (ticker, date) pairs — the
+            point-in-time scoring cross-section (BUG-008). Applied BEFORE
+            the min_tickers gate and cross-sectional z-scoring so a
+            non-member's ratios can never shift members' scores. Dates
+            absent from the frame are fully masked (fail closed). ``None``
+            keeps the legacy (provisional) behavior.
 
     Returns:
         Long-format DataFrame with columns:
@@ -64,6 +72,12 @@ def compute_value_scores(
 
     if score_dates is None:
         score_dates = sorted(prices["date"].unique())
+
+    eligible_by_date = None
+    if eligibility is not None:
+        from signals.composites._eligibility import eligibility_sets_by_date
+
+        eligible_by_date = eligibility_sets_by_date(eligibility)
 
     rows: list[dict] = []
 
@@ -81,6 +95,11 @@ def compute_value_scores(
             continue
 
         date_rows = _compute_ratios(visible, price_snap["close"], score_date)
+        if eligible_by_date is not None:
+            # PIT cross-section (BUG-008): only eligible tickers enter the
+            # min_tickers gate and the per-date z-scores below.
+            eligible = eligible_by_date.get(score_date, set())
+            date_rows = [r for r in date_rows if r["ticker"] in eligible]
         if len(date_rows) < min_tickers:
             continue
         rows.extend(date_rows)

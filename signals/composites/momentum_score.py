@@ -104,21 +104,9 @@ def compute_momentum_scores(
 
     eligible_mask: Optional[pd.DataFrame] = None
     if eligibility is not None:
-        required = {"ticker", "date"}
-        missing = required - set(eligibility.columns)
-        if missing:
-            raise ValueError(f"eligibility DataFrame missing columns: {missing}")
-        flags = eligibility[["ticker", "date"]].copy()
-        flags["eligible"] = True
-        # Cells hold True where the pair is eligible; everything else (never
-        # listed, or dates/tickers absent from eligibility) becomes NaN on
-        # reindex, so .notna() yields a clean boolean mask.
-        eligible_mask = (
-            flags.pivot_table(index="date", columns="ticker", values="eligible", aggfunc="any")
-            .reindex(index=wide.index, columns=wide.columns)
-            .notna()
-        )
-        eligible_mask.columns.name = None
+        from signals.composites._eligibility import build_wide_eligibility_mask
+
+        eligible_mask = build_wide_eligibility_mask(eligibility, wide.index, wide.columns)
 
     long_frames: list[pd.DataFrame] = []
 

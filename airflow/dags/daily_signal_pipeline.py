@@ -82,6 +82,40 @@ def _load_prices(**context: Any) -> None:
             params={"start": start_date, "end": end_date},
         )
 
+    # PIT cross-section BEFORE factor computation (BUG-008 / Codex PR #34
+    # P2): the factor tasks z-score across every ticker in this price panel,
+    # so an ineligible-but-priced ticker must be removed HERE, not after
+    # scoring. Filtering by ticker (keeping each eligible ticker's full
+    # lookback history) preserves rolling windows. Degrades to the
+    # unfiltered (provisional) panel when no published universe import
+    # covers score_date — BUG-069.
+    import structlog as _structlog
+
+    _log = _structlog.get_logger("rqis.airflow")
+    try:
+        _eligible = _pit_eligible_tickers_sql(os.environ["DATABASE_URL"], end_date)
+    except Exception as _exc:  # deliberate broad degrade — see _pit_membership_filter
+        _eligible = None
+        _log.warning("pit_universe_lookup_failed_scores_provisional", error=str(_exc))
+    if _eligible is not None:
+        n_before = df["ticker"].nunique()
+        df = df[df["ticker"].isin(_eligible)].reset_index(drop=True)
+        _log.info(
+            "pit_price_panel_filtered",
+            score_date=str(end_date),
+            tickers_before=n_before,
+            tickers_after=df["ticker"].nunique(),
+        )
+    else:
+        _log.warning(
+            "pit_universe_unavailable_scores_provisional",
+            score_date=str(end_date),
+            note=(
+                "factor cross-section NOT filtered to point-in-time members; "
+                "daily scores are provisional for research (BUG-008/BUG-069)"
+            ),
+        )
+
     context["ti"].xcom_push(key="prices_json", value=df.to_json(orient="records", date_format="iso"))
     context["ti"].xcom_push(key="score_date", value=str(end_date))
 

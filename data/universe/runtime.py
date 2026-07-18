@@ -230,6 +230,24 @@ class PITUniverseLookup:
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_as_of(as_of_date: object) -> date:
+        """Accept plain dates plus the pandas Timestamp/datetime values that
+        read_sql/CSV/parquet loaders commonly produce (Codex PR #34 P2 —
+        every PIT boundary normalizes its date dtype)."""
+        if isinstance(as_of_date, datetime):
+            return as_of_date.date()
+        if isinstance(as_of_date, date):
+            return as_of_date
+        try:
+            import pandas as pd
+
+            return pd.Timestamp(as_of_date).date()
+        except Exception as exc:
+            raise TypeError(
+                f"as_of_date must be a date-like value; got {type(as_of_date).__name__}"
+            ) from exc
+
     def _check_coverage(self, as_of_date: date) -> None:
         if not (self._coverage_start <= as_of_date <= self._coverage_end):
             raise CoverageGapError(
@@ -250,7 +268,8 @@ class PITUniverseLookup:
         membership was knowable by ``observation_cutoff``.
 
         Per-ticker absence is valid non-membership, never an error; only an
-        out-of-coverage date raises.
+        out-of-coverage date raises. Timestamp/datetime inputs are
+        normalized to plain dates.
 
         Removal gating (Codex PR #34 P2): an interval whose ``effective_end``
         has passed still confers eligibility while the removal itself was
@@ -260,6 +279,7 @@ class PITUniverseLookup:
         future removal information into the backtest (the exit-side
         mirror-image of the entry ``known_at`` rule).
         """
+        as_of_date = self._normalize_as_of(as_of_date)
         self._check_coverage(as_of_date)
         cutoff = observation_cutoff or session_close_cutoff(as_of_date)
         for iv in self._intervals.get(ticker, ()):
@@ -285,6 +305,7 @@ class PITUniverseLookup:
                 eligible — the fail-closed alternative to silently emitting
                 research from a shrunken universe.
         """
+        as_of_date = self._normalize_as_of(as_of_date)
         self._check_coverage(as_of_date)
         cutoff = observation_cutoff or session_close_cutoff(as_of_date)
 

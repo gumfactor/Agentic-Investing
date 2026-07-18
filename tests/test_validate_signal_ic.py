@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from scripts.validate_signal_ic import (
+    _build_eligibility_frame,
     _FACTORS,
     _add_gate_columns,
     _holdout_start,
@@ -96,3 +97,35 @@ def test_persist_summary_stamps_certified_rows_non_provisional():
     assert _persist_summary(engine, summary, provisional=False) == 1
     _, records = connection.execute.call_args.args
     assert records[0]["provisional"] is False
+
+
+def test_build_eligibility_frame_matches_lookup(tmp_path):
+    """The pre-scoring eligibility frame must agree exactly with the PIT
+    lookup used for IC merging (Codex PR #34 round-5 P1)."""
+    from datetime import date
+
+    from sqlalchemy import create_engine
+
+    from data.universe.import_pipeline import run_import
+    from data.universe.providers.fixture_provider import (
+        FIXTURE_COVERAGE_START,
+        FIXTURE_UNIVERSE_ID,
+        FixtureSP500Provider,
+    )
+    from data.universe.runtime import PITUniverseLookup
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'u.db'}", future=True)
+    run_import(
+        FixtureSP500Provider(),
+        engine=eng,
+        artifact_root=tmp_path / "a",
+        coverage_start=FIXTURE_COVERAGE_START,
+    )
+    lookup = PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID)
+
+    dates = [date(2021, 1, 1), date(2021, 6, 1), date(2022, 6, 1)]
+    frame = _build_eligibility_frame(lookup, dates)
+    for d in dates:
+        expected = set(lookup.load_universe_as_of(d).eligible_tickers)
+        actual = set(frame[frame["date"] == d]["ticker"])
+        assert actual == expected

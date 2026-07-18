@@ -171,3 +171,79 @@ class TestFilterDegradation:
                     text("UPDATE universe_membership SET universe_id='sp500_fixture'")
                 )
             eng.dispose()
+
+
+class TestLoadPricesPreFilter:
+    """Codex PR #34 round-5 P2: the PIT eligible set must define the factor
+    cross-section BEFORE scoring — _load_prices filters the price panel by
+    ticker (keeping full lookback history) before any factor task runs."""
+
+    class _FakeTI:
+        def __init__(self):
+            self.pushed = {}
+
+        def xcom_push(self, key, value):
+            self.pushed[key] = value
+
+    class _FakeInterval:
+        def __init__(self, d):
+            self._d = d
+
+        def in_timezone(self, _tz):
+            return self
+
+        def date(self):
+            return self._d
+
+    def _run_load_prices(self, dag_module, monkeypatch, db_url, score_date, tickers):
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            [
+                {"ticker": t, "date": score_date, "close": 100.0}
+                for t in tickers
+            ]
+        )
+        monkeypatch.setenv("DATABASE_URL", db_url)
+        monkeypatch.setattr(pd, "read_sql", lambda *a, **k: frame)
+        ti = self._FakeTI()
+        dag_module._load_prices(
+            ti=ti, data_interval_end=self._FakeInterval(score_date)
+        )
+        pushed = pd.read_json(
+            ti.pushed["prices_json"], orient="records", convert_dates=False
+        )
+        return set(pushed["ticker"]) if not pushed.empty else set()
+
+    def test_ineligible_tickers_removed_before_scoring(
+        self, dag_module, universe_db, monkeypatch
+    ) -> None:
+        from sqlalchemy import create_engine, text
+
+        eng = create_engine(universe_db, future=True)
+        with eng.begin() as conn:
+            conn.execute(text("UPDATE universe_import_batches SET universe_id='sp500'"))
+            conn.execute(text("UPDATE universe_membership SET universe_id='sp500'"))
+        try:
+            tickers = self._run_load_prices(
+                dag_module, monkeypatch, universe_db, date(2022, 6, 1), ["AAA", "NOPE"]
+            )
+            assert "AAA" in tickers
+            assert "NOPE" not in tickers
+        finally:
+            with eng.begin() as conn:
+                conn.execute(
+                    text("UPDATE universe_import_batches SET universe_id='sp500_fixture'")
+                )
+                conn.execute(
+                    text("UPDATE universe_membership SET universe_id='sp500_fixture'")
+                )
+            eng.dispose()
+
+    def test_degrades_to_unfiltered_panel_without_universe(
+        self, dag_module, monkeypatch
+    ) -> None:
+        tickers = self._run_load_prices(
+            dag_module, monkeypatch, "sqlite:///:memory:", date(2022, 6, 1), ["AAA", "NOPE"]
+        )
+        assert tickers == {"AAA", "NOPE"}
