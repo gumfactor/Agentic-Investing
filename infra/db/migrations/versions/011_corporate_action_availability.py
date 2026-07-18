@@ -53,7 +53,13 @@ down_revision: str = "010"
 branch_labels = None
 depends_on = None
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+assert (_REPO_ROOT / "data" / "universe" / "calendar.py").is_file(), (
+    f"_REPO_ROOT resolved to {_REPO_ROOT}, which does not contain "
+    "data/universe/calendar.py — the parents[] index above no longer points "
+    "at the repo root (this migration's own layout moved, or it was copied "
+    "elsewhere). Fix the index rather than removing this assertion."
+)
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
