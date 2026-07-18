@@ -116,7 +116,52 @@ def _load_prices(**context: Any) -> None:
             ),
         )
 
+    # ── Corporate-action cutoff-aware adjustment (BUG-009 section 2.3) ───────
+    # Price-ratio-based factors (momentum, lowvol — computed by
+    # _compute_momentum/_compute_lowvol below) must use only actions known-
+    # and-occurred by THIS run's own score_date cutoff (design plan section
+    # 2.3). Unlike scripts/validate_signal_ic.py's backfill (which computes
+    # many score dates in one vectorized pass and therefore documents a
+    # single-run-boundary-cutoff approximation — BUG-071), this DAG scores
+    # exactly ONE date (end_date) per run, so score_cutoff =
+    # session_close_cutoff(end_date) is the exact, fully correct per-date
+    # cutoff with no residual gap. Value/quality (_compute_value/_compute_
+    # quality) deliberately keep pulling raw prices via "prices_json" — a
+    # valuation ratio needs the actual traded price, not a total-return-
+    # adjusted synthetic one (same rationale as validate_signal_ic.py).
+    from data.normalization.corporate_actions import build_score_price_history_as_of
+    from data.universe.calendar import session_close_cutoff
+
+    with engine.connect() as conn:
+        corporate_actions = pd.read_sql(
+            text(
+                "SELECT ticker, ex_date, action_type, value, known_at, source_version "
+                "FROM corporate_actions ORDER BY ticker, ex_date"
+            ),
+            conn,
+        )
+    corporate_actions["ex_date"] = pd.to_datetime(corporate_actions["ex_date"]).dt.date
+    corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
+
+    score_cutoff = session_close_cutoff(end_date)
+    adjusted_df, adj_meta = build_score_price_history_as_of(
+        df, corporate_actions, score_cutoff=score_cutoff
+    )
+    _log.info(
+        "score_price_history_adjusted",
+        score_date=str(end_date),
+        score_cutoff=score_cutoff.isoformat(),
+        n_actions_considered=adj_meta.n_actions_considered,
+        n_actions_excluded_by_cutoff=adj_meta.n_actions_excluded_by_cutoff,
+        n_actions_excluded_missing_known_at=adj_meta.n_actions_excluded_missing_known_at,
+    )
+    adjusted_df = adjusted_df[["ticker", "date", "adj_close"]].rename(columns={"adj_close": "close"})
+    adjusted_df["close"] = adjusted_df["close"].astype(float)
+
     context["ti"].xcom_push(key="prices_json", value=df.to_json(orient="records", date_format="iso"))
+    context["ti"].xcom_push(
+        key="adjusted_prices_json", value=adjusted_df.to_json(orient="records", date_format="iso")
+    )
     context["ti"].xcom_push(key="score_date", value=str(end_date))
 
 
@@ -124,7 +169,11 @@ def _compute_momentum(**context: Any) -> None:
     import pandas as pd
     from signals.composites.momentum_score import compute_momentum_scores
 
-    prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
+    # Split/dividend-adjusted (BUG-009 section 2.3): momentum is a pure
+    # price-ratio indicator, so it must use build_score_price_history_as_of's
+    # cutoff-aware series (adjusted_prices_json), not the raw prices_json
+    # value/quality use.
+    prices_json: str = context["ti"].xcom_pull(key="adjusted_prices_json", task_ids="load_prices")
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
@@ -139,7 +188,10 @@ def _compute_lowvol(**context: Any) -> None:
     import pandas as pd
     from signals.composites.low_vol_score import compute_lowvol_scores
 
-    prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
+    # Split/dividend-adjusted (BUG-009 section 2.3): low-vol is a pure
+    # price-ratio indicator (volatility of returns), same rationale as
+    # _compute_momentum above.
+    prices_json: str = context["ti"].xcom_pull(key="adjusted_prices_json", task_ids="load_prices")
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
@@ -632,6 +684,61 @@ def _write_simulation(**context: Any) -> dict:
 _OPERATIONAL_METHODOLOGY_NAME = "daily_signal_pipeline_operational"
 
 
+def _get_active_research_run_id_sql(database_url: str, methodology_name: str) -> int:
+    """Resolve the id of the explicitly active research_runs row for
+    ``methodology_name`` via plain SQL, or raise.
+
+    SQLAlchemy-1.4-compatible ON PURPOSE, same reason as
+    ``_pit_eligible_tickers_sql`` above: the packaged Airflow runtime image
+    pins SQLAlchemy 1.4.51 (``infra/docker/Dockerfile.airflow``), while
+    ``data.research.models``/``data.research.identity`` use SQLAlchemy-2-only
+    APIs (``DeclarativeBase``/``Mapped``/``mapped_column``). Importing them
+    here — even lazily, inside a task function — would raise ``ImportError``
+    the moment this task actually executes inside that image, not at DAG
+    parse time, so the earlier ORM-based version of this lookup (adversarial
+    review, same-session follow-up) was dead on arrival in the real
+    deployment target despite passing every test in this repo's dev
+    environment (which runs SQLAlchemy 2.x). This function MUST stay in
+    semantic lockstep with ``data.research.identity.get_active_research_run``
+    (explicit active run only, never the newest row; raise, don't guess, if
+    zero or more than one row is active).
+
+    Raises RuntimeError with an actionable message if no run is active
+    (mirrors ``NoActiveResearchRunError``) or if more than one is (mirrors
+    ``MultipleActiveResearchRunsError`` — should be unreachable given the
+    partial unique index in migration 012, checked rather than assumed).
+    """
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(database_url)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT rr.id FROM research_runs rr "
+                "JOIN research_methodologies rm ON rm.id = rr.methodology_id "
+                "WHERE rm.name = :name AND rr.is_active = TRUE"
+            ),
+            {"name": methodology_name},
+        ).fetchall()
+
+    if not rows:
+        raise RuntimeError(
+            f"No active research run for methodology {methodology_name!r} "
+            "(BUG-009 section 4 / migration 012). Run "
+            "'python -m scripts.register_operational_research_run' once (see "
+            "docs/runbooks/research_run_registration.md) before this DAG can "
+            "write factor_scores/alpha_scores."
+        )
+    if len(rows) > 1:
+        raise RuntimeError(
+            f"{len(rows)} active research runs found for methodology "
+            f"{methodology_name!r}; expected exactly one. This should be "
+            "prevented by migration 012's partial unique index — investigate "
+            "before writing any more factor_scores/alpha_scores rows."
+        )
+    return int(rows[0][0])
+
+
 def _write_scores(**context: Any) -> dict:
     """Persist factor_scores and alpha_scores to TimescaleDB.
 
@@ -647,10 +754,7 @@ def _write_scores(**context: Any) -> dict:
     """
     import pandas as pd
     from sqlalchemy import create_engine, text
-    from sqlalchemy.orm import Session
     import os
-
-    from data.research.identity import NoActiveResearchRunError, get_active_research_run
 
     def _load(key: str) -> pd.DataFrame:
         raw = context["ti"].xcom_pull(key=key, task_ids="combine_scores")
@@ -667,20 +771,9 @@ def _write_scores(**context: Any) -> dict:
     if factor_df.empty and alpha_df.empty:
         return {"factor_rows": 0, "alpha_rows": 0}
 
-    engine = create_engine(os.environ["DATABASE_URL"])
-
-    with Session(engine) as session:
-        try:
-            active_run = get_active_research_run(session, _OPERATIONAL_METHODOLOGY_NAME)
-        except NoActiveResearchRunError as exc:
-            raise RuntimeError(
-                f"No active research run for methodology "
-                f"{_OPERATIONAL_METHODOLOGY_NAME!r} (BUG-009 section 4 / migration "
-                "012). Run 'python -m scripts.register_operational_research_run' "
-                "once (see docs/runbooks/research_run_registration.md) before "
-                "this DAG can write factor_scores/alpha_scores."
-            ) from exc
-    research_run_id = active_run.id
+    database_url = os.environ["DATABASE_URL"]
+    research_run_id = _get_active_research_run_id_sql(database_url, _OPERATIONAL_METHODOLOGY_NAME)
+    engine = create_engine(database_url)
 
     factor_count = 0
     alpha_count = 0

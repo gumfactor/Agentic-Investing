@@ -62,19 +62,35 @@ class TestImportIsolation:
         import ast
 
         tree = ast.parse(_DAG_PATH.read_text(encoding="utf-8"))
-        banned = ("data.universe.runtime", "data.universe.models", "data.universe.import_pipeline")
+        # BUG-009 section 4 follow-up (adversarial review, same-session):
+        # data.research.models/identity are just as SQLAlchemy-2-only as
+        # data.universe.models/runtime (DeclarativeBase/Mapped/mapped_column)
+        # — an earlier draft of the research-run lookup imported
+        # data.research.identity directly and would have raised ImportError
+        # the moment _write_scores actually ran inside the packaged Airflow
+        # image, despite passing every test in this repo's SQLAlchemy-2.x
+        # dev environment. Banned here so a regression fails loudly in CI-
+        # equivalent tests instead of silently in production.
+        banned = (
+            "data.universe.runtime",
+            "data.universe.models",
+            "data.universe.import_pipeline",
+            "data.research.identity",
+            "data.research.models",
+        )
         offenders = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 offenders += [a.name for a in node.names if a.name.startswith(banned)]
             elif isinstance(node, ast.ImportFrom) and node.module:
-                if node.module.startswith(banned) or node.module == "data.universe":
+                if node.module.startswith(banned) or node.module in ("data.universe", "data.research"):
                     offenders.append(node.module)
-        assert offenders == [], f"DAG imports SQLAlchemy-2-only universe modules: {offenders}"
+        assert offenders == [], f"DAG imports SQLAlchemy-2-only modules: {offenders}"
 
     def test_dag_module_imports_cleanly(self, dag_module) -> None:
         assert hasattr(dag_module, "_pit_eligible_tickers_sql")
         assert hasattr(dag_module, "_pit_membership_filter")
+        assert hasattr(dag_module, "_get_active_research_run_id_sql")
 
 
 class TestSemanticParityWithRuntime:
@@ -135,6 +151,80 @@ class TestSemanticParityWithRuntime:
         db_url = f"sqlite:///{tmp_path / 'empty.db'}"
         Base.metadata.create_all(create_engine(db_url, future=True))
         assert dag_module._pit_eligible_tickers_sql(db_url, date(2022, 6, 1)) is None
+
+
+class TestActiveResearchRunLookup:
+    """_get_active_research_run_id_sql must stay in semantic lockstep with
+    data.research.identity.get_active_research_run (BUG-009 section 4 /
+    adversarial-review follow-up): same answer, same fail-closed behavior,
+    without the DAG importing the SQLAlchemy-2-only ORM to get it."""
+
+    @pytest.fixture
+    def research_db(self, tmp_path):
+        from data.research.models import Base
+
+        db_url = f"sqlite:///{tmp_path / 'research.db'}"
+        Base.metadata.create_all(create_engine(db_url, future=True))
+        return db_url
+
+    def _register_and_activate(self, db_url: str, methodology_name: str, activate: bool = True):
+        from sqlalchemy import create_engine as _create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import (
+            MethodologySpec,
+            activate_run,
+            register_methodology,
+            register_run,
+        )
+
+        engine = _create_engine(db_url, future=True)
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=methodology_name,
+                    universe_import_policy="test",
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="score_cutoff_known_at_v1",
+                    realized_return_action_availability_policy="exit_cutoff_known_at_v1",
+                    action_source_version="test",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test",
+                ),
+            )
+            run = register_run(session, methodology.id, data_version="2026-07-18")
+            session.commit()
+            if activate:
+                activate_run(session, run.id, activated_by="test")
+                session.commit()
+            return run.id
+
+    def test_matches_orm_lookup_when_active(self, dag_module, research_db) -> None:
+        from sqlalchemy import create_engine as _create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import get_active_research_run
+
+        run_id = self._register_and_activate(research_db, "dag_test_methodology")
+
+        sql_result = dag_module._get_active_research_run_id_sql(research_db, "dag_test_methodology")
+        assert sql_result == run_id
+
+        engine = _create_engine(research_db, future=True)
+        with Session(engine) as session:
+            orm_result = get_active_research_run(session, "dag_test_methodology")
+        assert sql_result == orm_result.id
+
+    def test_raises_when_no_active_run(self, dag_module, research_db) -> None:
+        self._register_and_activate(research_db, "dag_test_methodology_inactive", activate=False)
+        with pytest.raises(RuntimeError, match="No active research run"):
+            dag_module._get_active_research_run_id_sql(research_db, "dag_test_methodology_inactive")
+
+    def test_raises_when_methodology_unknown(self, dag_module, research_db) -> None:
+        with pytest.raises(RuntimeError, match="No active research run"):
+            dag_module._get_active_research_run_id_sql(research_db, "does_not_exist")
 
 
 class TestFilterDegradation:
@@ -204,8 +294,21 @@ class TestLoadPricesPreFilter:
                 for t in tickers
             ]
         )
+        # BUG-009 section 2.3: _load_prices now also queries corporate_actions
+        # for the cutoff-aware adjustment. A single query-agnostic fake would
+        # answer that second query with the price frame (missing ex_date/
+        # known_at) and crash — distinguish by inspecting the SQL text.
+        empty_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            if "corporate_actions" in str(query):
+                return empty_actions.copy()
+            return frame.copy()
+
         monkeypatch.setenv("DATABASE_URL", db_url)
-        monkeypatch.setattr(pd, "read_sql", lambda *a, **k: frame)
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
         ti = self._FakeTI()
         dag_module._load_prices(
             ti=ti, data_interval_end=self._FakeInterval(score_date)
@@ -247,6 +350,79 @@ class TestLoadPricesPreFilter:
             dag_module, monkeypatch, "sqlite:///:memory:", date(2022, 6, 1), ["AAA", "NOPE"]
         )
         assert tickers == {"AAA", "NOPE"}
+
+
+class TestCorporateActionWiring:
+    """BUG-009 section 2.3 adversarial-review follow-up: momentum/lowvol
+    must receive split/dividend-adjusted prices, not the raw daily_prices
+    values value/quality use."""
+
+    def test_momentum_and_lowvol_read_adjusted_prices_key(self, dag_module) -> None:
+        """Source-level guard: the price-ratio factor tasks must pull
+        adjusted_prices_json, not prices_json, from load_prices' XCom."""
+        import inspect
+
+        momentum_source = inspect.getsource(dag_module._compute_momentum)
+        lowvol_source = inspect.getsource(dag_module._compute_lowvol)
+        value_source = inspect.getsource(dag_module._compute_value)
+        quality_source = inspect.getsource(dag_module._compute_quality)
+
+        assert 'xcom_pull(key="adjusted_prices_json"' in momentum_source
+        assert 'xcom_pull(key="adjusted_prices_json"' in lowvol_source
+        # Value/quality deliberately stay on raw prices (valuation ratios
+        # need the actual traded price, not a total-return-adjusted one).
+        assert 'xcom_pull(key="prices_json"' in value_source
+        assert 'xcom_pull(key="prices_json"' in quality_source
+        assert 'xcom_pull(key="adjusted_prices_json"' not in value_source
+        assert 'xcom_pull(key="adjusted_prices_json"' not in quality_source
+
+    def test_load_prices_pushes_split_adjusted_series(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+        from datetime import datetime, timezone
+
+        score_date = date(2022, 6, 3)
+        pre_split_date = date(2022, 6, 1)
+        raw_frame = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": pre_split_date, "close": 200.0},
+                {"ticker": "AAA", "date": date(2022, 6, 2), "close": 100.0},
+                {"ticker": "AAA", "date": score_date, "close": 101.0},
+            ]
+        )
+        actions_frame = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "ex_date": date(2022, 6, 2),
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime(2022, 6, 1, 21, 0, tzinfo=timezone.utc),
+                    "source_version": "test",
+                }
+            ]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return actions_frame.copy() if "corporate_actions" in str(query) else raw_frame.copy()
+
+        monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+
+        ti = TestLoadPricesPreFilter._FakeTI()
+        dag_module._load_prices(
+            ti=ti, data_interval_end=TestLoadPricesPreFilter._FakeInterval(score_date)
+        )
+
+        raw_pushed = pd.read_json(ti.pushed["prices_json"], orient="records", convert_dates=False)
+        adj_pushed = pd.read_json(ti.pushed["adjusted_prices_json"], orient="records", convert_dates=False)
+        raw_pushed["date"] = pd.to_datetime(raw_pushed["date"]).dt.date
+        adj_pushed["date"] = pd.to_datetime(adj_pushed["date"]).dt.date
+
+        raw_close = float(raw_pushed[raw_pushed["date"] == pre_split_date]["close"].iloc[0])
+        adj_close = float(adj_pushed[adj_pushed["date"] == pre_split_date]["close"].iloc[0])
+
+        assert abs(raw_close - 200.0) < 1e-6  # prices_json stays raw
+        assert abs(adj_close - 100.0) < 1e-6  # adjusted_prices_json is split-adjusted
 
 
 class TestComputeQualityPITCrossSection:

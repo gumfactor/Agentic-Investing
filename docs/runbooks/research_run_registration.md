@@ -12,12 +12,18 @@ written to those tables after migration 012 must be tagged with an
 newest row is the correct one to use (section 4 item 2).
 
 `airflow/dags/daily_signal_pipeline.py` (the scheduled `30 21 * * 1-5`
-factor/alpha scoring DAG) resolves its research run via
-`data.research.identity.get_active_research_run(session,
-"daily_signal_pipeline_operational")` and fails closed with a `RuntimeError`
-if none is active. **The DAG never registers or activates a run itself** —
-that is a deliberate operator action per section 4's design, not an
-oversight.
+factor/alpha scoring DAG) resolves its research run via a plain-SQL lookup
+(`_get_active_research_run_id_sql`, semantically identical to
+`data.research.identity.get_active_research_run` — see that function's
+docstring for why the DAG cannot import the ORM version directly: the
+packaged Airflow image pins SQLAlchemy 1.4.51, while `data.research.models`
+uses SQLAlchemy-2-only APIs) and fails closed with a `RuntimeError` if none
+is active. **The DAG never registers or activates a run itself** — that is
+a deliberate operator action per section 4's design, not an oversight. This
+registration script (`scripts/register_operational_research_run.py`) is a
+standalone CLI run from the normal dev/ops Python environment (SQLAlchemy
+2.x), not inside the packaged Airflow image, so it uses the ORM layer
+directly — that asymmetry is intentional.
 
 ## Consequence if you skip this step
 
