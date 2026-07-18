@@ -108,7 +108,66 @@ def _parse_args() -> argparse.Namespace:
         "backfill can never silently overwrite an old methodology's rows "
         "via the ON CONFLICT upsert.",
     )
+    p.add_argument(
+        "--allow-raw-prices-on-missing-actions",
+        action="store_true",
+        help="Explicit opt-in (adversarial-review round 9, BUG-009): a live "
+        "(non-dry-run) write with no corporate_actions snapshot pinned for "
+        "--snapshot-date fails closed by default rather than silently "
+        "persisting raw, unadjusted momentum scores under a research_run_id "
+        "whose methodology claims cutoff-adjustment was applied. Pass this "
+        "flag together with --research-run-id pointing at a run whose "
+        "methodology honestly declares score_action_availability_policy != "
+        "'score_cutoff_known_at_v1' to proceed anyway. --dry-run is always "
+        "permissive (preview only, never persists) and does not need this "
+        "flag.",
+    )
     return p.parse_args()
+
+
+def _validate_raw_prices_methodology_is_honest(research_run_id: int) -> None:
+    """Refuse to persist raw/unadjusted momentum scores under a methodology
+    that claims cutoff-adjustment was applied (adversarial-review round 9,
+    BUG-009 section 2.3/4): that is the same "provenance lies about what
+    actually happened" pattern as the original P0 finding this whole task
+    exists to prevent, just reached via a silent degrade (missing
+    corporate_actions snapshot) instead of missing wiring. This script is
+    not Airflow-reachable, so the ORM (data.research.models/identity) is
+    safe to use here unlike the DAG-reachable modules elsewhere in 01B-3.
+    """
+    import os
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from data.research.models import ResearchMethodology, ResearchRun
+
+    engine = create_engine(os.environ["DATABASE_URL"])
+    with Session(engine) as session:
+        run_row = session.get(ResearchRun, research_run_id)
+        if run_row is None:
+            raise ValueError(
+                f"--research-run-id={research_run_id} does not exist in research_runs."
+            )
+        methodology = session.get(ResearchMethodology, run_row.methodology_id)
+        if methodology is None:
+            raise ValueError(
+                f"research_runs.id={research_run_id} references a missing "
+                f"methodology_id={run_row.methodology_id}."
+            )
+        if methodology.score_action_availability_policy == "score_cutoff_known_at_v1":
+            raise ValueError(
+                f"--research-run-id={research_run_id} is tagged with methodology "
+                f"{methodology.name!r}, whose score_action_availability_policy is "
+                "'score_cutoff_known_at_v1' -- it claims cutoff-adjusted "
+                "corporate-action handling was applied. Writing RAW (unadjusted) "
+                "momentum scores under that methodology would misrepresent what "
+                "was actually computed (BUG-009). Register a distinct methodology "
+                "whose score_action_availability_policy honestly declares no "
+                "cutoff adjustment was applied (e.g. "
+                "'raw_unadjusted_no_corporate_action_data'), activate a run under "
+                "it, and pass that run's id instead."
+            )
 
 
 def run(
@@ -123,6 +182,7 @@ def run(
     universe_id: str = "sp500",
     provisional_no_universe: bool = False,
     universe_lookup=None,  # injectable for testing; None → construct from DATABASE_URL
+    allow_raw_prices_on_missing_actions: bool = False,
 ) -> None:
     from data.storage.timescale_writer import TimescaleWriter
     from signals.composites.momentum_score import compute_momentum_scores
@@ -213,6 +273,45 @@ def run(
     try:
         corporate_actions = snaps.load_snapshot("corporate_actions", snapshot_date)
     except FileNotFoundError:
+        # Adversarial-review round 9 (BUG-009): a missing snapshot used to
+        # silently degrade to an empty action set and let the run proceed --
+        # writing raw, unadjusted momentum scores tagged with a
+        # research_run_id whose registered methodology
+        # (score_cutoff_known_at_v1) claims cutoff-adjustment WAS applied.
+        # That is the same "provenance lies about what actually happened"
+        # pattern as the original P0 finding this task exists to prevent,
+        # just reached via a silent degrade instead of missing wiring. A
+        # dry run is still permissive (preview only, never persists); a
+        # live write fails closed unless the caller explicitly opts in via
+        # --allow-raw-prices-on-missing-actions AND supplies a
+        # --research-run-id whose methodology honestly declares it did not
+        # apply cutoff adjustment (validated below, before any further work).
+        if not dry_run:
+            if not allow_raw_prices_on_missing_actions:
+                raise RuntimeError(
+                    f"corporate_actions snapshot is missing for "
+                    f"snapshot_date={snapshot_date} and this is a live "
+                    "(non-dry-run) write. Proceeding would silently persist raw, "
+                    "unadjusted momentum scores under a research_run_id whose "
+                    "methodology may claim cutoff-adjusted corporate-action "
+                    "handling was applied (BUG-009). Either re-pin a "
+                    "corporate_actions snapshot for this snapshot_date "
+                    "(scripts/pin_snapshot.py), run with --dry-run to preview "
+                    "without persisting, or pass "
+                    "--allow-raw-prices-on-missing-actions together with a "
+                    "--research-run-id whose methodology honestly declares "
+                    "score_action_availability_policy != "
+                    "'score_cutoff_known_at_v1'."
+                )
+            if research_run_id is None:
+                raise ValueError(
+                    "--allow-raw-prices-on-missing-actions requires "
+                    "--research-run-id so the run's methodology can be "
+                    "validated for honesty before any scores are computed "
+                    "(BUG-009)."
+                )
+            _validate_raw_prices_methodology_is_honest(research_run_id)
+
         corporate_actions = pd.DataFrame(
             columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
         )
@@ -406,6 +505,7 @@ def main() -> None:
         research_run_id=args.research_run_id,
         universe_id=args.universe_id,
         provisional_no_universe=args.provisional_no_universe,
+        allow_raw_prices_on_missing_actions=args.allow_raw_prices_on_missing_actions,
     )
 
 

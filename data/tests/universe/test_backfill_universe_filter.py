@@ -425,3 +425,208 @@ class TestBackfillArgparseResearchRunId:
         )
         args = _parse_args()
         assert args.research_run_id == 42
+        assert args.allow_raw_prices_on_missing_actions is False
+
+
+class TestMissingActionsFailsClosedOnLiveWrite:
+    """Adversarial-review round 9 (BUG-009): a missing corporate_actions
+    snapshot used to silently degrade to raw (unadjusted) prices and let a
+    LIVE write proceed -- persisting scores under a research_run_id whose
+    registered methodology (score_cutoff_known_at_v1) falsely claims
+    cutoff-adjustment was applied. The same "provenance lies about what
+    actually happened" pattern as the original P0 finding, reached via a
+    silent degrade instead of missing wiring. dry_run stays permissive
+    (preview only, never persists); a live write must fail closed unless the
+    caller explicitly opts in AND supplies a research_run_id whose
+    methodology honestly does not claim cutoff adjustment.
+    """
+
+    def _engine_with_methodology(self, tmp_path, monkeypatch, score_action_availability_policy, name):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import MethodologySpec, activate_run, register_methodology, register_run
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy="pit_universe_effective_dated_v1",
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy=score_action_availability_policy,
+                    realized_return_action_availability_policy=score_action_availability_policy,
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run_row = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run_row.id, activated_by="test")
+            session.commit()
+            return run_row.id
+
+    def test_live_write_without_opt_in_raises_before_any_db_write(self) -> None:
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        with pytest.raises(RuntimeError, match="corporate_actions snapshot is missing"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=False,
+                research_run_id=None,
+                snapshots=mock_snaps,
+                provisional_no_universe=True,
+            )
+
+    def test_live_write_with_opt_in_but_no_research_run_id_raises(self) -> None:
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        with pytest.raises(ValueError, match="requires --research-run-id"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=False,
+                research_run_id=None,
+                snapshots=mock_snaps,
+                provisional_no_universe=True,
+                allow_raw_prices_on_missing_actions=True,
+            )
+
+    def test_live_write_with_opt_in_and_dishonest_methodology_raises(self, tmp_path, monkeypatch) -> None:
+        run_id = self._engine_with_methodology(
+            tmp_path, monkeypatch, "score_cutoff_known_at_v1", "dishonest_cutoff_claim"
+        )
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        with pytest.raises(ValueError, match="misrepresent"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=False,
+                research_run_id=run_id,
+                snapshots=mock_snaps,
+                provisional_no_universe=True,
+                allow_raw_prices_on_missing_actions=True,
+            )
+
+    def test_dry_run_remains_permissive_without_opt_in(self, lookup) -> None:
+        """Backward compatibility: --dry-run never persists, so it must stay
+        permissive on a missing snapshot exactly as before round 9."""
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        # Must not raise.
+        run(
+            snapshot_date=date(2024, 1, 2),
+            start=start,
+            end=end,
+            strategy_id="vtest",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+            universe_id=FIXTURE_UNIVERSE_ID,
+            universe_lookup=lookup,
+        )
+
+
+class TestValidateRawPricesMethodologyIsHonest:
+    """Direct unit coverage of the honesty gate used by the fail-closed path
+    above."""
+
+    def _register(self, engine, score_action_availability_policy, name):
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import MethodologySpec, activate_run, register_methodology, register_run
+
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy="pit_universe_effective_dated_v1",
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy=score_action_availability_policy,
+                    realized_return_action_availability_policy=score_action_availability_policy,
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run_row = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run_row.id, activated_by="test")
+            session.commit()
+            return run_row.id
+
+    def _engine(self, tmp_path, monkeypatch, name):
+        from sqlalchemy import create_engine
+
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(engine)
+        return engine
+
+    def test_raises_when_methodology_claims_cutoff_adjustment(self, tmp_path, monkeypatch) -> None:
+        from scripts.backfill_momentum_scores import _validate_raw_prices_methodology_is_honest
+
+        engine = self._engine(tmp_path, monkeypatch, "claims_cutoff")
+        run_id = self._register(engine, "score_cutoff_known_at_v1", "claims_cutoff_methodology")
+
+        with pytest.raises(ValueError, match="misrepresent"):
+            _validate_raw_prices_methodology_is_honest(run_id)
+
+    def test_passes_when_methodology_honestly_declares_no_adjustment(self, tmp_path, monkeypatch) -> None:
+        from scripts.backfill_momentum_scores import _validate_raw_prices_methodology_is_honest
+
+        engine = self._engine(tmp_path, monkeypatch, "honest_raw")
+        run_id = self._register(
+            engine, "raw_unadjusted_no_corporate_action_data", "honest_raw_methodology"
+        )
+
+        _validate_raw_prices_methodology_is_honest(run_id)  # must not raise
+
+    def test_raises_on_unknown_run_id(self, tmp_path, monkeypatch) -> None:
+        from scripts.backfill_momentum_scores import _validate_raw_prices_methodology_is_honest
+
+        self._engine(tmp_path, monkeypatch, "empty_db")
+
+        with pytest.raises(ValueError, match="does not exist"):
+            _validate_raw_prices_methodology_is_honest(999999)
