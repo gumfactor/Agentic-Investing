@@ -82,3 +82,6 @@ local/
 *.tar.gz
 *.zip
 .claude/worktrees/
+
+# pytest --basetemp scratch dirs (Windows temp-permission workaround)
+.pytest_basetemp*/
