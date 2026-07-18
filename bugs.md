@@ -555,6 +555,48 @@ timestamp defensively (a SQLite/pysqlite `MAX()`-over-aggregate quirk that
 loses the declared column type, surfaced only by adding real test
 coverage — the production Postgres driver was never affected).
 
+**Adversarial review round 7 (same day):** three P2 findings, closing out
+this review series. (1) The remaining two dashboard readers,
+`reporting/dashboards/queries.py`'s `alpha_score_at_fill_date`/
+`factor_scores_at_fill_date` and `reporting/dashboards/simulation.py`'s
+`alpha_overlap_matrix`, were fixed with the same `_ACTIVE_RUN_SUBQUERY`
+pattern (see BUG-072, now closed for every reader except the deliberately
+deferred `scripts/indicator_diagnostic.py`); a repo-wide grep for every
+remaining `FROM alpha_scores`/`FROM factor_scores` confirmed nothing else
+is unfiltered without a documented reason. (2)
+`scripts/register_operational_research_run.py` registered
+`action_source_version="yfinance-current"`, but ingestion
+(`data/ingestion/market/yfinance_client.py`,
+`airflow/dags/daily_data_pipeline.py`) calls
+`TimescaleWriter.upsert_corporate_actions(df)` without a `source_version`
+argument, so every row actually lands with the writer's own default,
+`"unknown"` — the registered methodology's provenance claim didn't match
+reality, undermining exactly what migrations 011/012 exist to guarantee.
+Fixed by registering `"unknown"` (matching actual behavior) rather than
+wiring a real version through ingestion (out of scope for this fix — that
+touches production ingestion code, not just methodology metadata); the
+`notes` field now documents the gap and the tightening path (re-register a
+NEW methodology once ingestion passes a real version, never edit this one
+in place). (3) `signals.research.ic.compute_realized_forward_returns_as_of`
+(the round-4 correctness fix) rebuilt a full adjusted price panel per
+DISTINCT EXIT DATE — assessed as a real but cheaply fixable performance
+concern, not deferred: it now caches the expensive panel build keyed by
+the actual SET of eligible corporate actions for a cutoff (reusing
+`_filter_actions_by_cutoff` directly so the cache key can never drift from
+what the builder itself considers eligible), since many consecutive exit
+dates in a multi-year holdout (~500-750 distinct trading dates) commonly
+share an identical eligible-action set — nothing new becomes knowable
+between them — collapsing what was an O(#exit_dates) loop of full-panel
+rebuilds to O(#distinct eligible-action-set changes), which is bounded by
+the number of corporate actions (typically dozens, far fewer than trading
+dates) rather than the holdout length. This is a pure performance
+optimization — the cache key is exactly the input that determines the
+adjusted panel's content, so it cannot change correctness — proven by new
+tests (`test_consecutive_exit_dates_with_no_new_actions_share_one_panel_build`,
+`test_new_action_forces_a_fresh_panel_build`) that count the underlying
+builder calls directly, plus the existing round-4 leak-reproduction test
+continuing to pass unchanged.
+
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
 **Severity:** P0 / signal correctness
@@ -1294,10 +1336,12 @@ pairs after the vectorized computation.
 ### BUG-072: Dashboard/diagnostic readers of alpha_scores/factor_scores are not filtered to the active research run
 
 **Severity:** P2 / display correctness (discovered during 01B-3's
-adversarial-review round 3, scoped out of that round's fix; dashboard
-portion closed in round 4)
+adversarial-review round 3; every reader except `scripts/
+indicator_diagnostic.py` closed by round 7)
 
-**Status:** Partially fixed. Round 3 of adversarial review on PR #35 found
+**Status:** Fixed for every dashboard reader; `scripts/indicator_diagnostic.py`
+remains open by deliberate design (see below — a documented, deliberate
+exception, not an oversight). Round 3 of adversarial review on PR #35 found
 that `scripts/paper_inputs_check.py` (and, through it,
 `scripts/paper_target_check.py`/`paper_order_candidates_check.py`/
 `paper_risk_compliance_check.py`/`paper_stage_blotter_check.py`),
@@ -1320,26 +1364,32 @@ behind by an inactive/superseded run could make the dashboard report the
 pipeline healthy while the active run was actually stale or absent; new
 tests (`tests/reporting/dashboards/test_pipeline_health.py`) reproduce
 exactly that scenario and prove the active run's own staleness now wins.
+Round 7 closed the remaining two: `reporting/dashboards/queries.py`'s
+`alpha_score_at_fill_date`/`factor_scores_at_fill_date` (Sprint 4
+audit-trail drill-down queries) and `reporting/dashboards/simulation.py`'s
+`alpha_overlap_matrix` now filter via the same `_ACTIVE_RUN_SUBQUERY`
+(`simulation.py` imports it directly from `queries.py` rather than
+duplicating the SQL string, so the two modules cannot drift out of sync).
+New tests in `tests/reporting/dashboards/test_sprint4.py`
+(`TestAlphaScoreAtFillDate`, `TestFactorScoresAtFillDate`, and
+`TestAlphaOverlapMatrix::test_inactive_run_row_excluded`) cover all three.
+A round-7 repo-wide grep for every remaining `FROM alpha_scores`/
+`FROM factor_scores` confirmed no other reader is unfiltered without a
+documented, deliberate reason (see below).
 
-**Still open:** `reporting/dashboards/simulation.py`,
-`reporting/dashboards/queries.py`'s `alpha_score_at_fill_date`/
-`factor_scores_at_fill_date` (audit-trail drill-down queries, Sprint 4),
-and `scripts/indicator_diagnostic.py` remain unfixed and retain the same
-gap.
+**Still open, by deliberate design — not an oversight:**
+`scripts/indicator_diagnostic.py` is a research/diagnostic tool per
+`docs/plans/01b-research-validity-design.md`'s "explicit opt-in for
+cross-run reads" principle; `scripts/pin_snapshot.py` already has its own
+explicit `--research-run-id` opt-in plus same-natural-key collision
+detection/rejection when no run is given (round 3) — the same pattern
+`indicator_diagnostic.py` should eventually get, but has not yet.
 
-**Impact (remaining scope):** after a backfill or run rotation writes a
-second `research_run_id` for dates/tickers these remaining read paths also
-query, they can still return more than one row per natural key,
-double-counting or displaying an arbitrary/inconsistent row. Display-
-correctness only — not an order-construction or DAG-write-path safety
-issue (those are fixed).
+**Impact (remaining scope):** `scripts/indicator_diagnostic.py` can still
+read across every run's rows for its diagnostic output; a documented,
+narrow, and low-severity gap (not order-construction or DAG-write-path
+safety) rather than a silent one.
 
-**Suggested direction (remaining scope):** apply the same
-`_ACTIVE_RUN_SUBQUERY` pattern now established in
-`reporting/dashboards/queries.py` to `alpha_score_at_fill_date`/
-`factor_scores_at_fill_date` and to `reporting/dashboards/simulation.py`'s
-alpha_scores query. `scripts/indicator_diagnostic.py` is a research/
-diagnostic tool per `docs/plans/01b-research-validity-design.md`'s
-"explicit opt-in for cross-run reads" principle — give it an explicit
-`--research-run-id` flag (optional) rather than a silent default filter,
-mirroring `scripts/pin_snapshot.py`'s `--research-run-id` fix.
+**Suggested direction (remaining scope):** give
+`scripts/indicator_diagnostic.py` an explicit, optional `--research-run-id`
+flag, mirroring `scripts/pin_snapshot.py`'s fix.
