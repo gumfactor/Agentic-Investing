@@ -32,11 +32,12 @@ def engine(tmp_path: Path):
 class TestEnsureOperationalRun:
     def test_first_call_creates_methodology_and_activates_run(self, engine) -> None:
         with Session(engine) as session:
-            methodology, run_id, created = ensure_operational_run(
+            methodology_id, methodology_name, run_id, created = ensure_operational_run(
                 session, data_version="2026-07-18", force_new_run=False, activated_by="op1"
             )
             assert created is True
-            assert methodology.name == _OPERATIONAL_METHODOLOGY_NAME
+            assert methodology_name == _OPERATIONAL_METHODOLOGY_NAME
+            assert methodology_id is not None
 
             active = get_active_research_run(session, _OPERATIONAL_METHODOLOGY_NAME)
             assert active.id == run_id
@@ -45,13 +46,13 @@ class TestEnsureOperationalRun:
 
     def test_second_call_is_a_true_no_op(self, engine) -> None:
         with Session(engine) as session:
-            _m1, run_id_1, created_1 = ensure_operational_run(
+            _mid1, _mname1, run_id_1, created_1 = ensure_operational_run(
                 session, data_version="2026-07-18", force_new_run=False, activated_by="op1"
             )
             assert created_1 is True
 
         with Session(engine) as session:
-            _m2, run_id_2, created_2 = ensure_operational_run(
+            _mid2, _mname2, run_id_2, created_2 = ensure_operational_run(
                 session, data_version="2026-07-19", force_new_run=False, activated_by="op2"
             )
             assert created_2 is False
@@ -60,12 +61,12 @@ class TestEnsureOperationalRun:
 
     def test_force_new_run_deactivates_prior_and_activates_new(self, engine) -> None:
         with Session(engine) as session:
-            _m1, run_id_1, _ = ensure_operational_run(
+            _mid1, _mname1, run_id_1, _ = ensure_operational_run(
                 session, data_version="2026-07-18", force_new_run=False, activated_by="op1"
             )
 
         with Session(engine) as session:
-            _m2, run_id_2, created_2 = ensure_operational_run(
+            _mid2, _mname2, run_id_2, created_2 = ensure_operational_run(
                 session, data_version="2026-08-01", force_new_run=True, activated_by="op2"
             )
             assert created_2 is True
@@ -83,6 +84,41 @@ class TestEnsureOperationalRun:
             prior = session.get(ResearchRun, run_id_1)
             assert prior is not None
             assert prior.is_active is False
+
+    def test_result_survives_session_close_like_main_does(self, engine) -> None:
+        """Regression test for adversarial-review round 8 P1: main() calls
+        ensure_operational_run() INSIDE a ``with Session(engine) as
+        session:`` block, then reads the returned values AFTER that block
+        exits and the session is closed. Because ``session.commit()``
+        expires ORM instances by default (``expire_on_commit=True``), the
+        original implementation returned the live ``ResearchMethodology``
+        ORM object; reading ``methodology.id``/``.name`` after session close
+        re-queried through the closed session and raised
+        ``DetachedInstanceError`` on literally the first required run
+        registration. This test deliberately mirrors that exact
+        open-then-close boundary (unlike the tests above, which keep the
+        session open across every assertion and would not have caught this)
+        and asserts on the returned values only after the session is gone.
+        """
+        with Session(engine) as session:
+            result = ensure_operational_run(
+                session, data_version="2026-07-18", force_new_run=False, activated_by="op1"
+            )
+        # Session is closed here — result must be plain scalars, not
+        # attached ORM instances, or the asserts below would raise
+        # DetachedInstanceError instead of failing/passing cleanly.
+        methodology_id, methodology_name, run_id, created = result
+        assert created is True
+        assert methodology_name == _OPERATIONAL_METHODOLOGY_NAME
+        assert isinstance(methodology_id, int)
+        assert isinstance(run_id, int)
+
+        # Also confirm main()'s exact f-string read pattern doesn't blow up.
+        message = (
+            f"Registered and activated research_runs.id={run_id} for methodology "
+            f"{methodology_name!r} (id={methodology_id})."
+        )
+        assert str(run_id) in message
 
     def test_daily_signal_pipeline_can_resolve_the_registered_run(self, engine) -> None:
         """End-to-end proof this actually unblocks the DAG's own lookup call."""

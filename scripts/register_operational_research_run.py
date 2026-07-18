@@ -109,33 +109,49 @@ def ensure_operational_run(
     data_version: str,
     force_new_run: bool,
     activated_by: str,
-) -> tuple[ResearchMethodology, int, bool]:
-    """Idempotent core: returns (methodology, run_id, created_new_run)."""
+) -> tuple[int, str, int, bool]:
+    """Idempotent core: returns (methodology_id, methodology_name, run_id,
+    created_new_run).
+
+    Deliberately returns plain scalars, not the ORM ``ResearchMethodology``
+    instance (adversarial-review round 8 P1 finding). ``session.commit()``
+    below expires the ORM object's attributes by default
+    (``expire_on_commit=True``), and the caller reads the return value AFTER
+    the ``with Session(...)`` block in ``main()`` has closed the session --
+    any attribute access on a still-attached-but-expired instance at that
+    point re-queries via the now-closed session and raises
+    ``DetachedInstanceError``. Reading the scalars here, while the session is
+    still open, avoids that lifecycle hazard entirely rather than papering
+    over it with ``expire_on_commit=False`` or an explicit refresh.
+    """
     methodology = session.query(ResearchMethodology).filter_by(
         name=_OPERATIONAL_METHODOLOGY_NAME
     ).one_or_none()
     if methodology is None:
         methodology = register_methodology(session, _current_methodology_spec())
         session.commit()
+    methodology_id = methodology.id
+    methodology_name = methodology.name
 
     if not force_new_run:
         try:
             active_run = get_active_research_run(session, _OPERATIONAL_METHODOLOGY_NAME)
-            return methodology, active_run.id, False
+            return methodology_id, methodology_name, active_run.id, False
         except NoActiveResearchRunError:
             pass  # fall through to register + activate below
 
     run = register_run(
         session,
-        methodology.id,
+        methodology_id,
         data_version=data_version,
         run_label=f"operational_{data_version}",
         notes="Registered by scripts/register_operational_research_run.py.",
     )
     session.commit()
-    activate_run(session, run.id, activated_by=activated_by)
+    run_id = run.id
+    activate_run(session, run_id, activated_by=activated_by)
     session.commit()
-    return methodology, run.id, True
+    return methodology_id, methodology_name, run_id, True
 
 
 def main() -> int:
@@ -168,20 +184,20 @@ def main() -> int:
 
     engine = create_engine(database_url)
     with Session(engine) as session:
-        methodology, run_id, created = ensure_operational_run(
+        methodology_id, methodology_name, run_id, created = ensure_operational_run(
             session, data_version, args.force_new_run, args.activated_by
         )
 
     if created:
         print(
             f"Registered and activated research_runs.id={run_id} for methodology "
-            f"{_OPERATIONAL_METHODOLOGY_NAME!r} (id={methodology.id}), "
+            f"{methodology_name!r} (id={methodology_id}), "
             f"data_version={data_version!r}."
         )
     else:
         print(
             f"Active run already exists: research_runs.id={run_id} for methodology "
-            f"{_OPERATIONAL_METHODOLOGY_NAME!r} (id={methodology.id}). No-op. "
+            f"{methodology_name!r} (id={methodology_id}). No-op. "
             "Use --force-new-run to activate a fresh run instead."
         )
     print("daily_signal_pipeline.py is now unblocked to write factor_scores/alpha_scores.")
