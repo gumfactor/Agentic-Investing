@@ -76,13 +76,30 @@ def _current_methodology_spec() -> MethodologySpec:
         timing_policy_id=DEFAULT_TIMING_POLICY.policy_id,
         score_action_availability_policy="score_cutoff_known_at_v1",
         realized_return_action_availability_policy="exit_cutoff_known_at_v1",
-        action_source_version="yfinance-current",
+        # Matches actual current behavior (adversarial review round 7):
+        # data/ingestion/market/yfinance_client.py and
+        # airflow/dags/daily_data_pipeline.py both call
+        # TimescaleWriter.upsert_corporate_actions(df) without a
+        # source_version argument, so every row actually lands with the
+        # writer's own default, "unknown" -- not a real yfinance version
+        # string. Registering "yfinance-current" here would have been a
+        # provenance claim ingestion doesn't back up, undermining exactly
+        # what migrations 011/012 were built to guarantee. See the notes
+        # field below for the tightening path.
+        action_source_version="unknown",
         return_adjustment_policy="total_return_adjusted_v1",
         missing_data_policy="pct_change_fill_none_v1",
         code_config_hash="01b3-daily-signal-pipeline-baseline",
         notes=(
             "Operational baseline for airflow/dags/daily_signal_pipeline.py. "
-            "Registered by scripts/register_operational_research_run.py."
+            "Registered by scripts/register_operational_research_run.py. "
+            "action_source_version is 'unknown' because ingestion "
+            "(data/ingestion/market/yfinance_client.py, "
+            "airflow/dags/daily_data_pipeline.py) does not currently pass a "
+            "real source_version to TimescaleWriter.upsert_corporate_actions "
+            "-- tighten this (and re-register a NEW methodology, never edit "
+            "this one in place) once ingestion is updated to pass one, e.g. "
+            "an actual yfinance library version string."
         ),
     )
 
