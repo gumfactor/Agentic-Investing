@@ -534,6 +534,27 @@ picking one policy if the frame mixed several. Now reads the frame's own
 column (rejecting with a clear error if it contains more than one distinct
 value) instead of trusting the argument.
 
+**Adversarial review round 6 (same day):** `reporting/dashboards/
+queries.py::pipeline_health()`'s signals-recency check ran
+`MAX(computed_at)` over ALL of `alpha_scores` with no active-run filter —
+the one dashboard query round 4's `_ACTIVE_RUN_SUBQUERY` fix missed. A
+fresher row left behind by an inactive/superseded run (post-backfill or
+run rotation) could make the dashboard report the pipeline healthy while
+the active `daily_signal_pipeline_operational` run was actually stale or
+had never written anything, undermining the active-run invariant this PR
+spent five rounds establishing everywhere else. Fixed with the same
+`_ACTIVE_RUN_SUBQUERY` pattern already used by the other three dashboard
+queries in this file (kept for in-module consistency rather than switching
+to `data/research/sql_compat.py`, which raises on no-active-run rather
+than degrading to an empty/None result the way this file's existing
+pattern does). New `tests/reporting/dashboards/test_pipeline_health.py`
+(the function had zero prior test coverage) reproduces the exact scenario
+Codex described and proves the active run's own staleness now wins over a
+fresher inactive run's row. Also hardened `_age()` to accept a string
+timestamp defensively (a SQLite/pysqlite `MAX()`-over-aggregate quirk that
+loses the declared column type, surfaced only by adding real test
+coverage — the production Postgres driver was never affected).
+
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
 **Severity:** P0 / signal correctness
@@ -1292,13 +1313,19 @@ the active `daily_signal_pipeline_operational` run, degrading to an empty
 result (not a crash) when none is active. New tests
 (`tests/reporting/dashboards/test_sprint3_queries.py::
 TestActiveResearchRunFiltering`) prove a stale/inactive run's colliding row
-is excluded and that no-active-run degrades gracefully.
+is excluded and that no-active-run degrades gracefully. Round 6 closed
+`pipeline_health()`'s signals-recency check the same way — it previously
+ran `MAX(computed_at)` over ALL of `alpha_scores`, so a fresher row left
+behind by an inactive/superseded run could make the dashboard report the
+pipeline healthy while the active run was actually stale or absent; new
+tests (`tests/reporting/dashboards/test_pipeline_health.py`) reproduce
+exactly that scenario and prove the active run's own staleness now wins.
 
 **Still open:** `reporting/dashboards/simulation.py`,
 `reporting/dashboards/queries.py`'s `alpha_score_at_fill_date`/
 `factor_scores_at_fill_date` (audit-trail drill-down queries, Sprint 4),
-and `scripts/indicator_diagnostic.py` were not touched in round 4 and
-retain the same gap.
+and `scripts/indicator_diagnostic.py` remain unfixed and retain the same
+gap.
 
 **Impact (remaining scope):** after a backfill or run rotation writes a
 second `research_run_id` for dates/tickers these remaining read paths also
