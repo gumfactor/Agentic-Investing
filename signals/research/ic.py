@@ -129,11 +129,19 @@ def compute_realized_forward_returns_as_of(
     cutoff, never a shared one), then reads each row's entry/exit adjusted
     closes from the series built for ITS OWN exit_date.
 
-    Cost: one ``build_realized_total_return_as_of`` call per distinct exit
-    date in the horizon set (typically on the order of the number of
-    trading dates in the holdout, not the number of (ticker, date, horizon)
-    rows) — each call is a single-pass corporate-action adjustment over the
-    full price panel, cheap given how sparse corporate actions are.
+    Cost: at most one ``build_realized_total_return_as_of`` call per
+    DISTINCT ELIGIBLE-ACTION-SET across the exit dates in the horizon set
+    (adversarial-review round 7 optimization), not one per distinct exit
+    date. Consecutive exit dates commonly share an identical eligible
+    action set — nothing new becomes knowable between them — so this
+    caches the expensive full-panel adjustment by the actual set of
+    actions ``_filter_actions_by_cutoff`` returns for that cutoff (cheap: a
+    vectorized boolean mask over the — sparse — action rows, not the price
+    panel) rather than rebuilding an identical panel from scratch for
+    every exit date. This is a pure performance optimization: the cache
+    key is exactly the input that determines the adjusted panel's content,
+    so it cannot change correctness (see the round-4 fix's per-exit-date
+    correctness guarantee above, unaffected by this caching).
 
     Args:
         prices: Long-format DataFrame with columns ``ticker``, ``date``,
@@ -150,7 +158,10 @@ def compute_realized_forward_returns_as_of(
         for :func:`compute_ic_series`'s ``precomputed_forward_returns``
         argument.
     """
-    from data.normalization.corporate_actions import build_realized_total_return_as_of
+    from data.normalization.corporate_actions import (
+        _filter_actions_by_cutoff,
+        build_realized_total_return_as_of,
+    )
     from data.universe.calendar import session_close_cutoff
 
     _validate_prices(prices)
@@ -165,14 +176,31 @@ def compute_realized_forward_returns_as_of(
     if structure.empty:
         return structure
 
+    # Round-7 perf optimization: cache the expensive adjusted panel by the
+    # exact set of actions eligible for a given cutoff (reusing
+    # _filter_actions_by_cutoff directly rather than reimplementing its
+    # known_at/ex_date logic, so the cache key can never silently drift
+    # from what the builder itself considers eligible). Uses the corporate
+    # actions' own natural key — (ticker, ex_date, action_type) is unique
+    # per migration 001's ``UniqueConstraint`` — so this needs no dependency
+    # on row order or index.
+    panel_cache: dict[frozenset, "pd.Series"] = {}
+
     rows: list[dict] = []
     for exit_date, group in structure.groupby("exit_date"):
         exit_cutoff = session_close_cutoff(exit_date)
-        entry_date_for_call = group["entry_date"].min()
-        adjusted, _meta = build_realized_total_return_as_of(
-            prices, corporate_actions, entry_date=entry_date_for_call, exit_cutoff=exit_cutoff
+        eligible_actions, _, _ = _filter_actions_by_cutoff(corporate_actions, exit_cutoff)
+        cache_key = frozenset(
+            zip(eligible_actions["ticker"], eligible_actions["ex_date"], eligible_actions["action_type"])
         )
-        adj_lookup = adjusted.set_index(["ticker", "date"])["adj_close"]
+        adj_lookup = panel_cache.get(cache_key)
+        if adj_lookup is None:
+            entry_date_for_call = group["entry_date"].min()
+            adjusted, _meta = build_realized_total_return_as_of(
+                prices, corporate_actions, entry_date=entry_date_for_call, exit_cutoff=exit_cutoff
+            )
+            adj_lookup = adjusted.set_index(["ticker", "date"])["adj_close"]
+            panel_cache[cache_key] = adj_lookup
 
         for row in group.itertuples(index=False):
             key_entry = (row.ticker, row.entry_date)

@@ -292,6 +292,83 @@ class TestComputeRealizedForwardReturnsAsOf:
         # Adjusted ratio = 50/50 - 1 = 0.0, not the raw -0.5.
         assert abs(row0["forward_return"] - 0.0) < 1e-9
 
+    def test_consecutive_exit_dates_with_no_new_actions_share_one_panel_build(self, monkeypatch):
+        """Adversarial-review round 7 perf fix: many consecutive exit dates
+        share an identical eligible-action set (no new action becomes
+        knowable between them) and must reuse ONE cached adjusted panel
+        instead of rebuilding it per exit date."""
+        import data.normalization.corporate_actions as corp_actions_module
+
+        d = self._dates(10)  # d0..d9, no corporate actions at all
+        prices = pd.DataFrame(
+            [{"ticker": "X", "date": dd, "close": 100.0 + i} for i, dd in enumerate(d)]
+        )
+        corporate_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+
+        call_count = {"n": 0}
+        real_builder = corp_actions_module.build_realized_total_return_as_of
+
+        def _counting_builder(*args, **kwargs):
+            call_count["n"] += 1
+            return real_builder(*args, **kwargs)
+
+        monkeypatch.setattr(corp_actions_module, "build_realized_total_return_as_of", _counting_builder)
+
+        result = compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[1, 2, 3])
+
+        # Several distinct exit dates are produced (one per score_date x
+        # horizon combination), but with zero corporate actions the
+        # eligible-action set is identical (empty) for every one of them —
+        # the panel must be built exactly once, not once per exit date.
+        n_distinct_exit_dates = result["exit_date"].nunique()
+        assert n_distinct_exit_dates > 1, "test needs more than one distinct exit date to be meaningful"
+        assert call_count["n"] == 1
+
+    def test_new_action_forces_a_fresh_panel_build(self, monkeypatch):
+        """Cache correctness guard: once a new action becomes eligible for
+        a later exit date, that date's eligible-action set differs from
+        earlier dates, so it must trigger a fresh (correct) panel build
+        rather than reusing the earlier, now-stale cache entry."""
+        import data.normalization.corporate_actions as corp_actions_module
+
+        d = self._dates(10)
+        prices = pd.DataFrame(
+            [{"ticker": "X", "date": dd, "close": 100.0 + i} for i, dd in enumerate(d)]
+        )
+        # Known well before d[9]'s cutoff but after d[2]'s -- splits the
+        # exit dates into (at least) two distinct eligible-action groups.
+        known_at = datetime(d[3].year, d[3].month, d[3].day, 21, 0, tzinfo=timezone.utc)
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "X",
+                    "ex_date": d[3],
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": known_at,
+                    "source_version": "test",
+                }
+            ]
+        )
+
+        call_count = {"n": 0}
+        real_builder = corp_actions_module.build_realized_total_return_as_of
+
+        def _counting_builder(*args, **kwargs):
+            call_count["n"] += 1
+            return real_builder(*args, **kwargs)
+
+        monkeypatch.setattr(corp_actions_module, "build_realized_total_return_as_of", _counting_builder)
+
+        compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[1, 2, 3])
+
+        # At least two distinct eligible-action groups (before/after the
+        # action becomes eligible) -- more than one build, but still far
+        # fewer than one per distinct exit date.
+        assert call_count["n"] >= 2
+
     def test_output_columns_match_return_series_columns(self):
         d = self._dates(4)
         prices = pd.DataFrame(
