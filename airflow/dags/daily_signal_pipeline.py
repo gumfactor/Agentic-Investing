@@ -639,9 +639,11 @@ def _write_scores(**context: Any) -> dict:
     unique constraint/primary key on both tables, so every row must be
     tagged with an explicitly approved active research run — never assumed.
     Fails closed with an actionable error if no run has been activated for
-    ``_OPERATIONAL_METHODOLOGY_NAME`` (an operator registers/activates one
-    once via ``data.research.identity``; this DAG never registers or
-    activates a run itself).
+    ``_OPERATIONAL_METHODOLOGY_NAME`` (an operator runs
+    ``python -m scripts.register_operational_research_run`` once — see
+    ``docs/runbooks/research_run_registration.md`` — a REQUIRED pre-deploy
+    step after migration 012; this DAG never registers or activates a run
+    itself).
     """
     import pandas as pd
     from sqlalchemy import create_engine, text
@@ -674,9 +676,9 @@ def _write_scores(**context: Any) -> dict:
             raise RuntimeError(
                 f"No active research run for methodology "
                 f"{_OPERATIONAL_METHODOLOGY_NAME!r} (BUG-009 section 4 / migration "
-                "012). Register a research_methodologies/research_runs pair and "
-                "call activate_run() once via data.research.identity before this "
-                "DAG can write factor_scores/alpha_scores."
+                "012). Run 'python -m scripts.register_operational_research_run' "
+                "once (see docs/runbooks/research_run_registration.md) before "
+                "this DAG can write factor_scores/alpha_scores."
             ) from exc
     research_run_id = active_run.id
 
