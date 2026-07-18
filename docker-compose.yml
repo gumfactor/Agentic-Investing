@@ -147,7 +147,11 @@ services:
 
   # ─── Experiment tracking ─────────────────────────────────────────────────────
   minio-init:
-    image: minio/mc:RELEASE.2024-01-16T16-07-38Z
+    # minio/mc no longer publishes pinned RELEASE.* tags on Docker Hub (only
+    # `latest` is retained) -- unlike minio/minio (the server image), which
+    # still resolves at its pinned tag above. `mc` is a thin, backward-
+    # compatible CLI client, so floating on `latest` here is low-risk.
+    image: minio/mc:latest
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
