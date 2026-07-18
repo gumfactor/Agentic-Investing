@@ -33,6 +33,18 @@ def _parse_args() -> argparse.Namespace:
         default=str(date.today()),
         help="Bundle version date (YYYY-MM-DD; default: today).",
     )
+    parser.add_argument(
+        "--research-run-id",
+        type=int,
+        default=None,
+        help="Pin alpha_scores only from this research_runs.id (BUG-009 section 4). "
+        "Optional: a strategy legitimately backfilled in several non-overlapping "
+        "date-range batches may span more than one run, each covering distinct "
+        "score_dates -- pin_bundle() detects and rejects the unsafe case (more "
+        "than one run's rows sharing the SAME (ticker, score_date)) instead of "
+        "silently pinning duplicates. Pass this to disambiguate, or to pin a "
+        "specific run's rows only.",
+    )
     return parser.parse_args()
 
 
@@ -41,6 +53,7 @@ def pin_bundle(
     benchmark_ticker: str,
     snapshot_date: date,
     *,
+    research_run_id: int | None = None,
     engine=None,
     snapshots=None,
     market_client=None,
@@ -58,18 +71,32 @@ def pin_bundle(
         "SELECT * FROM daily_prices ORDER BY ticker, date",
         engine,
     )
-    alpha_scores = pd.read_sql(
-        text(
-            """
-            SELECT *
-            FROM alpha_scores
-            WHERE strategy_id = :strategy_id
-            ORDER BY score_date, ticker
-            """
-        ),
-        engine,
-        params={"strategy_id": strategy_id},
-    )
+    if research_run_id is not None:
+        alpha_scores = pd.read_sql(
+            text(
+                """
+                SELECT *
+                FROM alpha_scores
+                WHERE strategy_id = :strategy_id AND research_run_id = :research_run_id
+                ORDER BY score_date, ticker
+                """
+            ),
+            engine,
+            params={"strategy_id": strategy_id, "research_run_id": research_run_id},
+        )
+    else:
+        alpha_scores = pd.read_sql(
+            text(
+                """
+                SELECT *
+                FROM alpha_scores
+                WHERE strategy_id = :strategy_id
+                ORDER BY score_date, ticker
+                """
+            ),
+            engine,
+            params={"strategy_id": strategy_id},
+        )
     corporate_actions = pd.read_sql(
         "SELECT * FROM corporate_actions ORDER BY ticker, ex_date",
         engine,
@@ -79,6 +106,27 @@ def pin_bundle(
         raise ValueError("daily_prices is empty; cannot pin a backtest bundle")
     if alpha_scores.empty:
         raise ValueError(f"No alpha_scores found for strategy_id={strategy_id!r}")
+
+    # BUG-009 section 4 (adversarial review round 3): research_run_id is part
+    # of alpha_scores' identity now, so a strategy backfilled more than once
+    # can legitimately have rows from several runs -- that is safe ONLY when
+    # each run covers a disjoint (ticker, score_date) range. Pinning two
+    # runs' rows for the SAME (ticker, score_date) would silently duplicate
+    # that cross-section in the bundle (a research-purity AND correctness
+    # bug for anything that groups by (ticker, score_date)). Detected and
+    # rejected here rather than pinned; --research-run-id disambiguates.
+    if research_run_id is None and "research_run_id" in alpha_scores.columns:
+        dup_key = alpha_scores.groupby(["ticker", "score_date"])["research_run_id"].nunique()
+        colliding = dup_key[dup_key > 1]
+        if not colliding.empty:
+            sample = list(colliding.index[:5])
+            raise ValueError(
+                f"alpha_scores for strategy_id={strategy_id!r} has {len(colliding)} "
+                f"(ticker, score_date) pairs spanning more than one research_run_id "
+                f"(e.g. {sample}). Pinning all of them would duplicate that "
+                "cross-section in the bundle. Pass --research-run-id to select the "
+                "run whose rows should be pinned."
+            )
 
     price_start = pd.to_datetime(prices["date"]).min().date()
     price_end = pd.to_datetime(prices["date"]).max().date()
@@ -141,6 +189,7 @@ def main() -> None:
         strategy_id=args.strategy_id,
         benchmark_ticker=args.benchmark,
         snapshot_date=date.fromisoformat(args.snapshot_date),
+        research_run_id=args.research_run_id,
     )
     print(f"Backtest dataset bundle pinned: {manifest_path}")
 

@@ -569,6 +569,31 @@ def _write_simulation(**context: Any) -> dict:
     except Exception:
         strategy_ids = [_DEFAULT_STRATEGY_ID]
 
+    # BUG-009 section 4 (adversarial review round 3): research_run_id is now
+    # part of alpha_scores' identity, so multiple rows can legitimately
+    # coexist for the same (ticker, score_date, strategy_id) across runs
+    # (legacy, superseded, active). The DB fallback query below (for
+    # strategies not present in this run's own XCom) must filter to the
+    # explicitly active run, never read across all of them — non-blocking,
+    # consistent with this function's existing degrade-and-skip philosophy:
+    # if no active run can be resolved, the DB fallback branch is skipped
+    # (that strategy's simulation row is simply not written this run) rather
+    # than aborting the whole task.
+    try:
+        _fallback_research_run_id: int | None = _get_active_research_run_id_sql(
+            database_url, _OPERATIONAL_METHODOLOGY_NAME
+        )
+    except Exception as _exc:
+        _fallback_research_run_id = None
+        import structlog as _structlog
+
+        _structlog.get_logger("rqis.airflow").warning(
+            "simulation_fallback_active_run_unavailable",
+            error=str(_exc),
+            note="DB fallback alpha_scores lookup for other strategies will be "
+            "skipped this run (BUG-009 section 4)",
+        )
+
     # Compute close-to-close daily returns from prices for sim_date
     today_closes = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
     prev_day_closes: pd.Series = pd.Series(dtype=float)
@@ -586,18 +611,21 @@ def _write_simulation(**context: Any) -> dict:
             # row on the same sim_date even when only one strategy ran today.
             if not alpha_df.empty and (alpha_df["strategy_id"] == strategy_id).any():
                 strat_scores = alpha_df[alpha_df["strategy_id"] == strategy_id].copy()
-            else:
+            elif _fallback_research_run_id is not None:
                 with engine.connect() as conn:
                     rows = conn.execute(
                         text(
                             "SELECT ticker, rank, alpha_score FROM alpha_scores "
-                            "WHERE strategy_id = :sid AND score_date = :d"
+                            "WHERE strategy_id = :sid AND score_date = :d "
+                            "AND research_run_id = :run_id"
                         ),
-                        {"sid": strategy_id, "d": sim_date},
+                        {"sid": strategy_id, "d": sim_date, "run_id": _fallback_research_run_id},
                     ).fetchall()
                 if not rows:
                     continue
                 strat_scores = pd.DataFrame(rows, columns=["ticker", "rank", "alpha_score"])
+            else:
+                continue
 
             if strat_scores.empty:
                 continue
