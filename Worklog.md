@@ -11,6 +11,55 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-07-18
+
+### Session — R2 PM: 01B-2 PIT universe review cycle completed; BUG-069 decision
+
+**Operator:** mshane@thecanadalist.ca
+**Role:** PM session (Claude — Fable 5, switched to Opus 4.8 mid-session at the
+operator's direction after Fable 5 usage limits)
+**Branch:** `dev/R2-phase1`
+
+#### What was done
+
+- **01B-2 (BUG-008 PIT universe)** completed its review cycle on PR #34: one
+  internal adversarial round plus seven Codex review items across six response
+  rounds, all resolved. The final item (quality-factor fundamentals z-scored
+  before PIT eligibility filtering) was fixed on tip `b583908`. The builder
+  agent was interrupted by usage limits mid-step, so the **PM session verified
+  and committed the builder's uncommitted worktree fix** and its contamination
+  regression test, ran the affected suites (16 PIT-DAG + 82 quality-composite
+  tests green), pushed, and replied to the review thread. PR #34 is ready for
+  operator merge; no further Codex round per operator instruction.
+- Corrected two PR-babysitting protocol flaws discovered this session: the
+  Codex summon must address `@chatgpt-codex-connector` (the `@chatgptcodex`
+  shorthand reached nobody), and all three GitHub comment surfaces must be
+  polled with `--paginate` (a P2 landed on page 2 and was briefly missed).
+  Both captured in PM memory.
+- Gitignored and removed `.pytest_basetemp*/` scratch dirs (7.6 MB) that
+  builder `--basetemp` runs left in the working tree.
+
+#### Decisions
+
+- `[DECISION]` **BUG-069 (stale-universe warn-degrade):** operator accepts the
+  daily signal DAG's warn-and-degrade-to-provisional behavior on a stale/absent
+  universe import **for now**. Revisit and consider flipping to hard-fail once
+  the universe import is on a scheduled cadence. bugs.md BUG-069 status to be
+  set accordingly when PR #34 merges (the entry currently lives only on the
+  01B-2 branch).
+- `[DECISION]` PM continues on Claude Opus 4.8 for the remainder of the R2
+  round per operator confirmation.
+
+#### Next steps
+
+- Operator: merge PR #34, then run `alembic upgrade head` (migration 009) and
+  the documented universe import against `DATABASE_URL`; run the 01A live
+  verification checklist (`docs/runbooks/01a_compose_paper_runtime_verification.md`).
+- PM: on #34 merge, set bugs.md BUG-069 status per the decision above and launch
+  01B-3 (timing/corporate-action contract + versioned research identity).
+
+---
+
 ## 2026-07-16
 
 ### Session — R2 round project management: roadmap review, 01A + 01B-1 delivered and merged
