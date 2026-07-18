@@ -7,8 +7,8 @@ import pandas as pd
 import pytest
 
 from scripts.validate_signal_ic import (
-    _build_adjusted_price_series,
     _build_eligibility_frame,
+    _build_score_adjusted_prices,
     _FACTORS,
     _add_gate_columns,
     _holdout_start,
@@ -210,7 +210,7 @@ def _business_dates(start: date, n: int) -> list[date]:
     return dates
 
 
-class TestBuildAdjustedPriceSeries:
+class TestBuildScoreAdjustedPrices:
     def _fixture(self):
         # AAPL: flat 200 for two sessions, then a 2-for-1 split on the third
         # (raw close halves to 100), matching the module-level parity
@@ -244,9 +244,7 @@ class TestBuildAdjustedPriceSeries:
         """The whole point of the P0 fix: prices feeding score computation
         must be split-adjusted, not the raw ~50%-jump series."""
         prices, corporate_actions, dates = self._fixture()
-        score_series, _realized_series = _build_adjusted_price_series(
-            prices, corporate_actions, dates
-        )
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
         row0 = score_series[score_series["date"] == dates[0]].iloc[0]
         # Raw close is 200; split-adjusted it must be 100 (200 * 0.5).
         assert abs(row0["close"] - 100.0) < 1e-6
@@ -257,23 +255,15 @@ class TestBuildAdjustedPriceSeries:
         this ever equals the raw series again, the cutoff-aware builder has
         silently stopped being wired in."""
         prices, corporate_actions, dates = self._fixture()
-        score_series, _ = _build_adjusted_price_series(prices, corporate_actions, dates)
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
         raw_row = prices[prices["date"] == dates[0]].iloc[0]
         adj_row = score_series[score_series["date"] == dates[0]].iloc[0]
         assert abs(adj_row["close"] - raw_row["close"]) > 1.0
 
-    def test_realized_series_also_applies_known_split(self):
-        prices, corporate_actions, dates = self._fixture()
-        _score_series, realized_series = _build_adjusted_price_series(
-            prices, corporate_actions, dates
-        )
-        row0 = realized_series[realized_series["date"] == dates[0]].iloc[0]
-        assert abs(row0["close"] - 100.0) < 1e-6
-
     def test_post_split_dates_unchanged(self):
         """Dates on/after the split ex_date keep their raw close (adj_factor=1)."""
         prices, corporate_actions, dates = self._fixture()
-        score_series, _ = _build_adjusted_price_series(prices, corporate_actions, dates)
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
         row = score_series[score_series["date"] == dates[2]].iloc[0]
         assert abs(row["close"] - 100.0) < 1e-6
 
@@ -281,15 +271,57 @@ class TestBuildAdjustedPriceSeries:
         """Empty corporate_actions must not crash and must be a no-op (adj_factor=1)."""
         prices, _corporate_actions, dates = self._fixture()
         empty_actions = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"])
-        score_series, realized_series = _build_adjusted_price_series(prices, empty_actions, dates)
-        for series in (score_series, realized_series):
-            row0 = series[series["date"] == dates[0]].iloc[0]
-            assert abs(row0["close"] - 200.0) < 1e-6
+        score_series = _build_score_adjusted_prices(prices, empty_actions, dates)
+        row0 = score_series[score_series["date"] == dates[0]].iloc[0]
+        assert abs(row0["close"] - 200.0) < 1e-6
 
     def test_output_columns(self):
         prices, corporate_actions, dates = self._fixture()
-        score_series, realized_series = _build_adjusted_price_series(
-            prices, corporate_actions, dates
-        )
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
         assert set(score_series.columns) == {"ticker", "date", "close"}
-        assert set(realized_series.columns) == {"ticker", "date", "close"}
+
+
+# ─── compute_realized_forward_returns_as_of wiring (adversarial review round 4) ──
+
+
+class TestRealizedForwardReturnsWiring:
+    """BUG-009 section 2.3/2.4 round-4 fix: the realized-return leg must use
+    a genuinely per-exit-date-cutoff-correct series, not the single
+    boundary-cutoff approximation _build_score_adjusted_prices still uses
+    for the SCORE leg (safe there via the ratio-cancellation argument;
+    NOT safe for realized returns — see compute_realized_forward_returns_as_of).
+    """
+
+    def test_earlier_exit_unaffected_by_action_unknown_at_its_own_cutoff(self):
+        from signals.research.ic import compute_realized_forward_returns_as_of
+
+        d = _business_dates(date(2024, 2, 1), 5)
+        prices = pd.DataFrame(
+            [
+                {"ticker": "X", "date": d[0], "close": 100.0},
+                {"ticker": "X", "date": d[1], "close": 100.0},  # entry (score_date=d0)
+                {"ticker": "X", "date": d[2], "close": 100.0},  # split ex_date
+                {"ticker": "X", "date": d[3], "close": 50.0},   # exit0 (score_date=d0, h=2)
+                {"ticker": "X", "date": d[4], "close": 51.0},   # exit1 (score_date=d1, h=2)
+            ]
+        )
+        # Known the evening AFTER exit0's own cutoff, but before exit1's.
+        known_at = datetime.combine(d[3], datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=22)
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "X",
+                    "ex_date": d[2],
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": known_at,
+                    "source_version": "test",
+                }
+            ]
+        )
+        result = compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[2])
+        row0 = result[result["score_date"] == d[0]].iloc[0]
+        # Must equal the RAW ratio (50/100 - 1): the split is not yet known
+        # by exit0's own cutoff, so it must not adjust this pair at all —
+        # not the distorted 0.0 a shared-boundary-cutoff approach would give.
+        assert abs(row0["forward_return"] - (50.0 / 100.0 - 1.0)) < 1e-9

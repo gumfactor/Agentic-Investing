@@ -48,7 +48,12 @@ from scipy import stats
 import structlog
 from statsmodels.regression.linear_model import OLS
 
-from signals.research.timing import DEFAULT_TIMING_POLICY, TimingPolicy, build_return_series
+from signals.research.timing import (
+    DEFAULT_TIMING_POLICY,
+    RETURN_SERIES_COLUMNS,
+    TimingPolicy,
+    build_return_series,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -97,15 +102,118 @@ def compute_forward_returns(
     return build_return_series(prices, horizons, timing_policy=timing_policy)
 
 
+def compute_realized_forward_returns_as_of(
+    prices: pd.DataFrame,
+    corporate_actions: pd.DataFrame,
+    horizons: list[int],
+    timing_policy: TimingPolicy = DEFAULT_TIMING_POLICY,
+) -> pd.DataFrame:
+    """Forward/realized returns using each row's OWN exit_date as the
+    corporate-action knowledge cutoff — not one shared boundary cutoff.
+
+    Adversarial-review round 4 finding (BUG-009 §2.3/§2.4): a single global
+    boundary cutoff shared across every row (as an earlier draft of
+    ``scripts/validate_signal_ic.py`` used for both the score and
+    realized-return series) is safe for the SCORE series' ratio-cancellation
+    argument (BUG-071 — a uniform adjustment factor across an entire
+    lookback window ending at the score date cancels out of the ratio), but
+    it is NOT safe for realized returns: for an earlier exit_date in a
+    holdout, an action whose ``ex_date`` falls between that specific
+    entry/exit pair but whose ``known_at`` is after that particular exit
+    (yet still before the later shared boundary) would be incorrectly
+    included — future information leaking into a "PIT-safe" realized
+    return. This function eliminates that approximation entirely: for each
+    DISTINCT ``exit_date`` needed, it builds a separate
+    ``build_realized_total_return_as_of`` series with
+    ``exit_cutoff = session_close_cutoff(exit_date)`` (that date's own
+    cutoff, never a shared one), then reads each row's entry/exit adjusted
+    closes from the series built for ITS OWN exit_date.
+
+    Cost: one ``build_realized_total_return_as_of`` call per distinct exit
+    date in the horizon set (typically on the order of the number of
+    trading dates in the holdout, not the number of (ticker, date, horizon)
+    rows) — each call is a single-pass corporate-action adjustment over the
+    full price panel, cheap given how sparse corporate actions are.
+
+    Args:
+        prices: Long-format DataFrame with columns ``ticker``, ``date``,
+            ``close`` (raw, unadjusted).
+        corporate_actions: must include ``known_at``/``ex_date`` columns
+            (migration 011) — see
+            :func:`data.normalization.corporate_actions.build_realized_total_return_as_of`.
+        horizons: forward-return horizons in trading sessions.
+        timing_policy: score_date -> entry_date execution-lag contract.
+
+    Returns:
+        DataFrame with the same columns as :func:`compute_forward_returns`
+        (:data:`signals.research.timing.RETURN_SERIES_COLUMNS`), suitable
+        for :func:`compute_ic_series`'s ``precomputed_forward_returns``
+        argument.
+    """
+    from data.normalization.corporate_actions import build_realized_total_return_as_of
+    from data.universe.calendar import session_close_cutoff
+
+    _validate_prices(prices)
+
+    # Structural pass: entry_date/exit_date/score_date depend only on each
+    # ticker's own price calendar, not on corporate-action adjustment — RAW
+    # prices are used here purely to enumerate the (ticker, score_date,
+    # entry_date, exit_date, horizon_days) rows needed; their forward_return
+    # values are discarded and recomputed below from the correctly-adjusted
+    # per-exit-date series.
+    structure = build_return_series(prices, horizons, timing_policy=timing_policy)
+    if structure.empty:
+        return structure
+
+    rows: list[dict] = []
+    for exit_date, group in structure.groupby("exit_date"):
+        exit_cutoff = session_close_cutoff(exit_date)
+        entry_date_for_call = group["entry_date"].min()
+        adjusted, _meta = build_realized_total_return_as_of(
+            prices, corporate_actions, entry_date=entry_date_for_call, exit_cutoff=exit_cutoff
+        )
+        adj_lookup = adjusted.set_index(["ticker", "date"])["adj_close"]
+
+        for row in group.itertuples(index=False):
+            key_entry = (row.ticker, row.entry_date)
+            key_exit = (row.ticker, row.exit_date)
+            if key_entry not in adj_lookup.index or key_exit not in adj_lookup.index:
+                continue
+            entry_close = float(adj_lookup.loc[key_entry])
+            exit_close = float(adj_lookup.loc[key_exit])
+            if entry_close == 0:
+                logger.warning(
+                    "zero_entry_close_skipped_realized",
+                    ticker=row.ticker,
+                    entry_date=str(row.entry_date),
+                    exit_date=str(row.exit_date),
+                )
+                continue
+            rows.append({
+                "ticker": row.ticker,
+                "score_date": row.score_date,
+                "entry_date": row.entry_date,
+                "exit_date": row.exit_date,
+                "horizon_days": row.horizon_days,
+                "forward_return": exit_close / entry_close - 1.0,
+                "timing_policy_id": row.timing_policy_id,
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=RETURN_SERIES_COLUMNS)
+    return pd.DataFrame(rows)[RETURN_SERIES_COLUMNS]
+
+
 # ─── IC series ────────────────────────────────────────────────────────────────
 
 def compute_ic_series(
     scores: pd.DataFrame,
-    prices: pd.DataFrame,
+    prices: Optional[pd.DataFrame],
     score_col: str,
     horizons: Optional[list[int]] = None,
     universe: Optional[object] = None,
     timing_policy: TimingPolicy = DEFAULT_TIMING_POLICY,
+    precomputed_forward_returns: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Compute per-score-date cross-sectional IC at multiple forward return horizons.
 
@@ -140,6 +248,18 @@ def compute_ic_series(
             (BUG-009 §2.1). Defaults to the baseline t+1 convention. The
             identifier is carried through to the output and to
             ``signal_ic_stats`` persistence (§2.4).
+        precomputed_forward_returns: when supplied, bypasses this
+            function's internal same-series ``compute_forward_returns``
+            call and uses this frame directly (must have the same columns
+            as :data:`signals.research.timing.RETURN_SERIES_COLUMNS`).
+            Callers that need per-exit-date-correct corporate-action
+            adjustment (design plan §2.3 — a single global adjustment
+            cutoff is only safe for the SCORE series' ratio-cancellation
+            argument, not for realized returns; adversarial-review round 4
+            finding) build this via
+            :func:`compute_realized_forward_returns_as_of` and pass it
+            here instead of a shared ``prices`` series. ``prices`` is not
+            read at all in this mode and may be ``None``.
 
     Returns:
         DataFrame with columns:
@@ -155,10 +275,18 @@ def compute_ic_series(
         horizons = _DEFAULT_HORIZONS
 
     _validate_scores(scores, score_col)
-    _validate_prices(prices)
     universe_lookup = _validate_universe_arg(universe)
 
-    fwd = compute_forward_returns(prices, horizons, timing_policy=timing_policy)
+    if precomputed_forward_returns is not None:
+        missing_cols = set(RETURN_SERIES_COLUMNS) - set(precomputed_forward_returns.columns)
+        if missing_cols:
+            raise ValueError(
+                f"precomputed_forward_returns is missing columns: {missing_cols}"
+            )
+        fwd = precomputed_forward_returns
+    else:
+        _validate_prices(prices)
+        fwd = compute_forward_returns(prices, horizons, timing_policy=timing_policy)
 
     scores_renamed = scores[["ticker", "date", score_col]].rename(columns={"date": "score_date"})
     merged = scores_renamed.merge(fwd, on=["ticker", "score_date"], how="inner")

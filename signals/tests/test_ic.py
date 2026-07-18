@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ from signals.research.ic import (
     chronological_split,
     compute_forward_returns,
     compute_ic_series,
+    compute_realized_forward_returns_as_of,
     multiple_testing_correction,
     summarize_ic,
 )
@@ -195,6 +196,147 @@ class TestComputeForwardReturns:
         prices = _make_prices(["A"], 10).drop(columns=["close"])
         with pytest.raises(ValueError, match="missing columns"):
             compute_forward_returns(prices, horizons=[1])
+
+
+# ─── compute_realized_forward_returns_as_of (adversarial review round 4) ──────
+
+class TestComputeRealizedForwardReturnsAsOf:
+    """BUG-009 section 2.3/2.4 adversarial-review round 4: a single global
+    boundary cutoff (used for both the score and realized-return series in
+    an earlier draft) is provably safe for the SCORE series (BUG-071's
+    ratio-cancellation argument) but NOT for realized returns: an action
+    not yet knowable at an EARLIER exit_date's own cutoff, but knowable by
+    a later shared boundary, must not adjust that earlier exit's return.
+    """
+
+    def _dates(self, n: int = 5) -> list[date]:
+        return _business_dates(date(2022, 1, 3), n)
+
+    def test_action_unknown_at_earlier_exit_does_not_adjust_it(self):
+        d = self._dates(5)  # d0..d4
+        prices = pd.DataFrame(
+            [
+                {"ticker": "X", "date": d[0], "close": 100.0},
+                {"ticker": "X", "date": d[1], "close": 100.0},  # entry (score_date=d0)
+                {"ticker": "X", "date": d[2], "close": 100.0},  # split ex_date
+                {"ticker": "X", "date": d[3], "close": 50.0},   # exit0 (score_date=d0, h=2)
+                {"ticker": "X", "date": d[4], "close": 51.0},   # exit1 (score_date=d1, h=2)
+            ]
+        )
+        # Split known the evening AFTER exit0's own session-close cutoff
+        # (21:00 UTC on d3) but before exit1's cutoff (21:00 UTC on d4) —
+        # exactly the gap a single shared boundary cutoff would blur.
+        known_at = datetime(d[3].year, d[3].month, d[3].day, 22, 0, tzinfo=timezone.utc)
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "X",
+                    "ex_date": d[2],
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": known_at,
+                    "source_version": "test",
+                }
+            ]
+        )
+
+        result = compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[2])
+
+        row0 = result[result["score_date"] == d[0]].iloc[0]  # entry=d1, exit=d3
+        row1 = result[result["score_date"] == d[1]].iloc[0]  # entry=d2, exit=d4
+
+        # Pair 0: entry(d1) < ex_date(d2) < exit(d3) — the split WOULD
+        # distort this ratio if incorrectly included. It must not be: the
+        # action was not yet known by exit0's own cutoff, so pair 0's
+        # return must equal the raw, unadjusted ratio.
+        expected_raw_ratio_0 = 50.0 / 100.0 - 1.0
+        assert abs(row0["forward_return"] - expected_raw_ratio_0) < 1e-9
+
+        # Pair 1 (entry=d2=ex_date, exit=d4): structurally unaffected by
+        # this action regardless of inclusion (neither endpoint is
+        # strictly before ex_date) — a control proving the test isolates
+        # pair 0 specifically, not some unrelated difference.
+        expected_raw_ratio_1 = 51.0 / 100.0 - 1.0
+        assert abs(row1["forward_return"] - expected_raw_ratio_1) < 1e-9
+
+    def test_action_known_by_its_own_exit_is_applied(self):
+        """Sanity check: when known_at IS before the relevant exit's own
+        cutoff, the adjustment must still apply (this is not a
+        never-adjust regression)."""
+        d = self._dates(4)
+        prices = pd.DataFrame(
+            [
+                {"ticker": "X", "date": d[0], "close": 100.0},
+                {"ticker": "X", "date": d[1], "close": 100.0},  # entry
+                {"ticker": "X", "date": d[2], "close": 100.0},  # split ex_date
+                {"ticker": "X", "date": d[3], "close": 50.0},   # exit
+            ]
+        )
+        known_at = datetime(d[2].year, d[2].month, d[2].day, 21, 0, tzinfo=timezone.utc)
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "X",
+                    "ex_date": d[2],
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": known_at,
+                    "source_version": "test",
+                }
+            ]
+        )
+
+        result = compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[2])
+        row0 = result[result["score_date"] == d[0]].iloc[0]
+        # entry(d1) gets adjusted (100 * 0.5 = 50), exit(d3) does not (50).
+        # Adjusted ratio = 50/50 - 1 = 0.0, not the raw -0.5.
+        assert abs(row0["forward_return"] - 0.0) < 1e-9
+
+    def test_output_columns_match_return_series_columns(self):
+        d = self._dates(4)
+        prices = pd.DataFrame(
+            [{"ticker": "X", "date": dd, "close": 100.0 + i} for i, dd in enumerate(d)]
+        )
+        corporate_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+        result = compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[1])
+        assert list(result.columns) == [
+            "ticker", "score_date", "entry_date", "exit_date",
+            "horizon_days", "forward_return", "timing_policy_id",
+        ]
+
+    def test_feeds_compute_ic_series_via_precomputed_forward_returns(self):
+        d = self._dates(6)
+        tickers = ["A", "B", "C", "D", "E", "F"]
+        rows = []
+        for i, t in enumerate(tickers):
+            for j, dd in enumerate(d):
+                rows.append({"ticker": t, "date": dd, "close": 100.0 + i + j})
+        prices = pd.DataFrame(rows)
+        corporate_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+        fwd = compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[1])
+
+        scores = pd.DataFrame(
+            [{"ticker": t, "date": d[0], "score": float(i)} for i, t in enumerate(tickers)]
+        )
+        result = compute_ic_series(
+            scores, None, score_col="score", horizons=[1], precomputed_forward_returns=fwd
+        )
+        assert not result.empty
+        assert set(result.columns) == {
+            "score_date", "horizon_days", "ic", "rank_ic", "n_obs", "timing_policy_id",
+        }
+
+    def test_precomputed_forward_returns_missing_columns_raises(self):
+        scores = pd.DataFrame({"ticker": ["A"], "date": [date(2022, 1, 3)], "score": [1.0]})
+        bad_fwd = pd.DataFrame({"ticker": ["A"], "score_date": [date(2022, 1, 3)]})
+        with pytest.raises(ValueError, match="missing columns"):
+            compute_ic_series(
+                scores, None, score_col="score", horizons=[1], precomputed_forward_returns=bad_fwd
+            )
 
 
 # ─── compute_ic_series ────────────────────────────────────────────────────────
