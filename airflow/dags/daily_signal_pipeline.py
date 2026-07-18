@@ -723,48 +723,23 @@ def _get_active_research_run_id_sql(database_url: str, methodology_name: str) ->
     APIs (``DeclarativeBase``/``Mapped``/``mapped_column``). Importing them
     here — even lazily, inside a task function — would raise ``ImportError``
     the moment this task actually executes inside that image, not at DAG
-    parse time, so the earlier ORM-based version of this lookup (adversarial
-    review, same-session follow-up) was dead on arrival in the real
-    deployment target despite passing every test in this repo's dev
-    environment (which runs SQLAlchemy 2.x). This function MUST stay in
-    semantic lockstep with ``data.research.identity.get_active_research_run``
-    (explicit active run only, never the newest row; raise, don't guess, if
-    zero or more than one row is active).
+    parse time.
 
-    Raises RuntimeError with an actionable message if no run is active
-    (mirrors ``NoActiveResearchRunError``) or if more than one is (mirrors
-    ``MultipleActiveResearchRunsError`` — should be unreachable given the
-    partial unique index in migration 012, checked rather than assumed).
+    Delegates to ``data.research.sql_compat.get_active_research_run_id`` —
+    a shared, plain-``text()``-only implementation (round 5 of the 01B-3 PR's
+    adversarial review found the identical SQLAlchemy-1.4 incompatibility
+    reintroduced at a second call site, ``scripts/paper_inputs_check.py``,
+    because that fix reused the ORM path instead of this one; centralizing
+    the lookup is meant to stop that recurring a third time). That module
+    has no ORM imports of its own, so importing it here is safe — the same
+    way ``data.normalization.corporate_actions``/``data.universe.calendar``
+    are already imported elsewhere in this DAG; the restriction is on the
+    SQLAlchemy-2-only ORM modules specifically, not the whole ``data``
+    package.
     """
-    from sqlalchemy import create_engine, text
+    from data.research.sql_compat import get_active_research_run_id
 
-    engine = create_engine(database_url)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT rr.id FROM research_runs rr "
-                "JOIN research_methodologies rm ON rm.id = rr.methodology_id "
-                "WHERE rm.name = :name AND rr.is_active = TRUE"
-            ),
-            {"name": methodology_name},
-        ).fetchall()
-
-    if not rows:
-        raise RuntimeError(
-            f"No active research run for methodology {methodology_name!r} "
-            "(BUG-009 section 4 / migration 012). Run "
-            "'python -m scripts.register_operational_research_run' once (see "
-            "docs/runbooks/research_run_registration.md) before this DAG can "
-            "write factor_scores/alpha_scores."
-        )
-    if len(rows) > 1:
-        raise RuntimeError(
-            f"{len(rows)} active research runs found for methodology "
-            f"{methodology_name!r}; expected exactly one. This should be "
-            "prevented by migration 012's partial unique index — investigate "
-            "before writing any more factor_scores/alpha_scores rows."
-        )
-    return int(rows[0][0])
+    return get_active_research_run_id(database_url, methodology_name)
 
 
 def _write_scores(**context: Any) -> dict:
