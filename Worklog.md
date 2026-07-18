@@ -13,6 +13,67 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-07-18
 
+### Session — Gate 01A operator live verification complete; BUG-001..004 Fixed
+
+**Operator:** mshane@thecanadalist.ca
+**Role:** operator-run checklist, PM (Opus 4.8) recording sign-off
+**Branch:** `dev/R2-phase1`
+
+#### What was done
+
+- Operator ran all four steps of
+  `docs/runbooks/01a_compose_paper_runtime_verification.md` against a real
+  Docker Desktop stack and a live TWS paper session (port 7497):
+  1. `docker compose build` + `up` — Airflow image built clean; paper env
+     vars (`PAPER_TRADING=true`, `IBKR_PORT=7497`,
+     `IBKR_HOST=host.docker.internal`, `RQIS_RUNTIME_CONTEXT=compose_bridged`)
+     confirmed rendered on all three Airflow services via a filtered
+     `docker compose config`; all services healthy.
+  2. `airflow dags list` / `list-import-errors` — all three DAGs listed with
+     zero import errors; `daily_paper_trading` confirmed paused.
+  3. `scripts.paper_readiness_check` run from inside `airflow-scheduler` —
+     confirmed `host.docker.internal:7497` reachability and a successful
+     paper-mode `IBKRBroker` connection (the core BUG-004 proof). A
+     downstream CAD/USD FX-rate fetch failed separately due to the paper
+     account lacking a live IBKR FX market-data subscription — a
+     pre-existing account limitation with an existing manual-fallback env
+     var pair (`IBKR_FX_RATE_CAD_USD`/`_AS_OF`), not a BUG-004 defect.
+  4. Restart-persistence sentinel round trip on the
+     `RQIS_PAPER_ARTIFACT_HOST_DIR` bind mount — content identical before
+     and after an `airflow-scheduler` restart.
+- `[BLOCKER]` (found and fixed mid-checklist): `docker compose up` failed
+  for the entire stack because `minio-init` referenced
+  `minio/mc:RELEASE.2024-01-16T16-07-38Z`, a tag Docker Hub had pruned
+  (confirmed via the Docker Hub API — `minio/mc` no longer publishes pinned
+  release tags, only `latest`; the `minio/minio` server image at the same
+  tag was unaffected). Repointed `minio-init` to `minio/mc:latest` on
+  `dev/R2-phase1` (commit `a23529e`).
+- `bugs.md`: BUG-001, BUG-002, BUG-003, BUG-004 all flipped from
+  "Implemented — pending operator verification" to **Fixed**, with the
+  operator-verification evidence recorded in each entry and the P0 summary
+  table.
+- `Roadmap.md`: "Make Compose paper runtime executable" row marked
+  `Delivered`/completed 2026-07-18; "Prove the Compose no-submit workflow"
+  (Gate 02A) unblocked from `Blocked` to `Ready`.
+
+#### Decisions
+
+- `[DECISION]` The CAD/USD live-FX-subscription gap surfaced during Step 3
+  is out of Gate 01A's scope (container→host connectivity, the actual
+  BUG-004 concern, was proven before that failure) and is not filed as a
+  new bug — it is a documented, pre-existing operational limitation with an
+  existing fallback mechanism, relevant to every real paper-trading day
+  regardless of this checklist.
+
+#### Next steps
+
+- Gate 02A ("Prove the Compose no-submit workflow") is now `Ready`: a
+  no-submit DAG run proving migrations + DAG imports + shared artifacts +
+  IBKR reachability together, once the operator is ready to schedule it.
+- PM: launch 01B-3 once PR #34 merges.
+
+---
+
 ### Session — R2 PM: 01B-2 PIT universe review cycle completed; BUG-069 decision
 
 **Operator:** mshane@thecanadalist.ca

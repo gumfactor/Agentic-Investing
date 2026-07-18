@@ -30,10 +30,10 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 
 | Bug | Category | Severity | Fix priority | Status | Short rationale |
 |-----|----------|----------|--------------|--------|-----------------|
-| BUG-001 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | Airflow paper DAG cannot pass its own env gate in Compose. |
-| BUG-002 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | Airflow image omits runtime dependencies used by DAGs. |
-| BUG-003 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | Paper artifacts are written to an unmounted container path. |
-| BUG-004 | Infra/Deploy | P0 | F0 | Implemented — pending operator verification | IBKR host defaults to container-local localhost. |
+| BUG-001 | Infra/Deploy | P0 | F0 | Fixed | Airflow paper DAG cannot pass its own env gate in Compose. |
+| BUG-002 | Infra/Deploy | P0 | F0 | Fixed | Airflow image omits runtime dependencies used by DAGs. |
+| BUG-003 | Infra/Deploy | P0 | F0 | Fixed | Paper artifacts are written to an unmounted container path. |
+| BUG-004 | Infra/Deploy | P0 | F0 | Fixed | IBKR host defaults to container-local localhost. |
 | BUG-005 | Trading Safety | P0 | F0 | Fixed | Approval quantity overrides can be tampered upward. |
 | BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
@@ -142,10 +142,15 @@ by `IBKRBroker.__init__` via a validated env default instead of being
 declared-but-ignored (P1-2), and `_require_paper_env` in the DAG now also
 requires `RQIS_RUNTIME_CONTEXT=compose_bridged` so a runtime that bypassed
 the reviewed Compose contract fails closed at the first task (P1-1).
-Status: implemented and locally verified; pending the operator running the
-live TWS/IB Gateway steps in
-`docs/runbooks/01a_compose_paper_runtime_verification.md` before this can be
-marked `Fixed`.
+**Status: Fixed.** Operator-verified 2026-07-18 per
+`docs/runbooks/01a_compose_paper_runtime_verification.md`: `docker compose
+config` confirmed the paper-runtime variables render on all three Airflow
+services against a live `.env`; `docker compose ps` showed
+`airflow-webserver`/`airflow-scheduler` healthy and `airflow-init` exited
+`0`. (One unrelated environment issue was hit and fixed en route: Docker Hub
+had pruned the pinned `minio/mc` client tag, blocking `docker compose up`
+for the whole stack; repointed to `minio/mc:latest` — see `Worklog.md`
+2026-07-18.)
 
 ### BUG-002: Airflow image omits runtime dependencies used by DAG execution paths
 
@@ -188,10 +193,10 @@ import with exit 0. Adversarial fix round (same branch): the build-time
 stderr output (previously a pip internal error with empty stdout would have
 passed silently — P2-1), and the allowlist anchors the full expected
 snowflake/cffi complaint text rather than a bare package-name prefix
-(P3). Status: implemented and locally verified (image rebuilt and smoke
-re-run after the gate change); see
-`docs/runbooks/01a_compose_paper_runtime_verification.md` for the remaining
-operator sign-off steps before this can be marked `Fixed`.
+(P3). **Status: Fixed.** Operator-verified 2026-07-18: `docker compose build`
+succeeded against a live `.env` on Windows Docker Desktop 29.6.1, and
+`airflow-scheduler`/`airflow-webserver` came up healthy from the built image
+(see `docs/runbooks/01a_compose_paper_runtime_verification.md`).
 
 ### BUG-003: Paper-trading artifacts are written to an unmounted container path
 
@@ -220,11 +225,10 @@ mount the same path from the same env-configurable source. Adversarial fix
 round (same branch): the Docker smoke test's mount list is now derived from
 `docker-compose.yml` `x-airflow-common.volumes` instead of being duplicated
 by hand, with a consistency test that fails if a compose mount the DAG
-runtime needs is removed (P2-3). Status:
-implemented and locally verified; restart-persistence and the host-side
-dashboard cross-check are operator steps in
-`docs/runbooks/01a_compose_paper_runtime_verification.md` before this can
-be marked `Fixed`.
+runtime needs is removed (P2-3). **Status: Fixed.** Operator-verified
+2026-07-18: a sentinel written from inside `airflow-scheduler` to
+`$RQIS_PAPER_ARTIFACT_DIR` was read back byte-identical from the host bind
+mount both before and after an `airflow-scheduler` container restart.
 
 ### BUG-004: IBKR connectivity defaults to container-local localhost
 
@@ -260,11 +264,17 @@ non-empty `RQIS_RUNTIME_CONTEXT` value as containerized fail-closed (a typo
 like `compose-bridged` can no longer silently deactivate enforcement —
 P2-2), and the DAG's `_require_paper_env` requires the marker outright so
 the guard cannot be bypassed by omitting it (P1-1).
-Status: implemented and locally verified with fakes; the live
-TWS/IB Gateway reachability preflight from inside the Airflow container is
-an operator step in
-`docs/runbooks/01a_compose_paper_runtime_verification.md` before this can
-be marked `Fixed`.
+**Status: Fixed.** Operator-verified 2026-07-18: `python -m
+scripts.paper_readiness_check` run from inside `airflow-scheduler` reported
+`OK: TWS/Gateway socket reachable at host.docker.internal:7497` and `OK:
+IBKRBroker connected in paper mode` against a live TWS paper session,
+proving the container correctly reaches the host broker through
+`host.docker.internal` rather than falling back to a container-local
+address. (The script then failed a downstream, unrelated CAD/USD FX-rate
+fetch because the paper account lacks a live IBKR FX market-data
+subscription — a pre-existing account limitation with an existing
+`IBKR_FX_RATE_CAD_USD`/`_AS_OF` manual fallback documented in
+`CLAUDE.md`/`.env.example`, not a BUG-004 defect.)
 
 ### BUG-005: Approval quantity overrides can be tampered upward and bypass validation
 
