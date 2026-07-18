@@ -76,16 +76,24 @@ def alpha_overlap_matrix(
     """
     from sqlalchemy import text
 
+    # BUG-009 section 4 / BUG-072 (adversarial review round 7): same
+    # active-run scoping as reporting.dashboards.queries' alpha_scores
+    # readers -- reused directly rather than duplicating the subquery
+    # string, so the two modules cannot drift out of sync.
+    from reporting.dashboards.queries import _ACTIVE_RUN_SUBQUERY
+
     top_tickers: dict[str, set[str]] = {}
     with engine.connect() as conn:
         for sid in strategy_ids:
             rows = conn.execute(
-                text("""
+                text(f"""
                     SELECT ticker FROM alpha_scores
                     WHERE score_date = (
-                        SELECT MAX(score_date) FROM alpha_scores WHERE strategy_id = :sid
+                        SELECT MAX(score_date) FROM alpha_scores
+                        WHERE strategy_id = :sid AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                     )
                     AND strategy_id = :sid
+                    AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                     ORDER BY rank ASC
                     LIMIT :n
                 """),

@@ -547,11 +547,12 @@ def alpha_score_at_fill_date(
     """Return the alpha score for a ticker on or before a fill date."""
     with engine.connect() as conn:
         row = conn.execute(
-            text("""
+            text(f"""
                 SELECT alpha_score, rank, universe_size, score_date
                 FROM alpha_scores
                 WHERE ticker = :ticker AND strategy_id = :sid
                   AND score_date <= :fdate
+                  AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY score_date DESC
                 LIMIT 1
             """),
@@ -566,15 +567,17 @@ def factor_scores_at_fill_date(
     """Return factor scores for a ticker on the latest score_date <= fill_date."""
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT factor_name, z_score, raw_value, score_date
                 FROM factor_scores
                 WHERE ticker = :ticker AND strategy_id = :sid
                   AND score_date <= :fdate
+                  AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                   AND score_date = (
                       SELECT MAX(score_date) FROM factor_scores
                       WHERE ticker = :ticker AND strategy_id = :sid
                         AND score_date <= :fdate
+                        AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                   )
                 ORDER BY factor_name ASC
             """),
