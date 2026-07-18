@@ -284,9 +284,30 @@ def compute_ic_series(
                 f"precomputed_forward_returns is missing columns: {missing_cols}"
             )
         fwd = precomputed_forward_returns
+        # BUG-009 round-5 P2 fix: stamp output rows with the POLICY ACTUALLY
+        # USED to build this frame, not the timing_policy argument (which a
+        # precomputed-forward-returns caller may not have even supplied
+        # consistently with how the frame was built). Reading it off the
+        # frame itself also catches a frame that mixes policies — silently
+        # picking one, or aggregating across them, would mislabel the
+        # persisted research identity (design plan §2.4).
+        if fwd.empty:
+            effective_timing_policy_id = timing_policy.policy_id
+        else:
+            distinct_policies = fwd["timing_policy_id"].dropna().unique()
+            if len(distinct_policies) > 1:
+                raise ValueError(
+                    "precomputed_forward_returns contains more than one distinct "
+                    f"timing_policy_id {sorted(distinct_policies)}; compute_ic_series "
+                    "cannot label a single IC series with a mixed timing policy."
+                )
+            effective_timing_policy_id = (
+                str(distinct_policies[0]) if len(distinct_policies) == 1 else timing_policy.policy_id
+            )
     else:
         _validate_prices(prices)
         fwd = compute_forward_returns(prices, horizons, timing_policy=timing_policy)
+        effective_timing_policy_id = timing_policy.policy_id
 
     scores_renamed = scores[["ticker", "date", score_col]].rename(columns={"date": "score_date"})
     merged = scores_renamed.merge(fwd, on=["ticker", "score_date"], how="inner")
@@ -341,7 +362,7 @@ def compute_ic_series(
             "ic": ic_val,
             "rank_ic": rank_ic_val,
             "n_obs": n,
-            "timing_policy_id": timing_policy.policy_id,
+            "timing_policy_id": effective_timing_policy_id,
         })
 
     if not rows:
@@ -359,7 +380,7 @@ def compute_ic_series(
         "ic_series_computed",
         score_col=score_col,
         horizons=horizons,
-        timing_policy_id=timing_policy.policy_id,
+        timing_policy_id=effective_timing_policy_id,
         n_date_horizon_pairs=len(result),
         ic_mean={
             h: round(float(g["ic"].mean()), 4)

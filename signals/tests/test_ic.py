@@ -338,6 +338,63 @@ class TestComputeRealizedForwardReturnsAsOf:
                 scores, None, score_col="score", horizons=[1], precomputed_forward_returns=bad_fwd
             )
 
+    def test_precomputed_forward_returns_stamps_frames_own_policy_id(self):
+        """BUG-009 round-5 P2: output must reflect the timing_policy_id
+        ACTUALLY present in the precomputed frame, not the timing_policy
+        argument's default -- especially when the caller didn't pass a
+        matching timing_policy argument at all."""
+        d = self._dates(6)
+        tickers = ["A", "B", "C", "D", "E", "F"]
+        fwd_rows = []
+        for i, t in enumerate(tickers):
+            fwd_rows.append({
+                "ticker": t,
+                "score_date": d[0],
+                "entry_date": d[1],
+                "exit_date": d[2],
+                "horizon_days": 1,
+                "forward_return": 0.01 * i,
+                "timing_policy_id": "custom_policy_v9",
+            })
+        fwd = pd.DataFrame(fwd_rows)
+        scores = pd.DataFrame(
+            [{"ticker": t, "date": d[0], "score": float(i)} for i, t in enumerate(tickers)]
+        )
+
+        # Note: no timing_policy argument passed -- default is
+        # DEFAULT_TIMING_POLICY ("t_plus_1_close_v1"), which must NOT leak
+        # into the output when a precomputed frame is supplied.
+        result = compute_ic_series(
+            scores, None, score_col="score", horizons=[1], precomputed_forward_returns=fwd
+        )
+        assert not result.empty
+        assert (result["timing_policy_id"] == "custom_policy_v9").all()
+        assert not (result["timing_policy_id"] == DEFAULT_TIMING_POLICY.policy_id).any()
+
+    def test_precomputed_forward_returns_mixed_policy_ids_rejected(self):
+        d = self._dates(6)
+        tickers = ["A", "B", "C", "D", "E", "F"]
+        fwd_rows = []
+        for i, t in enumerate(tickers):
+            fwd_rows.append({
+                "ticker": t,
+                "score_date": d[0],
+                "entry_date": d[1],
+                "exit_date": d[2],
+                "horizon_days": 1,
+                "forward_return": 0.01 * i,
+                # Half the rows claim one policy, half another -- ambiguous.
+                "timing_policy_id": "policy_a" if i % 2 == 0 else "policy_b",
+            })
+        fwd = pd.DataFrame(fwd_rows)
+        scores = pd.DataFrame(
+            [{"ticker": t, "date": d[0], "score": float(i)} for i, t in enumerate(tickers)]
+        )
+        with pytest.raises(ValueError, match="timing_policy_id"):
+            compute_ic_series(
+                scores, None, score_col="score", horizons=[1], precomputed_forward_returns=fwd
+            )
+
 
 # ─── compute_ic_series ────────────────────────────────────────────────────────
 
