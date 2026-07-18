@@ -100,7 +100,8 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-069 | Data/Universe | P2 | F2 | Deferred (operator-accepted 2026-07-18) | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
 | BUG-070 | Backtesting | P1 | F2 | Open | Backtester loads a single full-history (non-cutoff-aware) adjusted price series, shared for both scoring and execution. |
 | BUG-071 | Research/Signals | P2 | F2 | Open | IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff (documented residual). |
-| BUG-072 | Dashboard/API | P2 | F2 | Partially fixed | `reporting/dashboards/queries.py` alpha/factor-score queries now filter to the active research run; `scripts/indicator_diagnostic.py` remains open (deferred, research/diagnostic tool). |
+| BUG-072 | Dashboard/API | P2 | F2 | Fixed | All alpha/factor-score readers (dashboards, `scripts/indicator_diagnostic.py`) now filter to the active research run by default; `--all-runs`/`--research-run-id` are the only documented explicit opt-ins for cross-run reads. |
+| BUG-073 | Packaging/CI | P1 | F1 | Fixed | `pyproject.toml`'s pytest `testpaths` silently excluded ~412 tests (all of `tests/reporting/dashboards/`, `tests/infra/`) from every "full suite" run whenever a subdirectory (`tests/strategy_registry`) was also listed as its own testpath entry. |
 
 #### Long-term / lower-risk backlog
 
@@ -596,6 +597,46 @@ tests (`test_consecutive_exit_dates_with_no_new_actions_share_one_panel_build`,
 `test_new_action_forces_a_fresh_panel_build`) that count the underlying
 builder calls directly, plus the existing round-4 leak-reproduction test
 continuing to pass unchanged.
+
+**Adversarial review round 8 (same day):** one P1, one P2. (1) **P1:**
+`scripts/register_operational_research_run.py`'s `ensure_operational_run()`
+returned the live `ResearchMethodology` ORM instance, but `main()` read
+`methodology.id`/`.name` from it AFTER the `with Session(engine) as
+session:` block had already closed the session. Because
+`session.commit()` expires ORM instances by default
+(`expire_on_commit=True`), that post-close attribute access re-queried
+through a closed session and raised `DetachedInstanceError` —
+`main()`'s very first successful run would crash on its own final print
+statement, the exact "P1-fix-for-a-P1-fix" scenario this script exists to
+prevent (this script was built in round 3 specifically so
+`daily_signal_pipeline.py` doesn't fail closed on its first post-migration-
+012 run). Confirmed by running the actual script end-to-end against a real
+(SQLite) engine, not just the mocked-session unit tests, which had kept the
+session open across every assertion and so never exercised the close
+boundary that trips this bug. Fixed: `ensure_operational_run()` now reads
+`.id`/`.name` while the session is still open and returns plain scalars
+(`methodology_id: int, methodology_name: str, run_id: int, created: bool`)
+instead of the ORM object — the caller can no longer touch an
+expired/detached instance because it never receives one. New regression
+test `test_result_survives_session_close_like_main_does` in
+`tests/test_register_operational_research_run.py` deliberately mirrors
+`main()`'s exact open-then-close pattern (unpacks the result only after the
+`with Session(...)` block exits) rather than asserting inside it, so it
+would have caught this before it shipped. (2) **P2, closing the last open
+item of BUG-072:** `scripts/indicator_diagnostic.py::_load_factor_scores`
+loaded `factor_scores` by `strategy_id`/date range only, with no
+`research_run_id` filter — round 7 had left this open as a "deliberate,
+documented" research/diagnostic-tool exception, but Codex made the fair
+point that migration 012's widened PK (adding `research_run_id`) makes this
+a real correctness risk for the tool's own stated purpose, not just
+staleness: the tool's own duplicate-row detector only warns, and
+`pivot_table` silently averages duplicate `(ticker, score_date,
+factor_name)` rows, so a mixed-run blend could reach the reliability/
+validity report undetected. Fixed by defaulting to the same
+`_ACTIVE_RUN_SUBQUERY` pattern used everywhere else under BUG-072, with a
+new `--all-runs` explicit opt-in that itself fails closed (raises) on a
+real cross-run collision rather than silently blending. See BUG-072 for the
+full writeup — that entry is now fully closed.
 
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
@@ -1339,9 +1380,9 @@ pairs after the vectorized computation.
 adversarial-review round 3; every reader except `scripts/
 indicator_diagnostic.py` closed by round 7)
 
-**Status:** Fixed for every dashboard reader; `scripts/indicator_diagnostic.py`
-remains open by deliberate design (see below — a documented, deliberate
-exception, not an oversight). Round 3 of adversarial review on PR #35 found
+**Status:** Fixed. Round 8 closed the last open item
+(`scripts/indicator_diagnostic.py`) — see below. Round 3 of adversarial
+review on PR #35 found
 that `scripts/paper_inputs_check.py` (and, through it,
 `scripts/paper_target_check.py`/`paper_order_candidates_check.py`/
 `paper_risk_compliance_check.py`/`paper_stage_blotter_check.py`),
@@ -1375,21 +1416,85 @@ New tests in `tests/reporting/dashboards/test_sprint4.py`
 `TestAlphaOverlapMatrix::test_inactive_run_row_excluded`) cover all three.
 A round-7 repo-wide grep for every remaining `FROM alpha_scores`/
 `FROM factor_scores` confirmed no other reader is unfiltered without a
-documented, deliberate reason (see below).
+documented, deliberate reason (see below, at the time — round 8 later
+tightened the one remaining item).
 
-**Still open, by deliberate design — not an oversight:**
-`scripts/indicator_diagnostic.py` is a research/diagnostic tool per
-`docs/plans/01b-research-validity-design.md`'s "explicit opt-in for
-cross-run reads" principle; `scripts/pin_snapshot.py` already has its own
-explicit `--research-run-id` opt-in plus same-natural-key collision
-detection/rejection when no run is given (round 3) — the same pattern
-`indicator_diagnostic.py` should eventually get, but has not yet.
+**Round 8 (Codex, closing the entry):** Codex made a fair case that leaving
+`scripts/indicator_diagnostic.py` open as a deliberate exception (round 7's
+"research/diagnostic tool" rationale) was not actually justified once
+migration 012 widened `factor_scores`' PK/unique constraints to include
+`research_run_id` — this tool's own duplicate-row detector
+(`backtesting/validation/indicator_diagnostic.py`'s
+`indicator_diagnostic_duplicate_rows` check) only *warns* on duplicate
+`(ticker, score_date, factor_name)` rows and then `pivot_table` silently
+*averages* them, so a mixed-run blend could reach the reliability/validity
+report with no indication it happened — a real correctness risk for a tool
+whose entire purpose is measuring factor reliability/validity, not just a
+staleness/display issue like the dashboard cases. Fixed:
+`scripts/indicator_diagnostic.py::_load_factor_scores` now defaults to the
+same `_ACTIVE_RUN_SUBQUERY` pattern used everywhere else under this bug
+(scoped to the active `daily_signal_pipeline_operational` run). A new
+`--all-runs` flag is the documented, explicit opt-in for genuine cross-run
+diagnostic comparisons (the design plan's "explicit opt-in for cross-run
+reads" principle) — and unlike the old default behavior, `--all-runs`
+itself now fails closed (raises `ValueError`) if the resulting blend
+contains duplicate `(ticker, score_date, factor_name)` rows, rather than
+letting them reach the pivot. New tests in
+`tests/test_indicator_diagnostic_script.py` cover: default active-run
+scoping excludes a colliding inactive-run row, `--all-runs` raises on a
+real collision, `--all-runs` succeeds when runs don't collide (disjoint
+date ranges), and no-active-run degrades to an empty (not crashing) result.
+`scripts/pin_snapshot.py` remains the one intentionally different pattern
+(mandatory disambiguation via `--research-run-id` when a collision is
+detected, rather than an active-run default) — that asymmetry is
+deliberate: `pin_snapshot.py` pins a specific bundle an operator names
+explicitly, while every other reader (including this one, now) defaults to
+"whatever is currently operational."
 
-**Impact (remaining scope):** `scripts/indicator_diagnostic.py` can still
-read across every run's rows for its diagnostic output; a documented,
-narrow, and low-severity gap (not order-construction or DAG-write-path
-safety) rather than a silent one.
+**Resolution:** No remaining open scope. This entry is fully closed.
 
-**Suggested direction (remaining scope):** give
-`scripts/indicator_diagnostic.py` an explicit, optional `--research-run-id`
-flag, mirroring `scripts/pin_snapshot.py`'s fix.
+### BUG-073: pytest `testpaths` silently excluded ~412 tests from every "full suite" run
+
+**Severity:** P1 / test-coverage integrity (self-discovered while verifying
+round 8's fixes, 01B-3)
+
+**Status:** Fixed.
+
+**Evidence:** `pyproject.toml`'s `[tool.pytest.ini_options]` `testpaths`
+listed `"tests"` AND `"tests/strategy_registry"` (a subdirectory already
+inside `"tests"`) as two separate entries. Whenever pytest resolves this
+full multi-entry `testpaths` list with no explicit command-line path
+arguments — i.e. exactly how every round's "run affected suites + full
+suite once" step in this review series actually invoked it — the presence
+of that redundant nested entry silently dropped two entire subtrees from
+collection: `tests/reporting/dashboards/` (113 tests — including
+`test_pipeline_health.py`, `test_sprint3_queries.py`, `test_sprint4.py`,
+`test_blotter_approval.py` — the exact active-research-run-filtering
+regression tests added in rounds 4, 6, and 7 of this very review) and
+`tests/infra/` (Airflow image/compose smoke tests), totaling 411 missing
+tests (2096 truly-collectible minus 1685 actually collected). Removing the
+explicit CLI path arguments and instead adding/removing individual
+`testpaths` entries via `-o testpaths=...` overrides bisected the cause to
+that single redundant nested entry — removing it alone (without changing
+anything else) restored collection from 1685 to the full 2096.
+
+**Impact:** Every "full suite: N passed, 0 failed" status reported to the
+PM across rounds 1-8 of this review series was accurate for the tests it
+ran, but was NOT actually the full suite — it silently omitted the
+dashboard active-run-filtering regression tests and the Airflow
+image/compose smoke tests for the entire review. Because this was
+discovered and fixed with the true full suite immediately re-run and
+passing (2096 passed, 0 failed, including every previously-hidden test), no
+actual regression was found to have been hiding behind this gap in this
+case — but the gap itself was real and could have hidden one.
+
+**Fix:** `pyproject.toml`'s `testpaths` no longer lists
+`"tests/strategy_registry"` separately; `"tests"` alone already covers it
+recursively. Verified the corrected config collects 2096 tests (up from
+1685) with `python -m pytest --collect-only -q`, and that all 2096 pass.
+
+**Suggested direction (residual):** consider adding a CI-time guard (e.g. a
+lightweight test or lint step) that asserts `pytest --collect-only` finds
+every `test_*.py` file under the configured testpaths roots, to catch a
+similar silent-exclusion regression before it can recur — not implemented
+here to avoid scope creep on an already-large PR, but worth a follow-up.
