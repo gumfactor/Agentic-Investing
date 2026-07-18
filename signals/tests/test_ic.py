@@ -15,6 +15,7 @@ from signals.research.ic import (
     multiple_testing_correction,
     summarize_ic,
 )
+from signals.research.timing import DEFAULT_TIMING_POLICY, SameDateScoreError, TimingPolicy
 
 
 # ─── Fixtures / helpers ───────────────────────────────────────────────────────
@@ -88,13 +89,16 @@ def _make_predictive_scores(
     return pd.DataFrame(rows)
 
 
-# ─── compute_forward_returns ──────────────────────────────────────────────────
+# ─── compute_forward_returns (BUG-009 timing contract) ────────────────────────
 
 class TestComputeForwardReturns:
     def test_output_columns(self):
         prices = _make_prices(["A", "B", "C"], 50)
         result = compute_forward_returns(prices, horizons=[1, 5])
-        assert set(result.columns) == {"ticker", "date", "horizon_days", "forward_return"}
+        assert set(result.columns) == {
+            "ticker", "score_date", "entry_date", "exit_date",
+            "horizon_days", "forward_return", "timing_policy_id",
+        }
 
     def test_both_horizons_present(self):
         prices = _make_prices(["A", "B"], 30)
@@ -107,23 +111,80 @@ class TestComputeForwardReturns:
         assert result["forward_return"].notna().all()
 
     def test_last_h_dates_absent(self):
-        """The last h dates cannot have h-day forward returns."""
+        """The last h+1 dates cannot have h-session forward returns (score_date
+        needs an entry_date at +1 session AND an exit_date at +1+h sessions)."""
         prices = _make_prices(["A"], 20)
         result = compute_forward_returns(prices, horizons=[5])
         all_dates = sorted(prices["date"].unique())
-        result_dates = set(result[result["horizon_days"] == 5]["date"].unique())
-        for d in all_dates[-5:]:
-            assert d not in result_dates
+        result_score_dates = set(result[result["horizon_days"] == 5]["score_date"].unique())
+        for d in all_dates[-6:]:
+            assert d not in result_score_dates
+
+    def test_score_date_strictly_before_entry_date(self):
+        """BUG-009: score_date < entry_date is mandatory."""
+        prices = _make_prices(["A", "B"], 30)
+        result = compute_forward_returns(prices, horizons=[1, 5])
+        assert (result["score_date"] < result["entry_date"]).all()
+        assert (result["entry_date"] < result["exit_date"]).all()
+
+    def test_entry_date_is_one_session_after_score_date_under_baseline_policy(self):
+        dates = _business_dates(date(2022, 1, 3), 10)
+        prices = pd.DataFrame(
+            [{"ticker": "X", "date": d, "close": 100.0 + i} for i, d in enumerate(dates)]
+        )
+        result = compute_forward_returns(prices, horizons=[1])
+        row = result[result["score_date"] == dates[0]].iloc[0]
+        assert row["entry_date"] == dates[1]
+        assert row["exit_date"] == dates[2]
 
     def test_correct_return_magnitude(self):
-        """Manual check: 1-day forward return = price[t+1]/price[t] - 1."""
+        """Manual check: 1-session forward return = close[entry+1]/close[entry] - 1,
+        where entry = score_date + 1 session (BUG-009 baseline t+1 convention)."""
         dates = _business_dates(date(2022, 1, 3), 5)
         prices_data = [{"ticker": "X", "date": d, "close": float(100 + i * 10)} for i, d in enumerate(dates)]
         prices = pd.DataFrame(prices_data)
         result = compute_forward_returns(prices, horizons=[1])
-        row = result[result["date"] == dates[0]].iloc[0]
-        expected = 110.0 / 100.0 - 1.0
+        row = result[result["score_date"] == dates[0]].iloc[0]
+        # entry = dates[1] (close 110), exit = dates[2] (close 120)
+        expected = 120.0 / 110.0 - 1.0
         assert abs(row["forward_return"] - expected) < 1e-9
+
+    def test_timing_policy_id_recorded(self):
+        prices = _make_prices(["A", "B"], 20)
+        result = compute_forward_returns(prices, horizons=[1])
+        assert (result["timing_policy_id"] == DEFAULT_TIMING_POLICY.policy_id).all()
+
+    def test_custom_timing_policy_longer_lag(self):
+        """A 2-session execution lag pushes entry_date two sessions past score_date."""
+        dates = _business_dates(date(2022, 1, 3), 10)
+        prices = pd.DataFrame(
+            [{"ticker": "X", "date": d, "close": 100.0 + i} for i, d in enumerate(dates)]
+        )
+        policy = TimingPolicy(policy_id="t_plus_2_close_v1", execution_lag_sessions=2)
+        result = compute_forward_returns(prices, horizons=[1], timing_policy=policy)
+        row = result[result["score_date"] == dates[0]].iloc[0]
+        assert row["entry_date"] == dates[2]
+        assert row["exit_date"] == dates[3]
+
+    def test_zero_lag_policy_rejected_at_construction(self):
+        """execution_lag_sessions >= 1 is enforced: score_date < entry_date is mandatory."""
+        with pytest.raises(SameDateScoreError):
+            TimingPolicy(policy_id="bad", execution_lag_sessions=0)
+
+    def test_holiday_gap_on_one_ticker_does_not_shift_another_tickers_horizon(self):
+        """A missing bar for ticker B must not shift ticker A's row-derived horizon."""
+        dates_a = _business_dates(date(2022, 1, 3), 10)
+        dates_b = [d for i, d in enumerate(dates_a) if i != 5]  # B is missing one session
+        prices = pd.DataFrame(
+            [{"ticker": "A", "date": d, "close": 100.0 + i} for i, d in enumerate(dates_a)]
+            + [{"ticker": "B", "date": d, "close": 200.0 + i} for i, d in enumerate(dates_b)]
+        )
+        result = compute_forward_returns(prices, horizons=[1])
+        row_a = result[(result["ticker"] == "A") & (result["score_date"] == dates_a[0])].iloc[0]
+        # A's own calendar is unaffected by B's missing session: entry/exit are
+        # still A's immediate next two sessions.
+        assert row_a["entry_date"] == dates_a[1]
+        assert row_a["exit_date"] == dates_a[2]
 
     def test_empty_horizons_returns_empty(self):
         prices = _make_prices(["A"], 10)
@@ -143,7 +204,64 @@ class TestComputeICSeries:
         prices = _make_prices(["A", "B", "C", "D", "E", "F"], 100)
         scores = _make_scores(prices)
         result = compute_ic_series(scores, prices, score_col="score", horizons=[1, 5])
-        assert set(result.columns) == {"date", "horizon_days", "ic", "rank_ic", "n_obs"}
+        assert set(result.columns) == {
+            "score_date", "horizon_days", "ic", "rank_ic", "n_obs", "timing_policy_id",
+        }
+
+    def test_timing_policy_id_recorded(self):
+        prices = _make_prices(["A", "B", "C", "D", "E", "F"], 60)
+        scores = _make_scores(prices)
+        result = compute_ic_series(scores, prices, score_col="score", horizons=[1])
+        assert (result["timing_policy_id"] == DEFAULT_TIMING_POLICY.policy_id).all()
+
+    def test_score_at_close_t_cannot_receive_close_t_return(self):
+        """BUG-009 core acceptance test: a score using close[t] must not be
+        correlated against any component of the t close-to-close return.
+
+        Constructed so the t -> t+1 return (the historical same-close bug)
+        is a large, perfectly-known positive jump; if the fix regressed to
+        crediting that jump to score_date's own IC, this deterministic jump
+        would appear as return magnitude in the score_date row. Instead the
+        forward_return actually used is entry(t+1) -> exit(t+2), which is
+        flat, so IC on the jump date must be near zero / undefined — not the
+        artificially large value the same-close bug would have produced.
+        """
+        dates = _business_dates(date(2022, 1, 3), 10)
+        tickers = ["A", "B", "C", "D", "E", "F"]
+        rows = []
+        for i, ticker in enumerate(tickers):
+            for j, d in enumerate(dates):
+                # A deterministic, huge jump from dates[0] -> dates[1] whose
+                # magnitude is monotonically ticker-ranked (would produce a
+                # strong same-close IC=1.0 if the bug were present), then
+                # flat afterward (post-jump returns carry no signal).
+                if j == 0:
+                    close = 100.0 * (i + 1)
+                else:
+                    close = 100.0 * (i + 1) * 10.0  # jump applied from j=1 onward
+                rows.append({"ticker": ticker, "date": d, "close": close})
+        prices = pd.DataFrame(rows)
+
+        # Score on dates[0] ranks tickers identically to the jump size —
+        # under the same-close bug this would yield IC ~ 1.0 on dates[0].
+        scores = pd.DataFrame(
+            [{"ticker": t, "date": dates[0], "score": float(i)} for i, t in enumerate(tickers)]
+        )
+        result = compute_ic_series(scores, prices, score_col="score", horizons=[1])
+        # entry = dates[1], exit = dates[2]: both post-jump and IDENTICAL in
+        # relative terms (flat), so the forward_return is 0 for every ticker
+        # -> constant forward returns -> undefined (NaN) correlation, never 1.0.
+        row = result[result["score_date"] == dates[0]]
+        if not row.empty:
+            assert pd.isna(row.iloc[0]["ic"]) or abs(row.iloc[0]["ic"]) < 1e-6
+
+    def test_entry_and_exit_dates_available_via_forward_returns(self):
+        """compute_forward_returns (which compute_ic_series merges on) names
+        entry/exit dates explicitly per score_date."""
+        prices = _make_prices(["A", "B", "C", "D", "E", "F"], 40)
+        fwd = compute_forward_returns(prices, horizons=[1])
+        assert {"score_date", "entry_date", "exit_date"}.issubset(set(fwd.columns))
+        assert (fwd["score_date"] < fwd["entry_date"]).all()
 
     def test_both_horizons_present(self):
         prices = _make_prices(list("ABCDEFGHIJ"), 80)
@@ -207,7 +325,7 @@ class TestSummarizeIC:
         for d in dates:
             for h in horizons:
                 rows.append({
-                    "date": d,
+                    "score_date": d,
                     "horizon_days": h,
                     "ic": float(rng.normal(0.04, 0.10)),
                     "rank_ic": float(rng.normal(0.03, 0.10)),
@@ -237,7 +355,7 @@ class TestSummarizeIC:
 
     def test_eval_date_defaults_to_max(self):
         ic_series = self._make_ic_series(n_dates=30)
-        max_date = ic_series["date"].max()
+        max_date = ic_series["score_date"].max()
         result = summarize_ic(ic_series, factor_name="f")
         assert (result["eval_date"] == max_date).all()
 
@@ -251,7 +369,7 @@ class TestSummarizeIC:
         """A consistently positive IC time series should have a positive t-stat."""
         dates = _business_dates(date(2020, 1, 2), 60)
         ic_series = pd.DataFrame({
-            "date": dates,
+            "score_date": dates,
             "horizon_days": 21,
             "ic": [0.05] * 60,
             "rank_ic": [0.04] * 60,
@@ -270,7 +388,7 @@ class TestSummarizeIC:
             values[i] = 0.04 + 0.9 * (values[i - 1] - 0.04) + innovations[i]
         dates = _business_dates(date(2020, 1, 2), len(values))
         ic_series = pd.DataFrame({
-            "date": dates,
+            "score_date": dates,
             "horizon_days": 21,
             "ic": values,
             "rank_ic": values,
@@ -290,7 +408,7 @@ class TestSummarizeIC:
         """Horizons with fewer than _MIN_IC_DATES_FOR_TSTAT obs are excluded."""
         dates = _business_dates(date(2021, 1, 4), 5)  # only 5 dates
         ic_series = pd.DataFrame({
-            "date": dates,
+            "score_date": dates,
             "horizon_days": 21,
             "ic": [0.04] * 5,
             "rank_ic": [0.03] * 5,
@@ -440,7 +558,7 @@ class TestICEdgeCases:
         """A consistently positive IC time series should have p-value < 0.05 (one-sided)."""
         dates = _business_dates(date(2020, 1, 2), 60)
         ic_series = pd.DataFrame({
-            "date": dates,
+            "score_date": dates,
             "horizon_days": 21,
             "ic": [0.06] * 60,
             "rank_ic": [0.05] * 60,
@@ -525,7 +643,7 @@ class TestRollingICSummary:
     def _make_ic_series(self, n_dates: int = 100, ic_val: float = 0.05) -> pd.DataFrame:
         dates = _business_dates(date(2020, 1, 2), n_dates)
         return pd.DataFrame({
-            "date": dates * 2,
+            "score_date": dates * 2,
             "horizon_days": [21] * n_dates + [63] * n_dates,
             "ic": [ic_val] * n_dates + [ic_val * 0.8] * n_dates,
             "rank_ic": [ic_val * 0.9] * n_dates + [ic_val * 0.7] * n_dates,
@@ -565,7 +683,7 @@ class TestRollingICSummary:
 
     def test_empty_input_returns_empty(self):
         result = rolling_ic_summary(pd.DataFrame(
-            columns=["date", "horizon_days", "ic", "rank_ic"]
+            columns=["score_date", "horizon_days", "ic", "rank_ic"]
         ))
         assert result.empty
 
@@ -573,7 +691,7 @@ class TestRollingICSummary:
         """Windows with fewer than min_dates rows should be dropped."""
         dates = _business_dates(date(2022, 1, 3), 10)
         ic = pd.DataFrame({
-            "date": dates,
+            "score_date": dates,
             "horizon_days": 21,
             "ic": [0.05] * 10,
             "rank_ic": [0.04] * 10,
@@ -582,7 +700,7 @@ class TestRollingICSummary:
         assert result.empty
 
     def test_missing_column_raises(self):
-        ic = pd.DataFrame({"date": [date(2022, 1, 3)], "horizon_days": [21], "ic": [0.05]})
+        ic = pd.DataFrame({"score_date": [date(2022, 1, 3)], "horizon_days": [21], "ic": [0.05]})
         with pytest.raises(ValueError, match="missing columns"):
             rolling_ic_summary(ic)
 

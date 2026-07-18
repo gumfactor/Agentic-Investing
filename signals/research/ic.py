@@ -19,6 +19,20 @@ those results remain **provisional** (design plan §1: they may be kept for
 traceability but cannot be used for selection, promotion, or paper-trading
 qualification). Pass ``data_version`` to every MLflow call so results are
 traceable to the snapshot used (C7).
+
+Timing contract (BUG-009 / 01B-3)
+----------------------------------
+``compute_forward_returns`` no longer computes a same-close return
+(``close[t+h] / close[t] - 1``, using the signal date's own close). It
+delegates to :func:`signals.research.timing.build_return_series`, which
+enforces the design plan §2.1 baseline: a score observed at session t's
+close cannot receive a return from before session t+1's close
+(``score_date < entry_date`` is mandatory), and each ticker's own trading
+calendar — not a shared wide-matrix row shift — determines its horizon.
+Output rows are named ``score_date`` / ``entry_date`` / ``exit_date``
+explicitly rather than a bare ``date``. Pass ``timing_policy`` to use a
+different (still-approved) execution-lag contract; the policy identifier is
+carried through to ``compute_ic_series`` output and downstream persistence.
 """
 
 from __future__ import annotations
@@ -34,6 +48,8 @@ from scipy import stats
 import structlog
 from statsmodels.regression.linear_model import OLS
 
+from signals.research.timing import DEFAULT_TIMING_POLICY, TimingPolicy, build_return_series
+
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_HORIZONS: list[int] = [1, 5, 10, 21, 63]
@@ -48,53 +64,37 @@ _MIN_IC_DATES_FOR_TSTAT = 30
 def compute_forward_returns(
     prices: pd.DataFrame,
     horizons: list[int],
+    timing_policy: TimingPolicy = DEFAULT_TIMING_POLICY,
 ) -> pd.DataFrame:
-    """Compute forward returns at multiple horizons.
+    """Compute forward returns at multiple horizons under an explicit timing policy.
+
+    BUG-009 fix: this used to compute a same-close return
+    (``close[t+h] / close[t] - 1``), crediting the signal date's own close
+    to the return — a one-bar lookahead when the signal itself can use that
+    same close. It now delegates to
+    :func:`signals.research.timing.build_return_series`, which enforces
+    ``score_date < entry_date`` and names every date explicitly.
 
     Args:
         prices: Long-format DataFrame with columns ``ticker``, ``date``,
-            ``close``.
-        horizons: Forward return horizons in trading days (e.g. [1, 5, 21]).
+            ``close``. Use a total-return-adjusted close for research
+            (design plan §2.2); this function performs no adjustment.
+        horizons: Forward return horizons in trading *sessions* (e.g.
+            [1, 5, 21]), each >= 1, measured from ``entry_date``.
+        timing_policy: score_date -> entry_date execution-lag contract.
+            Defaults to the baseline t+1 convention.
 
     Returns:
-        Long-format DataFrame with columns:
-            ``ticker``, ``date``, ``horizon_days``, ``forward_return``
-
-        The ``date`` column is the *signal date* — the close that starts the
-        return window.  Rows where the horizon extends beyond available data
-        are dropped (no NaN forward returns).
+        Long-format DataFrame with columns ``ticker``, ``score_date``,
+        ``entry_date``, ``exit_date``, ``horizon_days``, ``forward_return``,
+        ``timing_policy_id``. Rows where the horizon extends beyond a given
+        ticker's own available price history are dropped (no fabricated
+        NaN forward returns); a holiday/missing bar for one ticker cannot
+        shift another ticker's horizon because horizons are computed on
+        each ticker's own date index, not a shared wide-matrix row shift.
     """
     _validate_prices(prices)
-
-    wide = (
-        prices[["ticker", "date", "close"]]
-        .assign(close=lambda df: df["close"].astype(float))
-        .pivot_table(index="date", columns="ticker", values="close")
-        .sort_index()
-    )
-    wide.columns.name = None
-
-    # shift(-h) advances by h *rows* in the wide matrix, not h calendar days.
-    # For a well-formed daily universe (e.g. S&P 500 with data on every
-    # trading day), rows correspond 1-to-1 with trading days so the result
-    # is correct.  Tickers with missing dates produce NaN forward returns
-    # (those rows are dropped later) — no bias is introduced, but the sample
-    # shrinks.  If your universe has irregular coverage, validate separately.
-    frames: list[pd.DataFrame] = []
-    for h in horizons:
-        fwd = wide.shift(-h) / wide - 1.0
-        melted = (
-            fwd.reset_index()
-            .melt(id_vars="date", var_name="ticker", value_name="forward_return")
-            .dropna(subset=["forward_return"])
-        )
-        melted["horizon_days"] = h
-        frames.append(melted)
-
-    if not frames:
-        return pd.DataFrame(columns=["ticker", "date", "horizon_days", "forward_return"])
-
-    return pd.concat(frames, ignore_index=True)
+    return build_return_series(prices, horizons, timing_policy=timing_policy)
 
 
 # ─── IC series ────────────────────────────────────────────────────────────────
@@ -105,36 +105,48 @@ def compute_ic_series(
     score_col: str,
     horizons: Optional[list[int]] = None,
     universe: Optional[object] = None,
+    timing_policy: TimingPolicy = DEFAULT_TIMING_POLICY,
 ) -> pd.DataFrame:
-    """Compute per-date cross-sectional IC at multiple forward return horizons.
+    """Compute per-score-date cross-sectional IC at multiple forward return horizons.
 
-    Cross-sectional IC on date *t* is the correlation between tickers' scores
-    at *t* and their *h*-day forward returns starting from *t*.
+    Cross-sectional IC on score date *t* is the correlation between tickers'
+    scores at *t* and their *h*-session forward returns starting from
+    ``entry_date`` (t + ``timing_policy.execution_lag_sessions`` sessions,
+    per BUG-009 §2.1 — never *t* itself).
 
     Args:
         scores: Long-format DataFrame with columns ``ticker``, ``date``,
-            and ``score_col``.
+            and ``score_col``. ``date`` is the score observation date.
         prices: Long-format DataFrame with columns ``ticker``, ``date``,
-            ``close``.
+            ``close``. Use a total-return-adjusted close for research use
+            (design plan §2.2); this function performs no adjustment.
         score_col: Column in *scores* to evaluate.
-        horizons: Forward return horizons in trading days.
+        horizons: Forward return horizons in trading sessions.
             Defaults to ``[1, 5, 10, 21, 63]``.
         universe: a ``data.universe.runtime.PITUniverseLookup`` for
             point-in-time membership enforcement (BUG-008). When provided:
-            score rows for tickers without knowable membership on the score
-            date are excluded; a score date outside the validated coverage
-            window raises ``CoverageGapError``; and a post-membership
-            cross-section below ``_MIN_TICKERS_PER_DATE`` raises
-            ``InsufficientCrossSectionError`` instead of being silently
-            dropped. Current-universe snapshots and plain ticker lists are
-            rejected with ``CurrentUniverseRejectedError``. ``None`` keeps
-            the legacy provisional behavior (see module docstring).
+            rows for tickers without knowable membership on the score date,
+            the entry date, OR the exit date are excluded (a ticker must be
+            a knowable member across its whole score-to-exit window, not
+            merely on the score date); a date outside the validated
+            coverage window raises ``CoverageGapError``; and a
+            post-membership cross-section below ``_MIN_TICKERS_PER_DATE``
+            raises ``InsufficientCrossSectionError`` instead of being
+            silently dropped. Current-universe snapshots and plain ticker
+            lists are rejected with ``CurrentUniverseRejectedError``.
+            ``None`` keeps the legacy provisional behavior (see module
+            docstring).
+        timing_policy: the score_date -> entry_date execution-lag contract
+            (BUG-009 §2.1). Defaults to the baseline t+1 convention. The
+            identifier is carried through to the output and to
+            ``signal_ic_stats`` persistence (§2.4).
 
     Returns:
         DataFrame with columns:
-            ``date``, ``horizon_days``, ``ic``, ``rank_ic``, ``n_obs``
+            ``score_date``, ``horizon_days``, ``ic``, ``rank_ic``,
+            ``n_obs``, ``timing_policy_id``
 
-        One row per (date, horizon) pair where at least
+        One row per (score_date, horizon) pair where at least
         ``_MIN_TICKERS_PER_DATE`` tickers had valid scores and forward
         returns.  Without a universe, rows where fewer tickers are
         available are dropped.
@@ -146,21 +158,20 @@ def compute_ic_series(
     _validate_prices(prices)
     universe_lookup = _validate_universe_arg(universe)
 
-    fwd = compute_forward_returns(prices, horizons)
+    fwd = compute_forward_returns(prices, horizons, timing_policy=timing_policy)
 
-    merged = scores[["ticker", "date", score_col]].merge(
-        fwd, on=["ticker", "date"], how="inner"
-    )
+    scores_renamed = scores[["ticker", "date", score_col]].rename(columns={"date": "score_date"})
+    merged = scores_renamed.merge(fwd, on=["ticker", "score_date"], how="inner")
 
     if universe_lookup is not None:
         pre_pairs = {
             (dt, int(h))
-            for dt, h in merged[["date", "horizon_days"]].drop_duplicates().itertuples(index=False)
+            for dt, h in merged[["score_date", "horizon_days"]].drop_duplicates().itertuples(index=False)
         }
         merged = _filter_by_membership(merged, universe_lookup)
         post_pairs = {
             (dt, int(h))
-            for dt, h in merged[["date", "horizon_days"]].drop_duplicates().itertuples(index=False)
+            for dt, h in merged[["score_date", "horizon_days"]].drop_duplicates().itertuples(index=False)
         }
         vanished = pre_pairs - post_pairs
         if vanished:
@@ -168,13 +179,13 @@ def compute_ic_series(
 
             sample = sorted(vanished)[:5]
             raise InsufficientCrossSectionError(
-                f"{len(vanished)} (date, horizon) cross-sections lost every ticker to "
-                f"membership filtering (e.g. {sample}). Failing closed instead of "
+                f"{len(vanished)} (score_date, horizon) cross-sections lost every ticker "
+                f"to membership filtering (e.g. {sample}). Failing closed instead of "
                 "emitting IC from a silently shrunken universe (BUG-008)."
             )
 
     rows: list[dict] = []
-    for (dt, h), group in merged.groupby(["date", "horizon_days"]):
+    for (dt, h), group in merged.groupby(["score_date", "horizon_days"]):
         valid = group.dropna(subset=[score_col, "forward_return"])
         n = len(valid)
         if n < _MIN_TICKERS_PER_DATE:
@@ -183,7 +194,7 @@ def compute_ic_series(
 
                 raise InsufficientCrossSectionError(
                     f"Only {n} member tickers have valid scores and forward returns "
-                    f"on {dt} (horizon {h}); minimum is {_MIN_TICKERS_PER_DATE}. "
+                    f"on score_date {dt} (horizon {h}); minimum is {_MIN_TICKERS_PER_DATE}. "
                     "Failing closed instead of emitting IC from a silently "
                     "shrunken universe (BUG-008)."
                 )
@@ -197,19 +208,22 @@ def compute_ic_series(
         )
 
         rows.append({
-            "date": dt,
+            "score_date": dt,
             "horizon_days": int(h),
             "ic": ic_val,
             "rank_ic": rank_ic_val,
             "n_obs": n,
+            "timing_policy_id": timing_policy.policy_id,
         })
 
     if not rows:
-        return pd.DataFrame(columns=["date", "horizon_days", "ic", "rank_ic", "n_obs"])
+        return pd.DataFrame(
+            columns=["score_date", "horizon_days", "ic", "rank_ic", "n_obs", "timing_policy_id"]
+        )
 
     result = (
         pd.DataFrame(rows)
-        .sort_values(["horizon_days", "date"])
+        .sort_values(["horizon_days", "score_date"])
         .reset_index(drop=True)
     )
 
@@ -217,6 +231,7 @@ def compute_ic_series(
         "ic_series_computed",
         score_col=score_col,
         horizons=horizons,
+        timing_policy_id=timing_policy.policy_id,
         n_date_horizon_pairs=len(result),
         ic_mean={
             h: round(float(g["ic"].mean()), 4)
@@ -259,7 +274,7 @@ def summarize_ic(
         return pd.DataFrame(columns=_COLS)
 
     if eval_date is None:
-        eval_date = ic_series["date"].max()
+        eval_date = ic_series["score_date"].max()
 
     rows: list[dict] = []
     for h, group in ic_series.groupby("horizon_days"):
@@ -547,7 +562,7 @@ def rolling_ic_summary(
 
     Args:
         ic_series: Output of :func:`compute_ic_series` — long-format
-            DataFrame with columns ``date``, ``horizon_days``, ``ic``,
+            DataFrame with columns ``score_date``, ``horizon_days``, ``ic``,
             ``rank_ic``.
         trailing_dates: Number of preceding dates to include in each
             rolling window.  Default 252 ≈ 1 trading year.
@@ -562,7 +577,7 @@ def rolling_ic_summary(
         One row per (date, horizon) where the trailing window is long
         enough.  ``score_date`` is the last date in the window.
     """
-    required = {"date", "horizon_days", "ic", "rank_ic"}
+    required = {"score_date", "horizon_days", "ic", "rank_ic"}
     missing = required - set(ic_series.columns)
     if missing:
         raise ValueError(f"ic_series missing columns: {missing}")
@@ -577,12 +592,12 @@ def rolling_ic_summary(
     for horizon in sorted(ic_series["horizon_days"].unique()):
         sub = (
             ic_series[ic_series["horizon_days"] == horizon]
-            .sort_values("date")
+            .sort_values("score_date")
             .reset_index(drop=True)
         )
         ics = sub["ic"].values
         rank_ics = sub["rank_ic"].values
-        dates = sub["date"].values
+        dates = sub["score_date"].values
 
         for i in range(len(dates)):
             start_idx = max(0, i - trailing_dates + 1)
@@ -765,9 +780,13 @@ def _validate_universe_arg(universe: Optional[object]):
 
 
 def _filter_by_membership(merged: pd.DataFrame, universe_lookup) -> pd.DataFrame:
-    """Keep only (ticker, date) rows with knowable index membership.
+    """Keep only rows with knowable index membership on score_date, entry_date,
+    AND exit_date (BUG-009 §2.5: "membership remains checked on score, entry,
+    and exit").  A ticker delisted between entry and exit must not silently
+    contribute a realized return computed on data it could not have earned as
+    an index member throughout the holding window.
 
-    Raises CoverageGapError (from the lookup) when any score date falls
+    Raises CoverageGapError (from the lookup) when any of these dates falls
     outside the validated coverage window — historical IC fails closed
     rather than silently scoring uncertified dates.
     """
@@ -780,17 +799,27 @@ def _filter_by_membership(merged: pd.DataFrame, universe_lookup) -> pd.DataFrame
             return value
         return pd.Timestamp(value).date()
 
+    date_cols = [c for c in ("score_date", "entry_date", "exit_date") if c in merged.columns]
+
     eligible_by_date: dict = {}
-    for dt in merged["date"].unique():
+    all_dates = set()
+    for col in date_cols:
+        all_dates.update(merged[col].unique())
+    for dt in all_dates:
         key = _as_plain_date(dt)
         if key not in eligible_by_date:
             result = universe_lookup.load_universe_as_of(key)
             eligible_by_date[key] = set(result.eligible_tickers)
 
-    mask = [
-        row.ticker in eligible_by_date[_as_plain_date(row.date)]
-        for row in merged[["ticker", "date"]].itertuples(index=False)
-    ]
+    def _row_eligible(row) -> bool:
+        for col in date_cols:
+            key = _as_plain_date(getattr(row, col))
+            if row.ticker not in eligible_by_date[key]:
+                return False
+        return True
+
+    columns = ["ticker"] + date_cols
+    mask = [_row_eligible(row) for row in merged[columns].itertuples(index=False)]
     filtered = merged[pd.Series(mask, index=merged.index)]
     n_excluded = len(merged) - len(filtered)
     if n_excluded:
