@@ -114,8 +114,26 @@ class TimescaleWriter:
         logger.info("upsert_ohlcv_complete", rows_written=rows_written)
         return rows_written
 
-    def upsert_corporate_actions(self, df: pd.DataFrame) -> int:
+    def upsert_corporate_actions(self, df: pd.DataFrame, source_version: str = "unknown") -> int:
         """Upsert corporate action records into corporate_actions.
+
+        BUG-009 / 01B-3 (design plan §2.3): every row must carry a defensible
+        availability timestamp (``known_at``) so downstream cutoff-aware
+        adjustment builders (``data.normalization.corporate_actions``) can
+        determine whether an action was knowable by a given score/return
+        cutoff. ``announced_at`` may be supplied per-row via an optional
+        ``announced_at`` column in *df*; when absent (the case for every
+        current source — yfinance supplies ex-dates only), ``known_at`` is
+        derived via the conservative date-only rule (no earlier than the
+        close of the next trading session after ``ex_date``), matching the
+        universe-membership availability contract (migration 009).
+
+        Args:
+            source_version: action-source version recorded on every row
+                (e.g. a yfinance client/library version string). Required
+                for the research-methodology action-source-version field
+                (§2.3, §4); defaults to ``"unknown"`` for callers that have
+                not yet been updated to supply one.
 
         Returns the number of rows written.
         """
@@ -127,11 +145,23 @@ class TimescaleWriter:
         if missing:
             raise ValueError(f"upsert_corporate_actions: missing required columns {missing}")
 
+        from data.universe.calendar import conservative_known_at_for_date_only_source
+
+        has_announced_col = "announced_at" in df.columns
         rows_written = 0
 
         for batch in _iter_batches(df, self._batch_size):
             rows = []
             for _, row in batch.iterrows():
+                announced_at = row.get("announced_at") if has_announced_col else None
+                if announced_at is not None and not pd.isna(announced_at):
+                    known_at = announced_at
+                    known_at_policy = "source_announced"
+                else:
+                    announced_at = None
+                    known_at = conservative_known_at_for_date_only_source(row["ex_date"])
+                    known_at_policy = "conservative_next_session"
+
                 rows.append(
                     {
                         "ticker": row["ticker"],
@@ -140,6 +170,10 @@ class TimescaleWriter:
                         "value": Decimal(str(row["value"])),
                         "notes": row.get("notes"),
                         "source": row["source"],
+                        "announced_at": announced_at,
+                        "known_at": known_at,
+                        "known_at_policy": known_at_policy,
+                        "source_version": source_version,
                     }
                 )
 
@@ -148,14 +182,20 @@ class TimescaleWriter:
                     text(
                         """
                         INSERT INTO corporate_actions
-                            (ticker, ex_date, action_type, value, notes, source)
+                            (ticker, ex_date, action_type, value, notes, source,
+                             announced_at, known_at, known_at_policy, source_version)
                         VALUES
-                            (:ticker, :ex_date, :action_type, :value, :notes, :source)
+                            (:ticker, :ex_date, :action_type, :value, :notes, :source,
+                             :announced_at, :known_at, :known_at_policy, :source_version)
                         ON CONFLICT (ticker, ex_date, action_type) DO UPDATE SET
-                            value       = EXCLUDED.value,
-                            notes       = EXCLUDED.notes,
-                            source      = EXCLUDED.source,
-                            ingested_at = NOW()
+                            value            = EXCLUDED.value,
+                            notes            = EXCLUDED.notes,
+                            source           = EXCLUDED.source,
+                            announced_at     = EXCLUDED.announced_at,
+                            known_at         = EXCLUDED.known_at,
+                            known_at_policy  = EXCLUDED.known_at_policy,
+                            source_version   = EXCLUDED.source_version,
+                            ingested_at      = NOW()
                         """
                     ),
                     rows,

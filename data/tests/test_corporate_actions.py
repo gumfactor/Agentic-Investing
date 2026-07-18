@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pandas as pd
 import pytest
 
-from data.normalization.corporate_actions import compute_adjustment_factors, apply_adjustment_factors
+from data.normalization.corporate_actions import (
+    apply_adjustment_factors,
+    build_realized_total_return_as_of,
+    build_score_price_history_as_of,
+    compute_adjustment_factors,
+)
 
 
 def _prices(rows: list[tuple]) -> pd.DataFrame:
@@ -124,6 +129,126 @@ class TestApplyAdjustmentFactors:
     def test_missing_factor_defaults_to_one(self) -> None:
         prices = _prices([("AAPL", "2024-01-01", 200)])
         factors = pd.DataFrame(columns=["ticker", "date", "adj_factor"])
-
         result = apply_adjustment_factors(prices, factors)
         assert result.iloc[0]["adj_close"] == Decimal("200")
+
+
+# ─── Cutoff-aware as-of builders (BUG-009 section 2.3) ───────────────────────
+
+def _actions_with_known_at(rows: list[tuple]) -> pd.DataFrame:
+    """Helper: (ticker, ex_date_str, action_type, value, known_at, source_version)."""
+    return pd.DataFrame(
+        [
+            {
+                "ticker": t,
+                "ex_date": date.fromisoformat(d),
+                "action_type": at,
+                "value": Decimal(str(v)),
+                "known_at": known_at,
+                "source_version": sv,
+            }
+            for t, d, at, v, known_at, sv in rows
+        ]
+    )
+
+
+class TestBuildScorePriceHistoryAsOf:
+    def test_action_known_before_cutoff_is_applied(self) -> None:
+        prices = _prices([
+            ("AAPL", "2024-01-01", 200),
+            ("AAPL", "2024-01-02", 200),
+            ("AAPL", "2024-01-03", 100),
+        ])
+        actions = _actions_with_known_at([
+            ("AAPL", "2024-01-03", "split", 2.0,
+             datetime(2024, 1, 2, 21, 0, tzinfo=timezone.utc), "v1"),
+        ])
+        cutoff = datetime(2024, 1, 3, 21, 0, tzinfo=timezone.utc)
+        adjusted, metadata = build_score_price_history_as_of(prices, actions, cutoff)
+        row = adjusted[adjusted["date"] == date(2024, 1, 1)].iloc[0]
+        assert row["adj_close"] == Decimal("100.000000")
+        assert metadata.n_actions_excluded_by_cutoff == 0
+        assert metadata.action_source_versions == ("v1",)
+
+    def test_action_announced_after_cutoff_excluded_even_with_earlier_effective_date(self) -> None:
+        """§2.5 acceptance test: an action announced after the score cutoff must be
+        excluded from score inputs even if its effective (ex) date is earlier."""
+        prices = _prices([
+            ("AAPL", "2024-01-01", 200),
+            ("AAPL", "2024-01-02", 200),
+            ("AAPL", "2024-01-03", 100),
+        ])
+        # The split's ex_date (2024-01-03) is at/after the cutoff, but even a
+        # hypothetical earlier ex_date wouldn't matter: known_at (2024-01-05,
+        # AFTER cutoff) is what gates inclusion, not ex_date.
+        actions = _actions_with_known_at([
+            ("AAPL", "2024-01-03", "split", 2.0,
+             datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc), "v1"),
+        ])
+        cutoff = datetime(2024, 1, 3, 21, 0, tzinfo=timezone.utc)
+        adjusted, metadata = build_score_price_history_as_of(prices, actions, cutoff)
+        row = adjusted[adjusted["date"] == date(2024, 1, 1)].iloc[0]
+        # Not adjusted: action was not knowable by the score cutoff.
+        assert row["adj_close"] == Decimal("200.000000")
+        assert metadata.n_actions_excluded_by_cutoff == 1
+
+    def test_future_split_leaves_score_feature_numerically_identical(self) -> None:
+        """§2.5 acceptance test: adding a future split must not change score[t]."""
+        prices = _prices([
+            ("AAPL", "2024-01-01", 200),
+            ("AAPL", "2024-01-02", 200),
+        ])
+        cutoff = datetime(2024, 1, 2, 21, 0, tzinfo=timezone.utc)
+        no_action_adjusted, _ = build_score_price_history_as_of(
+            prices, pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]), cutoff
+        )
+        future_actions = _actions_with_known_at([
+            ("AAPL", "2024-06-01", "split", 2.0,
+             datetime(2024, 6, 1, 21, 0, tzinfo=timezone.utc), "v1"),
+        ])
+        with_future_action_adjusted, _ = build_score_price_history_as_of(prices, future_actions, cutoff)
+
+        before = no_action_adjusted[no_action_adjusted["date"] == date(2024, 1, 1)].iloc[0]["adj_close"]
+        after = with_future_action_adjusted[with_future_action_adjusted["date"] == date(2024, 1, 1)].iloc[0]["adj_close"]
+        assert before == after == Decimal("200.000000")
+
+    def test_missing_known_at_column_raises(self) -> None:
+        prices = _prices([("AAPL", "2024-01-01", 200)])
+        actions = _actions([("AAPL", "2024-01-02", "split", 2.0)])  # no known_at column
+        with pytest.raises(ValueError, match="known_at"):
+            build_score_price_history_as_of(prices, actions, datetime(2024, 1, 2, tzinfo=timezone.utc))
+
+    def test_null_known_at_row_excluded_not_included(self) -> None:
+        prices = _prices([
+            ("AAPL", "2024-01-01", 200),
+            ("AAPL", "2024-01-02", 100),
+        ])
+        actions = _actions_with_known_at([
+            ("AAPL", "2024-01-02", "split", 2.0, None, "v1"),
+        ])
+        cutoff = datetime(2024, 1, 2, 21, 0, tzinfo=timezone.utc)
+        adjusted, metadata = build_score_price_history_as_of(prices, actions, cutoff)
+        row = adjusted[adjusted["date"] == date(2024, 1, 1)].iloc[0]
+        assert row["adj_close"] == Decimal("200.000000")  # not adjusted
+        assert metadata.n_actions_excluded_missing_known_at == 1
+
+
+class TestBuildRealizedTotalReturnAsOf:
+    def test_action_known_by_exit_cutoff_included_with_source_version(self) -> None:
+        prices = _prices([
+            ("AAPL", "2024-01-02", 200),
+            ("AAPL", "2024-01-03", 200),
+            ("AAPL", "2024-01-08", 100),
+        ])
+        actions = _actions_with_known_at([
+            ("AAPL", "2024-01-08", "split", 2.0,
+             datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc), "v2"),
+        ])
+        exit_cutoff = datetime(2024, 1, 8, 21, 0, tzinfo=timezone.utc)
+        adjusted, metadata = build_realized_total_return_as_of(
+            prices, actions, entry_date=date(2024, 1, 2), exit_cutoff=exit_cutoff
+        )
+        row = adjusted[adjusted["date"] == date(2024, 1, 2)].iloc[0]
+        assert row["adj_close"] == Decimal("100.000000")
+        assert metadata.action_source_versions == ("v2",)
+        assert metadata.builder == "build_realized_total_return_as_of"
