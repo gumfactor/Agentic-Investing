@@ -501,6 +501,39 @@ needed it — `run()` still hard-requires it for an actual write); and
 research run (closing the `queries.py` portion of BUG-072 — see that
 entry for what remains open there).
 
+**Adversarial review round 5 (same day):** the round-2 fix (plain-SQL
+active-run lookup, avoiding the SQLAlchemy-2-only ORM in
+`data.research.identity`/`data.research.models` because the packaged
+Airflow image pins SQLAlchemy 1.4.51) was reintroduced as a regression at a
+SECOND call site: round 3's `scripts/paper_inputs_check.py::
+_resolve_active_research_run_id` fix used the ORM `get_active_research_run`
+directly, and `paper_inputs_check.py` is Airflow-reachable via
+`airflow/dags/daily_paper_trading.py`'s `_verify_inputs`/`_construct_target`
+tasks — the identical failure mode as round 2, just a different file. Fixed
+by extracting the lookup into a new shared module,
+`data/research/sql_compat.py` (plain `text()` SQL, zero ORM imports),
+that both `airflow/dags/daily_signal_pipeline.py::
+_get_active_research_run_id_sql` and `scripts/paper_inputs_check.py::
+_resolve_active_research_run_id` now delegate to, so the lookup exists in
+exactly one place instead of being reimplemented (or regressed) at each
+new call site. Repo-wide grep confirmed no other Airflow-reachable call
+site had the same regression. Added
+`tests/test_airflow_sqlalchemy_import_isolation.py`: a generic,
+repo-wide (not DAG-specific) static check that walks every DAG under
+`airflow/dags/` for `scripts.*` imports (module-level or lazy, anywhere in
+the file) and asserts neither the DAG nor any transitively-imported script
+imports the banned SQLAlchemy-2-only modules — so this class of bug fails
+a fast local test instead of recurring silently a third time.
+
+Also fixed (P2): `compute_ic_series`'s `precomputed_forward_returns` mode
+previously stamped output rows with the function's own `timing_policy`
+argument rather than the `timing_policy_id` actually present in the
+supplied frame's rows — mislabeling the persisted research identity for
+any caller building a frame under a non-default policy, or silently
+picking one policy if the frame mixed several. Now reads the frame's own
+column (rejecting with a clear error if it contains more than one distinct
+value) instead of trusting the argument.
+
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
 **Severity:** P0 / signal correctness
