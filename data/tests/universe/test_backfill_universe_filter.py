@@ -326,3 +326,65 @@ class TestBackfillCorporateActionWiring:
             universe_id=FIXTURE_UNIVERSE_ID,
             universe_lookup=lookup,
         )
+
+    def test_pre_migration_011_snapshot_synthesizes_known_at(self, lookup, monkeypatch) -> None:
+        """BUG-009 P2 (adversarial review round 3): a corporate_actions
+        snapshot pinned before migration 011 has no known_at/source_version
+        columns at all. run() must not raise KeyError -- it synthesizes
+        known_at via the same conservative next-session rule migration 011
+        used, and the resulting adjustment is still applied."""
+        import signals.composites.momentum_score as momentum_module
+
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        all_dates = sorted(prices["date"].dt.date.unique())
+        start = all_dates[273]
+        end = all_dates[-1]
+        split_ex_date = all_dates[100]
+
+        # Legacy snapshot shape: no known_at, no source_version columns.
+        legacy_corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "ex_date": split_ex_date,
+                    "action_type": "split",
+                    "value": 2.0,
+                }
+            ]
+        )
+
+        pre_split_date = all_dates[50]
+        raw_row = prices[(prices["ticker"] == "AAA") & (prices["date"].dt.date == pre_split_date)]
+        raw_close = float(raw_row.iloc[0]["close"])
+
+        captured: dict = {}
+        real_compute = momentum_module.compute_momentum_scores
+
+        def _spy(prices_arg, *args, **kwargs):
+            captured["prices"] = prices_arg.copy()
+            return real_compute(prices_arg, *args, **kwargs)
+
+        monkeypatch.setattr(momentum_module, "compute_momentum_scores", _spy)
+
+        mock_snaps = self._mock_snapshots_with_actions(prices, legacy_corporate_actions)
+
+        # Must not raise KeyError.
+        run(
+            snapshot_date=date(2024, 1, 2),
+            start=start,
+            end=end,
+            strategy_id="vtest",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+            universe_id=FIXTURE_UNIVERSE_ID,
+            universe_lookup=lookup,
+        )
+
+        adjusted = captured["prices"]
+        adj_row = adjusted[(adjusted["ticker"] == "AAA") & (adjusted["date"] == pre_split_date)]
+        adj_close = float(adj_row.iloc[0]["close"])
+        # The synthesized known_at (next session after split_ex_date) is
+        # still well before `end`, so the split is still applied.
+        assert abs(adj_close - raw_close / 2.0) < 1e-6

@@ -222,7 +222,40 @@ def run(
         )
     else:
         corporate_actions["ex_date"] = pd.to_datetime(corporate_actions["ex_date"]).dt.date
-        corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
+
+        # BUG-009 P2 (adversarial review round 3): a snapshot pinned before
+        # migration 011 (scripts/pin_snapshot.py did `SELECT *` against
+        # corporate_actions, so its columns mirror whatever the live table
+        # had at pin time) has no known_at/source_version columns at all --
+        # every action it contains is, by construction, a legacy yfinance
+        # date-only record with no announcement timestamp. Synthesize
+        # known_at with the SAME conservative next-session rule migration
+        # 011 used to backfill the live table (no earlier than the close of
+        # the next trading session after ex_date), rather than raising a
+        # bare KeyError or silently skipping adjustment for the whole
+        # snapshot. This is provenance-labeled, not silently assumed: every
+        # synthesized row is tagged with a distinct source_version so a
+        # reader can tell it apart from a genuinely migrated live-table row.
+        if "known_at" not in corporate_actions.columns:
+            from data.universe.calendar import conservative_known_at_for_date_only_source
+
+            logger.warning(
+                "corporate_actions_snapshot_predates_migration_011",
+                snapshot_date=str(snapshot_date),
+                n_actions=len(corporate_actions),
+                note="snapshot has no known_at/source_version columns; synthesizing "
+                "known_at via the conservative next-session rule (BUG-009 section 2.3) "
+                "-- re-pin the snapshot after migration 011 for a live-table-backed "
+                "known_at instead",
+            )
+            corporate_actions["known_at"] = corporate_actions["ex_date"].apply(
+                conservative_known_at_for_date_only_source
+            )
+            corporate_actions["source_version"] = "legacy_pre_migration_011_snapshot"
+        else:
+            corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
+            if "source_version" not in corporate_actions.columns:
+                corporate_actions["source_version"] = "unknown"
 
     boundary_cutoff = session_close_cutoff(min(end, prices["date"].max()))
     adjusted_prices, adj_meta = build_score_price_history_as_of(
