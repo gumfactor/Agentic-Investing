@@ -754,7 +754,13 @@ def test_backfill_passes_with_sufficient_history():
     start = sorted(prices_all["date"].unique())[273]
 
     mock_snaps = MagicMock()
-    mock_snaps.load_snapshot.return_value = prices_all
+
+    def _load_snapshot(data_type, snapshot_date):
+        if data_type == "daily_prices":
+            return prices_all
+        raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
+
+    mock_snaps.load_snapshot.side_effect = _load_snapshot
 
     # dry_run=True exits before DB writes; should not raise.
     # provisional_no_universe=True: this test exercises the lookback guard

@@ -1,12 +1,13 @@
 """Tests for scripts/validate_signal_ic.py."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
 from scripts.validate_signal_ic import (
+    _build_adjusted_price_series,
     _build_eligibility_frame,
     _FACTORS,
     _add_gate_columns,
@@ -194,3 +195,101 @@ def test_eligibility_limited_to_scored_dates_avoids_coverage_gap(tmp_path):
 
     with _pytest.raises(CoverageGapError):
         _build_eligibility_frame(lookup, all_price_dates)
+
+
+# ─── _build_adjusted_price_series (BUG-009 P0 fix: cutoff-aware wiring) ──────
+
+
+def _business_dates(start: date, n: int) -> list[date]:
+    dates = []
+    d = start
+    while len(dates) < n:
+        if d.weekday() < 5:
+            dates.append(d)
+        d += timedelta(days=1)
+    return dates
+
+
+class TestBuildAdjustedPriceSeries:
+    def _fixture(self):
+        # AAPL: flat 200 for two sessions, then a 2-for-1 split on the third
+        # (raw close halves to 100), matching the module-level parity
+        # fixture's self-consistent no-independent-movement convention.
+        dates = _business_dates(date(2024, 1, 2), 5)
+        prices = pd.DataFrame(
+            [
+                {"ticker": "AAPL", "date": dates[0], "close": 200.0},
+                {"ticker": "AAPL", "date": dates[1], "close": 200.0},
+                {"ticker": "AAPL", "date": dates[2], "close": 100.0},
+                {"ticker": "AAPL", "date": dates[3], "close": 101.0},
+                {"ticker": "AAPL", "date": dates[4], "close": 102.0},
+            ]
+        )
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAPL",
+                    "ex_date": dates[2],
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime.combine(dates[1], datetime.min.time(), tzinfo=timezone.utc)
+                    + timedelta(hours=21),
+                    "source_version": "test-v1",
+                }
+            ]
+        )
+        return prices, corporate_actions, dates
+
+    def test_score_series_applies_known_split_before_ex_date(self):
+        """The whole point of the P0 fix: prices feeding score computation
+        must be split-adjusted, not the raw ~50%-jump series."""
+        prices, corporate_actions, dates = self._fixture()
+        score_series, _realized_series = _build_adjusted_price_series(
+            prices, corporate_actions, dates
+        )
+        row0 = score_series[score_series["date"] == dates[0]].iloc[0]
+        # Raw close is 200; split-adjusted it must be 100 (200 * 0.5).
+        assert abs(row0["close"] - 100.0) < 1e-6
+
+    def test_score_series_differs_from_raw_prices(self):
+        """Regression guard for the P0 finding: the adjusted series actually
+        differs from the raw daily_prices series for a pre-split date — if
+        this ever equals the raw series again, the cutoff-aware builder has
+        silently stopped being wired in."""
+        prices, corporate_actions, dates = self._fixture()
+        score_series, _ = _build_adjusted_price_series(prices, corporate_actions, dates)
+        raw_row = prices[prices["date"] == dates[0]].iloc[0]
+        adj_row = score_series[score_series["date"] == dates[0]].iloc[0]
+        assert abs(adj_row["close"] - raw_row["close"]) > 1.0
+
+    def test_realized_series_also_applies_known_split(self):
+        prices, corporate_actions, dates = self._fixture()
+        _score_series, realized_series = _build_adjusted_price_series(
+            prices, corporate_actions, dates
+        )
+        row0 = realized_series[realized_series["date"] == dates[0]].iloc[0]
+        assert abs(row0["close"] - 100.0) < 1e-6
+
+    def test_post_split_dates_unchanged(self):
+        """Dates on/after the split ex_date keep their raw close (adj_factor=1)."""
+        prices, corporate_actions, dates = self._fixture()
+        score_series, _ = _build_adjusted_price_series(prices, corporate_actions, dates)
+        row = score_series[score_series["date"] == dates[2]].iloc[0]
+        assert abs(row["close"] - 100.0) < 1e-6
+
+    def test_no_corporate_actions_leaves_prices_unchanged(self):
+        """Empty corporate_actions must not crash and must be a no-op (adj_factor=1)."""
+        prices, _corporate_actions, dates = self._fixture()
+        empty_actions = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"])
+        score_series, realized_series = _build_adjusted_price_series(prices, empty_actions, dates)
+        for series in (score_series, realized_series):
+            row0 = series[series["date"] == dates[0]].iloc[0]
+            assert abs(row0["close"] - 200.0) < 1e-6
+
+    def test_output_columns(self):
+        prices, corporate_actions, dates = self._fixture()
+        score_series, realized_series = _build_adjusted_price_series(
+            prices, corporate_actions, dates
+        )
+        assert set(score_series.columns) == {"ticker", "date", "close"}
+        assert set(realized_series.columns) == {"ticker", "date", "close"}

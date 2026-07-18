@@ -43,9 +43,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pandas as pd
+import structlog
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
+from data.normalization.corporate_actions import (
+    build_realized_total_return_as_of,
+    build_score_price_history_as_of,
+)
+from data.universe.calendar import session_close_cutoff
 from signals.composites.low_vol_score import compute_lowvol_scores
 from signals.composites.momentum_score import compute_momentum_scores
 from signals.composites.quality_score import compute_quality_scores
@@ -59,6 +65,8 @@ from signals.research.ic import (
 from signals.research.universe import audit_universe_survivorship
 
 load_dotenv()
+
+logger = structlog.get_logger(__name__)
 
 _DEFAULT_HORIZONS = [21, 63]
 _DEFAULT_STRATEGY_ID = "v1_base_momentum"
@@ -196,6 +204,75 @@ def _load_prices(engine) -> pd.DataFrame:
     return prices
 
 
+def _load_corporate_actions(engine) -> pd.DataFrame:
+    """Load corporate_actions with the availability columns (migration 011)
+    the cutoff-aware adjustment builders require."""
+    actions = pd.read_sql(
+        "SELECT ticker, ex_date, action_type, value, known_at, source_version "
+        "FROM corporate_actions ORDER BY ticker, ex_date",
+        engine,
+    )
+    actions["ex_date"] = pd.to_datetime(actions["ex_date"]).dt.date
+    actions["known_at"] = pd.to_datetime(actions["known_at"], utc=True)
+    return actions
+
+
+def _build_adjusted_price_series(
+    prices: pd.DataFrame,
+    corporate_actions: pd.DataFrame,
+    dates: list,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the two cutoff-aware adjusted price series BUG-009 §2.3-2.4
+    require: a score-feature series (only actions known by the score cutoff)
+    and a realized-return series (only actions known by the exit cutoff).
+
+    Single-boundary-cutoff note
+    ----------------------------
+    This backfill computes scores/returns for every holdout date in one
+    vectorized pass rather than looping per score_date. Both series below
+    are built from ONE boundary cutoff — the session close of the LATEST
+    available price date — rather than a literal per-score-date cutoff.
+    This is provably equivalent to a per-date cutoff for any window/ratio-
+    based indicator (which is what every factor in this script is): a
+    uniform multiplicative adjustment factor applied to an entire lookback
+    window cancels out of any price RATIO computed within that window, so
+    an action whose ex_date falls AFTER a given score_date's window has NO
+    effect on that score, uniform-cutoff or per-date-cutoff. The one
+    residual gap (documented as BUG-071 in bugs.md) is an action whose
+    ex_date falls exactly ON a score_date: a per-date cutoff would exclude
+    it (not yet knowable at that exact session's own close under the
+    conservative next-session rule) but this single global boundary cutoff
+    can include it once the boundary date has passed. That is a narrow,
+    single-session edge case — not the "zero adjustment happens at all" gap
+    this wiring closes.
+    """
+    boundary_cutoff = session_close_cutoff(dates[-1])
+
+    score_adjusted, score_meta = build_score_price_history_as_of(
+        prices, corporate_actions, score_cutoff=boundary_cutoff
+    )
+    realized_adjusted, realized_meta = build_realized_total_return_as_of(
+        prices, corporate_actions, entry_date=dates[0], exit_cutoff=boundary_cutoff
+    )
+    logger.info(
+        "cutoff_adjusted_price_series_built",
+        boundary_cutoff=boundary_cutoff.isoformat(),
+        score_actions_considered=score_meta.n_actions_considered,
+        score_actions_excluded_by_cutoff=score_meta.n_actions_excluded_by_cutoff,
+        score_actions_excluded_missing_known_at=score_meta.n_actions_excluded_missing_known_at,
+        realized_actions_considered=realized_meta.n_actions_considered,
+        realized_actions_excluded_by_cutoff=realized_meta.n_actions_excluded_by_cutoff,
+        realized_actions_excluded_missing_known_at=realized_meta.n_actions_excluded_missing_known_at,
+    )
+
+    def _to_close_frame(adjusted: pd.DataFrame) -> pd.DataFrame:
+        out = adjusted[["ticker", "date", "adj_close"]].copy()
+        out["close"] = out["adj_close"].astype(float)
+        return out[["ticker", "date", "close"]]
+
+    return _to_close_frame(score_adjusted), _to_close_frame(realized_adjusted)
+
+
 def _load_fundamentals(engine) -> pd.DataFrame:
     fundamentals = pd.read_sql(
         "SELECT ticker, period_end_date, release_date, period_type, "
@@ -313,6 +390,20 @@ def main() -> int:
     audit = audit_universe_survivorship(prices)
     fundamentals = None
 
+    # ── Corporate-action cutoff-aware adjustment (BUG-009 §2.3-2.4) ──────────
+    # score_adjusted_prices feeds price-RATIO-based factors (momentum,
+    # lowvol): only actions known-and-occurred by the cutoff adjust their
+    # inputs. realized_adjusted_prices feeds compute_ic_series's forward/
+    # realized-return leg for EVERY factor (a return is a return regardless
+    # of what produced the score). Fundamentals-based factors (value,
+    # quality) deliberately keep RAW prices for their own valuation-ratio
+    # inputs (P/E, P/B, ... use the actual traded price, not a total-return-
+    # adjusted synthetic price) — see the per-factor loop below.
+    corporate_actions = _load_corporate_actions(engine)
+    score_adjusted_prices, realized_adjusted_prices = _build_adjusted_price_series(
+        prices, corporate_actions, dates
+    )
+
     # ── Point-in-time universe (BUG-008 / 01B-2) ─────────────────────────────
     # This is a HISTORICAL caller: membership enforcement is required by
     # default and fails closed when no published universe import exists or
@@ -381,6 +472,10 @@ def main() -> int:
             if fundamentals is None:
                 fundamentals = _load_fundamentals(engine)
             holdout_dates = [date for date in dates if date >= holdout_start]
+            # Value/quality use RAW prices deliberately: P/E, P/B, and other
+            # valuation ratios need the actual traded price, not a total-
+            # return-adjusted synthetic price (adjusting for dividend
+            # reinvestment would distort a valuation ratio, not fix it).
             scores = spec.compute(
                 fundamentals,
                 prices,
@@ -388,12 +483,18 @@ def main() -> int:
                 eligibility=eligibility_df,
             )
         else:
-            scores = spec.compute(prices, eligibility=eligibility_df)
+            # Price-ratio-based factors (momentum, lowvol): BUG-009 §2.3 —
+            # only actions known-and-occurred by the score cutoff may adjust
+            # the price history feeding the score.
+            scores = spec.compute(score_adjusted_prices, eligibility=eligibility_df)
         holdout_scores = scores[scores["date"] >= holdout_start].copy()
 
+        # Forward/realized returns for IC use the total-return-adjusted
+        # series for EVERY factor (BUG-009 §2.3-2.4): a return is a return
+        # regardless of what produced the score being evaluated against it.
         ic_series = compute_ic_series(
             holdout_scores,
-            prices,
+            realized_adjusted_prices,
             score_col=spec.score_col,
             horizons=args.horizons,
             universe=universe_lookup,

@@ -55,6 +55,25 @@ def _make_prices(tickers: list[str], start: date, n_days: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _mock_snapshots(prices: pd.DataFrame) -> MagicMock:
+    """A ParquetSnapshots double distinguishing data_type — BUG-009 P0 fix
+    wiring means run() now also loads a "corporate_actions" snapshot; a
+    single-return_value mock would answer that call with the prices frame
+    (missing ex_date/known_at) and crash. No corporate_actions snapshot is
+    pinned in these fixtures, so the call raises FileNotFoundError, matching
+    the real ParquetSnapshots behavior for a snapshot that was never saved —
+    run() degrades to raw (unadjusted) prices with a logged warning."""
+    mock_snaps = MagicMock()
+
+    def _load_snapshot(data_type: str, snapshot_date: date):
+        if data_type == "daily_prices":
+            return prices
+        raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
+
+    mock_snaps.load_snapshot.side_effect = _load_snapshot
+    return mock_snaps
+
+
 class TestBackfillPITFilter:
     def test_non_member_scores_are_filtered_out(self, lookup, capsys) -> None:
         # 273+ lookback days before the score window; XXX is priced but never
@@ -64,8 +83,7 @@ class TestBackfillPITFilter:
         start = sorted(prices["date"].dt.date.unique())[273]
         end = prices["date"].dt.date.max()
 
-        mock_snaps = MagicMock()
-        mock_snaps.load_snapshot.return_value = prices
+        mock_snaps = _mock_snapshots(prices)
 
         run(
             snapshot_date=date(2024, 1, 2),
@@ -90,8 +108,7 @@ class TestBackfillPITFilter:
         end = prices["date"].dt.date.max()
         assert end > date(2024, 1, 2)
 
-        mock_snaps = MagicMock()
-        mock_snaps.load_snapshot.return_value = prices
+        mock_snaps = _mock_snapshots(prices)
 
         with pytest.raises(CoverageGapError):
             run(
@@ -187,4 +204,125 @@ class TestPITCrossSectionBeforeZScore:
         assert len(valid) > 0
         assert not np.allclose(
             valid["momentum_score_dirty"], valid["momentum_score_clean"]
+        )
+
+
+# ─── Corporate-action cutoff-aware wiring (BUG-009 P0 fix) ────────────────────
+
+class TestBackfillCorporateActionWiring:
+    """Verifies scripts.backfill_momentum_scores.run() actually feeds a
+    split-adjusted price series into compute_momentum_scores rather than
+    silently passing raw prices through (the P0 adversarial-review finding:
+    the cutoff-aware builders existed but had no production caller)."""
+
+    def _mock_snapshots_with_actions(self, prices: pd.DataFrame, corporate_actions: pd.DataFrame) -> MagicMock:
+        mock_snaps = MagicMock()
+
+        def _load_snapshot(data_type: str, snapshot_date: date):
+            if data_type == "daily_prices":
+                return prices
+            if data_type == "corporate_actions":
+                return corporate_actions
+            raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
+
+        mock_snaps.load_snapshot.side_effect = _load_snapshot
+        return mock_snaps
+
+    def test_split_adjusted_prices_reach_compute_momentum_scores(self, lookup, monkeypatch) -> None:
+        from datetime import datetime, timezone
+
+        import signals.composites.momentum_score as momentum_module
+
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        all_dates = sorted(prices["date"].dt.date.unique())
+        start = all_dates[273]
+        end = all_dates[-1]
+
+        # A 2-for-1 split on AAA effective (and known) well before `start`,
+        # so it must be applied to AAA's entire pre-start lookback history.
+        split_ex_date = all_dates[100]
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "ex_date": split_ex_date,
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime.combine(
+                        all_dates[101], datetime.min.time(), tzinfo=timezone.utc
+                    ),
+                    "source_version": "test-v1",
+                }
+            ]
+        )
+
+        pre_split_date = all_dates[50]  # strictly before the split's ex_date
+        # Captured BEFORE run() — run() mutates the prices DataFrame's `date`
+        # column in place (Timestamp -> date), so this must be read first.
+        raw_row = prices[(prices["ticker"] == "AAA") & (prices["date"].dt.date == pre_split_date)]
+        raw_close = float(raw_row.iloc[0]["close"])
+        raw_other = prices[(prices["ticker"] == "GGG") & (prices["date"].dt.date == pre_split_date)]
+        raw_other_close = float(raw_other.iloc[0]["close"])
+
+        captured: dict = {}
+        real_compute = momentum_module.compute_momentum_scores
+
+        def _spy(prices_arg, *args, **kwargs):
+            captured["prices"] = prices_arg.copy()
+            return real_compute(prices_arg, *args, **kwargs)
+
+        monkeypatch.setattr(momentum_module, "compute_momentum_scores", _spy)
+
+        mock_snaps = self._mock_snapshots_with_actions(prices, corporate_actions)
+
+        run(
+            snapshot_date=date(2024, 1, 2),
+            start=start,
+            end=end,
+            strategy_id="vtest",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+            universe_id=FIXTURE_UNIVERSE_ID,
+            universe_lookup=lookup,
+        )
+
+        assert "prices" in captured, "compute_momentum_scores was never called"
+        adjusted = captured["prices"]
+
+        adj_row = adjusted[(adjusted["ticker"] == "AAA") & (adjusted["date"] == pre_split_date)]
+        assert not adj_row.empty
+        adj_close = float(adj_row.iloc[0]["close"])
+        # Split-adjusted: pre-split close must be roughly half the raw close
+        # (the whole point of the P0 wiring fix) — not equal to it.
+        assert abs(adj_close - raw_close / 2.0) < 1e-6
+        assert abs(adj_close - raw_close) > 1.0
+
+        # A different ticker with no corporate actions is untouched.
+        adj_other = adjusted[(adjusted["ticker"] == "GGG") & (adjusted["date"] == pre_split_date)]
+        assert abs(float(adj_other.iloc[0]["close"]) - raw_other_close) < 1e-6
+
+    def test_missing_corporate_actions_snapshot_degrades_to_raw_prices(self, lookup) -> None:
+        """No corporate_actions snapshot pinned (FileNotFoundError) must not
+        crash the backfill — it degrades to raw (unadjusted) prices, matching
+        pre-01B-3 behavior, with a logged warning."""
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+
+        mock_snaps = _mock_snapshots(prices)
+
+        # Should not raise.
+        run(
+            snapshot_date=date(2024, 1, 2),
+            start=start,
+            end=end,
+            strategy_id="vtest",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+            universe_id=FIXTURE_UNIVERSE_ID,
+            universe_lookup=lookup,
         )

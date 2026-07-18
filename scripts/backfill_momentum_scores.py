@@ -192,10 +192,57 @@ def run(
             n_score_dates=len(candidate_dates),
         )
 
+    # ── Corporate-action cutoff-aware adjustment (BUG-009 section 2.3) ───────
+    # Momentum is a pure price-ratio indicator: its score at date t must be
+    # computed from a price history where only actions known-and-occurred by
+    # t's cutoff have adjusted the input prices. This backfill computes every
+    # score date in one vectorized pass rather than looping per date; using
+    # ONE boundary cutoff (session close of --end) rather than a literal
+    # per-score-date cutoff is provably equivalent for a window/ratio-based
+    # indicator like momentum, because a uniform multiplicative adjustment
+    # factor cancels out of any price ratio computed within a lookback window
+    # that lies entirely before the action's ex_date (see
+    # scripts/validate_signal_ic.py::_build_adjusted_price_series for the
+    # full derivation). The one residual gap — an action whose ex_date falls
+    # exactly on a given score_date — is documented as BUG-071 in bugs.md.
+    from data.normalization.corporate_actions import build_score_price_history_as_of
+    from data.universe.calendar import session_close_cutoff
+
+    try:
+        corporate_actions = snaps.load_snapshot("corporate_actions", snapshot_date)
+    except FileNotFoundError:
+        corporate_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+        logger.warning(
+            "corporate_actions_snapshot_missing",
+            snapshot_date=str(snapshot_date),
+            note="no corporate_actions snapshot pinned for this snapshot_date; "
+            "momentum scores will use raw (unadjusted) prices (BUG-009 section 2.3)",
+        )
+    else:
+        corporate_actions["ex_date"] = pd.to_datetime(corporate_actions["ex_date"]).dt.date
+        corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
+
+    boundary_cutoff = session_close_cutoff(min(end, prices["date"].max()))
+    adjusted_prices, adj_meta = build_score_price_history_as_of(
+        prices, corporate_actions, score_cutoff=boundary_cutoff
+    )
+    logger.info(
+        "cutoff_adjusted_price_series_built",
+        boundary_cutoff=boundary_cutoff.isoformat(),
+        n_actions_considered=adj_meta.n_actions_considered,
+        n_actions_excluded_by_cutoff=adj_meta.n_actions_excluded_by_cutoff,
+        n_actions_excluded_missing_known_at=adj_meta.n_actions_excluded_missing_known_at,
+    )
+    prices_for_scoring = adjusted_prices[["ticker", "date", "adj_close"]].rename(
+        columns={"adj_close": "close"}
+    )
+    prices_for_scoring["close"] = prices_for_scoring["close"].astype(float)
+
     # ── Compute momentum scores for all dates in one vectorised pass ──────────
-    logger.info("computing_momentum_scores", n_price_rows=len(prices))
-    prices["close"] = prices["close"].astype(float)
-    momentum_df = compute_momentum_scores(prices, eligibility=eligibility_df)
+    logger.info("computing_momentum_scores", n_price_rows=len(prices_for_scoring))
+    momentum_df = compute_momentum_scores(prices_for_scoring, eligibility=eligibility_df)
 
     # Keep "date" column name — combine_factor_scores expects "date", not "score_date".
     # The scorer renames the column internally when building the output DataFrames.
