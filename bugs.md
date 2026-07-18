@@ -99,6 +99,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-068 | Data/Universe | P2 | F2 | Open | Wikipedia constituent history has bounded count drift (left-censored inflation ~3% recent era; sparse pre-2000 changes; 3 ticker-collision exclusions). |
 | BUG-069 | Data/Universe | P2 | F2 | Deferred (operator-accepted 2026-07-18) | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
 | BUG-070 | Backtesting | P1 | F2 | Open | Backtester loads a single full-history (non-cutoff-aware) adjusted price series, shared for both scoring and execution. |
+| BUG-071 | Research/Signals | P2 | F2 | Open | IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff (documented residual). |
 
 #### Long-term / lower-risk backlog
 
@@ -389,10 +390,37 @@ backfill for legacy yfinance rows); versioned research identity
 UPSERT over an old methodology's rows; `scripts/validate_signal_ic.py` and
 `scripts/audit_pit_safety.py` updated accordingly (the audit script now also
 empirically verifies entry/exit alignment on live price data, not just
-`score_date < sim_date`). 1180+ signals/data tests plus 42 backtesting/
-engine tests passing at review time. No historical scores/backtests were
-recomputed by this change (identity/invalidation machinery only, per the
-design plan's implementation order).
+`score_date < sim_date`).
+
+**Adversarial review fix round (same day):** the first pass wired the
+timing-contract fix into `signals/research/ic.py` but left the two new
+cutoff-aware corporate-action builders with no production caller — the live
+`scripts/validate_signal_ic.py`/`scripts/backfill_momentum_scores.py` still
+loaded raw `close` with zero adjustment (worse than the pre-existing
+full-history routine). Both scripts now call `build_score_price_history_as_of`
+(momentum/lowvol — price-ratio-based factors) and
+`build_realized_total_return_as_of` (the forward/realized-return leg for
+every factor) before prices reach scoring/`compute_ic_series` — see BUG-071
+for the documented residual (single run-boundary cutoff, not literal
+per-score-date). Also fixed: `airflow/dags/daily_signal_pipeline.py` would
+have hard-failed its first post-migration run (no active research run was
+ever registered for the methodology name it requires) — see
+`scripts/register_operational_research_run.py` and the pre-deploy blocker
+note below. `data/normalization/corporate_actions.py`'s cutoff filter now
+also requires an action to have occurred (`ex_date <= cutoff`), not just been
+announced, matching `build_realized_total_return_as_of`'s docstring.
+
+Full non-tearsheet repo suite passing at review time (1600+ tests). No
+historical scores/backtests were recomputed by this change (identity/
+invalidation machinery only, per the design plan's implementation order).
+
+**PRE-MERGE/PRE-DEPLOY BLOCKER:** before migration 012 is applied to any
+database `daily_signal_pipeline.py` runs against, an operator MUST run
+`python -m scripts.register_operational_research_run` once (idempotent) to
+register and activate the `daily_signal_pipeline_operational` methodology/
+run — otherwise the next scheduled DAG run (`30 21 * * 1-5`) fails closed
+with `NoActiveResearchRunError`. See
+`docs/runbooks/research_run_registration.md`.
 
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
@@ -1040,8 +1068,26 @@ specifically (the same class of lookahead BUG-009 fixed for
 `signals/research/ic.py`), and the backtester's fills are computed from an
 adjusted (not raw) price series rather than the raw tradable price the
 design plan requires for order/cash notional (§2.2). This does not affect
-`signals/research/ic.py` (fixed by 01B-3) or IBKR paper/live order pricing
-(execution/ uses IBKR-quoted prices directly, not this loader).
+IBKR paper/live order pricing (execution/ uses IBKR-quoted prices directly,
+not this loader).
+
+**Correction (adversarial review, same day):** an earlier draft of this
+entry additionally claimed "this does not affect `signals/research/ic.py`
+(fixed by 01B-3)". That was **false** as applied to the live IC-validation
+entrypoint: `scripts/validate_signal_ic.py` and
+`scripts/backfill_momentum_scores.py` loaded raw `close` directly from
+`daily_prices`/the price snapshot with ZERO calls to the new cutoff-aware
+builders — the timing bug (BUG-009's namesake same-close lookahead) was
+fixed in `signals/research/ic.py` itself, but the adjustment gap this
+BUG-070 entry describes was equally present in the live callers, not just
+the backtester. **Fixed same-day**: both scripts now call
+`build_score_price_history_as_of` (price-ratio-based factors: momentum,
+lowvol) and `build_realized_total_return_as_of` (the forward/realized-return
+leg for every factor) before prices reach `compute_ic_series`/
+`compute_momentum_scores`. See BUG-071 for the residual limitation of that
+fix (a single run-boundary cutoff, not a literal per-score-date cutoff).
+`backtesting/loader.py` remains the one open instance of this class of gap
+after that fix, which is why this entry (BUG-070) stays open.
 
 **Suggested direction:** Split `backtesting/loader.py` into two series per
 the design plan: a raw execution series (for fills/cash/share accounting,
@@ -1052,3 +1098,40 @@ portfolio path) and a cutoff-aware analytic series
 Reject a requested backtest run when the required corporate-action data
 cannot be constructed for either series, rather than silently falling back
 to `adj_factor=1.0`.
+
+### BUG-071: IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff
+
+**Severity:** P2 / research validity (narrow residual gap, discovered during
+01B-3's P0 fix round)
+
+**Status:** Open, documented by design (accepted residual, not a fix
+deferral without analysis). `scripts/validate_signal_ic.py::
+_build_adjusted_price_series` and `scripts/backfill_momentum_scores.py`
+compute scores for many dates in one vectorized pass and adjust the WHOLE
+price history using a single boundary cutoff (the session close of the
+latest available/`--end` price date), not a literal per-score-date cutoff.
+
+**Why this is provably safe for the cases that matter:** for a window/
+ratio-based indicator (momentum, low-vol — everything BUG-070/071 wires),
+a uniform multiplicative adjustment factor applied across an entire
+lookback window cancels out of any price RATIO computed within that window.
+An action whose `ex_date` falls AFTER a given score_date's window has
+literally no effect on that score's value whether a per-date or a global
+boundary cutoff is used. Given the system's conservative next-session
+`known_at` rule for date-only sources, an action with `ex_date` strictly
+before a score_date is always already knowable by that score_date's own
+cutoff, so it is correctly included either way.
+
+**Residual gap:** the one case a literal per-score-date cutoff would treat
+differently is an action whose `ex_date` falls exactly ON a given
+score_date — not yet knowable at that exact session's own close under the
+conservative rule, but includable once the global run boundary has passed
+it. This is a single-session edge case per affected ticker/action, not the
+"zero adjustment happens at all" gap BUG-070/this fix closes.
+
+**Suggested direction:** if full per-score-date correctness is later
+required, either (a) loop score-date-by-score-date building a distinct
+adjusted series per date (correctness at the cost of losing the vectorized
+pass's performance), or (b) special-case actions whose `ex_date` falls
+inside the union of all requested score dates and mask just those specific
+(ticker, score_date) pairs after the vectorized computation.
