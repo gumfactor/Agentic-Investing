@@ -866,6 +866,28 @@ def test_audit_structural_pass(tmp_path):
     assert violations == [], f"Unexpected structural violations: {violations}"
 
 
+def test_audit_timing_contract_structural_pass():
+    """BUG-009 section 2.4: the timing-contract structural check passes on
+    the actual signals.research.timing / signals.research.ic source."""
+    import importlib
+    audit = importlib.import_module("scripts.audit_pit_safety")
+    violations = audit._structural_audit_timing_contract()
+    assert violations == [], f"Unexpected timing-contract violations: {violations}"
+
+
+def test_audit_entry_exit_alignment_clean():
+    """BUG-009 section 2.4: entry/exit alignment audit reports zero
+    violations on live price data — every row satisfies score_date <
+    entry_date < exit_date and forward_return matches the entry/exit close
+    recomputation exactly."""
+    import importlib
+    audit = importlib.import_module("scripts.audit_pit_safety")
+
+    prices_df = _make_audit_prices(n_days=60, tickers=["AAPL", "GOOG"])
+    violations = audit._entry_exit_alignment_audit(prices_df, sample_size=50, seed=42)
+    assert violations == [], f"Unexpected alignment violations: {violations}"
+
+
 def test_audit_empirical_clean(tmp_path):
     """Empirical audit reports zero violations on correctly computed scores."""
     import importlib

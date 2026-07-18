@@ -149,7 +149,8 @@ def _normalise(prices: pd.DataFrame, scores: pd.DataFrame) -> tuple[pd.DataFrame
 # ---------------------------------------------------------------------------
 
 def _structural_audit() -> list[str]:
-    """Verify DataHandler enforces strict score_date < sim_date."""
+    """Verify strict score visibility (DataHandler) AND the IC timing contract
+    (BUG-009 section 2) enforce score_date < entry_date structurally."""
     import inspect
 
     from backtesting.engine.data_handler import DataHandler
@@ -171,6 +172,44 @@ def _structural_audit() -> list[str]:
             "from source inspection. Manual review required."
         )
 
+    violations.extend(_structural_audit_timing_contract())
+    return violations
+
+
+def _structural_audit_timing_contract() -> list[str]:
+    """Verify signals.research.timing enforces score_date < entry_date < exit_date
+    (BUG-009 section 2) and that signals.research.ic delegates return
+    computation to it rather than reintroducing a same-close shortcut."""
+    import inspect
+
+    from signals.research import ic as ic_module
+    from signals.research import timing as timing_module
+
+    violations: list[str] = []
+
+    timing_source = inspect.getsource(timing_module.build_return_series)
+    if "SameDateScoreError" not in timing_source:
+        violations.append(
+            "signals.research.timing.build_return_series no longer references "
+            "SameDateScoreError — the score_date < entry_date < exit_date guard "
+            "may have been removed (BUG-009 section 2.1)."
+        )
+    if "execution_lag_sessions" not in inspect.getsource(timing_module.TimingPolicy):
+        violations.append(
+            "signals.research.timing.TimingPolicy no longer has an "
+            "execution_lag_sessions field — the timing contract may have changed "
+            "shape without updating this audit."
+        )
+
+    fwd_source = inspect.getsource(ic_module.compute_forward_returns)
+    if "build_return_series" not in fwd_source:
+        violations.append(
+            "signals.research.ic.compute_forward_returns no longer delegates to "
+            "signals.research.timing.build_return_series — it may have "
+            "reintroduced a same-close (BUG-009) return computation."
+        )
+    if not violations:
+        logger.info("structural_check_passed", check="timing_contract_score_lt_entry")
     return violations
 
 
@@ -280,6 +319,79 @@ def _empirical_audit(
     return n_checked, len(violations), violations
 
 
+def _entry_exit_alignment_audit(prices: pd.DataFrame, sample_size: int, seed: int) -> list[str]:
+    """Empirically verify actual entry/exit alignment (BUG-009 section 2.4):
+    every (score_date, entry_date, exit_date) row produced by
+    ``signals.research.timing.build_return_series`` from live price data
+    satisfies score_date < entry_date < exit_date, and the forward_return is
+    computed strictly from the entry/exit closes (never the score-date close).
+    """
+    from signals.research.timing import DEFAULT_TIMING_POLICY, build_return_series
+
+    violations: list[str] = []
+
+    prices_close = prices[["ticker", "date", "close"]].copy()
+    prices_close["date"] = pd.to_datetime(prices_close["date"]).dt.date
+    prices_close["close"] = prices_close["close"].astype(float)
+
+    try:
+        returns = build_return_series(prices_close, horizons=[1, 5, 21])
+    except ValueError as exc:
+        violations.append(f"build_return_series raised on live price data: {exc}")
+        return violations
+
+    if returns.empty:
+        logger.warning("entry_exit_alignment_audit_skipped", reason="no rows produced")
+        return violations
+
+    if not (returns["score_date"] < returns["entry_date"]).all():
+        violations.append(
+            "build_return_series produced a row with score_date >= entry_date "
+            "on live price data (BUG-009 section 2.1 violation)."
+        )
+    if not (returns["entry_date"] < returns["exit_date"]).all():
+        violations.append(
+            "build_return_series produced a row with entry_date >= exit_date "
+            "on live price data."
+        )
+    if not (returns["timing_policy_id"] == DEFAULT_TIMING_POLICY.policy_id).all():
+        violations.append(
+            "build_return_series did not stamp every row with the expected "
+            f"default timing_policy_id {DEFAULT_TIMING_POLICY.policy_id!r}."
+        )
+
+    # Spot-check a deterministic sample: forward_return recomputed from
+    # entry/exit closes must match the returned value exactly (proves the
+    # value is not silently derived from score_date's own close).
+    rng = np.random.default_rng(seed)
+    n = min(sample_size, len(returns))
+    sample = returns.iloc[rng.choice(len(returns), size=n, replace=False)]
+    closes = prices_close.set_index(["ticker", "date"])["close"]
+    n_checked = 0
+    for _, row in sample.iterrows():
+        try:
+            entry_close = closes[(row["ticker"], row["entry_date"])]
+            exit_close = closes[(row["ticker"], row["exit_date"])]
+        except KeyError:
+            continue
+        n_checked += 1
+        expected = exit_close / entry_close - 1.0
+        if abs(expected - row["forward_return"]) > _SCORE_TOLERANCE:
+            violations.append(
+                f"{row['ticker']} score_date={row['score_date']}: forward_return "
+                f"{row['forward_return']:.8f} does not match entry/exit close "
+                f"recomputation {expected:.8f}."
+            )
+
+    if not violations:
+        logger.info(
+            "entry_exit_alignment_audit_passed",
+            n_rows=len(returns),
+            n_spot_checked=n_checked,
+        )
+    return violations
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -351,6 +463,20 @@ def main() -> None:
             print("  [PASS] All sampled scores match PIT-filtered re-computation")
         print()
         all_clean = not struct_violations and n_checked > 0 and n_violations == 0
+
+    # ── Entry/exit alignment audit (BUG-009 section 2.4) ───────────────────
+    print("-- 3. Entry/exit timing alignment checks ----------------")
+    alignment_violations = _entry_exit_alignment_audit(prices, args.sample_size, args.seed)
+    if alignment_violations:
+        for v in alignment_violations:
+            print(f"  [FAIL] {v}")
+    else:
+        print(
+            "  [PASS] score_date < entry_date < exit_date and forward_return "
+            "match entry/exit close recomputation on live price data"
+        )
+    print()
+    all_clean = all_clean and not alignment_violations
 
     # ── Summary ───────────────────────────────────────────────────────────
     print("-- Summary ------------------------------------------------")

@@ -252,7 +252,11 @@ def summarize_ic(
     """Aggregate an IC series into per-horizon summary statistics.
 
     Args:
-        ic_series: Output of :func:`compute_ic_series`.
+        ic_series: Output of :func:`compute_ic_series`. If it carries a
+            ``timing_policy_id`` column (it always does from
+            ``compute_ic_series``), the value is propagated into the
+            summary's ``timing_policy_id`` column (design plan §2.4: "Add
+            the timing-policy identifier to IC summaries").
         factor_name: Factor identifier (e.g. ``'momentum_composite'``).
         strategy_id: Strategy config version identifier.
         eval_date: Last date of the evaluation window.  Defaults to the
@@ -262,19 +266,36 @@ def summarize_ic(
         DataFrame with columns:
             ``factor_name``, ``strategy_id``, ``eval_date``,
             ``horizon_days``, ``ic``, ``rank_ic``, ``ic_tstat``,
-            ``ic_ir``, ``ic_pvalue``, ``n_observations``
+            ``ic_ir``, ``ic_pvalue``, ``n_observations``, ``timing_policy_id``
         One row per horizon.  Horizons with fewer than
         ``_MIN_IC_DATES_FOR_TSTAT`` observations are excluded.
+
+    Raises:
+        ValueError: if *ic_series* carries more than one distinct
+            ``timing_policy_id`` — mixing timing policies within one summary
+            would make the aggregate statistics incomparable across rows.
     """
     _COLS = [
         "factor_name", "strategy_id", "eval_date", "horizon_days",
         "ic", "rank_ic", "ic_tstat", "ic_ir", "ic_pvalue", "n_observations",
+        "timing_policy_id",
     ]
     if ic_series.empty:
         return pd.DataFrame(columns=_COLS)
 
     if eval_date is None:
         eval_date = ic_series["score_date"].max()
+
+    timing_policy_id: Optional[str] = None
+    if "timing_policy_id" in ic_series.columns:
+        distinct_policies = ic_series["timing_policy_id"].dropna().unique()
+        if len(distinct_policies) > 1:
+            raise ValueError(
+                f"ic_series carries multiple timing_policy_id values {sorted(distinct_policies)}; "
+                "summarize_ic cannot aggregate across mixed timing policies."
+            )
+        if len(distinct_policies) == 1:
+            timing_policy_id = str(distinct_policies[0])
 
     rows: list[dict] = []
     for h, group in ic_series.groupby("horizon_days"):
@@ -317,6 +338,7 @@ def summarize_ic(
             "ic_ir": round(ic_ir, 6) if not np.isnan(ic_ir) else float("nan"),
             "ic_pvalue": round(float(pvalue), 6),
             "n_observations": n_dates,
+            "timing_policy_id": timing_policy_id,
         })
 
     return pd.DataFrame(rows, columns=_COLS)

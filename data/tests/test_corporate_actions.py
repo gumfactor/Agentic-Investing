@@ -252,3 +252,91 @@ class TestBuildRealizedTotalReturnAsOf:
         assert row["adj_close"] == Decimal("100.000000")
         assert metadata.action_source_versions == ("v2",)
         assert metadata.builder == "build_realized_total_return_as_of"
+
+
+class TestSplitDividendPortfolioAccountingParity:
+    """Design plan section 2.2 acceptance test: a buy-and-hold fixture
+    spanning a split and a dividend must produce the SAME total return from
+    (a) portfolio accounting math (shares/cash, computed analytically here —
+    no execution code is touched) and (b) the analytic adjusted-return
+    series from build_realized_total_return_as_of. Order/fill notional in
+    (a) uses only raw (unadjusted) prices, matching section 2.2's
+    requirement that fills never use adjusted prices.
+
+    Fixture: buy 10 shares at raw close 100 on d0. A 2-for-1 split on d1
+    (raw close 50, i.e. exactly half of d0's close: no independent price
+    movement between d0 and d1, so the split is the only thing happening)
+    doubles the share count to 20, cost basis conserved. A $1/share
+    dividend on d2 (raw close 50) is reinvested — using the total-return
+    convention build_realized_total_return_as_of/compute_adjustment_factors
+    implements: divide the prior price by (ex_close - div) / ex_close,
+    equivalently buy additional shares at the theoretical ex-dividend price
+    (ex_close - div) — yielding shares_after = shares_before * ex_close /
+    (ex_close - div) = 20 * 50 / 49 = 1000/49. Ending raw close on d3 is 60
+    (a genuine +20% move from d2, independent of any corporate action).
+
+    Hand-derived total return: (1000/49 * 60) / 1000 - 1 = 60/49 - 1
+    = 0.22448979591836735 (11/49).
+    """
+
+    def test_portfolio_accounting_matches_analytic_adjusted_series(self) -> None:
+        d0, d1, d2, d3 = (
+            date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5),
+        )
+        raw_closes = {d0: Decimal("100"), d1: Decimal("50"), d2: Decimal("50"), d3: Decimal("60")}
+        prices = pd.DataFrame(
+            [{"ticker": "AAPL", "date": d, "close": c} for d, c in raw_closes.items()]
+        )
+
+        # ── (a) Portfolio accounting: raw prices only, shares + cash ──────────
+        n0_shares = Decimal("10")
+        raw_entry_price = raw_closes[d0]
+        initial_notional = n0_shares * raw_entry_price  # order/fill notional: RAW price
+        assert initial_notional == Decimal("1000")
+
+        # Split: shares double, cost basis conserved (no cash flow).
+        split_ratio = Decimal("2")
+        shares_after_split = n0_shares * split_ratio
+        assert shares_after_split == Decimal("20")
+
+        # Dividend: $1/share, reinvested at the theoretical ex-dividend price
+        # (ex_close - div) — the convention compute_adjustment_factors
+        # implements via factor = (ex_close - div) / ex_close.
+        div_per_share = Decimal("1")
+        ex_close = raw_closes[d2]
+        shares_after_dividend = shares_after_split * ex_close / (ex_close - div_per_share)
+
+        # Exit: raw close on d3 — fill/order notional is raw, never adjusted.
+        raw_exit_price = raw_closes[d3]
+        ending_value = shares_after_dividend * raw_exit_price
+        portfolio_total_return = ending_value / initial_notional - Decimal("1")
+
+        # ── (b) Analytic adjusted-return series ────────────────────────────────
+        actions = _actions_with_known_at([
+            ("AAPL", str(d1), "split", 2.0,
+             datetime(2024, 1, 2, 21, 0, tzinfo=timezone.utc), "v1"),
+            ("AAPL", str(d2), "dividend", 1.0,
+             datetime(2024, 1, 3, 21, 0, tzinfo=timezone.utc), "v1"),
+        ])
+        exit_cutoff = datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc)
+        adjusted, metadata = build_realized_total_return_as_of(
+            prices, actions, entry_date=d0, exit_cutoff=exit_cutoff
+        )
+        adj_start = adjusted[adjusted["date"] == d0].iloc[0]["adj_close"]
+        adj_end = adjusted[adjusted["date"] == d3].iloc[0]["adj_close"]
+        analytic_total_return = adj_end / adj_start - Decimal("1")
+
+        # ── Parity ──────────────────────────────────────────────────────────
+        assert abs(portfolio_total_return - analytic_total_return) < Decimal("0.000001")
+
+        # Hand-derived exact value: 60/49 - 1.
+        expected = Decimal("60") / Decimal("49") - Decimal("1")
+        assert abs(portfolio_total_return - expected) < Decimal("0.000001")
+        assert abs(analytic_total_return - expected) < Decimal("0.000001")
+
+        # Raw prices were never touched by the adjustment — the raw `close`
+        # column on the returned frame is untouched and still the raw fill
+        # price a real order would use.
+        assert adjusted[adjusted["date"] == d0].iloc[0]["close"] == raw_entry_price
+        assert adjusted[adjusted["date"] == d3].iloc[0]["close"] == raw_exit_price
+        assert metadata.builder == "build_realized_total_return_as_of"

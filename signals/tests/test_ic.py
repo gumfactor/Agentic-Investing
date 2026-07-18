@@ -348,6 +348,26 @@ class TestSummarizeIC:
         assert len(result) == 2
         assert set(result["horizon_days"]) == {1, 21}
 
+    def test_timing_policy_id_propagated_from_ic_series(self):
+        ic_series = self._make_ic_series()
+        ic_series["timing_policy_id"] = "t_plus_1_close_v1"
+        result = summarize_ic(ic_series, factor_name="f")
+        assert (result["timing_policy_id"] == "t_plus_1_close_v1").all()
+
+    def test_mixed_timing_policy_ids_rejected(self):
+        ic_series = self._make_ic_series()
+        half = len(ic_series) // 2
+        ic_series["timing_policy_id"] = ["policy_a"] * half + ["policy_b"] * (len(ic_series) - half)
+        with pytest.raises(ValueError, match="timing_policy_id"):
+            summarize_ic(ic_series, factor_name="f")
+
+    def test_missing_timing_policy_id_column_yields_none(self):
+        """Backward-compat: ic_series without a timing_policy_id column
+        (e.g. a hand-built fixture) still summarizes, with the field null."""
+        ic_series = self._make_ic_series()
+        result = summarize_ic(ic_series, factor_name="f")
+        assert result["timing_policy_id"].isna().all()
+
     def test_factor_name_propagated(self):
         ic_series = self._make_ic_series()
         result = summarize_ic(ic_series, factor_name="my_factor")

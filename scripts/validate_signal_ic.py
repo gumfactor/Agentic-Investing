@@ -123,16 +123,32 @@ def _build_eligibility_frame(universe_lookup, dates: list) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["ticker", "date"])
 
 
-def _persist_summary(engine, summary: pd.DataFrame, provisional: bool = True) -> int:
+def _persist_summary(
+    engine, summary: pd.DataFrame, research_run_id: int, provisional: bool = True
+) -> int:
     """Persist IC summary rows.
+
+    ``research_run_id`` (BUG-009 section 4 / migration 012) is now part of
+    the table's unique constraint: it is REQUIRED so a new run can never
+    silently overwrite an old methodology's rows via this upsert. Register
+    a methodology/run first with ``data.research.identity`` (or use
+    ``data.research.identity.get_legacy_run_id`` only for tooling that
+    intentionally targets the migrated legacy row — never for a fresh run).
 
     ``provisional`` stamps each row (migration 010): True for runs without
     PIT universe enforcement (--provisional-no-universe and all pre-01B-2
-    rows), False for PIT-enforced runs. Interim marker — superseded by the
-    01B-3 research-run identity (design plan §4).
+    rows), False for PIT-enforced runs. Kept for backward read-compatibility
+    (migration 012 docstring); the authoritative marker is now
+    ``research_runs.status``/``is_active`` reached via ``research_run_id``.
     """
     if summary.empty:
         return 0
+    if not research_run_id:
+        raise ValueError(
+            "research_run_id is required to persist (BUG-009 section 4 / "
+            "migration 012): register a research_methodologies/research_runs "
+            "pair first via data.research.identity."
+        )
 
     records = summary[
         [
@@ -150,14 +166,16 @@ def _persist_summary(engine, summary: pd.DataFrame, provisional: bool = True) ->
     ].to_dict("records")
     for record in records:
         record["provisional"] = provisional
+        record["research_run_id"] = research_run_id
 
     statement = text(
         "INSERT INTO signal_ic_stats "
         "(factor_name, strategy_id, eval_date, horizon_days, ic, rank_ic, "
-        "ic_tstat, ic_ir, ic_pvalue, n_observations, provisional) "
+        "ic_tstat, ic_ir, ic_pvalue, n_observations, provisional, research_run_id) "
         "VALUES (:factor_name, :strategy_id, :eval_date, :horizon_days, :ic, "
-        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations, :provisional) "
-        "ON CONFLICT (factor_name, strategy_id, eval_date, horizon_days) "
+        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations, :provisional, "
+        ":research_run_id) "
+        "ON CONFLICT (research_run_id, factor_name, strategy_id, eval_date, horizon_days) "
         "DO UPDATE SET ic = EXCLUDED.ic, rank_ic = EXCLUDED.rank_ic, "
         "ic_tstat = EXCLUDED.ic_tstat, ic_ir = EXCLUDED.ic_ir, "
         "ic_pvalue = EXCLUDED.ic_pvalue, "
@@ -253,6 +271,14 @@ def main() -> int:
     parser.add_argument("--min-tstat", type=float, default=2.0)
     parser.add_argument("--persist", action="store_true")
     parser.add_argument(
+        "--research-run-id",
+        type=int,
+        default=None,
+        help="research_runs.id (BUG-009 section 4 / migration 012) to tag every "
+        "persisted signal_ic_stats row with. Required when --persist is set. "
+        "Register a methodology/run first via data.research.identity.",
+    )
+    parser.add_argument(
         "--universe-id",
         default="sp500",
         help="Point-in-time universe for membership enforcement (default: sp500).",
@@ -265,6 +291,15 @@ def main() -> int:
         "qualification.",
     )
     args = parser.parse_args()
+
+    if args.persist and not args.research_run_id:
+        print(
+            "ERROR: --persist requires --research-run-id (BUG-009 section 4 / "
+            "migration 012). Register a research_methodologies/research_runs "
+            "pair first via data.research.identity.",
+            file=sys.stderr,
+        )
+        return 1
 
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
@@ -383,8 +418,11 @@ def main() -> int:
     passed_tests = int(combined["passes_gate"].sum())
 
     if args.persist:
-        persisted = _persist_summary(engine, combined, provisional=universe_lookup is None)
-        print(f"\nPersisted {persisted} rows to signal_ic_stats.")
+        persisted = _persist_summary(
+            engine, combined, research_run_id=args.research_run_id,
+            provisional=universe_lookup is None,
+        )
+        print(f"\nPersisted {persisted} rows to signal_ic_stats (research_run_id={args.research_run_id}).")
 
     print(
         f"\nGate result: {passed_tests}/{expected_tests} factor-horizon tests pass "

@@ -38,7 +38,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
 | BUG-008 | Research/Signals | P0 | F0 | Fixed | Current-membership universe creates survivorship leakage. |
-| BUG-009 | Research/Signals | P0 | F0 | Open | Same-close signal/return timing can introduce lookahead. |
+| BUG-009 | Research/Signals | P0 | F0 | In Review | Same-close signal/return timing can introduce lookahead. |
 | BUG-010 | Research/Signals | P0 | F0 | Fixed | `pct_change()` defaults can distort many indicators. |
 | BUG-011 | Security/Auth | P1 | F1 | Open | Approval gate trusts any matching DB row. |
 | BUG-012 | Trading Safety | P1 | F1 | Open | Circuit breaker is UI-local and not enforced by Airflow submission. |
@@ -98,6 +98,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-067 | Data/Universe | P1 | F1 | Fixed (dev/R2-01B2-pit-universe) | `config/universe_loader.py` returned an empty universe on Wikipedia fetch failure (fail-open). |
 | BUG-068 | Data/Universe | P2 | F2 | Open | Wikipedia constituent history has bounded count drift (left-censored inflation ~3% recent era; sparse pre-2000 changes; 3 ticker-collision exclusions). |
 | BUG-069 | Data/Universe | P2 | F2 | Deferred (operator-accepted 2026-07-18) | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
+| BUG-070 | Backtesting | P1 | F2 | Open | Backtester loads a single full-history (non-cutoff-aware) adjusted price series, shared for both scoring and execution. |
 
 #### Long-term / lower-risk backlog
 
@@ -366,6 +367,32 @@ checksum-tamper detection is now covered by tests.
 **Impact:** Unless the project explicitly assumes known-before-close signals and close/auction execution, IC/backtests can include a one-bar lookahead.
 
 **Suggested direction:** Shift signals or forward-return windows to the next executable bar, or enforce timestamped market-on-close assumptions.
+
+**Status:** In review. Implemented on branch `dev/R2-01B3-timing-contract`
+(roadmap item 01B-3, scoped to `docs/plans/01b-research-validity-design.md`
+§2 and §4), not yet merged. Delivered: `signals/research/timing.py`
+(`TimingPolicy`, `build_return_series`, `reject_same_date`) enforcing the
+baseline `score_date < entry_date < exit_date` (t+1 close) convention on each
+ticker's own trading calendar; `signals/research/ic.py`
+`compute_forward_returns`/`compute_ic_series` rewritten to delegate to it,
+name every date explicitly (`score_date`/`entry_date`/`exit_date` — never a
+bare `date`), and check PIT membership on all three dates, not just
+`score_date`; two explicitly named corporate-action interfaces in
+`data/normalization/corporate_actions.py`
+(`build_score_price_history_as_of`, `build_realized_total_return_as_of`)
+backed by a new `known_at`/`announced_at`/`source_version` availability
+contract on `corporate_actions` (migration 011, conservative next-session
+backfill for legacy yfinance rows); versioned research identity
+(`research_methodologies`/`research_runs`, migration 012) with a
+`research_run_id` FK now part of the unique constraint/primary key on
+`signal_ic_stats`/`factor_scores`/`alpha_scores` so a new run cannot silently
+UPSERT over an old methodology's rows; `scripts/validate_signal_ic.py` and
+`scripts/audit_pit_safety.py` updated accordingly (the audit script now also
+empirically verifies entry/exit alignment on live price data, not just
+`score_date < sim_date`). 1180+ signals/data tests plus 42 backtesting/
+engine tests passing at review time. No historical scores/backtests were
+recomputed by this change (identity/invalidation machinery only, per the
+design plan's implementation order).
 
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
@@ -983,3 +1010,45 @@ research purposes; the only signal is a structlog warning.
 **Suggested direction:** Add an AlertManager hook or DAG-level SLA/telemetry when
 the filter degrades, and consider an Airflow maintenance task that re-runs the
 universe import on a schedule.
+
+### BUG-070: Backtester uses a single full-history adjusted price series for both scoring and execution
+
+**Severity:** P1 / backtest validity (discovered during 01B-3, BUG-009 follow-on)
+
+**Status:** Open. Discovered while implementing 01B-3
+(`docs/plans/01b-research-validity-design.md` §2.3-2.4) and deliberately left
+unfixed here: the task scope for 01B-3 explicitly excludes touching execution
+code, and §2.4's own required-changes list treats this as a distinct,
+separately-scoped item ("Make the backtester use the raw execution series
+plus explicit corporate-action accounting, then compare its total-return
+valuation to the analytic series").
+
+**Evidence:** `backtesting/loader.py::load_from_snapshot` calls the
+full-history `compute_adjustment_factors`/`apply_adjustment_factors` routine
+once over the entire price history (own docstring: "This loader applies
+corporate-action adjustment factors before constructing DataHandler so the
+backtest engine always operates on split- and dividend-adjusted closes") and
+passes the single resulting adjusted series into `DataHandler`, which serves
+it to both signal computation and simulated fills. 01B-3 added two
+cutoff-aware alternatives
+(`data/normalization/corporate_actions.build_score_price_history_as_of` /
+`build_realized_total_return_as_of`) but the backtester does not use them.
+
+**Impact:** A future corporate action within the loaded snapshot window can
+still adjust a historical score/signal's input price in the backtester
+specifically (the same class of lookahead BUG-009 fixed for
+`signals/research/ic.py`), and the backtester's fills are computed from an
+adjusted (not raw) price series rather than the raw tradable price the
+design plan requires for order/cash notional (§2.2). This does not affect
+`signals/research/ic.py` (fixed by 01B-3) or IBKR paper/live order pricing
+(execution/ uses IBKR-quoted prices directly, not this loader).
+
+**Suggested direction:** Split `backtesting/loader.py` into two series per
+the design plan: a raw execution series (for fills/cash/share accounting,
+with explicit split-share-adjustment and dividend-cash-accounting in the
+portfolio path) and a cutoff-aware analytic series
+(`build_score_price_history_as_of` for anything feeding signal computation,
+`build_realized_total_return_as_of` for total-return valuation/reporting).
+Reject a requested backtest run when the required corporate-action data
+cannot be constructed for either series, rather than silently falling back
+to `adj_factor=1.0`.

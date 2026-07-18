@@ -62,15 +62,41 @@ def test_persist_summary_uses_signal_ic_upsert():
         ]
     )
 
-    assert _persist_summary(engine, summary) == 1
+    assert _persist_summary(engine, summary, research_run_id=42) == 1
     statement, records = connection.execute.call_args.args
     sql = str(statement)
     assert "INSERT INTO signal_ic_stats" in sql
     assert "ON CONFLICT" in sql
+    assert "research_run_id" in sql
     assert records[0]["factor_name"] == "momentum"
+    assert records[0]["research_run_id"] == 42
     # Default is provisional=True (BUG-008 interim marker, migration 010).
     assert records[0]["provisional"] is True
     assert "provisional = EXCLUDED.provisional" in sql
+
+
+def test_persist_summary_requires_research_run_id():
+    """BUG-009 section 4: a persisted row without a research_run_id would
+    fall outside the run-scoped unique constraint added by migration 012."""
+    engine = MagicMock()
+    summary = pd.DataFrame(
+        [
+            {
+                "factor_name": "momentum",
+                "strategy_id": "v1",
+                "eval_date": date(2026, 5, 8),
+                "horizon_days": 21,
+                "ic": 0.09,
+                "rank_ic": 0.02,
+                "ic_tstat": 8.0,
+                "ic_ir": 0.4,
+                "ic_pvalue": 0.0,
+                "n_observations": 356,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="research_run_id"):
+        _persist_summary(engine, summary, research_run_id=None)
 
 
 def test_persist_summary_stamps_certified_rows_non_provisional():
@@ -94,7 +120,7 @@ def test_persist_summary_stamps_certified_rows_non_provisional():
     )
 
     # PIT-enforced run (universe lookup active) stamps provisional=False.
-    assert _persist_summary(engine, summary, provisional=False) == 1
+    assert _persist_summary(engine, summary, research_run_id=42, provisional=False) == 1
     _, records = connection.execute.call_args.args
     assert records[0]["provisional"] is False
 
