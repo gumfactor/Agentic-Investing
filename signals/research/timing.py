@@ -161,6 +161,15 @@ def build_return_series(
                 entry_close = closes[entry_idx]
                 exit_close = closes[exit_idx]
                 if entry_close == 0:
+                    logger.warning(
+                        "zero_entry_close_skipped",
+                        ticker=ticker,
+                        score_date=str(score_date),
+                        entry_date=str(entry_date),
+                        horizon_days=h,
+                        note="entry close is zero — a real data-quality event, "
+                        "not a routine gap; forward_return cannot be computed",
+                    )
                     continue
                 forward_return = exit_close / entry_close - 1.0
 

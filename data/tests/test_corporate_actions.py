@@ -170,6 +170,47 @@ class TestBuildScorePriceHistoryAsOf:
         assert metadata.n_actions_excluded_by_cutoff == 0
         assert metadata.action_source_versions == ("v1",)
 
+    def test_known_at_exactly_equal_to_cutoff_is_inclusive(self) -> None:
+        """Boundary test: known_at == cutoff exactly must be treated as
+        knowable (inclusive), not excluded."""
+        prices = _prices([
+            ("AAPL", "2024-01-01", 200),
+            ("AAPL", "2024-01-02", 200),
+            ("AAPL", "2024-01-03", 100),
+        ])
+        cutoff = datetime(2024, 1, 2, 21, 0, tzinfo=timezone.utc)
+        actions = _actions_with_known_at([
+            ("AAPL", "2024-01-02", "split", 2.0, cutoff, "v1"),
+        ])
+        adjusted, metadata = build_score_price_history_as_of(prices, actions, cutoff)
+        row = adjusted[adjusted["date"] == date(2024, 1, 1)].iloc[0]
+        assert row["adj_close"] == Decimal("100.000000")  # applied: 200 * 0.5
+        assert metadata.n_actions_excluded_by_cutoff == 0
+
+    def test_preannounced_action_not_yet_effective_is_excluded(self) -> None:
+        """An action known well before its own ex_date (pre-announced) must
+        NOT adjust historical prices before it has actually occurred — the
+        'occurred' half of build_realized_total_return_as_of's documented
+        (a) occurred / (b) known contract, enforced for both builders."""
+        prices = _prices([
+            ("AAPL", "2024-01-01", 200),
+            ("AAPL", "2024-01-02", 200),
+            ("AAPL", "2024-01-10", 100),
+        ])
+        # Announced Jan 1, but effective (ex_date) only on Jan 10 — well
+        # after the Jan 2 cutoff, even though already "known" by Jan 2.
+        actions = _actions_with_known_at([
+            ("AAPL", "2024-01-10", "split", 2.0,
+             datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc), "v1"),
+        ])
+        cutoff = datetime(2024, 1, 2, 21, 0, tzinfo=timezone.utc)
+        adjusted, metadata = build_score_price_history_as_of(prices, actions, cutoff)
+        row = adjusted[adjusted["date"] == date(2024, 1, 1)].iloc[0]
+        # Not adjusted: the split has not occurred yet as of the cutoff,
+        # even though it was already announced/known.
+        assert row["adj_close"] == Decimal("200.000000")
+        assert metadata.n_actions_excluded_by_cutoff == 1
+
     def test_action_announced_after_cutoff_excluded_even_with_earlier_effective_date(self) -> None:
         """§2.5 acceptance test: an action announced after the score cutoff must be
         excluded from score inputs even if its effective (ex) date is earlier."""

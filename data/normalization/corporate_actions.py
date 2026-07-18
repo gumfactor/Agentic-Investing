@@ -224,7 +224,21 @@ def _filter_actions_by_cutoff(
     corporate_actions: pd.DataFrame,
     cutoff: datetime,
 ) -> tuple[pd.DataFrame, int, int]:
-    """Keep only actions knowable by `cutoff`. Returns (filtered, n_excluded_by_cutoff, n_excluded_missing).
+    """Keep only actions that (a) had already occurred (`ex_date <= cutoff`'s
+    date) AND (b) were knowable by `cutoff` (`known_at <= cutoff`). Returns
+    (filtered, n_excluded_by_cutoff, n_excluded_missing).
+
+    Both criteria are required, not just (b): an action that is pre-announced
+    (known_at before its own ex_date — e.g. a split announced two weeks
+    ahead of its effective date) must not adjust historical prices before it
+    has actually occurred, even though it is already "known" in the sense of
+    (b) alone. Requiring (a) as well is what makes `build_realized_total_
+    return_as_of`'s docstring claim of "(a) occurred (ex_date) and (b) known
+    by exit_cutoff" true in the code, not just in prose (adversarial review
+    finding, BUG-009 P2). This is a pure additional restriction — it can
+    only exclude MORE actions than checking (b) alone, never include one
+    that (b)-only filtering would have excluded, so no interface that was
+    already correct under (b)-only regresses.
 
     An action with a null/missing `known_at` cannot be certified as knowable
     by any cutoff and is dropped (not silently included) — per §2.3, "an
@@ -233,10 +247,12 @@ def _filter_actions_by_cutoff(
     """
     if corporate_actions.empty:
         return corporate_actions, 0, 0
-    if "known_at" not in corporate_actions.columns:
+    required = {"known_at", "ex_date"}
+    missing_cols = required - set(corporate_actions.columns)
+    if missing_cols:
         raise ValueError(
-            "corporate_actions is missing the 'known_at' column required by the "
-            "cutoff-aware adjustment interfaces (migration 011). The legacy "
+            f"corporate_actions is missing required column(s) {missing_cols} for "
+            "the cutoff-aware adjustment interfaces (migration 011). The legacy "
             "compute_adjustment_factors() full-history routine does not enforce "
             "this and must not be substituted for historical score computation "
             "(BUG-009 §2.3)."
@@ -265,8 +281,13 @@ def _filter_actions_by_cutoff(
     cutoff_ts = pd.Timestamp(cutoff)
     if cutoff_ts.tzinfo is None:
         cutoff_ts = cutoff_ts.tz_localize("UTC")
+    cutoff_date = cutoff_ts.date()
 
-    knowable_mask = known_at.apply(lambda v: (_as_aware(v) is not None) and (_as_aware(v) <= cutoff_ts))
+    known_by_cutoff = known_at.apply(lambda v: (_as_aware(v) is not None) and (_as_aware(v) <= cutoff_ts))
+    occurred_by_cutoff = corporate_actions["ex_date"].apply(
+        lambda d: pd.Timestamp(d).date() <= cutoff_date
+    )
+    knowable_mask = known_by_cutoff & occurred_by_cutoff
     n_excluded_by_cutoff = int((~missing_mask & ~knowable_mask).sum())
 
     filtered = corporate_actions[knowable_mask].copy()
@@ -278,13 +299,15 @@ def build_score_price_history_as_of(
     corporate_actions: pd.DataFrame,
     score_cutoff: datetime,
 ) -> tuple[pd.DataFrame, AsOfAdjustmentMetadata]:
-    """Total-return-adjusted price history using only actions known by `score_cutoff`.
+    """Total-return-adjusted price history using only actions that had
+    occurred (`ex_date <= score_cutoff`) AND were known by `score_cutoff`.
 
     This is the ONLY corporate-action adjustment path permitted for a score
     feature at time t (design plan §2.3). A future split/dividend — even one
     that the legacy full-history `compute_adjustment_factors` routine would
-    back-adjust into the past — is excluded here because its `known_at` is
-    necessarily after any `score_cutoff` at or before its own occurrence.
+    back-adjust into the past, and even one already pre-announced (known_at
+    before its own ex_date) — is excluded here: a not-yet-effective action
+    must not adjust historical prices before it has actually occurred.
 
     Args:
         prices: long-format ticker/date/close (raw, unadjusted).
