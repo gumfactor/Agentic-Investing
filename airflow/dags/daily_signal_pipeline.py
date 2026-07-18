@@ -629,11 +629,26 @@ def _write_simulation(**context: Any) -> dict:
     return {"simulations_written": written}
 
 
+_OPERATIONAL_METHODOLOGY_NAME = "daily_signal_pipeline_operational"
+
+
 def _write_scores(**context: Any) -> dict:
-    """Persist factor_scores and alpha_scores to TimescaleDB."""
+    """Persist factor_scores and alpha_scores to TimescaleDB.
+
+    BUG-009 section 4 / migration 012: research_run_id is now part of the
+    unique constraint/primary key on both tables, so every row must be
+    tagged with an explicitly approved active research run — never assumed.
+    Fails closed with an actionable error if no run has been activated for
+    ``_OPERATIONAL_METHODOLOGY_NAME`` (an operator registers/activates one
+    once via ``data.research.identity``; this DAG never registers or
+    activates a run itself).
+    """
     import pandas as pd
     from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
     import os
+
+    from data.research.identity import NoActiveResearchRunError, get_active_research_run
 
     def _load(key: str) -> pd.DataFrame:
         raw = context["ti"].xcom_pull(key=key, task_ids="combine_scores")
@@ -652,6 +667,19 @@ def _write_scores(**context: Any) -> dict:
 
     engine = create_engine(os.environ["DATABASE_URL"])
 
+    with Session(engine) as session:
+        try:
+            active_run = get_active_research_run(session, _OPERATIONAL_METHODOLOGY_NAME)
+        except NoActiveResearchRunError as exc:
+            raise RuntimeError(
+                f"No active research run for methodology "
+                f"{_OPERATIONAL_METHODOLOGY_NAME!r} (BUG-009 section 4 / migration "
+                "012). Register a research_methodologies/research_runs pair and "
+                "call activate_run() once via data.research.identity before this "
+                "DAG can write factor_scores/alpha_scores."
+            ) from exc
+    research_run_id = active_run.id
+
     factor_count = 0
     alpha_count = 0
 
@@ -659,13 +687,15 @@ def _write_scores(**context: Any) -> dict:
     with engine.begin() as conn:
         if not factor_df.empty:
             factor_records = factor_df.to_dict("records")
+            for record in factor_records:
+                record["research_run_id"] = research_run_id
             conn.execute(
                 text(
                     "INSERT INTO factor_scores "
-                    "(ticker, score_date, factor_name, strategy_id, z_score, raw_value) "
+                    "(ticker, score_date, factor_name, strategy_id, research_run_id, z_score, raw_value) "
                     "VALUES (:ticker, :score_date, :factor_name, :strategy_id, "
-                    ":z_score, :raw_value) "
-                    "ON CONFLICT (ticker, score_date, factor_name, strategy_id) "
+                    ":research_run_id, :z_score, :raw_value) "
+                    "ON CONFLICT (ticker, score_date, factor_name, strategy_id, research_run_id) "
                     "DO UPDATE SET z_score = EXCLUDED.z_score, "
                     "raw_value = EXCLUDED.raw_value, "
                     "computed_at = NOW()"
@@ -676,13 +706,15 @@ def _write_scores(**context: Any) -> dict:
 
         if not alpha_df.empty:
             alpha_records = alpha_df.to_dict("records")
+            for record in alpha_records:
+                record["research_run_id"] = research_run_id
             conn.execute(
                 text(
                     "INSERT INTO alpha_scores "
-                    "(ticker, score_date, strategy_id, alpha_score, rank, universe_size) "
-                    "VALUES (:ticker, :score_date, :strategy_id, :alpha_score, "
-                    ":rank, :universe_size) "
-                    "ON CONFLICT (ticker, score_date, strategy_id) "
+                    "(ticker, score_date, strategy_id, research_run_id, alpha_score, rank, universe_size) "
+                    "VALUES (:ticker, :score_date, :strategy_id, :research_run_id, "
+                    ":alpha_score, :rank, :universe_size) "
+                    "ON CONFLICT (ticker, score_date, strategy_id, research_run_id) "
                     "DO UPDATE SET alpha_score = EXCLUDED.alpha_score, "
                     "rank = EXCLUDED.rank, "
                     "universe_size = EXCLUDED.universe_size, "
@@ -692,7 +724,7 @@ def _write_scores(**context: Any) -> dict:
             )
             alpha_count = len(alpha_records)
 
-    return {"factor_rows": factor_count, "alpha_rows": alpha_count}
+    return {"factor_rows": factor_count, "alpha_rows": alpha_count, "research_run_id": research_run_id}
 
 
 # ─── DAG definition ──────────────────────────────────────────────────────────
