@@ -74,8 +74,8 @@ Token figures are reported as `<agent/effort>: <tokens>`.
 |---|---|---|---|---|---|
 | 01A | `dev/R2-01A-compose-runtime` | [#33](https://github.com/gumfactor/Agentic-Investing/pull/33) | **Merged 2026-07-16** (`3e37bb5`); **operator live verification complete 2026-07-18** — BUG-001..004 all `Fixed`. Gate 01A done; Gate 02A (no-submit DAG run) unblocked | Sonnet 5 medium: 284K (builder incl. fix + review rounds) + 122K (adversarial reviewer) | Fable 5: ~50K |
 | 01B-1 | `dev/R2-01B1-missing-data` | [#32](https://github.com/gumfactor/Agentic-Investing/pull/32) | **Merged 2026-07-16** (`65e1b72`) | Sonnet 5 medium: 342K (builder incl. fix + review rounds) + 124K (adversarial reviewer) | Fable 5: ~45K |
-| 01B-2 | `dev/R2-01B2-pit-universe` | [#34](https://github.com/gumfactor/Agentic-Investing/pull/34) | **Ready for operator review/merge** — 7 Codex review items resolved (final quality-eligibility P2 fixed on tip `b583908`, committed by PM after builder hit usage limits); 1608+ tests green; no further review round per operator; operator DB steps (migration 009 + universe import) post-merge | Sonnet 5 medium: 494K (builder incl. all review rounds) + 167K (adversarial reviewer); PM completed final fix | Fable 5: ~70K |
-| 01B-3 | `dev/R2-01B3-timing-contract` | — | Queued (blocked on 01B-2) | — | — |
+| 01B-2 | `dev/R2-01B2-pit-universe` | [#34](https://github.com/gumfactor/Agentic-Investing/pull/34) | **Merged 2026-07-18** (`1df242e`) — BUG-008/BUG-067 Fixed; BUG-068/BUG-069 filed as residual data-quality/monitoring items (BUG-069 deferred, operator-accepted warn-degrade). Operator DB steps (migration 009 + universe import) still pending | Sonnet 5 medium: 494K (builder incl. all review rounds) + 167K (adversarial reviewer); PM completed final fix | Fable 5: ~75K |
+| 01B-3 | `dev/R2-01B3-timing-contract` | — | In progress | — | — |
 
 Both adversarial reviews returned APPROVE-WITH-FIXES with confirmed findings
 (01B-1: RSI-family EWM gap staleness and ungated A/D-line/Chaikin cumsum —
