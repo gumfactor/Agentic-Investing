@@ -234,7 +234,33 @@ def _compute_quality(**context: Any) -> None:
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
-    scores = compute_quality_scores(fund, prices, score_dates=[score_date])
+    # PIT cross-section for quality (BUG-008 / Codex PR #34 P2): unlike the
+    # price-based factors (and value, whose ratios join per-ticker closes
+    # from the already-filtered price panel), quality ratios use ONLY
+    # fundamentals — so a non-member with valid financial_statements rows
+    # would still enter the per-date z-scores even though _load_prices
+    # filtered the price panel. Pass the eligibility frame so the composite
+    # masks the cross-section BEFORE z-scoring; degrade to the provisional
+    # unfiltered cross-section when no published import covers score_date
+    # (BUG-069), matching the panel filter's behavior.
+    eligibility = None
+    try:
+        _eligible = _pit_eligible_tickers_sql(os.environ["DATABASE_URL"], score_date)
+    except Exception as _exc:  # deliberate broad degrade — see _pit_membership_filter
+        _eligible = None
+        import structlog as _structlog
+
+        _structlog.get_logger("rqis.airflow").warning(
+            "pit_universe_lookup_failed_quality_provisional", error=str(_exc)
+        )
+    if _eligible is not None:
+        eligibility = pd.DataFrame(
+            [{"ticker": t, "date": score_date} for t in sorted(_eligible)]
+        )
+
+    scores = compute_quality_scores(
+        fund, prices, score_dates=[score_date], eligibility=eligibility
+    )
     context["ti"].xcom_push(
         key="quality_scores_json",
         value=scores.to_json(orient="records", date_format="iso") if not scores.empty else "[]",

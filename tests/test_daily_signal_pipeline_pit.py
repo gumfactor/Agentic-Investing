@@ -247,3 +247,113 @@ class TestLoadPricesPreFilter:
             dag_module, monkeypatch, "sqlite:///:memory:", date(2022, 6, 1), ["AAA", "NOPE"]
         )
         assert tickers == {"AAA", "NOPE"}
+
+
+class TestComputeQualityPITCrossSection:
+    """Codex PR #34 final P2: quality ratios use only fundamentals, so a
+    non-member with valid financial_statements rows bypassed the filtered
+    price panel and contaminated per-date quality z-scores. The DAG task
+    must pass the PIT eligibility frame into compute_quality_scores."""
+
+    class _FakeTI:
+        def __init__(self, pulls):
+            self._pulls = pulls
+            self.pushed = {}
+
+        def xcom_pull(self, key, task_ids=None):
+            return self._pulls[key]
+
+        def xcom_push(self, key, value):
+            self.pushed[key] = value
+
+    def _fundamentals(self, tickers, whale_extreme=False):
+        import numpy as np
+
+        rng = np.random.default_rng(2)
+        rows = []
+        for t in tickers:
+            for item in [
+                "net_income", "total_equity", "total_assets",
+                "gross_profit", "operating_cash_flow",
+            ]:
+                value = float(rng.uniform(1e9, 5e9))
+                if whale_extreme and t == "WHALE":
+                    value *= 1000
+                rows.append(
+                    {
+                        "ticker": t,
+                        "period_end_date": "2021-12-31",
+                        "release_date": "2022-02-01",
+                        "period_type": "annual",
+                        "item_name": item,
+                        "value": value,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def _run_compute_quality(self, dag_module, monkeypatch, db_url, score_date, fund):
+        from sqlalchemy import text
+
+        eng = create_engine(db_url, future=True)
+        with eng.begin() as conn:
+            conn.execute(
+                text("CREATE TABLE IF NOT EXISTS financial_statements (id INTEGER)")
+            )
+            conn.execute(text("DELETE FROM financial_statements"))
+            conn.execute(text("INSERT INTO financial_statements (id) VALUES (1)"))
+        eng.dispose()
+
+        monkeypatch.setenv("DATABASE_URL", db_url)
+        monkeypatch.setattr(pd, "read_sql", lambda *a, **k: fund.copy())
+
+        members = ["AAA", "CCC", "DDD", "FFF", "GGG", "HHH", "III", "JJJ"]
+        prices = pd.DataFrame(
+            [{"ticker": t, "date": str(score_date), "close": 100.0} for t in members]
+        )
+        ti = self._FakeTI(
+            {
+                "score_date": str(score_date),
+                "prices_json": prices.to_json(orient="records", date_format="iso"),
+            }
+        )
+        dag_module._compute_quality(ti=ti)
+        raw = ti.pushed["quality_scores_json"]
+        if raw == "[]":
+            return pd.DataFrame(columns=["ticker", "quality_score"])
+        return pd.read_json(raw, orient="records", convert_dates=False)
+
+    def test_non_member_fundamentals_cannot_shift_member_quality_scores(
+        self, dag_module, universe_db, monkeypatch, tmp_path
+    ) -> None:
+        from sqlalchemy import text
+
+        score_date = date(2022, 6, 1)
+        members = ["AAA", "CCC", "DDD", "FFF", "GGG", "HHH", "III", "JJJ"]
+
+        eng = create_engine(universe_db, future=True)
+        with eng.begin() as conn:
+            conn.execute(text("UPDATE universe_import_batches SET universe_id='sp500'"))
+            conn.execute(text("UPDATE universe_membership SET universe_id='sp500'"))
+        try:
+            with_whale = self._run_compute_quality(
+                dag_module, monkeypatch, universe_db, score_date,
+                self._fundamentals(members + ["WHALE"], whale_extreme=True),
+            )
+            without_whale = self._run_compute_quality(
+                dag_module, monkeypatch, universe_db, score_date,
+                self._fundamentals(members),
+            )
+        finally:
+            with eng.begin() as conn:
+                conn.execute(
+                    text("UPDATE universe_import_batches SET universe_id='sp500_fixture'")
+                )
+                conn.execute(
+                    text("UPDATE universe_membership SET universe_id='sp500_fixture'")
+                )
+            eng.dispose()
+
+        assert not (with_whale["ticker"] == "WHALE").any()
+        w = with_whale.sort_values("ticker").reset_index(drop=True)
+        wo = without_whale.sort_values("ticker").reset_index(drop=True)
+        pd.testing.assert_frame_equal(w, wo)
