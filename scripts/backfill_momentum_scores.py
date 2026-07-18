@@ -17,6 +17,17 @@ prices enter any score.  The price snapshot must therefore cover at least
 the skip buffer).  The recommended practice is to load a snapshot that begins
 at least 18 months before --start.
 
+Point-in-time universe (BUG-008 / 01B-2)
+----------------------------------------
+This is a HISTORICAL caller: by default it requires a published point-in-time
+universe import (scripts/import_universe_membership.py) and filters every
+score date's cross-section to tickers with knowable index membership on that
+date.  It fails closed when no published import exists or when any score date
+falls outside the validated coverage window.  --provisional-no-universe
+skips the membership filter with a loud warning; the resulting scores are
+PROVISIONAL and must not be used for selection, promotion, or paper-trading
+qualification.
+
 Usage
 ------
     # Dry run — shows what would be written, writes nothing:
@@ -71,6 +82,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Compute and print summary statistics but do not write to DB.",
     )
+    p.add_argument(
+        "--universe-id",
+        default="sp500",
+        help="Point-in-time universe to filter membership against (default: sp500).",
+    )
+    p.add_argument(
+        "--provisional-no-universe",
+        action="store_true",
+        help="Skip point-in-time membership filtering (BUG-008). The resulting "
+        "scores are PROVISIONAL: not valid for selection, promotion, or "
+        "paper-trading qualification.",
+    )
     return p.parse_args()
 
 
@@ -82,6 +105,9 @@ def run(
     batch_size: int,
     dry_run: bool,
     snapshots=None,  # injectable for testing; None → construct from env vars
+    universe_id: str = "sp500",
+    provisional_no_universe: bool = False,
+    universe_lookup=None,  # injectable for testing; None → construct from DATABASE_URL
 ) -> None:
     from data.storage.timescale_writer import TimescaleWriter
     from signals.composites.momentum_score import compute_momentum_scores
@@ -113,16 +139,73 @@ def run(
             f"earlier start date or move --start later."
         )
 
+    # ── Point-in-time scoring cross-section (BUG-008 / Codex PR #34 P1) ──────
+    # Membership must define the cross-section BEFORE z-scoring: filtering
+    # only the output rows would leave non-members contaminating each date's
+    # cross-sectional mean/std even though their rows are later dropped.
+    # Raw window returns still use every ticker's full price history, so
+    # lookbacks spanning a ticker's pre-membership period are unaffected.
+    eligibility_df = None
+    eligible_by_date: dict = {}
+    if provisional_no_universe:
+        logger.warning(
+            "backfill_without_pit_universe",
+            note=(
+                "membership filtering skipped (--provisional-no-universe); the "
+                "resulting scores are PROVISIONAL and must not be used for "
+                "selection, promotion, or paper-trading qualification (BUG-008)"
+            ),
+        )
+    else:
+        import os
+
+        from data.universe.runtime import PITUniverseLookup
+
+        if universe_lookup is None:
+            universe_lookup = PITUniverseLookup(os.environ["DATABASE_URL"], universe_id)
+        candidate_dates = sorted(
+            d for d in prices["date"].unique() if start <= d <= end
+        )
+        eligibility_rows: list[dict] = []
+        for d in candidate_dates:
+            eligible = set(universe_lookup.load_universe_as_of(d).eligible_tickers)
+            eligible_by_date[d] = eligible
+            eligibility_rows.extend({"ticker": t, "date": d} for t in eligible)
+        eligibility_df = pd.DataFrame(eligibility_rows, columns=["ticker", "date"])
+        logger.info(
+            "pit_scoring_cross_section_built",
+            universe_id=universe_lookup.universe_id,
+            import_batch_id=universe_lookup.import_batch_id,
+            n_score_dates=len(candidate_dates),
+        )
+
     # ── Compute momentum scores for all dates in one vectorised pass ──────────
     logger.info("computing_momentum_scores", n_price_rows=len(prices))
     prices["close"] = prices["close"].astype(float)
-    momentum_df = compute_momentum_scores(prices)  # returns (ticker, date, mom_*, momentum_score)
+    momentum_df = compute_momentum_scores(prices, eligibility=eligibility_df)
 
     # Keep "date" column name — combine_factor_scores expects "date", not "score_date".
     # The scorer renames the column internally when building the output DataFrames.
     momentum_df["date"] = pd.to_datetime(momentum_df["date"]).dt.date
     mask = (momentum_df["date"] >= start) & (momentum_df["date"] <= end)
     momentum_df = momentum_df[mask].reset_index(drop=True)
+
+    if eligibility_df is not None:
+        # Belt-and-braces output filter: with the pre-z-score mask this is a
+        # no-op for members, but it guarantees no ineligible (ticker, date)
+        # row can ever be persisted.
+        n_before = len(momentum_df)
+        keep = [
+            row.ticker in eligible_by_date.get(row.date, set())
+            for row in momentum_df[["ticker", "date"]].itertuples(index=False)
+        ]
+        momentum_df = momentum_df[pd.Series(keep, index=momentum_df.index)].reset_index(drop=True)
+        logger.info(
+            "pit_membership_filter_applied",
+            rows_before=n_before,
+            rows_after=len(momentum_df),
+            rows_excluded=n_before - len(momentum_df),
+        )
 
     score_dates = sorted(momentum_df["date"].unique())
     logger.info(
@@ -215,6 +298,8 @@ def main() -> None:
         strategy_id=args.strategy_id,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        universe_id=args.universe_id,
+        provisional_no_universe=args.provisional_no_universe,
     )
 
 

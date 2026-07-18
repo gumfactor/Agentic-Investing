@@ -4,12 +4,21 @@ Computes Information Coefficient (IC) and related diagnostics for any factor
 that produces cross-sectional scores.  Results can be persisted to MLflow
 and the signal_ic_stats DB table.
 
-Survivorship-bias note
-----------------------
-Phase 1 uses a current-membership S&P 500 universe.  All IC results computed
-against that universe are labelled provisional until point-in-time constituent
-history replaces it in Phase 2/3.  Pass ``data_version`` to every MLflow call
-so results are traceable to the snapshot used (C7).
+Survivorship-bias note (BUG-008 / 01B-2)
+----------------------------------------
+Point-in-time membership enforcement is available: pass a
+``data.universe.runtime.PITUniverseLookup`` as the ``universe`` argument of
+:func:`compute_ic_series`. With a universe, tickers that have prices but were
+not (knowably) index members on the score date are excluded, out-of-coverage
+dates fail closed, and an insufficient post-membership cross-section raises
+instead of silently emitting IC from a shrunken universe. Current-universe
+objects and plain ticker lists are rejected at the type level.
+
+Calling without ``universe`` retains the legacy current-membership behavior;
+those results remain **provisional** (design plan §1: they may be kept for
+traceability but cannot be used for selection, promotion, or paper-trading
+qualification). Pass ``data_version`` to every MLflow call so results are
+traceable to the snapshot used (C7).
 """
 
 from __future__ import annotations
@@ -95,6 +104,7 @@ def compute_ic_series(
     prices: pd.DataFrame,
     score_col: str,
     horizons: Optional[list[int]] = None,
+    universe: Optional[object] = None,
 ) -> pd.DataFrame:
     """Compute per-date cross-sectional IC at multiple forward return horizons.
 
@@ -109,6 +119,16 @@ def compute_ic_series(
         score_col: Column in *scores* to evaluate.
         horizons: Forward return horizons in trading days.
             Defaults to ``[1, 5, 10, 21, 63]``.
+        universe: a ``data.universe.runtime.PITUniverseLookup`` for
+            point-in-time membership enforcement (BUG-008). When provided:
+            score rows for tickers without knowable membership on the score
+            date are excluded; a score date outside the validated coverage
+            window raises ``CoverageGapError``; and a post-membership
+            cross-section below ``_MIN_TICKERS_PER_DATE`` raises
+            ``InsufficientCrossSectionError`` instead of being silently
+            dropped. Current-universe snapshots and plain ticker lists are
+            rejected with ``CurrentUniverseRejectedError``. ``None`` keeps
+            the legacy provisional behavior (see module docstring).
 
     Returns:
         DataFrame with columns:
@@ -116,13 +136,15 @@ def compute_ic_series(
 
         One row per (date, horizon) pair where at least
         ``_MIN_TICKERS_PER_DATE`` tickers had valid scores and forward
-        returns.  Rows where fewer tickers are available are dropped.
+        returns.  Without a universe, rows where fewer tickers are
+        available are dropped.
     """
     if horizons is None:
         horizons = _DEFAULT_HORIZONS
 
     _validate_scores(scores, score_col)
     _validate_prices(prices)
+    universe_lookup = _validate_universe_arg(universe)
 
     fwd = compute_forward_returns(prices, horizons)
 
@@ -130,11 +152,41 @@ def compute_ic_series(
         fwd, on=["ticker", "date"], how="inner"
     )
 
+    if universe_lookup is not None:
+        pre_pairs = {
+            (dt, int(h))
+            for dt, h in merged[["date", "horizon_days"]].drop_duplicates().itertuples(index=False)
+        }
+        merged = _filter_by_membership(merged, universe_lookup)
+        post_pairs = {
+            (dt, int(h))
+            for dt, h in merged[["date", "horizon_days"]].drop_duplicates().itertuples(index=False)
+        }
+        vanished = pre_pairs - post_pairs
+        if vanished:
+            from data.universe.runtime import InsufficientCrossSectionError
+
+            sample = sorted(vanished)[:5]
+            raise InsufficientCrossSectionError(
+                f"{len(vanished)} (date, horizon) cross-sections lost every ticker to "
+                f"membership filtering (e.g. {sample}). Failing closed instead of "
+                "emitting IC from a silently shrunken universe (BUG-008)."
+            )
+
     rows: list[dict] = []
     for (dt, h), group in merged.groupby(["date", "horizon_days"]):
         valid = group.dropna(subset=[score_col, "forward_return"])
         n = len(valid)
         if n < _MIN_TICKERS_PER_DATE:
+            if universe_lookup is not None:
+                from data.universe.runtime import InsufficientCrossSectionError
+
+                raise InsufficientCrossSectionError(
+                    f"Only {n} member tickers have valid scores and forward returns "
+                    f"on {dt} (horizon {h}); minimum is {_MIN_TICKERS_PER_DATE}. "
+                    "Failing closed instead of emitting IC from a silently "
+                    "shrunken universe (BUG-008)."
+                )
             continue
 
         ic_val = float(
@@ -677,6 +729,78 @@ def compute_ic_ir_weights(
         weights={n: round(v, 4) for n, v in normalised.items()},
     )
     return normalised
+
+
+# ─── Point-in-time universe enforcement (BUG-008) ────────────────────────────
+
+def _validate_universe_arg(universe: Optional[object]):
+    """Accept a PITUniverseLookup, reject anything else non-None (BUG-008).
+
+    Type-level enforcement per design plan §1.4: a current-universe loader
+    (CurrentUniverseSnapshot) or a plain ticker list cannot be passed to
+    historical IC code. Returns the lookup, or None for the legacy
+    provisional path.
+    """
+    if universe is None:
+        logger.warning(
+            "ic_without_pit_universe",
+            note=(
+                "compute_ic_series called without a PITUniverseLookup — results "
+                "use whatever tickers appear in scores/prices and remain "
+                "PROVISIONAL (BUG-008); not valid for selection or promotion"
+            ),
+        )
+        return None
+
+    from data.universe.runtime import CurrentUniverseRejectedError, PITUniverseLookup
+
+    if isinstance(universe, PITUniverseLookup):
+        return universe
+    raise CurrentUniverseRejectedError(
+        f"compute_ic_series requires a PITUniverseLookup for membership "
+        f"enforcement; got {type(universe).__name__}. Current-universe snapshots "
+        "and plain ticker lists are rejected because their historical membership "
+        "provenance cannot be verified (BUG-008)."
+    )
+
+
+def _filter_by_membership(merged: pd.DataFrame, universe_lookup) -> pd.DataFrame:
+    """Keep only (ticker, date) rows with knowable index membership.
+
+    Raises CoverageGapError (from the lookup) when any score date falls
+    outside the validated coverage window — historical IC fails closed
+    rather than silently scoring uncertified dates.
+    """
+    # Normalize to plain datetime.date before querying the PIT lookup
+    # (Codex PR #34 P2): callers commonly hold pandas Timestamp/datetime64
+    # dates from read_sql/CSV/parquet loads, which the coverage-window
+    # comparison rejects. The same normalized key is used for row filtering.
+    def _as_plain_date(value) -> date:
+        if isinstance(value, date) and not isinstance(value, pd.Timestamp):
+            return value
+        return pd.Timestamp(value).date()
+
+    eligible_by_date: dict = {}
+    for dt in merged["date"].unique():
+        key = _as_plain_date(dt)
+        if key not in eligible_by_date:
+            result = universe_lookup.load_universe_as_of(key)
+            eligible_by_date[key] = set(result.eligible_tickers)
+
+    mask = [
+        row.ticker in eligible_by_date[_as_plain_date(row.date)]
+        for row in merged[["ticker", "date"]].itertuples(index=False)
+    ]
+    filtered = merged[pd.Series(mask, index=merged.index)]
+    n_excluded = len(merged) - len(filtered)
+    if n_excluded:
+        logger.info(
+            "ic_rows_excluded_by_membership",
+            n_excluded=n_excluded,
+            n_kept=len(filtered),
+            universe_id=universe_lookup.universe_id,
+        )
+    return filtered
 
 
 # ─── Input validation ─────────────────────────────────────────────────────────

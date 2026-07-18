@@ -14,7 +14,12 @@ import pandas as pd
 import pytest
 import yaml
 
-from config.universe_loader import load_universe, _fetch_sp500_from_wikipedia, _load_from_csv
+from config.universe_loader import (
+    UniverseFetchError,
+    _fetch_sp500_from_wikipedia,
+    _load_from_csv,
+    load_universe,
+)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -70,10 +75,16 @@ class TestFetchSp500FromWikipedia:
         assert "BF-B" in result
         assert "BRK.B" not in result
 
-    @patch("config.universe_loader.requests.get", side_effect=Exception("network error"))
-    def test_returns_empty_list_on_failure(self, mock_get: MagicMock) -> None:
-        result = _fetch_sp500_from_wikipedia()
-        assert result == []
+    @patch(
+        "config.universe_loader.requests.get",
+        side_effect=__import__("requests").RequestException("network error"),
+    )
+    def test_raises_universe_fetch_error_on_failure(self, mock_get: MagicMock) -> None:
+        # Deliberately changed for 01B-2 (BUG-008): the pre-01B-2 behavior of
+        # returning [] on failure silently emptied downstream pipelines
+        # (fail-open). The loader now fails closed.
+        with pytest.raises(UniverseFetchError, match="Failing closed"):
+            _fetch_sp500_from_wikipedia()
 
     @patch("config.universe_loader.requests.get")
     def test_returns_list_not_series(self, mock_get: MagicMock) -> None:

@@ -108,7 +108,29 @@ def _add_gate_columns(
     return out
 
 
-def _persist_summary(engine, summary: pd.DataFrame) -> int:
+def _build_eligibility_frame(universe_lookup, dates: list) -> pd.DataFrame:
+    """Long-format (ticker, date) PIT eligibility frame for factor scoring.
+
+    Built from the same PITUniverseLookup used for IC merging, so the
+    scoring cross-section and the IC membership filter are guaranteed to
+    agree. Fails closed (CoverageGapError propagates) when any requested
+    date is outside validated coverage.
+    """
+    rows: list[dict] = []
+    for d in dates:
+        eligible = universe_lookup.load_universe_as_of(d).eligible_tickers
+        rows.extend({"ticker": t, "date": d} for t in eligible)
+    return pd.DataFrame(rows, columns=["ticker", "date"])
+
+
+def _persist_summary(engine, summary: pd.DataFrame, provisional: bool = True) -> int:
+    """Persist IC summary rows.
+
+    ``provisional`` stamps each row (migration 010): True for runs without
+    PIT universe enforcement (--provisional-no-universe and all pre-01B-2
+    rows), False for PIT-enforced runs. Interim marker — superseded by the
+    01B-3 research-run identity (design plan §4).
+    """
     if summary.empty:
         return 0
 
@@ -126,18 +148,21 @@ def _persist_summary(engine, summary: pd.DataFrame) -> int:
             "n_observations",
         ]
     ].to_dict("records")
+    for record in records:
+        record["provisional"] = provisional
 
     statement = text(
         "INSERT INTO signal_ic_stats "
         "(factor_name, strategy_id, eval_date, horizon_days, ic, rank_ic, "
-        "ic_tstat, ic_ir, ic_pvalue, n_observations) "
+        "ic_tstat, ic_ir, ic_pvalue, n_observations, provisional) "
         "VALUES (:factor_name, :strategy_id, :eval_date, :horizon_days, :ic, "
-        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations) "
+        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations, :provisional) "
         "ON CONFLICT (factor_name, strategy_id, eval_date, horizon_days) "
         "DO UPDATE SET ic = EXCLUDED.ic, rank_ic = EXCLUDED.rank_ic, "
         "ic_tstat = EXCLUDED.ic_tstat, ic_ir = EXCLUDED.ic_ir, "
         "ic_pvalue = EXCLUDED.ic_pvalue, "
-        "n_observations = EXCLUDED.n_observations, computed_at = NOW()"
+        "n_observations = EXCLUDED.n_observations, "
+        "provisional = EXCLUDED.provisional, computed_at = NOW()"
     )
     with engine.begin() as connection:
         connection.execute(statement, records)
@@ -227,6 +252,18 @@ def main() -> int:
     parser.add_argument("--min-ic", type=float, default=0.03)
     parser.add_argument("--min-tstat", type=float, default=2.0)
     parser.add_argument("--persist", action="store_true")
+    parser.add_argument(
+        "--universe-id",
+        default="sp500",
+        help="Point-in-time universe for membership enforcement (default: sp500).",
+    )
+    parser.add_argument(
+        "--provisional-no-universe",
+        action="store_true",
+        help="Skip point-in-time membership enforcement (BUG-008). Results are "
+        "PROVISIONAL: not valid for selection, promotion, or paper-trading "
+        "qualification.",
+    )
     args = parser.parse_args()
 
     database_url = os.environ.get("DATABASE_URL")
@@ -241,6 +278,36 @@ def main() -> int:
     audit = audit_universe_survivorship(prices)
     fundamentals = None
 
+    # ── Point-in-time universe (BUG-008 / 01B-2) ─────────────────────────────
+    # This is a HISTORICAL caller: membership enforcement is required by
+    # default and fails closed when no published universe import exists or
+    # when any holdout date is outside validated coverage.
+    universe_lookup = None
+    if args.provisional_no_universe:
+        print(
+            "WARNING: --provisional-no-universe set. IC results are PROVISIONAL "
+            "(current-membership universe, BUG-008): not valid for selection, "
+            "promotion, or paper-trading qualification."
+        )
+    else:
+        from data.universe.runtime import NoPublishedImportError, PITUniverseLookup
+
+        try:
+            universe_lookup = PITUniverseLookup(engine, args.universe_id)
+        except NoPublishedImportError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            print(
+                "Run scripts/import_universe_membership.py first, or rerun with "
+                "--provisional-no-universe to accept provisional results.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"PIT universe: {args.universe_id} import batch "
+            f"{universe_lookup.import_batch_id}, coverage "
+            f"[{universe_lookup.coverage_start}, {universe_lookup.coverage_end}]"
+        )
+
     print(
         f"Live prices: {len(prices):,} rows, {prices['ticker'].nunique()} tickers, "
         f"{len(dates)} dates ({dates[0]} to {dates[-1]})"
@@ -249,7 +316,28 @@ def main() -> int:
         f"Holdout: {holdout_start} onward "
         f"(final {(1.0 - args.train_fraction):.0%} of trading dates)"
     )
-    print(audit["warning"])
+    if universe_lookup is None:
+        # Survivorship warning applies only to provisional (non-PIT) runs;
+        # with membership enforcement active it would cry wolf.
+        print(audit["warning"])
+
+    # ── PIT scoring cross-section (BUG-008 / Codex PR #34 P1) ────────────────
+    # Membership must define each factor's cross-section BEFORE its
+    # z-scoring: passing the lookup only to compute_ic_series would leave
+    # non-members contaminating the cross-sectional mean/std that member
+    # scores (persisted with provisional=false) are built from.
+    #
+    # Eligibility is built ONLY for the dates actually scored/evaluated
+    # (the holdout window) — factor lookbacks need only prices, and pre-
+    # holdout price history may legitimately predate the published PIT
+    # coverage window; querying it would fail an otherwise valid run
+    # (Codex PR #34 P2). Dates absent from the frame are fully masked by
+    # the composites (fail closed), so pre-holdout cross-sections are
+    # never emitted, merely skipped.
+    eligibility_df = None
+    if universe_lookup is not None:
+        scored_dates = [d for d in dates if d >= holdout_start]
+        eligibility_df = _build_eligibility_frame(universe_lookup, scored_dates)
 
     summaries: list[pd.DataFrame] = []
     for factor_name in args.factors:
@@ -262,9 +350,10 @@ def main() -> int:
                 fundamentals,
                 prices,
                 score_dates=holdout_dates,
+                eligibility=eligibility_df,
             )
         else:
-            scores = spec.compute(prices)
+            scores = spec.compute(prices, eligibility=eligibility_df)
         holdout_scores = scores[scores["date"] >= holdout_start].copy()
 
         ic_series = compute_ic_series(
@@ -272,6 +361,7 @@ def main() -> int:
             prices,
             score_col=spec.score_col,
             horizons=args.horizons,
+            universe=universe_lookup,
         )
         summary = summarize_ic(
             ic_series,
@@ -293,7 +383,7 @@ def main() -> int:
     passed_tests = int(combined["passes_gate"].sum())
 
     if args.persist:
-        persisted = _persist_summary(engine, combined)
+        persisted = _persist_summary(engine, combined, provisional=universe_lookup is None)
         print(f"\nPersisted {persisted} rows to signal_ic_stats.")
 
     print(

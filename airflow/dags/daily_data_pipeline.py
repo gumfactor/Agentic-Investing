@@ -49,6 +49,14 @@ _default_args: dict[str, Any] = {
 # ─── Task functions ───────────────────────────────────────────────────────────
 
 def _fetch_universe(**context: Any) -> list[str]:
+    # OPERATIONAL CURRENT-UNIVERSE MODE (BUG-008 / 01B-2): this daily
+    # ingestion task deliberately uses current S&P 500 membership — it decides
+    # which tickers to fetch prices for TODAY, not historical eligibility.
+    # Historical research paths (IC, backfills, backtests) must use
+    # data.universe.runtime.load_universe_as_of / PITUniverseLookup instead;
+    # config.universe_loader is rejected there at the type level.
+    # Note: load_universe now raises UniverseFetchError on fetch failure
+    # (fail closed) — Airflow retries handle transient Wikipedia outages.
     from config.universe_loader import load_universe
     tickers = load_universe()
     context["ti"].xcom_push(key="tickers", value=tickers)

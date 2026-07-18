@@ -37,7 +37,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-005 | Trading Safety | P0 | F0 | Fixed | Approval quantity overrides can be tampered upward. |
 | BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
-| BUG-008 | Research/Signals | P0 | F0 | Open | Current-membership universe creates survivorship leakage. |
+| BUG-008 | Research/Signals | P0 | F0 | Implemented — pending review/merge (dev/R2-01B2-pit-universe) | Current-membership universe creates survivorship leakage. |
 | BUG-009 | Research/Signals | P0 | F0 | Open | Same-close signal/return timing can introduce lookahead. |
 | BUG-010 | Research/Signals | P0 | F0 | Implemented — pending review/merge (dev/R2-01B1-missing-data) | `pct_change()` defaults can distort many indicators. |
 | BUG-011 | Security/Auth | P1 | F1 | Open | Approval gate trusts any matching DB row. |
@@ -95,6 +95,9 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-064 | Research/Signals | P2 | F2 | Fixed | `_write_simulation` only processes current-run strategy from XCom; shadow strategies are skipped. |
 | BUG-065 | Research/Signals | P2 | F2 | Fixed | `simulated_return` divides by n_long when universe < n_long, understating returns for small strategies. |
 | BUG-066 | Research/Signals | P2 | F2 | Open | Cross-sectional scoring has no minimum-eligible-count gate; full-window suppression increases silent cross-section shrinkage. |
+| BUG-067 | Data/Universe | P1 | F1 | Fixed (dev/R2-01B2-pit-universe) | `config/universe_loader.py` returned an empty universe on Wikipedia fetch failure (fail-open). |
+| BUG-068 | Data/Universe | P2 | F2 | Open | Wikipedia constituent history has bounded count drift (left-censored inflation ~3% recent era; sparse pre-2000 changes; 3 ticker-collision exclusions). |
+| BUG-069 | Data/Universe | P2 | F2 | Open | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
 
 #### Long-term / lower-risk backlog
 
@@ -309,6 +312,37 @@ subscription — a pre-existing account limitation with an existing
 ### BUG-008: Current-membership universe creates survivorship/data leakage in IC research
 
 **Severity:** P0 / research validity
+
+**Status:** Implemented — pending review/merge. Branch `dev/R2-01B2-pit-universe`
+(roadmap item 01B-2, scoped to `docs/plans/01b-research-validity-design.md` §1).
+Delivered: Alembic migration 009 (effective-dated `universe_membership`,
+`universe_symbol_history`, `universe_import_batches`); provider-agnostic import
+pipeline with checksummed raw-source persistence and publish-only-validated gates
+(`data/universe/import_pipeline.py`); real Wikipedia constituent history imported
+and verified from the checked-in snapshot `data/vendor/wikipedia_sp500/2026-07-17/`
+(source contract: `docs/plans/01b2-constituent-source-contract.md`); fail-closed
+runtime API `data/universe/runtime.py` (`load_universe_as_of` / `PITUniverseLookup`)
+with type-level rejection of current-universe objects in historical code;
+`compute_ic_series`, `scripts/validate_signal_ic.py`, and
+`scripts/backfill_momentum_scores.py` migrated to PIT membership enforcement;
+operational current-mode callers explicitly labeled. All §1.4 acceptance tests
+pass (`data/tests/universe/test_acceptance_1_4.py`). Historical outputs computed
+under the old current-membership universe remain provisional; recompute is 01B-3/§4
+scope. Residual data-quality limits tracked as BUG-068/BUG-069.
+
+Adversarial-review fix round (same branch): operator `--exclude-tickers`
+exclusions are now persisted as a JSON audit record on
+`universe_import_batches.excluded_tickers` (migration 009 amended pre-release)
+and surfaced by `coverage_report()`; migration 010 adds an interim
+`signal_ic_stats.provisional` boolean (existing rows default TRUE — all
+pre-01B-2 rows are provisional by definition; superseded by 01B-3's §4
+`research_run_id` identity) stamped by `scripts/validate_signal_ic.py`;
+the Wikipedia changes-table parser validates actual header text before its
+positional rename and fails closed on reordered/renamed headers; left-censored
+intervals get `known_at` at the coverage-start session close so pre-window
+members are eligible on day one of the certified window; the survivorship
+warning in `validate_signal_ic.py` is gated to provisional runs; snapshot
+checksum-tamper detection is now covered by tests.
 
 **Evidence:** The research universe is documented as current-membership S&P 500 and excludes removed constituents. The IC engine merges scores to forward returns on available ticker/date rows without enforcing point-in-time membership.
 
@@ -874,3 +908,67 @@ scoring a tiny universe.
 
 **Origin:** Confirmed during the 01B-1 (BUG-010) adversarial review, 2026-07-16;
 out of scope for that fix round.
+
+### BUG-067: Universe loader returned an empty universe on fetch failure (fail-open)
+
+**Severity:** P1 / pipeline integrity
+
+**Status:** Fixed on `dev/R2-01B2-pit-universe` (01B-2 Phase 3).
+
+**Evidence:** `config/universe_loader.py::_fetch_sp500_from_wikipedia` caught all
+exceptions and returned `[]`, so a Wikipedia outage silently emptied the daily
+ingestion universe and every downstream consumer.
+
+**Impact:** A transient network failure could produce a zero-ticker ingestion run
+with no task failure or alert; downstream scoring would quietly shrink.
+
+**Fix:** The loader now raises `UniverseFetchError` (fail closed); Airflow retries
+absorb transient outages. The affected test was deliberately updated. The module is
+also now labeled operational-current-mode only (BUG-008 type-level separation).
+
+### BUG-068: Wikipedia constituent history has bounded count drift
+
+**Severity:** P2 / research data quality
+
+**Status:** Open — documented limitation of the 01B-2 initial provider; remediate
+at Gate 03 with a commercial constituent source (entity-level identifiers).
+
+**Evidence:** 2026-07-17 verification import: per-date member counts are 417
+(2000-01-03), 502 (2010-01-04), 522 (2020-01-02), 519 (2023-06-01) versus a true
+~503-505. 245 of 890 intervals are left-censored (assumed start at 1976-07-01);
+three ticker-collision symbols (AN, SUN, AGN) are excluded entirely. See
+`docs/plans/01b2-constituent-source-contract.md`.
+
+**Impact:** Mild universe over-inclusion in the recent era and under-coverage
+pre-2000. The drift adds/retains names rather than excluding removed losers, so it
+does not reintroduce the BUG-008 survivorship direction, but IC cross-sections can
+include a small number of non-members in older periods.
+
+**Suggested direction:** Replace/augment the Wikipedia import with a licensed
+point-in-time constituent feed at Gate 03; the schema and runtime API are already
+provider-agnostic (`source`/`source_version` columns, `ConstituentProvider`
+protocol).
+
+**Update (01B-2 fix round):** ticker-collision exclusions are now persisted as a
+DB-queryable JSON audit record on `universe_import_batches.excluded_tickers` and
+surfaced by `coverage_report()`, so the AN/SUN/AGN exclusions no longer live only
+in logs and this document's companion contract doc.
+
+### BUG-069: Signal DAG degrades to unfiltered provisional scores when the PIT universe is stale
+
+**Severity:** P2 / operational monitoring
+
+**Status:** Open.
+
+**Evidence:** `airflow/dags/daily_signal_pipeline.py::_pit_membership_filter`
+deliberately logs a warning and proceeds without membership filtering when no
+published universe import covers the score date (the import advances coverage only
+when `scripts/import_universe_membership.py` is re-run).
+
+**Impact:** Daily operational scores remain available (paper pipeline is not
+blocked), but they silently revert to provisional current-membership semantics for
+research purposes; the only signal is a structlog warning.
+
+**Suggested direction:** Add an AlertManager hook or DAG-level SLA/telemetry when
+the filter degrades, and consider an Airflow maintenance task that re-runs the
+universe import on a schedule.

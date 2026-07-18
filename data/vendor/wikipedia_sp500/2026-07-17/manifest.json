@@ -1,0 +1,10 @@
+{
+  "attribution": "Content derived from Wikipedia, licensed CC BY-SA 4.0. See docs/plans/01b2-constituent-source-contract.md.",
+  "checksum_sha256": "3395c346fba67789d1e0170d919c6d74e42922d66001755a50ad691cc647d170",
+  "content_type": "text/html",
+  "n_bytes": 1505247,
+  "origin_url": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+  "provider_name": "wikipedia_sp500",
+  "retrieved_at": "2026-07-17T14:48:43.649653+00:00",
+  "source_version": "wikipedia_sp500_v1"
+}

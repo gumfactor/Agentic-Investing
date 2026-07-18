@@ -82,6 +82,40 @@ def _load_prices(**context: Any) -> None:
             params={"start": start_date, "end": end_date},
         )
 
+    # PIT cross-section BEFORE factor computation (BUG-008 / Codex PR #34
+    # P2): the factor tasks z-score across every ticker in this price panel,
+    # so an ineligible-but-priced ticker must be removed HERE, not after
+    # scoring. Filtering by ticker (keeping each eligible ticker's full
+    # lookback history) preserves rolling windows. Degrades to the
+    # unfiltered (provisional) panel when no published universe import
+    # covers score_date — BUG-069.
+    import structlog as _structlog
+
+    _log = _structlog.get_logger("rqis.airflow")
+    try:
+        _eligible = _pit_eligible_tickers_sql(os.environ["DATABASE_URL"], end_date)
+    except Exception as _exc:  # deliberate broad degrade — see _pit_membership_filter
+        _eligible = None
+        _log.warning("pit_universe_lookup_failed_scores_provisional", error=str(_exc))
+    if _eligible is not None:
+        n_before = df["ticker"].nunique()
+        df = df[df["ticker"].isin(_eligible)].reset_index(drop=True)
+        _log.info(
+            "pit_price_panel_filtered",
+            score_date=str(end_date),
+            tickers_before=n_before,
+            tickers_after=df["ticker"].nunique(),
+        )
+    else:
+        _log.warning(
+            "pit_universe_unavailable_scores_provisional",
+            score_date=str(end_date),
+            note=(
+                "factor cross-section NOT filtered to point-in-time members; "
+                "daily scores are provisional for research (BUG-008/BUG-069)"
+            ),
+        )
+
     context["ti"].xcom_push(key="prices_json", value=df.to_json(orient="records", date_format="iso"))
     context["ti"].xcom_push(key="score_date", value=str(end_date))
 
@@ -200,11 +234,166 @@ def _compute_quality(**context: Any) -> None:
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
-    scores = compute_quality_scores(fund, prices, score_dates=[score_date])
+    # PIT cross-section for quality (BUG-008 / Codex PR #34 P2): unlike the
+    # price-based factors (and value, whose ratios join per-ticker closes
+    # from the already-filtered price panel), quality ratios use ONLY
+    # fundamentals — so a non-member with valid financial_statements rows
+    # would still enter the per-date z-scores even though _load_prices
+    # filtered the price panel. Pass the eligibility frame so the composite
+    # masks the cross-section BEFORE z-scoring; degrade to the provisional
+    # unfiltered cross-section when no published import covers score_date
+    # (BUG-069), matching the panel filter's behavior.
+    eligibility = None
+    try:
+        _eligible = _pit_eligible_tickers_sql(os.environ["DATABASE_URL"], score_date)
+    except Exception as _exc:  # deliberate broad degrade — see _pit_membership_filter
+        _eligible = None
+        import structlog as _structlog
+
+        _structlog.get_logger("rqis.airflow").warning(
+            "pit_universe_lookup_failed_quality_provisional", error=str(_exc)
+        )
+    if _eligible is not None:
+        eligibility = pd.DataFrame(
+            [{"ticker": t, "date": score_date} for t in sorted(_eligible)]
+        )
+
+    scores = compute_quality_scores(
+        fund, prices, score_dates=[score_date], eligibility=eligibility
+    )
     context["ti"].xcom_push(
         key="quality_scores_json",
         value=scores.to_json(orient="records", date_format="iso") if not scores.empty else "[]",
     )
+
+
+def _pit_eligible_tickers_sql(database_url: str, score_date: date) -> set[str] | None:
+    """Eligible sp500 tickers as of score_date via plain SQL, or None.
+
+    SQLAlchemy-1.4-compatible ON PURPOSE (Codex PR #34 P1): the Airflow
+    runtime image (infra/docker/Dockerfile.airflow) pins SQLAlchemy 1.4.51,
+    while data.universe.models uses SQLAlchemy 2-only APIs
+    (DeclarativeBase/mapped_column). Importing data.universe.runtime here
+    would raise at import time inside the packaged DAG environment — before
+    any graceful fallback could run — so this function reimplements the
+    runtime eligibility predicate with text() queries only. It MUST stay in
+    semantic lockstep with data.universe.runtime._interval_confers_eligibility:
+    entry side known_at <= cutoff; exit side (end IS NULL, or as_of < end,
+    or end_known_at > cutoff). tests/test_daily_signal_pipeline_pit.py
+    asserts both the import isolation and the semantic parity.
+
+    Returns None when no published import covers score_date (caller
+    degrades to provisional scores).
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import create_engine, text
+
+    # Session-close observation cutoff, mirroring
+    # data.universe.calendar.session_close_cutoff (21:00 UTC — the
+    # conservative year-round choice documented there).
+    cutoff = datetime(
+        score_date.year, score_date.month, score_date.day, 21, 0, 0, tzinfo=timezone.utc
+    )
+
+    def _as_date(value: Any) -> date:
+        return value if isinstance(value, date) else date.fromisoformat(str(value)[:10])
+
+    def _as_utc(value: Any) -> datetime:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    # Rows are selected plainly and the eligibility predicate is applied in
+    # Python: SQL-side date/datetime comparisons are dialect-fragile, and
+    # this keeps the logic byte-for-byte comparable with the runtime's
+    # _interval_confers_eligibility.
+    engine = create_engine(database_url)
+    try:
+        with engine.connect() as conn:
+            batch = conn.execute(
+                text(
+                    "SELECT id, coverage_start, coverage_end "
+                    "FROM universe_import_batches "
+                    "WHERE universe_id = 'sp500' AND status = 'published' "
+                    "ORDER BY published_at DESC LIMIT 1"
+                )
+            ).fetchone()
+            if batch is None:
+                return None
+            batch_id = batch[0]
+            if not (_as_date(batch[1]) <= score_date <= _as_date(batch[2])):
+                return None
+            rows = conn.execute(
+                text(
+                    "SELECT ticker, effective_start, effective_end, known_at, end_known_at "
+                    "FROM universe_membership "
+                    "WHERE universe_id = 'sp500' AND import_batch_id = :batch_id"
+                ),
+                {"batch_id": batch_id},
+            ).fetchall()
+    finally:
+        engine.dispose()
+
+    eligible: set[str] = set()
+    for ticker, effective_start, effective_end, known_at, end_known_at in rows:
+        if _as_date(effective_start) > score_date:
+            continue
+        if _as_utc(known_at) > cutoff:
+            continue
+        if effective_end is None or score_date < _as_date(effective_end):
+            eligible.add(ticker)
+        elif end_known_at is not None and _as_utc(end_known_at) > cutoff:
+            eligible.add(ticker)
+    return eligible
+
+
+def _pit_membership_filter(df: Any, score_date: date) -> Any:
+    """Filter a factor-score DataFrame to knowable index members (BUG-008).
+
+    Uses the point-in-time universe when a published import covers
+    score_date. This DAG's same-day output is OPERATIONAL (it feeds the
+    paper pipeline), so a missing/stale universe import — or any lookup
+    failure (missing tables, DB drift) — degrades to a loud warning instead
+    of failing the daily run; the emitted scores are then PROVISIONAL for
+    research purposes, exactly like the pre-01B-2 behavior (BUG-069).
+    Historical research callers (IC validation, backfills) use the
+    fail-closed path in data.universe.runtime directly.
+    """
+    import os
+
+    import structlog
+
+    log = structlog.get_logger("rqis.airflow")
+    try:
+        eligible = _pit_eligible_tickers_sql(os.environ["DATABASE_URL"], score_date)
+        degrade_reason = "no published universe import covers score_date"
+    except Exception as exc:  # deliberate broad degrade — see docstring
+        eligible = None
+        degrade_reason = f"universe lookup failed: {exc}"
+    if eligible is None:
+        log.warning(
+            "pit_universe_unavailable_scores_provisional",
+            score_date=str(score_date),
+            reason=degrade_reason,
+            note=(
+                "daily scores emitted WITHOUT point-in-time membership filtering; "
+                "provisional for research (BUG-008). Run "
+                "scripts/import_universe_membership.py to advance coverage."
+            ),
+        )
+        return df
+    if df.empty:
+        return df
+    n_before = len(df)
+    filtered = df[df["ticker"].isin(eligible)].reset_index(drop=True)
+    if len(filtered) != n_before:
+        log.info(
+            "pit_membership_filter_applied",
+            score_date=str(score_date),
+            rows_before=n_before,
+            rows_after=len(filtered),
+        )
+    return filtered
 
 
 def _combine_scores(**context: Any) -> None:
@@ -225,7 +414,9 @@ def _combine_scores(**context: Any) -> None:
         df = pd.read_json(raw, orient="records", convert_dates=False)
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"]).dt.date
-        return df
+        # Point-in-time membership filter (BUG-008 / 01B-2); degrades to a
+        # warning when no published universe import covers score_date.
+        return _pit_membership_filter(df, score_date)
 
     factor_scores = {}
     score_col_map = {}

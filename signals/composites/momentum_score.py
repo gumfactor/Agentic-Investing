@@ -55,6 +55,7 @@ def compute_momentum_scores(
     windows: Optional[dict[str, int]] = None,
     skip_days: int = _SKIP_DAYS,
     min_obs_fraction: float = 0.7,
+    eligibility: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Compute cross-sectional momentum scores.
 
@@ -67,6 +68,17 @@ def compute_momentum_scores(
             return (short-term reversal buffer).  Default = 21.
         min_obs_fraction: Fraction of the lookback window that must have
             valid prices for a score to be assigned vs NaN.
+        eligibility: optional long-format DataFrame with ``ticker``/``date``
+            columns listing the ELIGIBLE (ticker, date) pairs — the
+            point-in-time scoring cross-section (BUG-008 / Codex PR #34 P1).
+            Raw window returns still use each ticker's full price history
+            (lookbacks are unaffected), but ineligible cells are masked to
+            NaN BEFORE the cross-sectional mean/std, so a non-member's
+            return can never shift members' z-scores. Dates present in
+            ``prices`` but absent from ``eligibility`` are fully masked
+            (fail closed). ``None`` keeps the legacy behavior: every priced
+            ticker is in the cross-section (provisional per the design
+            plan).
 
     Returns:
         Long-format DataFrame with columns:
@@ -90,6 +102,12 @@ def compute_momentum_scores(
     )
     wide.columns.name = None
 
+    eligible_mask: Optional[pd.DataFrame] = None
+    if eligibility is not None:
+        from signals.composites._eligibility import build_wide_eligibility_mask
+
+        eligible_mask = build_wide_eligibility_mask(eligibility, wide.index, wide.columns)
+
     long_frames: list[pd.DataFrame] = []
 
     for col_name, lookback in windows.items():
@@ -105,6 +123,10 @@ def compute_momentum_scores(
 
         raw_return = near_price / far_price - 1.0
         raw_return[obs_in_window < min_obs] = np.nan
+        if eligible_mask is not None:
+            # PIT cross-section: ineligible cells leave the row statistics
+            # entirely, not merely the output rows.
+            raw_return = raw_return.where(eligible_mask)
 
         row_mean = raw_return.mean(axis=1)
         row_std = raw_return.std(axis=1, ddof=1)
