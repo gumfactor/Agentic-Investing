@@ -211,14 +211,23 @@ def nav_history(
 
 
 def pipeline_health(engine: "Engine") -> dict:
-    """Infer pipeline health from data recency (D3 decision)."""
+    """Infer pipeline health from data recency (D3 decision).
+
+    BUG-009 section 4 / BUG-072 (adversarial review round 6): the signals
+    recency check must be scoped to the active daily_signal_pipeline_
+    operational run, same as latest_alpha_scores/bottom_alpha_scores/
+    factor_scores_for_ticker above -- otherwise a fresher row left behind
+    by an inactive/superseded run (post-backfill or run rotation) can make
+    the dashboard report the pipeline as healthy while the ACTIVE run is
+    actually stale or has never written anything.
+    """
     now = datetime.now(timezone.utc)
     with engine.connect() as conn:
         prices_ts = conn.execute(
             text("SELECT MAX(ingested_at) FROM daily_prices")
         ).scalar()
         scores_ts = conn.execute(
-            text("SELECT MAX(computed_at) FROM alpha_scores")
+            text(f"SELECT MAX(computed_at) FROM alpha_scores WHERE research_run_id = {_ACTIVE_RUN_SUBQUERY}")
         ).scalar()
         try:
             sim_ts = conn.execute(
@@ -227,9 +236,17 @@ def pipeline_health(engine: "Engine") -> dict:
         except (sa_exc.OperationalError, sa_exc.ProgrammingError):
             sim_ts = None
 
-    def _age(ts: datetime | None) -> timedelta | None:
+    def _age(ts) -> timedelta | None:
         if ts is None:
             return None
+        if isinstance(ts, str):
+            # SQLite's MAX() aggregate loses the declared column type (a
+            # sqlite3/pysqlite quirk with detect_types over aggregates), so
+            # a TIMESTAMP column can come back as a plain ISO-format string
+            # here in tests even though the production Postgres driver
+            # always returns a real datetime. Parse defensively rather than
+            # assuming one driver's behavior.
+            ts = datetime.fromisoformat(ts)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         return now - ts
