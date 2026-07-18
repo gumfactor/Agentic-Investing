@@ -79,6 +79,19 @@ def _holidays_for_year(year: int) -> frozenset[date]:
     }
     if year < 2021:
         holidays.discard(_observed(date(year, 6, 19)))
+
+    # NEXT year's New Year's Day observed in THIS year (Codex PR #34 P2):
+    # when Jan 1 of year+1 falls on a Saturday, the observed closure is the
+    # preceding Friday, Dec 31 of THIS year — _holidays_for_year(year+1)
+    # alone would lose it and make date-only membership changes around the
+    # year boundary knowable one session too early. (NYSE has occasionally
+    # stayed open on such Fridays — e.g. 2021-12-31 — but including the
+    # closure is the conservative direction for this module's purpose:
+    # known_at can only move later, never earlier.)
+    next_new_year_observed = _observed(date(year + 1, 1, 1))
+    if next_new_year_observed.year == year:
+        holidays.add(next_new_year_observed)
+
     return frozenset(holidays)
 
 

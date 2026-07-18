@@ -326,9 +326,18 @@ def main() -> int:
     # z-scoring: passing the lookup only to compute_ic_series would leave
     # non-members contaminating the cross-sectional mean/std that member
     # scores (persisted with provisional=false) are built from.
+    #
+    # Eligibility is built ONLY for the dates actually scored/evaluated
+    # (the holdout window) — factor lookbacks need only prices, and pre-
+    # holdout price history may legitimately predate the published PIT
+    # coverage window; querying it would fail an otherwise valid run
+    # (Codex PR #34 P2). Dates absent from the frame are fully masked by
+    # the composites (fail closed), so pre-holdout cross-sections are
+    # never emitted, merely skipped.
     eligibility_df = None
     if universe_lookup is not None:
-        eligibility_df = _build_eligibility_frame(universe_lookup, dates)
+        scored_dates = [d for d in dates if d >= holdout_start]
+        eligibility_df = _build_eligibility_frame(universe_lookup, scored_dates)
 
     summaries: list[pd.DataFrame] = []
     for factor_name in args.factors:

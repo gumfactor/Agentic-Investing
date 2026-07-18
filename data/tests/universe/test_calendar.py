@@ -90,3 +90,38 @@ class TestConservativeKnownAt:
         effective = date(2024, 3, 8)  # Friday
         known_at = conservative_known_at_for_date_only_source(effective)
         assert known_at.date() == date(2024, 3, 11)  # next Monday
+
+
+class TestObservedNewYearsAcrossYearBoundary:
+    """Codex PR #34 P2: when Jan 1 of the NEXT year falls on a Saturday,
+    the observed closure is Dec 31 of THIS year — it must not be lost by
+    building holidays per nominal year. Getting this wrong made date-only
+    membership changes near the year boundary knowable one session early."""
+
+    def test_dec_31_observed_when_next_jan_1_is_saturday(self) -> None:
+        # 2022-01-01 is a Saturday -> observed 2021-12-31 (Friday).
+        assert is_trading_session(date(2021, 12, 31)) is False
+
+    def test_next_session_skips_observed_closure(self) -> None:
+        # 2021-12-30 (Thu) -> Friday is the observed closure, weekend
+        # follows, so the next session is Monday 2022-01-03.
+        assert next_trading_session(date(2021, 12, 30)) == date(2022, 1, 3)
+
+    def test_known_at_not_one_session_early_at_year_boundary(self) -> None:
+        # A date-only change effective 2021-12-30 must become knowable at
+        # the 2022-01-03 close, not the 2021-12-31 close.
+        known_at = conservative_known_at_for_date_only_source(date(2021, 12, 30))
+        assert known_at.date() == date(2022, 1, 3)
+
+    def test_ordinary_year_boundary_unaffected(self) -> None:
+        # 2024-01-01 is a Monday: 2023-12-29 (Fri) trades normally and a
+        # 2023-12-28 change is knowable at the 2023-12-29 close.
+        assert is_trading_session(date(2023, 12, 29)) is True
+        known_at = conservative_known_at_for_date_only_source(date(2023, 12, 28))
+        assert known_at.date() == date(2023, 12, 29)
+
+    def test_jan_1_on_sunday_still_observed_monday(self) -> None:
+        # 2023-01-01 is a Sunday -> observed Monday 2023-01-02 (same year,
+        # pre-existing rule) and Friday 2022-12-30 trades.
+        assert is_trading_session(date(2023, 1, 2)) is False
+        assert is_trading_session(date(2022, 12, 30)) is True

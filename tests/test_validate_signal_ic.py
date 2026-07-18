@@ -129,3 +129,42 @@ def test_build_eligibility_frame_matches_lookup(tmp_path):
         expected = set(lookup.load_universe_as_of(d).eligible_tickers)
         actual = set(frame[frame["date"] == d]["ticker"])
         assert actual == expected
+
+
+def test_eligibility_limited_to_scored_dates_avoids_coverage_gap(tmp_path):
+    """Codex PR #34 P2: pre-holdout lookback price history may predate the
+    published coverage window; eligibility is built only for scored
+    (holdout) dates, so such runs succeed — while querying the full price
+    date range would fail closed."""
+    from datetime import date
+
+    import pytest as _pytest
+    from sqlalchemy import create_engine
+
+    from data.universe.import_pipeline import run_import
+    from data.universe.providers.fixture_provider import (
+        FIXTURE_COVERAGE_START,
+        FIXTURE_UNIVERSE_ID,
+        FixtureSP500Provider,
+    )
+    from data.universe.runtime import CoverageGapError, PITUniverseLookup
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'u.db'}", future=True)
+    run_import(
+        FixtureSP500Provider(),
+        engine=eng,
+        artifact_root=tmp_path / "a",
+        coverage_start=FIXTURE_COVERAGE_START,  # 2020-01-01
+    )
+    lookup = PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID)
+
+    # Price history reaches back before coverage; holdout starts inside it.
+    all_price_dates = [date(2019, 6, 3), date(2019, 6, 4), date(2022, 6, 1), date(2022, 6, 2)]
+    holdout_start = date(2022, 1, 1)
+    scored_dates = [d for d in all_price_dates if d >= holdout_start]
+
+    frame = _build_eligibility_frame(lookup, scored_dates)
+    assert set(frame["date"]) == set(scored_dates)
+
+    with _pytest.raises(CoverageGapError):
+        _build_eligibility_frame(lookup, all_price_dates)
