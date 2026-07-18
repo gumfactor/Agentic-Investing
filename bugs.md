@@ -37,9 +37,9 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-005 | Trading Safety | P0 | F0 | Fixed | Approval quantity overrides can be tampered upward. |
 | BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
-| BUG-008 | Research/Signals | P0 | F0 | Implemented — pending review/merge (dev/R2-01B2-pit-universe) | Current-membership universe creates survivorship leakage. |
+| BUG-008 | Research/Signals | P0 | F0 | Fixed | Current-membership universe creates survivorship leakage. |
 | BUG-009 | Research/Signals | P0 | F0 | Open | Same-close signal/return timing can introduce lookahead. |
-| BUG-010 | Research/Signals | P0 | F0 | Implemented — pending review/merge (dev/R2-01B1-missing-data) | `pct_change()` defaults can distort many indicators. |
+| BUG-010 | Research/Signals | P0 | F0 | Fixed | `pct_change()` defaults can distort many indicators. |
 | BUG-011 | Security/Auth | P1 | F1 | Open | Approval gate trusts any matching DB row. |
 | BUG-012 | Trading Safety | P1 | F1 | Open | Circuit breaker is UI-local and not enforced by Airflow submission. |
 | BUG-013 | Security/Auth | P1 | F1 | Open | Host-published services and weak auth create compromise paths. |
@@ -97,7 +97,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-066 | Research/Signals | P2 | F2 | Open | Cross-sectional scoring has no minimum-eligible-count gate; full-window suppression increases silent cross-section shrinkage. |
 | BUG-067 | Data/Universe | P1 | F1 | Fixed (dev/R2-01B2-pit-universe) | `config/universe_loader.py` returned an empty universe on Wikipedia fetch failure (fail-open). |
 | BUG-068 | Data/Universe | P2 | F2 | Open | Wikipedia constituent history has bounded count drift (left-censored inflation ~3% recent era; sparse pre-2000 changes; 3 ticker-collision exclusions). |
-| BUG-069 | Data/Universe | P2 | F2 | Open | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
+| BUG-069 | Data/Universe | P2 | F2 | Deferred (operator-accepted 2026-07-18) | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
 
 #### Long-term / lower-risk backlog
 
@@ -313,8 +313,15 @@ subscription — a pre-existing account limitation with an existing
 
 **Severity:** P0 / research validity
 
-**Status:** Implemented — pending review/merge. Branch `dev/R2-01B2-pit-universe`
-(roadmap item 01B-2, scoped to `docs/plans/01b-research-validity-design.md` §1).
+**Status:** Fixed. Merged to `dev/R2-phase1` via PR #34 (`1df242e`), branch
+`dev/R2-01B2-pit-universe` (roadmap item 01B-2, scoped to
+`docs/plans/01b-research-validity-design.md` §1). Review history: one internal
+adversarial round plus six Codex review rounds (seven items total, including
+two P1s beyond the adversarial round's own findings — SQLAlchemy 1.4
+compatibility for the DAG's PIT filter, and PIT membership applied before
+cross-sectional z-scoring, closed as a class sweep across all four factor
+composites — and a final P2 on the quality factor's independent fundamentals
+load bypassing that same eligibility filter). 1608+ tests passing at merge.
 Delivered: Alembic migration 009 (effective-dated `universe_membership`,
 `universe_symbol_history`, `universe_import_batches`); provider-agnostic import
 pipeline with checksummed raw-source persistence and publish-only-validated gates
@@ -364,8 +371,9 @@ checksum-tamper detection is now covered by tests.
 
 **Severity:** P0 / signal correctness
 
-**Status:** Implemented — pending review/merge. Branch `dev/R2-01B1-missing-data`
-(roadmap item 01B-1, scoped to `docs/plans/01b-research-validity-design.md` §3).
+**Status:** Fixed. Merged to `dev/R2-phase1` via PR #32 (`65e1b72`), branch
+`dev/R2-01B1-missing-data` (roadmap item 01B-1, scoped to
+`docs/plans/01b-research-validity-design.md` §3).
 
 **Evidence:** Multiple indicators call `pct_change()` without `fill_method=None` on wide data containing NaNs.
 
@@ -958,7 +966,10 @@ in logs and this document's companion contract doc.
 
 **Severity:** P2 / operational monitoring
 
-**Status:** Open.
+**Status:** Deferred. Operator decision 2026-07-18: the warn-and-degrade
+behavior is acceptable for now. Revisit flipping to hard-fail once the
+universe import (`scripts/import_universe_membership.py`) is on a scheduled
+cadence rather than run ad hoc — see `Worklog.md` 2026-07-18.
 
 **Evidence:** `airflow/dags/daily_signal_pipeline.py::_pit_membership_filter`
 deliberately logs a warning and proceeds without membership filtering when no
