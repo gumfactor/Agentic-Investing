@@ -188,6 +188,82 @@ class TestUpsertCorporateActions:
         assert "ON CONFLICT" in str(sql_arg)
 
 
+# ─── upsert_factor_scores / upsert_alpha_scores (BUG-009 section 4) ──────────
+
+def _make_factor_scores_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "score_date": date(2024, 1, 2),
+                "factor_name": "momentum",
+                "strategy_id": "v1",
+                "research_run_id": 7,
+                "z_score": Decimal("1.5"),
+            }
+        ]
+    )
+
+
+def _make_alpha_scores_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "score_date": date(2024, 1, 2),
+                "strategy_id": "v1",
+                "research_run_id": 7,
+                "alpha_score": Decimal("0.5"),
+            }
+        ]
+    )
+
+
+class TestUpsertFactorScores:
+    def test_returns_zero_for_empty_df(self, writer: TimescaleWriter) -> None:
+        assert writer.upsert_factor_scores(pd.DataFrame()) == 0
+
+    def test_raises_on_missing_research_run_id(self, writer: TimescaleWriter) -> None:
+        df = _make_factor_scores_df().drop(columns=["research_run_id"])
+        with pytest.raises(ValueError, match="research_run_id"):
+            writer.upsert_factor_scores(df)
+
+    def test_conflict_target_includes_research_run_id(self, writer: TimescaleWriter) -> None:
+        """A new research run must never silently overwrite an old
+        methodology's rows (BUG-009 section 4) — the ON CONFLICT target
+        includes research_run_id."""
+        mock_conn = MagicMock()
+        writer._engine.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        writer._engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = writer.upsert_factor_scores(_make_factor_scores_df())
+        assert result == 1
+
+        sql_arg = str(mock_conn.execute.call_args[0][0])
+        assert "ON CONFLICT (ticker, score_date, factor_name, strategy_id, research_run_id)" in sql_arg
+
+
+class TestUpsertAlphaScores:
+    def test_returns_zero_for_empty_df(self, writer: TimescaleWriter) -> None:
+        assert writer.upsert_alpha_scores(pd.DataFrame()) == 0
+
+    def test_raises_on_missing_research_run_id(self, writer: TimescaleWriter) -> None:
+        df = _make_alpha_scores_df().drop(columns=["research_run_id"])
+        with pytest.raises(ValueError, match="research_run_id"):
+            writer.upsert_alpha_scores(df)
+
+    def test_conflict_target_includes_research_run_id(self, writer: TimescaleWriter) -> None:
+        mock_conn = MagicMock()
+        writer._engine.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        writer._engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = writer.upsert_alpha_scores(_make_alpha_scores_df())
+        assert result == 1
+
+        sql_arg = str(mock_conn.execute.call_args[0][0])
+        assert "ON CONFLICT (ticker, score_date, strategy_id, research_run_id)" in sql_arg
+
+
 # ─── write_quality_flags ──────────────────────────────────────────────────────
 
 class TestWriteQualityFlags:

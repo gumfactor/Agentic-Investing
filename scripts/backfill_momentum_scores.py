@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+from typing import Optional
 
 import pandas as pd
 import structlog
@@ -94,6 +95,17 @@ def _parse_args() -> argparse.Namespace:
         "scores are PROVISIONAL: not valid for selection, promotion, or "
         "paper-trading qualification.",
     )
+    p.add_argument(
+        "--research-run-id",
+        type=int,
+        required=True,
+        help="research_runs.id (BUG-009 section 4 / migration 012) tagging every "
+        "written factor_scores/alpha_scores row with the methodology that "
+        "produced it. Register one first with "
+        "data.research.identity.register_methodology/register_run — required "
+        "so a new backfill can never silently overwrite an old methodology's "
+        "rows via the ON CONFLICT upsert.",
+    )
     return p.parse_args()
 
 
@@ -104,6 +116,7 @@ def run(
     strategy_id: str,
     batch_size: int,
     dry_run: bool,
+    research_run_id: Optional[int] = None,
     snapshots=None,  # injectable for testing; None → construct from env vars
     universe_id: str = "sp500",
     provisional_no_universe: bool = False,
@@ -226,6 +239,13 @@ def run(
         return
 
     # ── Write to DB in batches ────────────────────────────────────────────────
+    if research_run_id is None:
+        raise ValueError(
+            "research_run_id is required for a non-dry-run write (BUG-009 section "
+            "4 / migration 012): register a research_methodologies/research_runs "
+            "pair first via data.research.identity so this backfill's rows are "
+            "attributable and cannot silently overwrite an old methodology's rows."
+        )
     writer = TimescaleWriter()
     total_factor_rows = 0
     total_alpha_rows = 0
@@ -248,6 +268,7 @@ def run(
         )
         factor_rows["factor_name"] = "momentum"
         factor_rows["strategy_id"] = strategy_id
+        factor_rows["research_run_id"] = research_run_id
 
         # combine_factor_scores expects "date" column — pass the original.
         alpha_frames = []
@@ -264,6 +285,8 @@ def run(
             alpha_frames.append(alpha_df)
 
         alpha_combined = pd.concat(alpha_frames, ignore_index=True) if alpha_frames else pd.DataFrame()
+        if not alpha_combined.empty:
+            alpha_combined["research_run_id"] = research_run_id
 
         n_f = writer.upsert_factor_scores(factor_rows)
         n_a = writer.upsert_alpha_scores(alpha_combined) if not alpha_combined.empty else 0
@@ -298,6 +321,7 @@ def main() -> None:
         strategy_id=args.strategy_id,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        research_run_id=args.research_run_id,
         universe_id=args.universe_id,
         provisional_no_universe=args.provisional_no_universe,
     )

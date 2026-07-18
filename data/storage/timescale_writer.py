@@ -208,13 +208,23 @@ class TimescaleWriter:
     def upsert_factor_scores(self, df: pd.DataFrame) -> int:
         """Upsert factor z-scores into factor_scores.
 
-        Required columns: ticker, score_date, factor_name, strategy_id, z_score.
-        Optional: raw_value.
+        Required columns: ticker, score_date, factor_name, strategy_id,
+        z_score, research_run_id. Optional: raw_value.
+
+        BUG-009 section 4 / migration 012: research_run_id is now part of
+        the table's identity (primary key), not merely a label. Every row
+        must be tagged with the research run that produced it so a new run
+        can never silently UPSERT over an old methodology's rows — the
+        ON CONFLICT target below includes research_run_id, so two runs that
+        happen to score the same (ticker, score_date, factor_name,
+        strategy_id) tuple insert two distinct rows instead of one
+        overwriting the other.
+
         Returns the number of rows written.
         """
         if df.empty:
             return 0
-        required = {"ticker", "score_date", "factor_name", "strategy_id", "z_score"}
+        required = {"ticker", "score_date", "factor_name", "strategy_id", "z_score", "research_run_id"}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"upsert_factor_scores: missing required columns {missing}")
@@ -227,6 +237,7 @@ class TimescaleWriter:
                     "score_date": row["score_date"],
                     "factor_name": row["factor_name"],
                     "strategy_id": row["strategy_id"],
+                    "research_run_id": int(row["research_run_id"]),
                     "z_score": _to_decimal_or_none(row["z_score"]),
                     "raw_value": _to_decimal_or_none(row.get("raw_value")),
                 }
@@ -237,10 +248,10 @@ class TimescaleWriter:
                     text(
                         """
                         INSERT INTO factor_scores
-                            (ticker, score_date, factor_name, strategy_id, z_score, raw_value)
+                            (ticker, score_date, factor_name, strategy_id, research_run_id, z_score, raw_value)
                         VALUES
-                            (:ticker, :score_date, :factor_name, :strategy_id, :z_score, :raw_value)
-                        ON CONFLICT (ticker, score_date, factor_name, strategy_id) DO UPDATE SET
+                            (:ticker, :score_date, :factor_name, :strategy_id, :research_run_id, :z_score, :raw_value)
+                        ON CONFLICT (ticker, score_date, factor_name, strategy_id, research_run_id) DO UPDATE SET
                             z_score     = EXCLUDED.z_score,
                             raw_value   = EXCLUDED.raw_value,
                             computed_at = NOW()
@@ -256,13 +267,17 @@ class TimescaleWriter:
     def upsert_alpha_scores(self, df: pd.DataFrame) -> int:
         """Upsert composite alpha scores into alpha_scores.
 
-        Required columns: ticker, score_date, strategy_id, alpha_score.
-        Optional: rank, universe_size.
+        Required columns: ticker, score_date, strategy_id, alpha_score,
+        research_run_id. Optional: rank, universe_size.
+
+        See :meth:`upsert_factor_scores` for why research_run_id is required
+        and part of the ON CONFLICT target (BUG-009 section 4 / migration 012).
+
         Returns the number of rows written.
         """
         if df.empty:
             return 0
-        required = {"ticker", "score_date", "strategy_id", "alpha_score"}
+        required = {"ticker", "score_date", "strategy_id", "alpha_score", "research_run_id"}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"upsert_alpha_scores: missing required columns {missing}")
@@ -274,6 +289,7 @@ class TimescaleWriter:
                     "ticker": row["ticker"],
                     "score_date": row["score_date"],
                     "strategy_id": row["strategy_id"],
+                    "research_run_id": int(row["research_run_id"]),
                     "alpha_score": _to_decimal_or_none(row["alpha_score"]),
                     "rank": _to_int_or_none(row.get("rank")),
                     "universe_size": _to_int_or_none(row.get("universe_size")),
@@ -285,10 +301,10 @@ class TimescaleWriter:
                     text(
                         """
                         INSERT INTO alpha_scores
-                            (ticker, score_date, strategy_id, alpha_score, rank, universe_size)
+                            (ticker, score_date, strategy_id, research_run_id, alpha_score, rank, universe_size)
                         VALUES
-                            (:ticker, :score_date, :strategy_id, :alpha_score, :rank, :universe_size)
-                        ON CONFLICT (ticker, score_date, strategy_id) DO UPDATE SET
+                            (:ticker, :score_date, :strategy_id, :research_run_id, :alpha_score, :rank, :universe_size)
+                        ON CONFLICT (ticker, score_date, strategy_id, research_run_id) DO UPDATE SET
                             alpha_score    = EXCLUDED.alpha_score,
                             rank           = EXCLUDED.rank,
                             universe_size  = EXCLUDED.universe_size,
