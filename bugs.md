@@ -638,6 +638,51 @@ new `--all-runs` explicit opt-in that itself fails closed (raises) on a
 real cross-run collision rather than silently blending. See BUG-072 for the
 full writeup — that entry is now fully closed.
 
+**Adversarial review round 9 (same day):** one P1, one P2. (1) **P1:**
+`scripts/backfill_momentum_scores.py` silently degraded to raw (unadjusted)
+prices when no `corporate_actions` snapshot was pinned for
+`--snapshot-date`, and LIVE (non-dry-run) writes proceeded anyway —
+persisting momentum scores tagged with a `research_run_id` whose
+registered methodology (`score_cutoff_known_at_v1`) falsely claims
+cutoff-adjusted corporate-action handling was applied. The same
+"provenance lies about what actually happened" pattern as the original P0
+finding this whole task exists to prevent, reached this time via a silent
+degrade instead of missing wiring. Fixed: a live write now fails closed by
+default on a missing snapshot; `--dry-run` stays permissive (preview only,
+never persists — no persisted provenance to lie about). A new
+`--allow-raw-prices-on-missing-actions` opt-in requires `--research-run-id`
+and a new `_validate_raw_prices_methodology_is_honest` helper queries that
+run's registered methodology, refusing to proceed if
+`score_action_availability_policy == "score_cutoff_known_at_v1"` — the
+operator must register and pass a run under a methodology that honestly
+declares no cutoff adjustment was applied. (This script is not
+Airflow-reachable, so using the ORM here is safe, unlike the DAG-reachable
+modules elsewhere in this bug.) New tests
+(`data/tests/universe/test_backfill_universe_filter.py::
+TestMissingActionsFailsClosedOnLiveWrite`,
+`TestValidateRawPricesMethodologyIsHonest`) cover: live write without
+opt-in raises before any DB write, opt-in without `--research-run-id`
+raises, opt-in with a dishonest methodology raises, dry-run stays
+permissive, and the honesty gate is unit tested directly. (2) **P2:** the
+`precomputed_forward_returns` bypass in `compute_ic_series`
+(`signals/research/ic.py`, added round 4) validated columns before use but
+never checked `score_date < entry_date < exit_date` on the supplied rows
+— it deliberately skips the internal `build_return_series` call where
+that invariant is normally enforced, making it the one entry point that
+could silently reintroduce the exact BUG-009 lookahead. Fixed: new
+`_validate_return_series_date_ordering` checks every distinct date triple
+in the frame (deduped across tickers sharing a cross-section), reusing
+`signals.research.timing.reject_same_date` for the score/entry pair and
+raising the same `SameDateScoreError` for entry/exit. Both entry points to
+`compute_ic_series` now enforce the identical invariant. New tests in
+`signals/tests/test_ic.py` reproduce a same-close precomputed frame being
+rejected, an exit-before-entry frame being rejected, and confirm a
+genuinely valid hand-built frame still passes.
+
+The PM independently reproduced and confirmed round 8's BUG-073 testpaths
+finding this round (old buggy config: 1685 vs corrected 2096, previously
+hidden subtrees run clean) — no further action needed there.
+
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
 **Severity:** P0 / signal correctness
