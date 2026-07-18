@@ -16,6 +16,21 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
 
+# BUG-009 section 4 / BUG-072 (adversarial review): research_run_id is part
+# of alpha_scores'/factor_scores' identity (migration 012) -- more than one
+# row can legitimately exist for the same (ticker, score_date, strategy_id)
+# across runs (legacy, superseded, active). Every dashboard query below
+# filters to the explicitly active daily_signal_pipeline_operational run via
+# this subquery rather than reading across all of them. If no run is active,
+# the subquery evaluates to NULL and "research_run_id = NULL" matches
+# nothing -- an empty result, not a crash (dashboards should stay up).
+_ACTIVE_RUN_SUBQUERY = """(
+    SELECT rr.id FROM research_runs rr
+    JOIN research_methodologies rm ON rm.id = rr.methodology_id
+    WHERE rm.name = 'daily_signal_pipeline_operational' AND rr.is_active = TRUE
+)"""
+
+
 # ---------------------------------------------------------------------------
 # Blotter approval queries (Sprint 1 — Page 4)
 # ---------------------------------------------------------------------------
@@ -325,14 +340,15 @@ def latest_alpha_scores(
 ) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT ticker, alpha_score, rank, universe_size
                 FROM alpha_scores
                 WHERE score_date = (
                     SELECT MAX(score_date) FROM alpha_scores
-                    WHERE strategy_id = :sid
+                    WHERE strategy_id = :sid AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 )
                 AND strategy_id = :sid
+                AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY rank ASC
                 LIMIT :lim
             """),
@@ -347,14 +363,15 @@ def bottom_alpha_scores(
     """Return bottom-ranked alpha scores for the latest score_date."""
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT ticker, alpha_score, rank, universe_size
                 FROM alpha_scores
                 WHERE score_date = (
                     SELECT MAX(score_date) FROM alpha_scores
-                    WHERE strategy_id = :sid
+                    WHERE strategy_id = :sid AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 )
                 AND strategy_id = :sid
+                AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY rank DESC
                 LIMIT :lim
             """),
@@ -369,11 +386,12 @@ def factor_scores_for_ticker(
     cutoff = date.today() - timedelta(days=lookback_days)
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT score_date, factor_name, z_score, raw_value
                 FROM factor_scores
                 WHERE ticker = :ticker AND strategy_id = :sid
                   AND score_date >= :cutoff
+                  AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY score_date ASC, factor_name ASC
             """),
             conn,

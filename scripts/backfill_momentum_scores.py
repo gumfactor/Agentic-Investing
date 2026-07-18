@@ -98,13 +98,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--research-run-id",
         type=int,
-        required=True,
+        default=None,
         help="research_runs.id (BUG-009 section 4 / migration 012) tagging every "
         "written factor_scores/alpha_scores row with the methodology that "
         "produced it. Register one first with "
-        "data.research.identity.register_methodology/register_run — required "
-        "so a new backfill can never silently overwrite an old methodology's "
-        "rows via the ON CONFLICT upsert.",
+        "data.research.identity.register_methodology/register_run. Optional "
+        "at the CLI level for --dry-run (which never writes); run() still "
+        "hard-requires it for an actual (non-dry-run) write so a new "
+        "backfill can never silently overwrite an old methodology's rows "
+        "via the ON CONFLICT upsert.",
     )
     return p.parse_args()
 

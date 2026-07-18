@@ -22,7 +22,7 @@ from data.universe.providers.fixture_provider import (
     FixtureSP500Provider,
 )
 from data.universe.runtime import CoverageGapError, PITUniverseLookup
-from scripts.backfill_momentum_scores import run
+from scripts.backfill_momentum_scores import _parse_args, run
 
 
 @pytest.fixture(scope="module")
@@ -388,3 +388,40 @@ class TestBackfillCorporateActionWiring:
         # The synthesized known_at (next session after split_ex_date) is
         # still well before `end`, so the split is still applied.
         assert abs(adj_close - raw_close / 2.0) < 1e-6
+
+
+class TestBackfillArgparseResearchRunId:
+    """Codex round-4 P2: --dry-run never persists (research_run_id=None is
+    explicitly allowed in that code path), so --research-run-id must not be
+    a required CLI argument -- only run()'s actual write path enforces it."""
+
+    def test_dry_run_does_not_require_research_run_id(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "backfill_momentum_scores.py",
+                "--snapshot-date", "2026-06-10",
+                "--start", "2020-01-02",
+                "--end", "2020-06-30",
+                "--strategy-id", "v1",
+                "--dry-run",
+            ],
+        )
+        args = _parse_args()  # must not raise / exit
+        assert args.research_run_id is None
+        assert args.dry_run is True
+
+    def test_research_run_id_still_accepted_when_provided(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "backfill_momentum_scores.py",
+                "--snapshot-date", "2026-06-10",
+                "--start", "2020-01-02",
+                "--end", "2020-06-30",
+                "--strategy-id", "v1",
+                "--research-run-id", "42",
+            ],
+        )
+        args = _parse_args()
+        assert args.research_run_id == 42
