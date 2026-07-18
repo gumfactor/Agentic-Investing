@@ -100,7 +100,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-069 | Data/Universe | P2 | F2 | Deferred (operator-accepted 2026-07-18) | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
 | BUG-070 | Backtesting | P1 | F2 | Open | Backtester loads a single full-history (non-cutoff-aware) adjusted price series, shared for both scoring and execution. |
 | BUG-071 | Research/Signals | P2 | F2 | Open | IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff (documented residual). |
-| BUG-072 | Dashboard/API | P2 | F2 | Open | Streamlit dashboard queries and scripts/indicator_diagnostic.py read alpha_scores/factor_scores without an active-research-run filter; can display duplicate rows across a run rotation. |
+| BUG-072 | Dashboard/API | P2 | F2 | Partially fixed | `reporting/dashboards/queries.py` alpha/factor-score queries now filter to the active research run; `scripts/indicator_diagnostic.py` remains open (deferred, research/diagnostic tool). |
 
 #### Long-term / lower-risk backlog
 
@@ -466,6 +466,40 @@ genuinely migrated live-table read. See BUG-072 for the one reader class
 (Streamlit dashboard queries, `scripts/indicator_diagnostic.py`) explicitly
 scoped OUT of this round with rationale, rather than silently left
 unaddressed.
+
+**Adversarial review round 4 (same day) — the most serious finding of this
+whole review series:** the single-run-boundary-cutoff simplification
+documented as BUG-071 was safe for the SCORE series but NOT for the
+REALIZED-RETURN series: for an earlier exit date in a holdout, an action
+whose `ex_date` fell between that specific entry/exit pair but whose
+`known_at` was after that exit (yet before the later shared boundary) was
+incorrectly included — future information leaking into a persisted,
+"PIT-safe" IC result, for every exit date in a holdout except the very
+last one. This is fixed, not approximated: new
+`signals.research.ic.compute_realized_forward_returns_as_of` builds a
+genuinely per-exit-date-cutoff-correct realized-return series (one
+`build_realized_total_return_as_of` call per distinct exit date needed,
+not one shared boundary), and `compute_ic_series` gained a
+`precomputed_forward_returns` parameter so `scripts/validate_signal_ic.py`
+can feed it in directly, bypassing the same-series shortcut entirely for
+the realized-return leg. `_build_adjusted_price_series` was split into
+`_build_score_adjusted_prices` (score leg only, single boundary cutoff —
+re-verified safe for a structurally different reason than the
+realized-return case, see BUG-071's updated entry) plus the new realized-
+return path. A new test (`TestComputeRealizedForwardReturnsAsOf::
+test_action_unknown_at_earlier_exit_does_not_adjust_it`) reproduces the
+exact leak scenario and proves the earlier exit's return is unaffected by
+an action not yet known at ITS cutoff, while a later exit whose own cutoff
+does cover it is adjusted correctly.
+
+Also fixed the same round: `scripts/backfill_momentum_scores.py`'s
+`--research-run-id` CLI flag is no longer `required=True` (it blocked the
+documented `--dry-run` preview command, which never persists and never
+needed it — `run()` still hard-requires it for an actual write); and
+`reporting/dashboards/queries.py`'s `latest_alpha_scores`/
+`bottom_alpha_scores`/`factor_scores_for_ticker` now filter to the active
+research run (closing the `queries.py` portion of BUG-072 — see that
+entry for what remains open there).
 
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
@@ -1144,96 +1178,108 @@ Reject a requested backtest run when the required corporate-action data
 cannot be constructed for either series, rather than silently falling back
 to `adj_factor=1.0`.
 
-### BUG-071: IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff
+### BUG-071: Score-series cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff
 
 **Severity:** P2 / research validity (narrow residual gap, discovered during
-01B-3's P0 fix round)
+01B-3's P0 fix round; re-verified and re-scoped in round 4 after a
+related, more severe finding on the REALIZED-RETURN leg)
 
-**Status:** Open, documented by design (accepted residual, not a fix
-deferral without analysis). `scripts/validate_signal_ic.py::
-_build_adjusted_price_series` and `scripts/backfill_momentum_scores.py`
-compute scores for many dates in one vectorized pass and adjust the WHOLE
-price history using a single boundary cutoff (the session close of the
-latest available/`--end` price date), not a literal per-score-date cutoff.
+**Status:** Open for the SCORE leg only, re-verified and re-scoped —
+CLOSED (fixed) for the realized-return leg, which this bug originally
+also covered. Do not conflate the two: they turned out to need different
+verdicts.
 
-**Why this is provably safe for the cases that matter:** for a window/
-ratio-based indicator (momentum, low-vol — everything BUG-070/071 wires),
-a uniform multiplicative adjustment factor applied across an entire
-lookback window cancels out of any price RATIO computed within that window.
-An action whose `ex_date` falls AFTER a given score_date's window has
-literally no effect on that score's value whether a per-date or a global
-boundary cutoff is used. Given the system's conservative next-session
-`known_at` rule for date-only sources, an action with `ex_date` strictly
-before a score_date is always already knowable by that score_date's own
-cutoff, so it is correctly included either way.
+**Round-4 history (read this first):** adversarial review round 4 found
+that the single-boundary-cutoff shortcut this bug originally described for
+BOTH the score series and the realized-return series was actually UNSAFE
+for realized returns — an action not yet knowable at an EARLIER exit
+date's own cutoff, but knowable by the later shared boundary, was
+incorrectly included in that earlier exit's return: future information
+leaking into a persisted, "PIT-safe" result. That was a real defect, not a
+narrow edge case, and is now FIXED: `scripts/validate_signal_ic.py` uses
+`signals.research.ic.compute_realized_forward_returns_as_of`, which builds
+a genuinely per-exit-date-cutoff-correct series (one
+`build_realized_total_return_as_of` call per distinct exit date, not one
+shared boundary) — see the fixing commit for the full derivation and a
+reproduction test (`TestComputeRealizedForwardReturnsAsOf` /
+`TestRealizedForwardReturnsWiring`).
 
-**Residual gap:** the one case a literal per-score-date cutoff would treat
-differently is an action whose `ex_date` falls exactly ON a given
-score_date — not yet knowable at that exact session's own close under the
-conservative rule, but includable once the global run boundary has passed
-it. This is a single-session edge case per affected ticker/action, not the
-"zero adjustment happens at all" gap BUG-070/this fix closes.
+Per the same round's instruction, the SCORE series' original cancellation
+argument was re-examined rather than assumed still valid: `scripts/
+validate_signal_ic.py::_build_score_adjusted_prices` (renamed from
+`_build_adjusted_price_series`, which no longer exists — it built both
+series with the same flawed approach) still uses one boundary cutoff, and
+this remains provably safe for a DIFFERENT structural reason than the
+realized-return case: a score's ratio is always computed between two dates
+INSIDE the same lookback window, both on the same side of any action whose
+`ex_date` is after the window's end (the score_date) — there is no second,
+later "exit" endpoint the way a realized return has, so the failure mode
+round 4 found cannot arise here. See `_build_score_adjusted_prices`'s
+docstring for the full re-verified derivation.
 
-**Suggested direction:** if full per-score-date correctness is later
-required, either (a) loop score-date-by-score-date building a distinct
-adjusted series per date (correctness at the cost of losing the vectorized
-pass's performance), or (b) special-case actions whose `ex_date` falls
-inside the union of all requested score dates and mask just those specific
-(ticker, score_date) pairs after the vectorized computation.
+**Residual gap for the score leg:** the one case a literal per-score-date
+cutoff would treat differently is an action whose `ex_date` falls exactly
+ON a given score_date — not yet knowable at that exact session's own close
+under the conservative rule, but includable once the global run boundary
+has passed it. This is a single-session edge case per affected
+ticker/action, not the "zero adjustment happens at all" gap the original
+P0 fix closed, and not the "future information leaks across an entire
+holdout" class of bug round 4 found (and fixed) in the realized-return
+path.
+
+**Suggested direction (score leg only):** if full per-score-date
+correctness is later required for scores too, either (a) loop
+score-date-by-score-date building a distinct adjusted series per date
+(correctness at the cost of losing the vectorized pass's performance —
+`signals.composites.*` compute an entire panel in one call, so this would
+require restructuring those composites, not just this script), or (b)
+special-case actions whose `ex_date` falls inside the union of all
+requested score dates and mask just those specific (ticker, score_date)
+pairs after the vectorized computation.
 
 ### BUG-072: Dashboard/diagnostic readers of alpha_scores/factor_scores are not filtered to the active research run
 
 **Severity:** P2 / display correctness (discovered during 01B-3's
-adversarial-review round 3, scoped out of that round's fix)
+adversarial-review round 3, scoped out of that round's fix; dashboard
+portion closed in round 4)
 
-**Status:** Open, deliberately deferred with rationale (not silently
-skipped). Round 3 of adversarial review on PR #35 found that
-`scripts/paper_inputs_check.py` (and, through it,
+**Status:** Partially fixed. Round 3 of adversarial review on PR #35 found
+that `scripts/paper_inputs_check.py` (and, through it,
 `scripts/paper_target_check.py`/`paper_order_candidates_check.py`/
 `paper_risk_compliance_check.py`/`paper_stage_blotter_check.py`),
 `airflow/dags/daily_signal_pipeline.py`'s two internal readers, and
 `scripts/pin_snapshot.py` all read `alpha_scores`/`factor_scores` without
 filtering to the explicitly active `research_run_id` — the production-
-safety-critical instances (paper-trading order construction, the DAG's own
-simulation fallback, and backtest bundle pinning) were fixed in that same
-round (commits fixing the P1/P2 findings; see BUG-009's status notes).
+safety-critical instances were fixed in round 3 (see BUG-009's status
+notes). Round 4 (Codex, independently) flagged the same gap in
+`reporting/dashboards/queries.py`'s `latest_alpha_scores`,
+`bottom_alpha_scores`, and `factor_scores_for_ticker` and it was fixed the
+same round: each now joins against an `_ACTIVE_RUN_SUBQUERY` filtering to
+the active `daily_signal_pipeline_operational` run, degrading to an empty
+result (not a crash) when none is active. New tests
+(`tests/reporting/dashboards/test_sprint3_queries.py::
+TestActiveResearchRunFiltering`) prove a stale/inactive run's colliding row
+is excluded and that no-active-run degrades gracefully.
 
-**Evidence:** `reporting/dashboards/queries.py` (`latest_alpha_scores`,
-`bottom_alpha_scores`, `factor_scores_for_ticker`, `alpha_score_at_fill_date`,
-`factor_scores_at_fill_date`, and related Sprint 3/4 query functions),
-`reporting/dashboards/simulation.py`, and `scripts/indicator_diagnostic.py`
-all `SELECT ... FROM alpha_scores`/`factor_scores` filtered only by
-`strategy_id`/`ticker`/date range — never by `research_run_id`.
+**Still open:** `reporting/dashboards/simulation.py`,
+`reporting/dashboards/queries.py`'s `alpha_score_at_fill_date`/
+`factor_scores_at_fill_date` (audit-trail drill-down queries, Sprint 4),
+and `scripts/indicator_diagnostic.py` were not touched in round 4 and
+retain the same gap.
 
-**Impact:** After a backfill or run rotation writes a second
-`research_run_id` for dates/tickers the dashboard or diagnostic tool also
-queries, these read paths can return more than one row per natural key,
-double-counting or displaying an arbitrary/inconsistent row in the
-Streamlit UI or diagnostic output. This is a display-correctness issue, not
-an order-construction or DAG-write-path safety issue (those are fixed) —
-scoped down accordingly rather than left completely unaddressed.
+**Impact (remaining scope):** after a backfill or run rotation writes a
+second `research_run_id` for dates/tickers these remaining read paths also
+query, they can still return more than one row per natural key,
+double-counting or displaying an arbitrary/inconsistent row. Display-
+correctness only — not an order-construction or DAG-write-path safety
+issue (those are fixed).
 
-**Why deferred rather than fixed in the same round:** the paper-trading and
-DAG fixes required updating 6 test fixture files' `_engine()` helpers plus a
-new shared test helper (`tests/_research_run_test_helpers.py`); the
-dashboard/diagnostic surface spans a comparable number of query functions
-across `reporting/dashboards/queries.py`, `reporting/dashboards/
-simulation.py`, and their own test suites
-(`tests/reporting/dashboards/test_sprint2_queries.py`,
-`test_sprint3_queries.py`, `test_sprint4.py`, `test_blotter_approval.py`,
-`test_page4_integration.py`), none of which currently set up
-`research_methodologies`/`research_runs`. Given the production-safety
-findings were the priority for this fix round, this lower-severity surface
-is recorded here rather than rushed.
-
-**Suggested direction:** add an `AND research_run_id = (<active-run
-subquery for daily_signal_pipeline_operational>)` clause (or an explicit
-`research_run_id` parameter, defaulting to the active run) to each
-`alpha_scores`/`factor_scores` query in `reporting/dashboards/queries.py`
-and `reporting/dashboards/simulation.py`, degrading to an empty result
-(not a crash — dashboards should stay up) when no run is active.
-`scripts/indicator_diagnostic.py` is a research/diagnostic tool per
-`docs/plans/01b-research-validity-design.md`'s "explicit opt-in for
-cross-run reads" principle — give it an explicit `--research-run-id`
-flag (optional) rather than a silent default filter, mirroring
-`scripts/pin_snapshot.py`'s `--research-run-id` fix.
+**Suggested direction (remaining scope):** apply the same
+`_ACTIVE_RUN_SUBQUERY` pattern now established in
+`reporting/dashboards/queries.py` to `alpha_score_at_fill_date`/
+`factor_scores_at_fill_date` and to `reporting/dashboards/simulation.py`'s
+alpha_scores query. `scripts/indicator_diagnostic.py` is a research/
+diagnostic tool per `docs/plans/01b-research-validity-design.md`'s
+"explicit opt-in for cross-run reads" principle — give it an explicit
+`--research-run-id` flag (optional) rather than a silent default filter,
+mirroring `scripts/pin_snapshot.py`'s `--research-run-id` fix.
