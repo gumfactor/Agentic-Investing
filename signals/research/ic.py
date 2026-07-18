@@ -51,8 +51,10 @@ from statsmodels.regression.linear_model import OLS
 from signals.research.timing import (
     DEFAULT_TIMING_POLICY,
     RETURN_SERIES_COLUMNS,
+    SameDateScoreError,
     TimingPolicy,
     build_return_series,
+    reject_same_date,
 )
 
 logger = structlog.get_logger(__name__)
@@ -312,6 +314,14 @@ def compute_ic_series(
                 f"precomputed_forward_returns is missing columns: {missing_cols}"
             )
         fwd = precomputed_forward_returns
+        # BUG-009 round-9 P2 fix: this bypass skips the internal
+        # build_return_series call where score_date < entry_date < exit_date
+        # is normally enforced, so a legacy or hand-built same-close frame
+        # could pass straight through undetected -- the exact lookahead this
+        # whole task exists to prevent, reachable via the one entry point
+        # that doesn't already guard against it. Validate explicitly before
+        # anything else touches this frame.
+        _validate_return_series_date_ordering(fwd)
         # BUG-009 round-5 P2 fix: stamp output rows with the POLICY ACTUALLY
         # USED to build this frame, not the timing_policy argument (which a
         # precomputed-forward-returns caller may not have even supplied
@@ -1049,3 +1059,44 @@ def _validate_prices(prices: pd.DataFrame) -> None:
         raise ValueError(f"prices DataFrame missing columns: {missing}")
     if prices.empty:
         raise ValueError("prices DataFrame is empty")
+
+
+def _validate_return_series_date_ordering(fwd: pd.DataFrame) -> None:
+    """Enforce score_date < entry_date < exit_date on every row of a
+    ``precomputed_forward_returns`` frame (adversarial-review round 9,
+    BUG-009 §2.1/2.5).
+
+    The normal path (``prices`` supplied, no precompute) always builds its
+    return series via :func:`signals.research.timing.build_return_series`,
+    which enforces this invariant internally. The
+    ``precomputed_forward_returns`` bypass (added for the round-4
+    per-exit-date-cutoff-correct realized-return fix) exists *specifically*
+    to let a caller substitute a hand-built or externally-constructed frame
+    -- which means it is also the one entry point that could silently
+    reintroduce the exact same-close lookahead BUG-009 exists to prevent,
+    with no internal call to ``build_return_series`` ever validating it.
+    This closes that gap so both entry points to :func:`compute_ic_series`
+    enforce the same core invariant.
+
+    Checked on the DISTINCT (score_date, entry_date, exit_date) combinations
+    rather than every row, since the same date triple is typically repeated
+    across every ticker in a cross-section -- correctness is unaffected
+    (every row still gets checked via its date triple; only the number of
+    ``reject_same_date`` calls is reduced) but this avoids O(n_rows) redundant
+    checks on a frame with many tickers per date.
+    """
+    if fwd.empty:
+        return
+    triples = fwd[["score_date", "entry_date", "exit_date"]].drop_duplicates()
+    for score_date, entry_date, exit_date in triples.itertuples(index=False):
+        # score_date < entry_date (the BUG-009 §2.1 baseline invariant).
+        reject_same_date(score_date, entry_date)
+        # entry_date < exit_date: a horizon must still move forward from
+        # entry, or a "forward return" could be zero-or-negative-length --
+        # not caught by reject_same_date alone, which only checks the first
+        # pair.
+        if not entry_date < exit_date:
+            raise SameDateScoreError(
+                f"entry_date {entry_date} must be strictly before exit_date "
+                f"{exit_date} (BUG-009 section 2.1) for score_date {score_date}."
+            )

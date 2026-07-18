@@ -472,6 +472,91 @@ class TestComputeRealizedForwardReturnsAsOf:
                 scores, None, score_col="score", horizons=[1], precomputed_forward_returns=fwd
             )
 
+    def test_precomputed_forward_returns_same_close_score_date_rejected(self):
+        """Adversarial-review round 9 (BUG-009): the precomputed-frame bypass
+        skips the internal build_return_series call where score_date <
+        entry_date is normally enforced. A legacy or hand-built same-close
+        frame (entry_date == score_date, reproducing the ORIGINAL BUG-009
+        lookahead) must be rejected here too, not silently accepted just
+        because it arrived via this entry point instead of the normal one."""
+        d = self._dates(6)
+        tickers = ["A", "B", "C", "D", "E", "F"]
+        fwd_rows = []
+        for i, t in enumerate(tickers):
+            fwd_rows.append({
+                "ticker": t,
+                "score_date": d[0],
+                "entry_date": d[0],  # same-close lookahead: entry == score
+                "exit_date": d[1],
+                "horizon_days": 1,
+                "forward_return": 0.01 * i,
+                "timing_policy_id": "legacy_same_close_v0",
+            })
+        fwd = pd.DataFrame(fwd_rows)
+        scores = pd.DataFrame(
+            [{"ticker": t, "date": d[0], "score": float(i)} for i, t in enumerate(tickers)]
+        )
+        with pytest.raises(SameDateScoreError, match="score_date"):
+            compute_ic_series(
+                scores, None, score_col="score", horizons=[1], precomputed_forward_returns=fwd
+            )
+
+    def test_precomputed_forward_returns_entry_after_exit_rejected(self):
+        """entry_date must also be strictly before exit_date -- a
+        zero-or-negative-length "forward" return is just as invalid as a
+        same-close one, and reject_same_date alone only checks the
+        score_date/entry_date pair."""
+        d = self._dates(6)
+        tickers = ["A", "B", "C", "D", "E", "F"]
+        fwd_rows = []
+        for i, t in enumerate(tickers):
+            fwd_rows.append({
+                "ticker": t,
+                "score_date": d[0],
+                "entry_date": d[2],
+                "exit_date": d[1],  # exit BEFORE entry
+                "horizon_days": 1,
+                "forward_return": 0.01 * i,
+                "timing_policy_id": "custom_policy_v9",
+            })
+        fwd = pd.DataFrame(fwd_rows)
+        scores = pd.DataFrame(
+            [{"ticker": t, "date": d[0], "score": float(i)} for i, t in enumerate(tickers)]
+        )
+        with pytest.raises(SameDateScoreError, match="exit_date"):
+            compute_ic_series(
+                scores, None, score_col="score", horizons=[1], precomputed_forward_returns=fwd
+            )
+
+    def test_precomputed_forward_returns_valid_ordering_still_passes(self):
+        """Sanity: the new validation must not reject a genuinely valid
+        precomputed frame (score_date < entry_date < exit_date on every
+        row) -- covered implicitly by
+        test_feeds_compute_ic_series_via_precomputed_forward_returns, but
+        asserted directly here against a hand-built frame rather than one
+        built via compute_realized_forward_returns_as_of."""
+        d = self._dates(6)
+        tickers = ["A", "B", "C", "D", "E", "F"]
+        fwd_rows = []
+        for i, t in enumerate(tickers):
+            fwd_rows.append({
+                "ticker": t,
+                "score_date": d[0],
+                "entry_date": d[1],
+                "exit_date": d[2],
+                "horizon_days": 1,
+                "forward_return": 0.01 * i,
+                "timing_policy_id": "custom_policy_v9",
+            })
+        fwd = pd.DataFrame(fwd_rows)
+        scores = pd.DataFrame(
+            [{"ticker": t, "date": d[0], "score": float(i)} for i, t in enumerate(tickers)]
+        )
+        result = compute_ic_series(
+            scores, None, score_col="score", horizons=[1], precomputed_forward_returns=fwd
+        )
+        assert not result.empty
+
 
 # ─── compute_ic_series ────────────────────────────────────────────────────────
 
