@@ -100,6 +100,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-069 | Data/Universe | P2 | F2 | Deferred (operator-accepted 2026-07-18) | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
 | BUG-070 | Backtesting | P1 | F2 | Open | Backtester loads a single full-history (non-cutoff-aware) adjusted price series, shared for both scoring and execution. |
 | BUG-071 | Research/Signals | P2 | F2 | Open | IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff (documented residual). |
+| BUG-072 | Dashboard/API | P2 | F2 | Open | Streamlit dashboard queries and scripts/indicator_diagnostic.py read alpha_scores/factor_scores without an active-research-run filter; can display duplicate rows across a run rotation. |
 
 #### Long-term / lower-risk backlog
 
@@ -421,6 +422,50 @@ register and activate the `daily_signal_pipeline_operational` methodology/
 run — otherwise the next scheduled DAG run (`30 21 * * 1-5`) fails closed
 with `NoActiveResearchRunError`. See
 `docs/runbooks/research_run_registration.md`.
+
+**Adversarial review round 2 (same day):** two more confirmed findings.
+`airflow/dags/daily_signal_pipeline.py` never got the corporate-action
+adjustment wiring the CLI scripts received — `_load_prices` now also loads
+`corporate_actions` and calls `build_score_price_history_as_of` with
+`score_cutoff = session_close_cutoff(end_date)` (this DAG scores exactly one
+date per run, so this is the exact per-date cutoff, no BUG-071-style
+approximation) before `_compute_momentum`/`_compute_lowvol` run; a new
+`adjusted_prices_json` XCom key carries the adjusted series,
+`_compute_value`/`_compute_quality` keep the raw `prices_json` key. Fixing
+this surfaced a second, unrelated latent bug: `_write_scores`'s active-run
+lookup imported `data.research.identity`, which imports SQLAlchemy-2-only
+ORM APIs the packaged Airflow image (SQLAlchemy 1.4.51 pinned, see
+`infra/docker/Dockerfile.airflow`) cannot import — replaced with a plain-SQL
+`_get_active_research_run_id_sql`, kept in semantic lockstep via new parity
+tests, and the DAG's existing import-isolation test now bans that import
+path. Also fixed: migration 011's `sys.path` shim resolved to `infra/`, not
+the repo root (`parents[3]` → `parents[4]`, with an assertion guard).
+
+**Adversarial review round 3 (same day):** research_run_id is now part of
+`alpha_scores`/`factor_scores` identity, so multiple rows can legitimately
+coexist for the same `(ticker, score_date, strategy_id)` across runs
+(legacy, superseded, active) — every production reader must filter to the
+active run explicitly, never read across all of them. Fixed:
+`scripts/paper_inputs_check.py::_load_latest_scores` (and, through it,
+`paper_target_check.py`/`paper_order_candidates_check.py`/
+`paper_risk_compliance_check.py`/`paper_stage_blotter_check.py`, all of
+which import it) now resolves and filters to the active
+`daily_signal_pipeline_operational` run, failing closed with an actionable
+message if none is active; `daily_signal_pipeline.py`'s `_write_simulation`
+fallback query (for strategies not present in the current run's own XCom)
+now filters the same way, degrading (skip, not crash) if no active run can
+be resolved; `scripts/pin_snapshot.py` gained a `--research-run-id` option
+and detects+rejects (rather than silently pinning) the case where more than
+one run's rows collide on the same `(ticker, score_date)`. Also fixed (P2):
+`scripts/backfill_momentum_scores.py` raised a bare `KeyError` against a
+`corporate_actions` snapshot pinned before migration 011 (no
+`known_at`/`source_version` columns); it now synthesizes `known_at` via the
+same conservative next-session rule migration 011 used, tagging synthesized
+rows with a distinct `source_version` so they remain distinguishable from a
+genuinely migrated live-table read. See BUG-072 for the one reader class
+(Streamlit dashboard queries, `scripts/indicator_diagnostic.py`) explicitly
+scoped OUT of this round with rationale, rather than silently left
+unaddressed.
 
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
@@ -1135,3 +1180,60 @@ adjusted series per date (correctness at the cost of losing the vectorized
 pass's performance), or (b) special-case actions whose `ex_date` falls
 inside the union of all requested score dates and mask just those specific
 (ticker, score_date) pairs after the vectorized computation.
+
+### BUG-072: Dashboard/diagnostic readers of alpha_scores/factor_scores are not filtered to the active research run
+
+**Severity:** P2 / display correctness (discovered during 01B-3's
+adversarial-review round 3, scoped out of that round's fix)
+
+**Status:** Open, deliberately deferred with rationale (not silently
+skipped). Round 3 of adversarial review on PR #35 found that
+`scripts/paper_inputs_check.py` (and, through it,
+`scripts/paper_target_check.py`/`paper_order_candidates_check.py`/
+`paper_risk_compliance_check.py`/`paper_stage_blotter_check.py`),
+`airflow/dags/daily_signal_pipeline.py`'s two internal readers, and
+`scripts/pin_snapshot.py` all read `alpha_scores`/`factor_scores` without
+filtering to the explicitly active `research_run_id` — the production-
+safety-critical instances (paper-trading order construction, the DAG's own
+simulation fallback, and backtest bundle pinning) were fixed in that same
+round (commits fixing the P1/P2 findings; see BUG-009's status notes).
+
+**Evidence:** `reporting/dashboards/queries.py` (`latest_alpha_scores`,
+`bottom_alpha_scores`, `factor_scores_for_ticker`, `alpha_score_at_fill_date`,
+`factor_scores_at_fill_date`, and related Sprint 3/4 query functions),
+`reporting/dashboards/simulation.py`, and `scripts/indicator_diagnostic.py`
+all `SELECT ... FROM alpha_scores`/`factor_scores` filtered only by
+`strategy_id`/`ticker`/date range — never by `research_run_id`.
+
+**Impact:** After a backfill or run rotation writes a second
+`research_run_id` for dates/tickers the dashboard or diagnostic tool also
+queries, these read paths can return more than one row per natural key,
+double-counting or displaying an arbitrary/inconsistent row in the
+Streamlit UI or diagnostic output. This is a display-correctness issue, not
+an order-construction or DAG-write-path safety issue (those are fixed) —
+scoped down accordingly rather than left completely unaddressed.
+
+**Why deferred rather than fixed in the same round:** the paper-trading and
+DAG fixes required updating 6 test fixture files' `_engine()` helpers plus a
+new shared test helper (`tests/_research_run_test_helpers.py`); the
+dashboard/diagnostic surface spans a comparable number of query functions
+across `reporting/dashboards/queries.py`, `reporting/dashboards/
+simulation.py`, and their own test suites
+(`tests/reporting/dashboards/test_sprint2_queries.py`,
+`test_sprint3_queries.py`, `test_sprint4.py`, `test_blotter_approval.py`,
+`test_page4_integration.py`), none of which currently set up
+`research_methodologies`/`research_runs`. Given the production-safety
+findings were the priority for this fix round, this lower-severity surface
+is recorded here rather than rushed.
+
+**Suggested direction:** add an `AND research_run_id = (<active-run
+subquery for daily_signal_pipeline_operational>)` clause (or an explicit
+`research_run_id` parameter, defaulting to the active run) to each
+`alpha_scores`/`factor_scores` query in `reporting/dashboards/queries.py`
+and `reporting/dashboards/simulation.py`, degrading to an empty result
+(not a crash — dashboards should stay up) when no run is active.
+`scripts/indicator_diagnostic.py` is a research/diagnostic tool per
+`docs/plans/01b-research-validity-design.md`'s "explicit opt-in for
+cross-run reads" principle — give it an explicit `--research-run-id`
+flag (optional) rather than a silent default filter, mirroring
+`scripts/pin_snapshot.py`'s `--research-run-id` fix.
