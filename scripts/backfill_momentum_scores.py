@@ -26,14 +26,14 @@ date.  It fails closed when no published import exists or when any score date
 falls outside the validated coverage window.  --provisional-no-universe
 skips the membership filter with a loud warning; the resulting scores are
 PROVISIONAL and must not be used for selection, promotion, or paper-trading
-qualification. A LIVE (non-dry-run) write combining --provisional-no-universe
-with --research-run-id additionally fails closed if that run's registered
-methodology claims PIT-universe safety (universe_import_policy =
-"pit_universe_effective_dated_v1") -- adversarial-review round 10: the same
-honesty-check pattern as the round-9 corporate-action gate below, applied to
-the universe dimension, so a downstream reader filtering solely by
-research_run_id can never silently consume current-membership
-(survivorship-biased) rows while believing them PIT-safe.
+qualification. A LIVE (non-dry-run) write additionally fails closed if
+--research-run-id's registered methodology claims something this run did not
+actually do -- PIT-universe safety (--provisional-no-universe skipped
+membership filtering) or cutoff-adjusted corporate-action handling (the
+snapshot was missing) -- via the single shared
+data.research.sql_compat.assert_methodology_write_is_honest gate
+(adversarial-review round 11; consolidates what used to be two separate
+script-local checks here).
 
 Usage
 ------
@@ -132,98 +132,6 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _get_methodology_fields_for_run(research_run_id: int) -> dict:
-    """Look up the (name, score_action_availability_policy,
-    universe_import_policy) of the methodology a research_run_id is tagged
-    with. Returns plain dict values, read while the session is still open
-    (round 8 lesson: never return/leak a live ORM instance past its session
-    -- session.commit()/close expires attributes and raises
-    DetachedInstanceError on later access). Shared by both honesty checks
-    below so the session/lookup boilerplate exists in exactly one place.
-    """
-    import os
-
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import Session
-
-    from data.research.models import ResearchMethodology, ResearchRun
-
-    engine = create_engine(os.environ["DATABASE_URL"])
-    with Session(engine) as session:
-        run_row = session.get(ResearchRun, research_run_id)
-        if run_row is None:
-            raise ValueError(
-                f"--research-run-id={research_run_id} does not exist in research_runs."
-            )
-        methodology = session.get(ResearchMethodology, run_row.methodology_id)
-        if methodology is None:
-            raise ValueError(
-                f"research_runs.id={research_run_id} references a missing "
-                f"methodology_id={run_row.methodology_id}."
-            )
-        return {
-            "name": methodology.name,
-            "score_action_availability_policy": methodology.score_action_availability_policy,
-            "universe_import_policy": methodology.universe_import_policy,
-        }
-
-
-def _validate_raw_prices_methodology_is_honest(research_run_id: int) -> None:
-    """Refuse to persist raw/unadjusted momentum scores under a methodology
-    that claims cutoff-adjustment was applied (adversarial-review round 9,
-    BUG-009 section 2.3/4): that is the same "provenance lies about what
-    actually happened" pattern as the original P0 finding this whole task
-    exists to prevent, just reached via a silent degrade (missing
-    corporate_actions snapshot) instead of missing wiring. This script is
-    not Airflow-reachable, so the ORM (data.research.models/identity) is
-    safe to use here unlike the DAG-reachable modules elsewhere in 01B-3.
-    """
-    fields = _get_methodology_fields_for_run(research_run_id)
-    if fields["score_action_availability_policy"] == "score_cutoff_known_at_v1":
-        raise ValueError(
-            f"--research-run-id={research_run_id} is tagged with methodology "
-            f"{fields['name']!r}, whose score_action_availability_policy is "
-            "'score_cutoff_known_at_v1' -- it claims cutoff-adjusted "
-            "corporate-action handling was applied. Writing RAW (unadjusted) "
-            "momentum scores under that methodology would misrepresent what "
-            "was actually computed (BUG-009). Register a distinct methodology "
-            "whose score_action_availability_policy honestly declares no "
-            "cutoff adjustment was applied (e.g. "
-            "'raw_unadjusted_no_corporate_action_data'), activate a run under "
-            "it, and pass that run's id instead."
-        )
-
-
-def _validate_provisional_no_universe_methodology_is_honest(research_run_id: int) -> None:
-    """Refuse to persist current-membership (non-PIT, survivorship-biased)
-    scores under a methodology that claims point-in-time universe safety
-    (adversarial-review round 10, BUG-008/BUG-009): the same honesty-check
-    pattern as :func:`_validate_raw_prices_methodology_is_honest`, on a
-    different dimension. --provisional-no-universe correctly skips PIT
-    membership filtering, but nothing else stops an operator from tagging
-    the resulting rows with the ACTIVE operational research_run_id, whose
-    registered methodology (universe_import_policy=
-    "pit_universe_effective_dated_v1") claims PIT-universe safety.
-    Downstream readers filter solely by research_run_id (BUG-072), so they
-    would silently consume current-membership rows believing them PIT-safe.
-    """
-    fields = _get_methodology_fields_for_run(research_run_id)
-    if fields["universe_import_policy"] == "pit_universe_effective_dated_v1":
-        raise ValueError(
-            f"--research-run-id={research_run_id} is tagged with methodology "
-            f"{fields['name']!r}, whose universe_import_policy is "
-            "'pit_universe_effective_dated_v1' -- it claims point-in-time "
-            "universe membership filtering was applied. Writing "
-            "--provisional-no-universe (current-membership, "
-            "survivorship-biased) scores under that methodology would "
-            "misrepresent what was actually computed (BUG-008/BUG-009). "
-            "Register a distinct methodology whose universe_import_policy "
-            "honestly declares no PIT filtering was applied (e.g. "
-            "'legacy_current_membership_no_pit_enforcement'), activate a run "
-            "under it, and pass that run's id instead."
-        )
-
-
 def run(
     snapshot_date: date,
     start: date,
@@ -292,16 +200,18 @@ def run(
         # solely by research_run_id (BUG-072) and would silently consume
         # current-membership (survivorship-biased) rows believing them
         # PIT-safe. A dry run never persists, so it stays permissive; a live
-        # write must not lie about its own methodology.
-        if not dry_run:
-            if research_run_id is None:
-                raise ValueError(
-                    "--provisional-no-universe on a live (non-dry-run) write "
-                    "requires --research-run-id so the run's methodology can "
-                    "be validated for honesty before any scores are computed "
-                    "(BUG-008/BUG-009)."
-                )
-            _validate_provisional_no_universe_methodology_is_honest(research_run_id)
+        # write must not lie about its own methodology. The actual honesty
+        # check (round 11: routed through the single shared
+        # data.research.sql_compat.assert_methodology_write_is_honest gate,
+        # not a script-local variant) happens once, below, after the
+        # corporate-action state is also known -- see that call for why.
+        if not dry_run and research_run_id is None:
+            raise ValueError(
+                "--provisional-no-universe on a live (non-dry-run) write "
+                "requires --research-run-id so the run's methodology can "
+                "be validated for honesty before any scores are computed "
+                "(BUG-008/BUG-009)."
+            )
     else:
         import os
 
@@ -341,9 +251,11 @@ def run(
     from data.normalization.corporate_actions import build_score_price_history_as_of
     from data.universe.calendar import session_close_cutoff
 
+    corporate_actions_snapshot_missing = False
     try:
         corporate_actions = snaps.load_snapshot("corporate_actions", snapshot_date)
     except FileNotFoundError:
+        corporate_actions_snapshot_missing = True
         # Adversarial-review round 9 (BUG-009): a missing snapshot used to
         # silently degrade to an empty action set and let the run proceed --
         # writing raw, unadjusted momentum scores tagged with a
@@ -355,8 +267,10 @@ def run(
         # dry run is still permissive (preview only, never persists); a
         # live write fails closed unless the caller explicitly opts in via
         # --allow-raw-prices-on-missing-actions AND supplies a
-        # --research-run-id whose methodology honestly declares it did not
-        # apply cutoff adjustment (validated below, before any further work).
+        # --research-run-id (the methodology-honesty check itself happens
+        # once, below, after this whole try/except -- round 11: routed
+        # through the single shared
+        # data.research.sql_compat.assert_methodology_write_is_honest gate).
         if not dry_run:
             if not allow_raw_prices_on_missing_actions:
                 raise RuntimeError(
@@ -381,7 +295,6 @@ def run(
                     "validated for honesty before any scores are computed "
                     "(BUG-009)."
                 )
-            _validate_raw_prices_methodology_is_honest(research_run_id)
 
         corporate_actions = pd.DataFrame(
             columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
@@ -428,6 +341,32 @@ def run(
             corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
             if "source_version" not in corporate_actions.columns:
                 corporate_actions["source_version"] = "unknown"
+
+    # ── Methodology-honesty gate (BUG-009 section 4, adversarial-review ──────
+    # round 11): ONE consolidated check, replacing the two ad hoc
+    # script-local variants this file used to carry
+    # (_validate_raw_prices_methodology_is_honest,
+    # _validate_provisional_no_universe_methodology_is_honest -- both
+    # removed). Placed here rather than at each degrade point individually
+    # because by this point BOTH dimensions (PIT-universe, corporate-action
+    # adjustment) are already known, and this is still before the
+    # expensive per-date momentum computation below -- no fail-fast benefit
+    # is lost versus checking earlier. Skipped entirely (no DB round-trip)
+    # when nothing is degraded on either dimension, since a fully-honest
+    # write cannot violate either claim regardless of methodology.
+    pit_universe_applied = not provisional_no_universe
+    corporate_action_adjustment_applied = not corporate_actions_snapshot_missing
+    if not dry_run and (not pit_universe_applied or not corporate_action_adjustment_applied):
+        import os
+
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        assert_methodology_write_is_honest(
+            os.environ["DATABASE_URL"],
+            research_run_id,
+            pit_universe_applied=pit_universe_applied,
+            corporate_action_adjustment_applied=corporate_action_adjustment_applied,
+        )
 
     boundary_cutoff = session_close_cutoff(min(end, prices["date"].max()))
     adjusted_prices, adj_meta = build_score_price_history_as_of(
