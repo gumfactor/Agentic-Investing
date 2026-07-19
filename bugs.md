@@ -1447,6 +1447,11 @@ explicitly and flagged here rather than silently overridden — operators
 should be aware the paper pipeline CAN now stall on a stale PIT import in
 a way it did not before this round.
 
+**Operator sign-off (2026-07-19):** presented explicitly as a choice
+before merge — fail-closed on write (this behavior) vs. reverting to
+warn-and-persist under an honestly-labeled provisional methodology. The
+operator chose to accept fail-closed on write as-is.
+
 **Suggested direction (residual, not yet implemented):** if continuous
 availability during PIT degradation is still wanted, the correct design
 is an auto-provisioned fallback methodology/run (idempotently registered
