@@ -1397,23 +1397,72 @@ in logs and this document's companion contract doc.
 
 **Severity:** P2 / operational monitoring
 
-**Status:** Deferred. Operator decision 2026-07-18: the warn-and-degrade
-behavior is acceptable for now. Revisit flipping to hard-fail once the
-universe import (`scripts/import_universe_membership.py`) is on a scheduled
-cadence rather than run ad hoc — see `Worklog.md` 2026-07-18.
+**Status:** Partially superseded by BUG-009 round 11 (see below) — the
+"degrade and keep writing silently" half of the original operator
+acceptance no longer holds for the WRITE path; the underlying "warn and
+degrade" filtering behavior itself is unchanged.
 
-**Evidence:** `airflow/dags/daily_signal_pipeline.py::_pit_membership_filter`
-deliberately logs a warning and proceeds without membership filtering when no
-published universe import covers the score date (the import advances coverage only
-when `scripts/import_universe_membership.py` is re-run).
+**Original evidence:** `airflow/dags/daily_signal_pipeline.py::
+_pit_membership_filter` deliberately logs a warning and proceeds without
+membership filtering when no published universe import covers the score
+date (the import advances coverage only when
+`scripts/import_universe_membership.py` is re-run).
 
-**Impact:** Daily operational scores remain available (paper pipeline is not
-blocked), but they silently revert to provisional current-membership semantics for
-research purposes; the only signal is a structlog warning.
+**Original operator decision (2026-07-18):** the warn-and-degrade behavior
+is acceptable for now; daily operational scores remain available (paper
+pipeline is not blocked), but they silently revert to provisional
+current-membership semantics for research purposes with the only signal
+being a structlog warning. Revisit flipping to hard-fail once the universe
+import is on a scheduled cadence rather than run ad hoc — see
+`Worklog.md` 2026-07-18.
 
-**Suggested direction:** Add an AlertManager hook or DAG-level SLA/telemetry when
-the filter degrades, and consider an Airflow maintenance task that re-runs the
-universe import on a schedule.
+**Round 11 supersession (same day, BUG-009 section 4):** adversarial
+review found that the degrade path's silence was worse than originally
+scoped — `_write_scores` tags every persisted row with the ACTIVE run for
+`daily_signal_pipeline_operational`, whose registered methodology claims
+`universe_import_policy = "pit_universe_effective_dated_v1"` (PIT-universe
+safety). A degraded, unfiltered write under that methodology is not just
+an availability trade-off, it is a provenance-honesty violation: any
+reader trusting `research_run_id` to mean "PIT-certified" (which is the
+documented, authoritative meaning per migration 012) would be misled with
+NO indication beyond a log line. `_write_scores` now calls the shared
+`data.research.sql_compat.assert_methodology_write_is_honest` gate and
+FAILS CLOSED (raises, Airflow marks the task failed — real alerting,
+unlike the prior "log warning only") whenever either independent PIT
+lookup this DAG performs (`_load_prices` for momentum/lowvol/value,
+`_compute_quality`'s own separate lookup) degraded. This deliberately
+reverses the "daily operational scores remain available" half of the
+2026-07-18 acceptance for the WRITE path specifically — a degraded day no
+longer silently persists provisional scores under the PIT-claiming run,
+it fails loudly instead. The underlying filtering/degrade LOGIC itself
+(`_pit_membership_filter`, the per-task try/except degrade pattern) is
+unchanged; only what happens to the resulting provisional rows at write
+time changed.
+
+**Impact:** A stale/unavailable PIT universe import now blocks that day's
+`_write_scores` task entirely (visible Airflow task failure) rather than
+silently writing provisional scores. This is a genuine operational
+availability trade-off against the original 2026-07-18 decision, made
+explicitly and flagged here rather than silently overridden — operators
+should be aware the paper pipeline CAN now stall on a stale PIT import in
+a way it did not before this round.
+
+**Suggested direction (residual, not yet implemented):** if continuous
+availability during PIT degradation is still wanted, the correct design
+is an auto-provisioned fallback methodology/run (idempotently registered
+the same way `scripts/register_operational_research_run.py` registers the
+operational one) whose `universe_import_policy` honestly declares no PIT
+filtering, so `_write_scores` can keep persisting DURING a degrade
+without lying about it — rather than either lying (pre-round-11) or
+refusing to write at all (post-round-11). Deliberately not built this
+round: a stateful "auto-register a second methodology from inside a DAG
+task" mechanism is a meaningfully larger change than the honesty gate
+itself and was judged out of scope to rush under review pressure (see
+round 7/10's precedent for this same judgment call). Also still open: an
+AlertManager hook or DAG-level SLA/telemetry when the filter degrades
+(now at least partially superseded by the write failure itself acting as
+an alert), and an Airflow maintenance task that re-runs the universe
+import on a schedule.
 
 ### BUG-070: Backtester uses a single full-history adjusted price series for both scoring and execution
 

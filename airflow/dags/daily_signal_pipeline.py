@@ -163,6 +163,14 @@ def _load_prices(**context: Any) -> None:
         key="adjusted_prices_json", value=adjusted_df.to_json(orient="records", date_format="iso")
     )
     context["ti"].xcom_push(key="score_date", value=str(end_date))
+    # Adversarial-review round 11 (BUG-008/BUG-009 section 4): _write_scores
+    # needs to know whether PIT membership filtering actually succeeded for
+    # THIS score_date -- _eligible is None on a degraded run (BUG-069), and
+    # _write_scores must not tag those rows with a research_run_id whose
+    # methodology claims PIT-universe safety. Pushed as an explicit XCom
+    # flag since Airflow tasks are separate invocations with no shared
+    # in-process state.
+    context["ti"].xcom_push(key="pit_universe_applied", value=_eligible is not None)
 
 
 def _compute_momentum(**context: Any) -> None:
@@ -317,6 +325,12 @@ def _compute_quality(**context: Any) -> None:
         key="quality_scores_json",
         value=scores.to_json(orient="records", date_format="iso") if not scores.empty else "[]",
     )
+    # Adversarial-review round 11 (BUG-008/BUG-009 section 4): quality does
+    # its OWN independent PIT lookup (unlike momentum/lowvol/value, which
+    # all rely solely on _load_prices' single panel filter) -- so its
+    # degrade state must be surfaced to _write_scores separately. See
+    # _load_prices' equivalent "pit_universe_applied" XCom push.
+    context["ti"].xcom_push(key="quality_pit_universe_applied", value=_eligible is not None)
 
 
 def _pit_eligible_tickers_sql(database_url: str, score_date: date) -> set[str] | None:
@@ -856,6 +870,31 @@ def _write_scores(**context: Any) -> dict:
     ``docs/runbooks/research_run_registration.md`` — a REQUIRED pre-deploy
     step after migration 012; this DAG never registers or activates a run
     itself).
+
+    Adversarial-review round 11 (BUG-008/BUG-009 section 4): this DAG's own
+    degrade path had never been routed through a methodology-honesty check
+    (the ad hoc checks built in rounds 9-10 only ever covered standalone
+    scripts). ``_OPERATIONAL_METHODOLOGY_NAME``'s registered methodology
+    claims PIT-universe safety (``universe_import_policy =
+    "pit_universe_effective_dated_v1"``), but ``_load_prices``/
+    ``_compute_quality`` degrade to an unfiltered, provisional cross-section
+    (BUG-069) on a PIT lookup failure with only a log warning -- silently
+    tagging those degraded rows with the PIT-claiming operational run would
+    misrepresent what was actually computed. This now fails closed via the
+    single shared
+    ``data.research.sql_compat.assert_methodology_write_is_honest`` gate
+    before any row is written, superseding BUG-069's "silently write
+    provisional scores" acceptance for the WRITE path specifically (the
+    task now fails loudly instead) -- an operator who wants degraded days to
+    keep persisting must register and activate a run under a distinct
+    methodology that honestly declares no PIT filtering, matching the same
+    pattern used everywhere else in this PR (never done automatically).
+    Corporate-action adjustment has no equivalent degrade path here:
+    ``_load_prices`` has no try/except around its corporate_actions query,
+    so a failure there fails the task outright rather than silently
+    persisting raw prices -- the operational methodology's
+    ``score_cutoff_known_at_v1`` claim is always true for whatever this DAG
+    actually persists.
     """
     import pandas as pd
     from sqlalchemy import create_engine, text
@@ -878,6 +917,31 @@ def _write_scores(**context: Any) -> dict:
 
     database_url = os.environ["DATABASE_URL"]
     research_run_id = _get_active_research_run_id_sql(database_url, _OPERATIONAL_METHODOLOGY_NAME)
+
+    # PIT-universe honesty gate (see docstring above). Two independent PIT
+    # lookups feed this write: _load_prices' panel filter (covers momentum/
+    # lowvol/value) and _compute_quality's own separate lookup (quality
+    # only). Missing XCom (task didn't run / older DAG run) is treated
+    # conservatively as "not applied" -- fail safe, never assume success.
+    load_prices_pit_applied = bool(
+        context["ti"].xcom_pull(key="pit_universe_applied", task_ids="load_prices")
+    )
+    quality_pit_applied_raw = context["ti"].xcom_pull(
+        key="quality_pit_universe_applied", task_ids="compute_quality"
+    )
+    quality_pit_applied = True if quality_pit_applied_raw is None else bool(quality_pit_applied_raw)
+    pit_universe_applied = load_prices_pit_applied and quality_pit_applied
+
+    if not pit_universe_applied:
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        assert_methodology_write_is_honest(
+            database_url,
+            research_run_id,
+            pit_universe_applied=False,
+            corporate_action_adjustment_applied=True,
+        )
+
     engine = create_engine(database_url)
 
     factor_count = 0

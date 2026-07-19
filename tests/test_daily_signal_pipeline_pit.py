@@ -351,6 +351,220 @@ class TestLoadPricesPreFilter:
         )
         assert tickers == {"AAA", "NOPE"}
 
+    def test_pit_universe_applied_xcom_true_when_universe_available(
+        self, dag_module, universe_db, monkeypatch
+    ) -> None:
+        """Adversarial-review round 11 (BUG-008/BUG-009 section 4):
+        _write_scores needs to know whether PIT filtering actually
+        succeeded for this score_date."""
+        from sqlalchemy import create_engine, text
+
+        eng = create_engine(universe_db, future=True)
+        with eng.begin() as conn:
+            conn.execute(text("UPDATE universe_import_batches SET universe_id='sp500'"))
+            conn.execute(text("UPDATE universe_membership SET universe_id='sp500'"))
+        try:
+            import pandas as pd
+
+            frame = pd.DataFrame([{"ticker": "AAA", "date": date(2022, 6, 1), "close": 100.0}])
+            empty_actions = pd.DataFrame(
+                columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+            )
+
+            def _fake_read_sql(query, *a, **k):
+                return empty_actions.copy() if "corporate_actions" in str(query) else frame.copy()
+
+            monkeypatch.setenv("DATABASE_URL", universe_db)
+            monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+            ti = self._FakeTI()
+            dag_module._load_prices(ti=ti, data_interval_end=self._FakeInterval(date(2022, 6, 1)))
+
+            assert ti.pushed["pit_universe_applied"] is True
+        finally:
+            with eng.begin() as conn:
+                conn.execute(
+                    text("UPDATE universe_import_batches SET universe_id='sp500_fixture'")
+                )
+                conn.execute(
+                    text("UPDATE universe_membership SET universe_id='sp500_fixture'")
+                )
+            eng.dispose()
+
+    def test_pit_universe_applied_xcom_false_when_universe_unavailable(
+        self, dag_module, monkeypatch
+    ) -> None:
+        import pandas as pd
+
+        frame = pd.DataFrame([{"ticker": "AAA", "date": date(2022, 6, 1), "close": 100.0}])
+        empty_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return empty_actions.copy() if "corporate_actions" in str(query) else frame.copy()
+
+        monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+        ti = self._FakeTI()
+        dag_module._load_prices(ti=ti, data_interval_end=self._FakeInterval(date(2022, 6, 1)))
+
+        assert ti.pushed["pit_universe_applied"] is False
+
+
+class TestWriteScoresMethodologyHonesty:
+    """Adversarial-review round 11 (BUG-008/BUG-009 section 4): _write_scores
+    must not tag a degraded (non-PIT-filtered) write with a research_run_id
+    whose methodology claims PIT-universe safety -- routed through the
+    single shared data.research.sql_compat.assert_methodology_write_is_honest
+    gate, called BEFORE any row is written."""
+
+    class _FakeTI:
+        def __init__(self, xcom: dict):
+            self._xcom = xcom
+
+        def xcom_pull(self, key, task_ids=None):
+            return self._xcom.get((task_ids, key))
+
+    def _research_db(self, tmp_path, monkeypatch, *, universe_import_policy, name):
+        from sqlalchemy import create_engine as _create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import (
+            MethodologySpec,
+            activate_run,
+            register_methodology,
+            register_run,
+        )
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        db_url = f"sqlite:///{db_path}"
+        monkeypatch.setenv("DATABASE_URL", db_url)
+        engine = _create_engine(db_url, future=True)
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy=universe_import_policy,
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="score_cutoff_known_at_v1",
+                    realized_return_action_availability_policy="exit_cutoff_known_at_v1",
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run.id, activated_by="test")
+            session.commit()
+        return db_url
+
+    def test_raises_before_any_write_when_pit_degraded_under_pit_claiming_run(
+        self, dag_module, tmp_path, monkeypatch
+    ) -> None:
+        import pandas as pd
+
+        # dag_module._OPERATIONAL_METHODOLOGY_NAME is the fixed methodology
+        # name _write_scores always resolves its active run against.
+        self._research_db(
+            tmp_path,
+            monkeypatch,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            name=dag_module._OPERATIONAL_METHODOLOGY_NAME,
+        )
+        # Deliberately no factor_scores/alpha_scores tables in this DB --
+        # proves the honesty gate raises BEFORE any INSERT is even attempted
+        # (an INSERT against a missing table would raise a different,
+        # SQLAlchemy-generic error, not MethodologyHonestyError).
+        factor_json = pd.DataFrame(
+            [{"ticker": "AAA", "score_date": date(2026, 6, 1), "factor_name": "momentum",
+              "strategy_id": "v1", "z_score": 1.0, "raw_value": 0.1}]
+        ).to_json(orient="records", date_format="iso")
+
+        xcom = {
+            ("combine_scores", "factor_scores_json"): factor_json,
+            ("combine_scores", "alpha_scores_json"): "[]",
+            ("load_prices", "pit_universe_applied"): False,
+            ("compute_quality", "quality_pit_universe_applied"): True,
+        }
+        ti = self._FakeTI(xcom)
+
+        from data.research.sql_compat import MethodologyHonestyError
+
+        with pytest.raises(MethodologyHonestyError, match="misrepresent"):
+            dag_module._write_scores(ti=ti)
+
+    def test_does_not_raise_honesty_error_when_pit_applied(
+        self, dag_module, tmp_path, monkeypatch
+    ) -> None:
+        """Sanity: a fully-PIT-applied write must clear the honesty gate
+        (any later failure must come from the actual INSERT, e.g. a missing
+        table -- proving the gate itself did not block an honest write)."""
+        import pandas as pd
+        from sqlalchemy.exc import SQLAlchemyError
+
+        self._research_db(
+            tmp_path,
+            monkeypatch,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            name=dag_module._OPERATIONAL_METHODOLOGY_NAME,
+        )
+        factor_json = pd.DataFrame(
+            [{"ticker": "AAA", "score_date": date(2026, 6, 1), "factor_name": "momentum",
+              "strategy_id": "v1", "z_score": 1.0, "raw_value": 0.1}]
+        ).to_json(orient="records", date_format="iso")
+
+        xcom = {
+            ("combine_scores", "factor_scores_json"): factor_json,
+            ("combine_scores", "alpha_scores_json"): "[]",
+            ("load_prices", "pit_universe_applied"): True,
+            ("compute_quality", "quality_pit_universe_applied"): True,
+        }
+        ti = self._FakeTI(xcom)
+
+        from data.research.sql_compat import MethodologyHonestyError
+
+        # No factor_scores table exists in this DB, so the INSERT itself
+        # must fail -- but with a generic SQLAlchemy error, never
+        # MethodologyHonestyError, proving the gate cleared this write.
+        with pytest.raises(SQLAlchemyError):
+            dag_module._write_scores(ti=ti)
+
+    def test_missing_pit_flag_xcom_treated_as_not_applied(
+        self, dag_module, tmp_path, monkeypatch
+    ) -> None:
+        """Missing XCom (e.g. an older DAG run without this key) must fail
+        safe -- treated as PIT NOT applied, never assumed successful."""
+        import pandas as pd
+
+        self._research_db(
+            tmp_path,
+            monkeypatch,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            name=dag_module._OPERATIONAL_METHODOLOGY_NAME,
+        )
+        factor_json = pd.DataFrame(
+            [{"ticker": "AAA", "score_date": date(2026, 6, 1), "factor_name": "momentum",
+              "strategy_id": "v1", "z_score": 1.0, "raw_value": 0.1}]
+        ).to_json(orient="records", date_format="iso")
+
+        xcom = {
+            ("combine_scores", "factor_scores_json"): factor_json,
+            ("combine_scores", "alpha_scores_json"): "[]",
+            # pit_universe_applied deliberately absent from XCom.
+        }
+        ti = self._FakeTI(xcom)
+
+        from data.research.sql_compat import MethodologyHonestyError
+
+        with pytest.raises(MethodologyHonestyError, match="misrepresent"):
+            dag_module._write_scores(ti=ti)
+
 
 class TestCorporateActionWiring:
     """BUG-009 section 2.3 adversarial-review follow-up: momentum/lowvol
@@ -662,3 +876,78 @@ class TestComputeQualityPITCrossSection:
         w = with_whale.sort_values("ticker").reset_index(drop=True)
         wo = without_whale.sort_values("ticker").reset_index(drop=True)
         pd.testing.assert_frame_equal(w, wo)
+
+    def test_quality_pit_universe_applied_xcom_reflects_its_own_lookup(
+        self, dag_module, universe_db, monkeypatch
+    ) -> None:
+        """Adversarial-review round 11 (BUG-008/BUG-009 section 4): quality
+        does its own independent PIT lookup (unlike momentum/lowvol/value,
+        which rely solely on _load_prices' panel filter), so _write_scores
+        needs its degrade state surfaced separately."""
+        from sqlalchemy import text
+
+        score_date = date(2022, 6, 1)
+        members = ["AAA", "CCC"]
+
+        eng = create_engine(universe_db, future=True)
+        with eng.begin() as conn:
+            conn.execute(text("UPDATE universe_import_batches SET universe_id='sp500'"))
+            conn.execute(text("UPDATE universe_membership SET universe_id='sp500'"))
+        try:
+            ti = self._run_compute_quality_ti(
+                dag_module, monkeypatch, universe_db, score_date, self._fundamentals(members)
+            )
+            assert ti.pushed["quality_pit_universe_applied"] is True
+        finally:
+            with eng.begin() as conn:
+                conn.execute(
+                    text("UPDATE universe_import_batches SET universe_id='sp500_fixture'")
+                )
+                conn.execute(
+                    text("UPDATE universe_membership SET universe_id='sp500_fixture'")
+                )
+            eng.dispose()
+
+    def test_quality_pit_universe_applied_xcom_false_when_lookup_unavailable(
+        self, dag_module, monkeypatch, tmp_path
+    ) -> None:
+        # A real file-backed DB (not :memory:) so financial_statements
+        # persists across the setup connection and _compute_quality's own
+        # internal create_engine() call -- :memory: creates a fresh, empty
+        # DB per connection. No research_methodologies/universe tables
+        # exist in this DB at all, so the PIT lookup itself degrades.
+        score_date = date(2022, 6, 1)
+        members = ["AAA", "CCC"]
+        db_url = f"sqlite:///{tmp_path / 'no_universe.db'}"
+        ti = self._run_compute_quality_ti(
+            dag_module, monkeypatch, db_url, score_date, self._fundamentals(members)
+        )
+        assert ti.pushed["quality_pit_universe_applied"] is False
+
+    def _run_compute_quality_ti(self, dag_module, monkeypatch, db_url, score_date, fund):
+        from sqlalchemy import text
+
+        eng = create_engine(db_url, future=True)
+        with eng.begin() as conn:
+            conn.execute(
+                text("CREATE TABLE IF NOT EXISTS financial_statements (id INTEGER)")
+            )
+            conn.execute(text("DELETE FROM financial_statements"))
+            conn.execute(text("INSERT INTO financial_statements (id) VALUES (1)"))
+        eng.dispose()
+
+        monkeypatch.setenv("DATABASE_URL", db_url)
+        monkeypatch.setattr(pd, "read_sql", lambda *a, **k: fund.copy())
+
+        members = ["AAA", "CCC"]
+        prices = pd.DataFrame(
+            [{"ticker": t, "date": str(score_date), "close": 100.0} for t in members]
+        )
+        ti = self._FakeTI(
+            {
+                "score_date": str(score_date),
+                "prices_json": prices.to_json(orient="records", date_format="iso"),
+            }
+        )
+        dag_module._compute_quality(ti=ti)
+        return ti
