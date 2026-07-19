@@ -287,6 +287,64 @@ def _validate_portfolio_method(value: Any) -> list[str]:
     return []
 
 
+def field_status(dot_path: str) -> str:
+    """Classify a single config dot-path without running full validation.
+
+    Used by the conformance test (``backtesting/tests/test_config_contract.py``)
+    to assert every key that appears in any ``config/strategy/*.yaml`` file is
+    explicitly accounted for by this module -- never merely "not mentioned
+    and therefore silently allowed". Only the first one or two path segments
+    are inspected (mirroring what :func:`validate_backtest_config` itself
+    inspects); deeper segments under a wildcard-informational section are
+    not walked further since the whole subtree is informational regardless
+    of depth.
+
+    Returns one of:
+
+    * ``"consumed"`` -- read and used to control backtest behavior.
+    * ``"consumed_value_restricted"`` -- read, but only a specific value is
+      supported (currently only ``portfolio.method``); the caller must still
+      check the actual value via :func:`validate_backtest_config`.
+    * ``"informational"`` -- accepted, but not read by the backtest path.
+    * ``"rejected"`` -- explicitly unsupported; any presence fails closed.
+    * ``"unknown"`` -- neither classified as consumed/informational nor as
+      an explicitly rejected section/key. This is the status a genuinely
+      NEW, never-reviewed top-level config key gets -- the case the
+      conformance test exists to catch before it can ship silently ignored.
+    """
+    parts = dot_path.split(".")
+    top = parts[0]
+
+    if len(parts) == 1:
+        if top in _TOP_LEVEL_FIELDS:
+            return _TOP_LEVEL_FIELDS[top]
+        if top in _WILDCARD_INFORMATIONAL_SECTIONS:
+            return INFORMATIONAL
+        if top in _REJECTED_SECTIONS:
+            return "rejected"
+        if top in _KNOWN_SECTION_VALIDATORS:
+            # A known section itself (not one of its sub-keys) carries no
+            # independent meaning -- classification lives at the sub-key
+            # level below.
+            return INFORMATIONAL
+        return "unknown"
+
+    if top in _WILDCARD_INFORMATIONAL_SECTIONS:
+        return INFORMATIONAL
+    if top in _REJECTED_SECTIONS:
+        return "rejected"
+    if top in _KNOWN_SECTION_VALIDATORS:
+        sub = parts[1]
+        allowed = _KNOWN_SECTION_VALIDATORS[top]
+        if sub not in allowed:
+            return "rejected"
+        if top == "portfolio" and sub == "method":
+            return "consumed_value_restricted"
+        return allowed[sub]
+
+    return "unknown"
+
+
 def consumed_contract_summary() -> dict[str, dict[str, str]]:
     """Return the full classification table, keyed by dot-path, for
     reporting/documentation purposes (e.g. printed by a CLI, or used to

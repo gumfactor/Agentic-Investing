@@ -103,6 +103,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-072 | Dashboard/API | P2 | F2 | Fixed | All alpha/factor-score readers (dashboards, `scripts/indicator_diagnostic.py`) now filter to the active research run by default; `--all-runs`/`--research-run-id` are the only documented explicit opt-ins for cross-run reads. |
 | BUG-073 | Packaging/CI | P1 | F1 | Fixed | `pyproject.toml`'s pytest `testpaths` silently excluded ~412 tests (all of `tests/reporting/dashboards/`, `tests/infra/`) from every "full suite" run whenever a subdirectory (`tests/strategy_registry`) was also listed as its own testpath entry. |
 | BUG-074 | Research/Signals | P2 | F2 | Open | Registered operational methodology labels action_source_version as plain "unknown", imprecise for a DB with migrated legacy corporate_actions rows tagged "legacy_unknown". |
+| BUG-075 | Backtesting | P0 | F0 | Implemented — pending review (branch `dev/R2-02B-config-failclosed`) | Backtest path silently ignored strategy-config fields it does not implement (`portfolio.method: mvo`/`risk_parity`, `optimizer_mode`, `constraints`, `risk_model`, live-only `execution` fields) instead of rejecting them — a backtest labeled "mvo with sector caps" was actually an uncapped equal-weight backtest. |
 
 #### Long-term / lower-risk backlog
 
@@ -1749,3 +1750,85 @@ lightweight test or lint step) that asserts `pytest --collect-only` finds
 every `test_*.py` file under the configured testpaths roots, to catch a
 similar silent-exclusion regression before it can recur — not implemented
 here to avoid scope creep on an already-large PR, but worth a follow-up.
+
+### BUG-075: Backtest path silently ignored unsupported strategy-config fields (portfolio.method, constraints, risk_model, live-only execution fields)
+
+**Severity:** P0 / research-validity (Roadmap row 02B)
+
+**Status:** Implemented — pending review (branch `dev/R2-02B-config-failclosed`).
+
+**Evidence:** `config/strategy/v2_mvo_momentum.yaml` declares
+`portfolio.method: mvo`, `portfolio.optimizer_mode: max_sharpe`, a
+`constraints` section (`max_sector_weight`, `max_portfolio_beta`,
+`min_order_notional`), a `risk_model` section (Ledoit-Wolf covariance
+methodology), and live-only `execution` fields (`broker: ibkr`,
+`paper_trading: true`, `algo: market`). Before this fix,
+`backtesting/engine/event_loop.py::BacktestEngine.run` never branched on
+`portfolio.method` at all -- `_select_equal_weight` ran unconditionally
+regardless of what the config declared -- and never read `constraints`,
+`risk_model`, `portfolio.optimizer_mode`, or the live-only `execution`
+fields anywhere. A backtest run against `v2_mvo_momentum.yaml` and logged
+to MLflow as "mvo with a 25% sector cap and a 1.5 beta ceiling" was
+silently, indistinguishably an uncapped equal-weight backtest. This is the
+same defect class BUG-009 fixed for the write path (a persisted artifact's
+label not matching what was actually computed), on the strategy-config axis
+instead. A related, narrower instance of the same bug: `v2_mvo_momentum.yaml`
+nests `data_version` under `backtest:` rather than at the top level, but
+`BacktestEngine.run` only ever reads top-level `config["data_version"]` --
+so as originally written, a v2 backtest run would silently produce an empty
+`BacktestResult.data_version`, only surfacing as a C7 failure at the much
+later MLflow-logging step instead of immediately at config-validation time.
+
+**Impact:** Any backtest, walk-forward validation, or parameter-sensitivity
+sweep run against a config declaring an unimplemented portfolio method,
+constraint, risk model, or live-only execution field silently produced
+results mislabeled with the declared (unimplemented) methodology instead of
+the actual (equal-weight, unconstrained) one -- exactly the kind of
+research-validity misrepresentation this project's C7 methodology-honesty
+discipline exists to prevent, just not previously enforced on this axis.
+
+**Fix:** Added `backtesting/config_contract.py` as the single shared
+enforcement point (mirrors `data.research.sql_compat.assert_methodology_write_is_honest`,
+BUG-009 section 4). `validate_backtest_config()` classifies every config
+field as CONSUMED (read and behavior-changing), INFORMATIONAL (declared,
+harmless -- pure metadata or a different subsystem's already-tracked knob,
+e.g. `universe.*`/`indicators.*` describing upstream signal methodology, or
+`portfolio.target_volatility` which belongs to the live/paper sizing path),
+or unlisted -- which fails closed. `portfolio.method` is value-restricted to
+`"equal_weight"`, the only method the engine actually runs; `constraints`
+and `risk_model` sections, `portfolio.optimizer_mode`/`drift_threshold`,
+`execution.broker`/`paper_trading`/`algo`, and a nested `backtest.data_version`
+are all explicitly rejected. `UnsupportedStrategyConfigError` deliberately
+does not subclass `ValueError`/`RuntimeError` so existing broad `except`
+clauses (e.g. `ParameterSweeper.sweep`'s per-variant data-error handling,
+which intentionally records data-availability failures as a single NaN
+variant and continues) cannot swallow a config rejection into a
+warn-and-continue path -- it always propagates and halts. Wired into every
+backtest-path call site that accepts a raw config dict:
+`BacktestEngine.run`, `backtesting.loader.load_from_snapshot`,
+`WalkForwardValidator.run`, `ParameterSweeper.sweep`,
+`BacktestLogger.log_run`, and `BacktestLogger.log_walk_forward_run`.
+`bootstrap_stress`/`SurvivalFunnel` take an already-computed
+`WalkForwardResult`, not a raw config, so they inherit validation
+transitively. A conformance test suite
+(`backtesting/tests/test_config_contract.py`) flattens every key in every
+`config/strategy/*.yaml` file and asserts each resolves to an explicit
+CONSUMED/INFORMATIONAL/rejected classification (never "unknown") via
+`config_contract.field_status()`, so a future PR that adds a new,
+unreviewed key to an existing strategy YAML fails CI instead of the key
+passing through silently unclassified. `v1_base_momentum.yaml` passes
+validation unchanged (no code change to that file was required);
+`v2_mvo_momentum.yaml` is now rejected with all nine of its unsupported
+fields/sections listed in a single error instead of silently downgrading.
+
+**Scope note:** This fix does NOT implement MVO/risk-parity/beta-constraint
+semantics inside the backtest engine -- that remains explicitly out of
+scope here (and would collide with the separate Roadmap 03B loader work,
+BUG-070). It only makes the backtest path honest about what it does and
+does not implement, by rejecting configs that claim more than the engine
+delivers rather than silently running a degraded version of what was
+asked. Implementing MVO/risk-parity inside `BacktestEngine` remains a
+distinct, larger future roadmap item; until then, `v2_mvo_momentum.yaml`
+(or any future MVO/risk-parity strategy config) cannot be backtested at
+all -- it can only be run through the live/paper execution path, which
+already implements these methods.
