@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import structlog
 
+from backtesting.config_contract import validate_backtest_config
 from backtesting.engine.data_handler import DataHandler
 from backtesting.engine.fill_simulator import Fill, FillSimulator, Order, compute_orders
 
@@ -118,7 +119,15 @@ class BacktestEngine:
 
         Returns:
             BacktestResult with full performance history and metrics.
+
+        Raises:
+            UnsupportedStrategyConfigError: ``config`` declares a field,
+                section, or value the backtest path does not implement
+                (Roadmap 02B / BUG-075, fail-closed -- see
+                ``backtesting/config_contract.py``).
         """
+        validate_backtest_config(config)
+
         bt_cfg = config["backtest"]
         port_cfg = config["portfolio"]
 

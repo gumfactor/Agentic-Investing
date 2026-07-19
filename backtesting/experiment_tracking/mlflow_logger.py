@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Optional
 import mlflow
 import structlog
 
+from backtesting.config_contract import validate_backtest_config
 from backtesting.engine.event_loop import BacktestResult
 
 if TYPE_CHECKING:
@@ -75,7 +76,18 @@ class BacktestLogger:
 
         Returns:
             MLflow run_id string.
+
+        Raises:
+            UnsupportedStrategyConfigError: ``config`` declares a field,
+                section, or value the backtest path does not implement
+                (Roadmap 02B / BUG-075, fail-closed -- see
+                ``backtesting/config_contract.py``). Checked here too, not
+                just at the engine that produced ``result``, so a config
+                swapped out between running and logging cannot mislabel a
+                persisted MLflow record.
         """
+        validate_backtest_config(config)
+
         data_version = (result.data_version or "").strip()
         if not data_version:
             raise ValueError(
@@ -170,7 +182,15 @@ class BacktestLogger:
 
         Returns:
             MLflow run_id string.
+
+        Raises:
+            UnsupportedStrategyConfigError: ``config`` declares a field,
+                section, or value the backtest path does not implement
+                (Roadmap 02B / BUG-075, fail-closed -- see
+                ``backtesting/config_contract.py``).
         """
+        validate_backtest_config(config)
+
         # data_version for walk-forward runs lives in the config dict (via
         # BacktestEngine, which reads config["data_version"] and stores it on
         # BacktestResult).  log_run() reads result.data_version instead, but

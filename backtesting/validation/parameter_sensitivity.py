@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 import structlog
 
+from backtesting.config_contract import validate_backtest_config
 from backtesting.engine.data_handler import DataHandler
 from backtesting.engine.event_loop import BacktestEngine
 from backtesting.engine.fill_simulator import FillSimulator
@@ -175,9 +176,21 @@ class ParameterSweeper:
 
         Raises:
             ValueError: If param_grid is empty.
+            UnsupportedStrategyConfigError: ``base_config`` declares a field,
+                section, or value the backtest path does not implement
+                (Roadmap 02B / BUG-075, fail-closed -- see
+                ``backtesting/config_contract.py``). Checked here up front
+                for a fast failure; each per-variant config is re-validated
+                inside ``WalkForwardValidator.run`` too, since a dot-path
+                override (e.g. sweeping ``portfolio.method``) can turn an
+                otherwise-valid base config into an unsupported one. Unlike
+                engine/data errors, this is never caught-and-recorded as a
+                NaN variant -- it propagates and halts the whole sweep.
         """
         if not param_grid:
             raise ValueError("param_grid must not be empty.")
+
+        validate_backtest_config(base_config)
 
         param_keys = list(param_grid.keys())
         combos = list(itertools.product(*param_grid.values()))

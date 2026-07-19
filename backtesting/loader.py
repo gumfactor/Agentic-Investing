@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 import structlog
 
+from backtesting.config_contract import validate_backtest_config
 from backtesting.engine.data_handler import DataHandler
 from data.normalization.corporate_actions import (
     apply_adjustment_factors,
@@ -64,7 +65,14 @@ def load_from_snapshot(
         FileNotFoundError: if daily_prices, alpha_scores, or benchmark snapshots
             are absent for data_version.
         ValueError: if a required column is missing from a loaded snapshot.
+        UnsupportedStrategyConfigError: ``config`` declares a field, section,
+            or value the backtest path does not implement (Roadmap 02B /
+            BUG-075, fail-closed -- see ``backtesting/config_contract.py``).
+            Checked here, first in the backtest pipeline, so a rejected
+            config never even reaches the expensive snapshot-loading step.
     """
+    validate_backtest_config(config)
+
     if snapshots is None:
         from dotenv import load_dotenv
 
