@@ -441,7 +441,14 @@ class TestMissingActionsFailsClosedOnLiveWrite:
     methodology honestly does not claim cutoff adjustment.
     """
 
-    def _engine_with_methodology(self, tmp_path, monkeypatch, score_action_availability_policy, name):
+    def _engine_with_methodology(
+        self,
+        tmp_path,
+        monkeypatch,
+        score_action_availability_policy,
+        name,
+        universe_import_policy="pit_universe_effective_dated_v1",
+    ):
         from sqlalchemy import create_engine
         from sqlalchemy.orm import Session
 
@@ -457,7 +464,7 @@ class TestMissingActionsFailsClosedOnLiveWrite:
                 session,
                 MethodologySpec(
                     name=name,
-                    universe_import_policy="pit_universe_effective_dated_v1",
+                    universe_import_policy=universe_import_policy,
                     timing_policy_id="t_plus_1_close_v1",
                     score_action_availability_policy=score_action_availability_policy,
                     realized_return_action_availability_policy=score_action_availability_policy,
@@ -474,7 +481,10 @@ class TestMissingActionsFailsClosedOnLiveWrite:
             session.commit()
             return run_row.id
 
-    def test_live_write_without_opt_in_raises_before_any_db_write(self) -> None:
+    def test_live_write_without_opt_in_raises_before_any_db_write(self, lookup) -> None:
+        # Uses the PIT lookup fixture (not --provisional-no-universe) so this
+        # test exercises ONLY the round-9 corporate_actions gate, not the
+        # round-10 --provisional-no-universe honesty gate added later.
         members = ["AAA", "GGG", "HHH", "III", "JJJ"]
         prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
         start = sorted(prices["date"].dt.date.unique())[273]
@@ -491,10 +501,11 @@ class TestMissingActionsFailsClosedOnLiveWrite:
                 dry_run=False,
                 research_run_id=None,
                 snapshots=mock_snaps,
-                provisional_no_universe=True,
+                universe_id=FIXTURE_UNIVERSE_ID,
+                universe_lookup=lookup,
             )
 
-    def test_live_write_with_opt_in_but_no_research_run_id_raises(self) -> None:
+    def test_live_write_with_opt_in_but_no_research_run_id_raises(self, lookup) -> None:
         members = ["AAA", "GGG", "HHH", "III", "JJJ"]
         prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
         start = sorted(prices["date"].dt.date.unique())[273]
@@ -511,11 +522,14 @@ class TestMissingActionsFailsClosedOnLiveWrite:
                 dry_run=False,
                 research_run_id=None,
                 snapshots=mock_snaps,
-                provisional_no_universe=True,
+                universe_id=FIXTURE_UNIVERSE_ID,
+                universe_lookup=lookup,
                 allow_raw_prices_on_missing_actions=True,
             )
 
-    def test_live_write_with_opt_in_and_dishonest_methodology_raises(self, tmp_path, monkeypatch) -> None:
+    def test_live_write_with_opt_in_and_dishonest_methodology_raises(
+        self, tmp_path, monkeypatch, lookup
+    ) -> None:
         run_id = self._engine_with_methodology(
             tmp_path, monkeypatch, "score_cutoff_known_at_v1", "dishonest_cutoff_claim"
         )
@@ -535,7 +549,8 @@ class TestMissingActionsFailsClosedOnLiveWrite:
                 dry_run=False,
                 research_run_id=run_id,
                 snapshots=mock_snaps,
-                provisional_no_universe=True,
+                universe_id=FIXTURE_UNIVERSE_ID,
+                universe_lookup=lookup,
                 allow_raw_prices_on_missing_actions=True,
             )
 
@@ -630,3 +645,221 @@ class TestValidateRawPricesMethodologyIsHonest:
 
         with pytest.raises(ValueError, match="does not exist"):
             _validate_raw_prices_methodology_is_honest(999999)
+
+
+class TestProvisionalNoUniverseFailsClosedOnLiveWrite:
+    """Adversarial-review round 10 (BUG-008/BUG-009): --provisional-no-universe
+    correctly skips PIT membership filtering, but nothing stopped an operator
+    from tagging the resulting current-membership (survivorship-biased) rows
+    with a research_run_id whose registered methodology
+    (universe_import_policy="pit_universe_effective_dated_v1") claims
+    PIT-universe safety -- downstream readers filter solely by
+    research_run_id (BUG-072) and would silently consume those rows
+    believing them PIT-safe. Same honesty-check pattern as round 9, on the
+    universe dimension instead of the corporate-action dimension.
+    """
+
+    def _engine_with_methodology(self, tmp_path, monkeypatch, universe_import_policy, name):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import MethodologySpec, activate_run, register_methodology, register_run
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy=universe_import_policy,
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+                    realized_return_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run_row = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run_row.id, activated_by="test")
+            session.commit()
+            return run_row.id
+
+    def test_live_write_without_research_run_id_raises(self) -> None:
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        with pytest.raises(ValueError, match="requires --research-run-id"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=False,
+                research_run_id=None,
+                snapshots=mock_snaps,
+                provisional_no_universe=True,
+            )
+
+    def test_live_write_tagged_with_pit_claiming_run_raises(self, tmp_path, monkeypatch) -> None:
+        run_id = self._engine_with_methodology(
+            tmp_path, monkeypatch, "pit_universe_effective_dated_v1", "dishonest_pit_claim"
+        )
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        with pytest.raises(ValueError, match="misrepresent"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=False,
+                research_run_id=run_id,
+                snapshots=mock_snaps,
+                provisional_no_universe=True,
+            )
+
+    def test_live_write_tagged_with_honest_run_proceeds_past_the_gate(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """An honestly-tagged (non-PIT-claiming) run must not be blocked by
+        this gate -- it should proceed to the next stage of run() (the
+        corporate_actions gate, round 9), not fail here."""
+        run_id = self._engine_with_methodology(
+            tmp_path, monkeypatch, "legacy_current_membership_no_pit_enforcement", "honest_no_pit"
+        )
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        # Passes the round-10 universe-honesty gate, then hits the round-9
+        # corporate_actions gate (no snapshot pinned in this fixture) --
+        # proves the round-10 gate itself did not block an honest run.
+        with pytest.raises(RuntimeError, match="corporate_actions snapshot is missing"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=False,
+                research_run_id=run_id,
+                snapshots=mock_snaps,
+                provisional_no_universe=True,
+            )
+
+    def test_dry_run_remains_permissive_without_research_run_id(self) -> None:
+        """--dry-run never persists, so the honesty gate must not block it
+        even with no --research-run-id supplied."""
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+        mock_snaps = _mock_snapshots(prices)
+
+        # Must not raise.
+        run(
+            snapshot_date=date(2024, 1, 2),
+            start=start,
+            end=end,
+            strategy_id="vtest",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+            provisional_no_universe=True,
+        )
+
+
+class TestValidateProvisionalNoUniverseMethodologyIsHonest:
+    """Direct unit coverage of the round-10 universe-honesty gate."""
+
+    def _register(self, engine, universe_import_policy, name):
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import MethodologySpec, activate_run, register_methodology, register_run
+
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy=universe_import_policy,
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+                    realized_return_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run_row = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run_row.id, activated_by="test")
+            session.commit()
+            return run_row.id
+
+    def _engine(self, tmp_path, monkeypatch, name):
+        from sqlalchemy import create_engine
+
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(engine)
+        return engine
+
+    def test_raises_when_methodology_claims_pit_universe(self, tmp_path, monkeypatch) -> None:
+        from scripts.backfill_momentum_scores import (
+            _validate_provisional_no_universe_methodology_is_honest,
+        )
+
+        engine = self._engine(tmp_path, monkeypatch, "claims_pit")
+        run_id = self._register(engine, "pit_universe_effective_dated_v1", "claims_pit_methodology")
+
+        with pytest.raises(ValueError, match="misrepresent"):
+            _validate_provisional_no_universe_methodology_is_honest(run_id)
+
+    def test_passes_when_methodology_honestly_declares_no_pit_filtering(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from scripts.backfill_momentum_scores import (
+            _validate_provisional_no_universe_methodology_is_honest,
+        )
+
+        engine = self._engine(tmp_path, monkeypatch, "honest_no_pit")
+        run_id = self._register(
+            engine, "legacy_current_membership_no_pit_enforcement", "honest_no_pit_methodology"
+        )
+
+        _validate_provisional_no_universe_methodology_is_honest(run_id)  # must not raise
+
+    def test_raises_on_unknown_run_id(self, tmp_path, monkeypatch) -> None:
+        from scripts.backfill_momentum_scores import (
+            _validate_provisional_no_universe_methodology_is_honest,
+        )
+
+        self._engine(tmp_path, monkeypatch, "empty_db")
+
+        with pytest.raises(ValueError, match="does not exist"):
+            _validate_provisional_no_universe_methodology_is_honest(999999)

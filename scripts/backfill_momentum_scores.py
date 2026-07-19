@@ -26,7 +26,14 @@ date.  It fails closed when no published import exists or when any score date
 falls outside the validated coverage window.  --provisional-no-universe
 skips the membership filter with a loud warning; the resulting scores are
 PROVISIONAL and must not be used for selection, promotion, or paper-trading
-qualification.
+qualification. A LIVE (non-dry-run) write combining --provisional-no-universe
+with --research-run-id additionally fails closed if that run's registered
+methodology claims PIT-universe safety (universe_import_policy =
+"pit_universe_effective_dated_v1") -- adversarial-review round 10: the same
+honesty-check pattern as the round-9 corporate-action gate below, applied to
+the universe dimension, so a downstream reader filtering solely by
+research_run_id can never silently consume current-membership
+(survivorship-biased) rows while believing them PIT-safe.
 
 Usage
 ------
@@ -125,15 +132,14 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _validate_raw_prices_methodology_is_honest(research_run_id: int) -> None:
-    """Refuse to persist raw/unadjusted momentum scores under a methodology
-    that claims cutoff-adjustment was applied (adversarial-review round 9,
-    BUG-009 section 2.3/4): that is the same "provenance lies about what
-    actually happened" pattern as the original P0 finding this whole task
-    exists to prevent, just reached via a silent degrade (missing
-    corporate_actions snapshot) instead of missing wiring. This script is
-    not Airflow-reachable, so the ORM (data.research.models/identity) is
-    safe to use here unlike the DAG-reachable modules elsewhere in 01B-3.
+def _get_methodology_fields_for_run(research_run_id: int) -> dict:
+    """Look up the (name, score_action_availability_policy,
+    universe_import_policy) of the methodology a research_run_id is tagged
+    with. Returns plain dict values, read while the session is still open
+    (round 8 lesson: never return/leak a live ORM instance past its session
+    -- session.commit()/close expires attributes and raises
+    DetachedInstanceError on later access). Shared by both honesty checks
+    below so the session/lookup boilerplate exists in exactly one place.
     """
     import os
 
@@ -155,19 +161,67 @@ def _validate_raw_prices_methodology_is_honest(research_run_id: int) -> None:
                 f"research_runs.id={research_run_id} references a missing "
                 f"methodology_id={run_row.methodology_id}."
             )
-        if methodology.score_action_availability_policy == "score_cutoff_known_at_v1":
-            raise ValueError(
-                f"--research-run-id={research_run_id} is tagged with methodology "
-                f"{methodology.name!r}, whose score_action_availability_policy is "
-                "'score_cutoff_known_at_v1' -- it claims cutoff-adjusted "
-                "corporate-action handling was applied. Writing RAW (unadjusted) "
-                "momentum scores under that methodology would misrepresent what "
-                "was actually computed (BUG-009). Register a distinct methodology "
-                "whose score_action_availability_policy honestly declares no "
-                "cutoff adjustment was applied (e.g. "
-                "'raw_unadjusted_no_corporate_action_data'), activate a run under "
-                "it, and pass that run's id instead."
-            )
+        return {
+            "name": methodology.name,
+            "score_action_availability_policy": methodology.score_action_availability_policy,
+            "universe_import_policy": methodology.universe_import_policy,
+        }
+
+
+def _validate_raw_prices_methodology_is_honest(research_run_id: int) -> None:
+    """Refuse to persist raw/unadjusted momentum scores under a methodology
+    that claims cutoff-adjustment was applied (adversarial-review round 9,
+    BUG-009 section 2.3/4): that is the same "provenance lies about what
+    actually happened" pattern as the original P0 finding this whole task
+    exists to prevent, just reached via a silent degrade (missing
+    corporate_actions snapshot) instead of missing wiring. This script is
+    not Airflow-reachable, so the ORM (data.research.models/identity) is
+    safe to use here unlike the DAG-reachable modules elsewhere in 01B-3.
+    """
+    fields = _get_methodology_fields_for_run(research_run_id)
+    if fields["score_action_availability_policy"] == "score_cutoff_known_at_v1":
+        raise ValueError(
+            f"--research-run-id={research_run_id} is tagged with methodology "
+            f"{fields['name']!r}, whose score_action_availability_policy is "
+            "'score_cutoff_known_at_v1' -- it claims cutoff-adjusted "
+            "corporate-action handling was applied. Writing RAW (unadjusted) "
+            "momentum scores under that methodology would misrepresent what "
+            "was actually computed (BUG-009). Register a distinct methodology "
+            "whose score_action_availability_policy honestly declares no "
+            "cutoff adjustment was applied (e.g. "
+            "'raw_unadjusted_no_corporate_action_data'), activate a run under "
+            "it, and pass that run's id instead."
+        )
+
+
+def _validate_provisional_no_universe_methodology_is_honest(research_run_id: int) -> None:
+    """Refuse to persist current-membership (non-PIT, survivorship-biased)
+    scores under a methodology that claims point-in-time universe safety
+    (adversarial-review round 10, BUG-008/BUG-009): the same honesty-check
+    pattern as :func:`_validate_raw_prices_methodology_is_honest`, on a
+    different dimension. --provisional-no-universe correctly skips PIT
+    membership filtering, but nothing else stops an operator from tagging
+    the resulting rows with the ACTIVE operational research_run_id, whose
+    registered methodology (universe_import_policy=
+    "pit_universe_effective_dated_v1") claims PIT-universe safety.
+    Downstream readers filter solely by research_run_id (BUG-072), so they
+    would silently consume current-membership rows believing them PIT-safe.
+    """
+    fields = _get_methodology_fields_for_run(research_run_id)
+    if fields["universe_import_policy"] == "pit_universe_effective_dated_v1":
+        raise ValueError(
+            f"--research-run-id={research_run_id} is tagged with methodology "
+            f"{fields['name']!r}, whose universe_import_policy is "
+            "'pit_universe_effective_dated_v1' -- it claims point-in-time "
+            "universe membership filtering was applied. Writing "
+            "--provisional-no-universe (current-membership, "
+            "survivorship-biased) scores under that methodology would "
+            "misrepresent what was actually computed (BUG-008/BUG-009). "
+            "Register a distinct methodology whose universe_import_policy "
+            "honestly declares no PIT filtering was applied (e.g. "
+            "'legacy_current_membership_no_pit_enforcement'), activate a run "
+            "under it, and pass that run's id instead."
+        )
 
 
 def run(
@@ -231,6 +285,23 @@ def run(
                 "selection, promotion, or paper-trading qualification (BUG-008)"
             ),
         )
+        # Adversarial-review round 10 (BUG-008/BUG-009): --provisional-no-universe
+        # correctly skips PIT membership filtering, but nothing else stops an
+        # operator from tagging the result with a research_run_id whose
+        # methodology claims PIT-universe safety -- downstream readers filter
+        # solely by research_run_id (BUG-072) and would silently consume
+        # current-membership (survivorship-biased) rows believing them
+        # PIT-safe. A dry run never persists, so it stays permissive; a live
+        # write must not lie about its own methodology.
+        if not dry_run:
+            if research_run_id is None:
+                raise ValueError(
+                    "--provisional-no-universe on a live (non-dry-run) write "
+                    "requires --research-run-id so the run's methodology can "
+                    "be validated for honesty before any scores are computed "
+                    "(BUG-008/BUG-009)."
+                )
+            _validate_provisional_no_universe_methodology_is_honest(research_run_id)
     else:
         import os
 
