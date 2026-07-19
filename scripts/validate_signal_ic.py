@@ -129,62 +129,6 @@ def _build_eligibility_frame(universe_lookup, dates: list) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["ticker", "date"])
 
 
-def _validate_provisional_no_universe_methodology_is_honest(research_run_id: int) -> None:
-    """Refuse to persist current-membership (non-PIT, survivorship-biased)
-    IC results under a methodology that claims point-in-time universe
-    safety (adversarial-review round 10 self-audit sweep, BUG-008/BUG-009):
-    the same honesty-check pattern built for
-    scripts/backfill_momentum_scores.py's --provisional-no-universe gate,
-    applied here since --persist + --research-run-id +
-    --provisional-no-universe is the identical risk -- an operator could
-    tag current-membership signal_ic_stats rows with a research_run_id
-    whose registered methodology (universe_import_policy=
-    "pit_universe_effective_dated_v1") claims PIT-universe safety.
-    signal_ic_stats' own per-row ``provisional`` column (migration 010)
-    self-describes honestly regardless of which research_run_id is
-    supplied, but migration 012's docstring is explicit that
-    ``research_runs.status``/``is_active`` (reached via research_run_id),
-    not ``provisional``, is the authoritative marker going forward -- a
-    reader built to that newer model could still be misled by a
-    PIT-claiming methodology tag. This script is not Airflow-reachable, so
-    the ORM (data.research.models) is safe to use here, matching
-    scripts/backfill_momentum_scores.py's equivalent check.
-    """
-    import os
-
-    from sqlalchemy import create_engine as _create_engine
-    from sqlalchemy.orm import Session
-
-    from data.research.models import ResearchMethodology, ResearchRun
-
-    engine = _create_engine(os.environ["DATABASE_URL"])
-    with Session(engine) as session:
-        run_row = session.get(ResearchRun, research_run_id)
-        if run_row is None:
-            raise ValueError(
-                f"--research-run-id={research_run_id} does not exist in research_runs."
-            )
-        methodology = session.get(ResearchMethodology, run_row.methodology_id)
-        if methodology is None:
-            raise ValueError(
-                f"research_runs.id={research_run_id} references a missing "
-                f"methodology_id={run_row.methodology_id}."
-            )
-        if methodology.universe_import_policy == "pit_universe_effective_dated_v1":
-            raise ValueError(
-                f"--research-run-id={research_run_id} is tagged with methodology "
-                f"{methodology.name!r}, whose universe_import_policy is "
-                "'pit_universe_effective_dated_v1' -- it claims point-in-time "
-                "universe membership filtering was applied. Persisting "
-                "--provisional-no-universe (current-membership, "
-                "survivorship-biased) results under that methodology would "
-                "misrepresent what was actually computed (BUG-008/BUG-009). "
-                "Register a distinct methodology whose universe_import_policy "
-                "honestly declares no PIT filtering was applied, activate a "
-                "run under it, and pass that run's id instead."
-            )
-
-
 def _persist_summary(
     engine, summary: pd.DataFrame, research_run_id: int, provisional: bool = True
 ) -> int:
@@ -438,17 +382,30 @@ def main() -> int:
         )
         return 1
 
-    if args.persist and args.provisional_no_universe:
-        try:
-            _validate_provisional_no_universe_methodology_is_honest(args.research_run_id)
-        except ValueError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         print("ERROR: DATABASE_URL is not set.", file=sys.stderr)
         return 1
+
+    if args.persist and args.provisional_no_universe:
+        # Adversarial-review round 11 (BUG-008/BUG-009): routed through the
+        # single shared data.research.sql_compat.assert_methodology_write_is_honest
+        # gate rather than a script-local variant -- this script always
+        # applies corporate-action cutoff adjustment (score_adjusted_prices/
+        # realized_forward_returns below have no raw-price fallback path),
+        # so only the PIT-universe dimension can ever be dishonest here.
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        try:
+            assert_methodology_write_is_honest(
+                database_url,
+                args.research_run_id,
+                pit_universe_applied=False,
+                corporate_action_adjustment_applied=True,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
     engine = create_engine(database_url)
     prices = _load_prices(engine)

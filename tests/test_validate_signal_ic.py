@@ -13,7 +13,6 @@ from scripts.validate_signal_ic import (
     _add_gate_columns,
     _holdout_start,
     _persist_summary,
-    _validate_provisional_no_universe_methodology_is_honest,
 )
 
 
@@ -127,18 +126,28 @@ def test_persist_summary_stamps_certified_rows_non_provisional():
     assert records[0]["provisional"] is False
 
 
-class TestValidateProvisionalNoUniverseMethodologyIsHonest:
-    """Adversarial-review round 10 self-audit sweep (BUG-008/BUG-009): the
-    same --provisional-no-universe honesty-check pattern built for
-    scripts/backfill_momentum_scores.py, applied here since --persist +
-    --provisional-no-universe + --research-run-id is the identical risk on
-    signal_ic_stats."""
+class TestMainRoutesProvisionalNoUniverseThroughSharedHonestyGate:
+    """Adversarial-review round 11 (BUG-008/BUG-009): main()'s
+    --persist + --provisional-no-universe path now routes through the ONE
+    shared data.research.sql_compat.assert_methodology_write_is_honest gate
+    instead of a script-local variant (direct unit coverage of the shared
+    gate itself lives in data/tests/research/test_sql_compat.py -- this
+    class only proves main() is actually wired to it). The gate runs
+    before any price/DB work beyond resolving DATABASE_URL, so these tests
+    reach it via main()'s real CLI entry point without needing a full
+    prices/fundamentals fixture."""
 
-    def _register(self, engine, universe_import_policy, name):
+    def _engine_with_methodology(self, tmp_path, monkeypatch, universe_import_policy, name):
+        from sqlalchemy import create_engine
         from sqlalchemy.orm import Session
 
         from data.research.identity import MethodologySpec, activate_run, register_methodology, register_run
+        from data.research.models import Base
 
+        db_path = tmp_path / f"{name}.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(engine)
         with Session(engine) as session:
             methodology = register_methodology(
                 session,
@@ -161,39 +170,53 @@ class TestValidateProvisionalNoUniverseMethodologyIsHonest:
             session.commit()
             return run_row.id
 
-    def _engine(self, tmp_path, monkeypatch, name):
+    def test_pit_claiming_run_exits_1_with_misrepresent_message(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        from scripts.validate_signal_ic import main
+
+        run_id = self._engine_with_methodology(
+            tmp_path, monkeypatch, "pit_universe_effective_dated_v1", "claims_pit_methodology"
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "validate_signal_ic.py",
+                "--persist",
+                "--provisional-no-universe",
+                "--research-run-id", str(run_id),
+            ],
+        )
+
+        assert main() == 1
+        err = capsys.readouterr().err
+        assert "misrepresent" in err
+
+    def test_unknown_run_id_exits_1_with_does_not_exist_message(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        from scripts.validate_signal_ic import main
+
+        db_path = tmp_path / "empty.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
         from sqlalchemy import create_engine
 
         from data.research.models import Base
 
-        db_path = tmp_path / f"{name}.db"
-        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
-        engine = create_engine(f"sqlite:///{db_path}")
-        Base.metadata.create_all(engine)
-        return engine
-
-    def test_raises_when_methodology_claims_pit_universe(self, tmp_path, monkeypatch) -> None:
-        engine = self._engine(tmp_path, monkeypatch, "claims_pit")
-        run_id = self._register(engine, "pit_universe_effective_dated_v1", "claims_pit_methodology")
-
-        with pytest.raises(ValueError, match="misrepresent"):
-            _validate_provisional_no_universe_methodology_is_honest(run_id)
-
-    def test_passes_when_methodology_honestly_declares_no_pit_filtering(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        engine = self._engine(tmp_path, monkeypatch, "honest_no_pit")
-        run_id = self._register(
-            engine, "legacy_current_membership_no_pit_enforcement", "honest_no_pit_methodology"
+        Base.metadata.create_all(create_engine(f"sqlite:///{db_path}"))
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "validate_signal_ic.py",
+                "--persist",
+                "--provisional-no-universe",
+                "--research-run-id", "999999",
+            ],
         )
 
-        _validate_provisional_no_universe_methodology_is_honest(run_id)  # must not raise
-
-    def test_raises_on_unknown_run_id(self, tmp_path, monkeypatch) -> None:
-        self._engine(tmp_path, monkeypatch, "empty_db")
-
-        with pytest.raises(ValueError, match="does not exist"):
-            _validate_provisional_no_universe_methodology_is_honest(999999)
+        assert main() == 1
+        err = capsys.readouterr().err
+        assert "does not exist" in err
 
 
 def test_build_eligibility_frame_matches_lookup(tmp_path):
