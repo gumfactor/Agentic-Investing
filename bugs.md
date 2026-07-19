@@ -683,6 +683,121 @@ The PM independently reproduced and confirmed round 8's BUG-073 testpaths
 finding this round (old buggy config: 1685 vs corrected 2096, previously
 hidden subtrees run clean) — no further action needed there.
 
+**Adversarial review round 10 (same day):** two P2s, plus a required
+self-audit sweep before closing the round. (1) **P2:**
+`scripts/audit_pit_safety.py::_empirical_audit` recomputed expected
+momentum from raw `daily_prices.close` with no corporate-action
+adjustment, but the backfill (round 4/9) writes scores from a
+cutoff-adjusted `adj_close` series — any audited window crossing a
+split/dividend showed a spurious mismatch, making the audit tool itself
+unreliable exactly where it matters most. Fixed: new
+`_adjusted_prices_for_audit` rebuilds the same cutoff-adjusted scoring
+input the backfill actually wrote scores from (reusing
+`build_score_price_history_as_of`), with an optional
+`--corporate-actions-file`/automatic snapshot load that degrades to a
+loud raw-price caveat (not a failure — this is a read-only diagnostic
+tool) if unavailable. New test
+`test_audit_empirical_false_positives_without_corporate_actions_but_clean_with_them`
+reproduces the exact finding: raw recomputation false-positives across a
+split window; supplying `corporate_actions` reports zero violations. (2)
+**P2:** `--provisional-no-universe` on `scripts/backfill_momentum_scores.py`
+could be combined with a live write tagged to the ACTIVE operational
+`research_run_id` (whose methodology claims PIT-universe safety), letting
+current-membership (survivorship-biased) rows masquerade as PIT-safe to
+any downstream reader filtering solely by `research_run_id` (BUG-072) —
+same honesty-check pattern as round 9, on the universe dimension instead
+of the corporate-action dimension. Fixed: new
+`_validate_provisional_no_universe_methodology_is_honest` (sharing the
+plain-scalar `_get_methodology_fields_for_run` lookup with round 9's
+check) refuses a live `--provisional-no-universe` write unless
+`--research-run-id` points at a methodology that honestly declares no PIT
+filtering was applied. New tests in
+`data/tests/universe/test_backfill_universe_filter.py::
+TestProvisionalNoUniverseFailsClosedOnLiveWrite`/
+`TestValidateProvisionalNoUniverseMethodologyIsHonest` cover the gate and
+its unit-level honesty check directly; the round-9 tests that had used
+`--provisional-no-universe` merely as a convenience were updated to use
+the PIT `lookup` fixture instead, since the new round-10 gate would
+otherwise intercept them before they reached what they were actually
+testing.
+
+**Round-10 self-audit sweep (required before closing the round):** a
+comprehensive repo-wide check across four dimensions, per explicit review
+directive.
+- *Corporate-action adjustment wiring*: grepped every production path
+  reading `daily_prices`/computing a return. Found and fixed a THIRD
+  instance of the same defect class:
+  `airflow/dags/daily_signal_pipeline.py::_write_simulation`'s
+  close-to-close daily return divided RAW prices with no adjustment — a
+  split/dividend on `sim_date` or `prev_date` would inject a fabricated
+  return into the COMPOUNDING `simulated_nav` chain, permanently
+  distorting every later NAV row for the strategy. Fixed via new
+  `_adjusted_closes_for_simulation`, reusing
+  `build_realized_total_return_as_of` with `entry_date=prev_date` and
+  `exit_cutoff=session_close_cutoff(sim_date)` (exact per-run cutoff, not
+  an approximation, since this task scores exactly one `sim_date` per DAG
+  run); non-blocking degrade-to-raw on any adjustment failure
+  (`strategy_simulations` has no `research_run_id` column, so there is no
+  provenance-honesty claim to violate by degrading). Extracted as a
+  standalone testable function since the production INSERT uses
+  Postgres-only `jsonb` CAST syntax SQLite tests can't exercise
+  end-to-end. New tests in `tests/test_daily_signal_pipeline_pit.py::
+  TestSimulationCorporateActionAdjustment` prove a split is correctly
+  back-adjusted (raw closes would imply a fake ~49% loss; adjusted is a
+  genuine +2% gain), and that missing/absent corporate actions degrade to
+  raw without raising. `signals/composites/momentum_score.py`/
+  `low_vol_score.py` are pure functions operating on whatever series their
+  caller passes and were confirmed to always be fed already-adjusted
+  series by every caller checked.
+- *SQLAlchemy 1.4/2.0 isolation test robustness*: audited
+  `tests/test_airflow_sqlalchemy_import_isolation.py` itself and found it
+  only walked ONE level deep (the DAG plus its direct `scripts.*`
+  imports), not the full transitive closure — a script reachable ONLY
+  through another script (a real, multi-level import graph exists in the
+  `scripts/paper_*_check.py` family) would have been silently unchecked,
+  and `data.*` modules reached only through a script were never checked at
+  all. Rewritten to a proper BFS closure over every `scripts.*`/`data.*`
+  module transitively reachable from each DAG, with a sanity assertion
+  that the BFS actually reaches depth > 1 for `daily_paper_trading.py` (so
+  a future regression narrowing this back to depth-1 fails the test rather
+  than silently passing). No live gap found — the repo's actual import
+  graph is currently clean — but the coverage gap in the guard itself was
+  real.
+- *Provenance-honesty sweep*: grepped every `research_run_id=`/
+  `research_run_id[...]=` write-site repo-wide. Found and fixed a second
+  instance of the round-10 universe-honesty gap:
+  `scripts/validate_signal_ic.py`'s `--persist` path (writes
+  `signal_ic_stats`) had the identical `--provisional-no-universe` +
+  `--research-run-id` risk as `backfill_momentum_scores.py` — its per-row
+  `provisional` column (migration 010) self-describes honestly, but
+  migration 012's docstring is explicit that `research_runs.status`/
+  `is_active` (reached via `research_run_id`), not `provisional`, is now
+  the authoritative marker, so a reader trusting that newer model could
+  still be misled by a PIT-claiming methodology tag. Fixed with the same
+  `_validate_provisional_no_universe_methodology_is_honest` pattern
+  (duplicated deliberately rather than refactored into a shared module,
+  to avoid touching already-reviewed round-9/round-10 code under review
+  pressure), wired into `main()` alongside the existing
+  `--persist`/`--research-run-id` requirement check. `airflow/dags/
+  daily_signal_pipeline.py::_write_scores` and `scripts/pin_snapshot.py`
+  were reviewed and found exempt by design (the former resolves
+  `research_run_id` via the DAG's own fixed active-run lookup with no
+  operator-suppliable override; the latter already has its own explicit
+  `--research-run-id` opt-in plus same-natural-key collision detection,
+  round 3). `data/storage/timescale_writer.py`'s `upsert_factor_scores`/
+  `upsert_alpha_scores` are infra-layer writers that require
+  `research_run_id` present but have no methodology-claim semantics of
+  their own — the honesty check is each higher-level caller's
+  responsibility, already covered at every current call site.
+- *Active-run read-filtering final sweep*: repeated the BUG-072 grep for
+  every `FROM alpha_scores`/`FROM factor_scores`/ORM-table-reflection
+  read across the full repo (including `notebooks/`, `mcp_servers/`,
+  which currently have no matching code). Confirmed every reader is
+  either filtered via `_ACTIVE_RUN_SUBQUERY`/an explicit `research_run_id`
+  parameter, or is one of the two documented exceptions
+  (`scripts/pin_snapshot.py`, `scripts/indicator_diagnostic.py`'s
+  `--all-runs` opt-in). No new gap found.
+
 ### BUG-010: `pct_change()` missing-data defaults distort many indicators
 
 **Severity:** P0 / signal correctness
