@@ -13,6 +13,45 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ## 2026-07-19
 
+### Session — Roadmap review (post-Gate-01 wave boundary)
+
+**Operator:** mshane@thecanadalist.ca
+**Role:** PM roadmap review (Claude — Fable 5)
+**Branch:** `dev/R2-phase1`
+
+#### What was done
+
+- Ran the scheduled `/roadmap-review` at the Gate 01 → Gate 02/03 wave
+  boundary. Verified all roadmap statuses against `bugs.md`, `Worklog.md`,
+  and merged PRs (#32–#35): 01A/01B `Delivered` correct; 02A/02B/03 `Ready`
+  correct; all spec-reference paths resolve; execution log matches merges.
+- All changes below were proposed to and approved by the operator before
+  editing.
+- `[DECISION]` **BUG-070 promoted to roadmap row 03B** ("Split backtester
+  prices into execution and analytic series", P1, Ready). It was the only
+  open P1 not mapped to any roadmap row. Existing Gate 03 relabeled 03A;
+  Gate 04 (strategy-selection protocol) now depends on 02B + 03A + 03B,
+  since selecting strategies on a backtester with the BUG-070 lookahead/
+  non-tradable-price defect would qualify noise.
+- Rewrote the stale "Current decision" section (still pointed at Gate 01):
+  active front is Gate 02 with the Gate 03 research track in parallel,
+  mirroring the 01A/01B platform/research split. Four-week clock still not
+  started; current backtests still not selection evidence.
+- Cited residual P2s (BUG-066, BUG-068, BUG-071) in row 04's spec column so
+  qualification-time work sees them.
+- Operator confirmed the 01B-2 DB steps (migration 009 + PIT universe
+  import) are **not yet done**; recorded as an explicit entry condition on
+  Gate 02A so they cannot be skipped.
+- Cross-referenced row 03B in the `bugs.md` BUG-070 status cell.
+
+#### Next steps
+
+- Operator: run migration 009 + universe import, then schedule the 02A
+  no-submit Compose run.
+- PM: sequence 02B and 03A/03B builder work per the R2 PR workflow.
+
+---
+
 ### Session — R2 PM: 01B-3 (BUG-009) merged; Gate 01B research-validity baseline complete
 
 **Operator:** mshane@thecanadalist.ca

@@ -1,6 +1,6 @@
 # RQIS Current Delivery Roadmap
 
-**Current baseline:** `main` at `39c5e5b` (2026-06-30). This roadmap was rebuilt on 2026-07-12 from the synced repository, current `bugs.md`, `CLAUDE.md`, `Worklog.md`, and three independent reviews of execution, strategy/research, and dashboard/operator experience.
+**Current baseline:** `main` at `39c5e5b` (2026-06-30). This roadmap was rebuilt on 2026-07-12 from the synced repository, current `bugs.md`, `CLAUDE.md`, `Worklog.md`, and three independent reviews of execution, strategy/research, and dashboard/operator experience. Reviewed 2026-07-19 (post-Gate-01): BUG-070 added as row 03B, Gate 04 dependencies/citations extended, current decision updated to the Gate 02/03 front.
 
 This is the task-selection plan, not a second bug tracker. `bugs.md` remains the detailed finding register; `PRD.md` remains product scope; `Worklog.md` remains the chronological record.
 
@@ -23,10 +23,11 @@ This is the task-selection plan, not a second bug tracker. `bugs.md` remains the
 | Yes | Signal library and validation toolkit | P1 | Baseline | Research | XL | Delivered | None | [Phase 5 milestones](CLAUDE.md) | Composite signals, registry support, parameter sensitivity, and survival-funnel tooling exist; strategy validity remains unproven. | 2026-06-28 | 2026-06-28 |
 | Yes | Make Compose paper runtime executable | P0 | 01A — Runtime foundation | Platform | L | Delivered | None | [BUG-001 to BUG-004](bugs.md) | Pass all required paper/IBKR settings into Airflow, install DAG runtime dependencies, mount the shared artifact directory, and configure host-to-IBKR connectivity. | 2026-07-12 | 2026-07-18 |
 | Yes | Repair research-validity baseline | P0 | 01B — Research foundation | Research | XL | Delivered | None | [BUG-008 to BUG-010](bugs.md) | Replace current-membership historical universes, define and enforce signal-to-trade timing, and remediate unsafe missing-data defaults across the indicator library. | 2026-07-12 | 2026-07-19 |
-| No | Prove the Compose no-submit workflow | P0 | 02A — Runtime proof | Platform | L | Ready | Make Compose paper runtime executable | [DAG runbook](docs/runbooks/airflow_fire_drill.md) | Build the images, apply migrations, import both DAGs, verify shared artifacts and IBKR reachability, then complete a no-submit DAG run with retained evidence. | 2026-07-12 | |
+| No | Prove the Compose no-submit workflow | P0 | 02A — Runtime proof | Platform | L | Ready | Make Compose paper runtime executable | [DAG runbook](docs/runbooks/airflow_fire_drill.md) | Entry condition: operator first runs migration 009 (`alembic upgrade head`) and the documented PIT universe import against `DATABASE_URL` (pending from 01B-2). Then build the images, apply migrations, import both DAGs, verify shared artifacts and IBKR reachability, then complete a no-submit DAG run with retained evidence. | 2026-07-12 | |
 | No | Fail closed on unsupported strategy configuration | P0 | 02B — Semantic proof | Strategy Correctness | L | Ready | Repair research-validity baseline | [v2 strategy config](config/strategy/v2_mvo_momentum.yaml) | Implement declared MVO/risk-parity/constraint semantics in the backtester or reject unsupported fields; add a consumed-field conformance test for every strategy config key. | 2026-07-12 | |
-| No | Make research data immutable and PIT-complete | P0 | 03 — Reproducible research | Data / Research | XL | Ready | Repair research-validity baseline | [BUG-037 to BUG-039](bugs.md) | Add effective-dated universe and eligibility data, immutable content-addressed snapshots, corporate-action preservation, and fail-closed object-store handling. | 2026-07-12 | |
-| No | Establish a real strategy-selection protocol | P1 | 04 — Research qualification | Strategy Validation | XL | Blocked | Make research data immutable and PIT-complete; Fail closed on unsupported strategy configuration | [Backtesting validation](backtesting/validation) | Record hypotheses and trials, select only inside training windows, freeze configuration, test out of sample, retain a final holdout, and capture all variants for multiple-testing analysis. | 2026-07-12 | |
+| No | Make research data immutable and PIT-complete | P0 | 03A — Reproducible research | Data / Research | XL | Ready | Repair research-validity baseline | [BUG-037 to BUG-039](bugs.md) | Add effective-dated universe and eligibility data, immutable content-addressed snapshots, corporate-action preservation, and fail-closed object-store handling. | 2026-07-12 | |
+| No | Split backtester prices into execution and analytic series | P1 | 03B — Reproducible research | Backtesting | M | Ready | Repair research-validity baseline | [BUG-070](bugs.md); [design plan §2](docs/plans/01b-research-validity-design.md) | Replace the single full-history adjusted series in `backtesting/loader.py` with a raw tradable execution series (fills, cash, share accounting) plus the cutoff-aware analytic builders from 01B-3 for signals and valuation; fail closed when corporate-action data is missing instead of assuming `adj_factor=1.0`. | 2026-07-19 | |
+| No | Establish a real strategy-selection protocol | P1 | 04 — Research qualification | Strategy Validation | XL | Blocked | Make research data immutable and PIT-complete; Split backtester prices into execution and analytic series; Fail closed on unsupported strategy configuration | [Backtesting validation](backtesting/validation); residual caveats [BUG-066, BUG-068, BUG-071](bugs.md) | Record hypotheses and trials, select only inside training windows, freeze configuration, test out of sample, retain a final holdout, and capture all variants for multiple-testing analysis. | 2026-07-12 | |
 | No | Persist one authoritative safety state | P0 | 05A — Shared control plane | Risk / Execution | XL | Blocked | Prove the Compose no-submit workflow | [BUG-007, BUG-012](bugs.md) | Persist circuit-breaker events, alerts, acknowledgements, qualification state, and operational exceptions; dashboard and Airflow must read the same state and fail closed when unavailable. | 2026-07-12 | |
 | No | Secure and bind approval to the exact DAG run | P0 | 05B — Shared control plane | Security / Operator UI | XL | Blocked | Persist one authoritative safety state | [BUG-005, BUG-011 to BUG-016](bugs.md) | Authenticate approvers, enforce approval/reset roles, publish explicit approval requests per DAG run, bind the canonical artifact/hash/expiry, and reuse submission-side schema validation. | 2026-07-12 | |
 | No | Handle indeterminate orders and duplicate fills | P0 | 06A — Recovery correctness | Execution | XL | Blocked | Secure and bind approval to the exact DAG run | [BUG-006, BUG-042 and BUG-048](bugs.md) | Persist broker correlation identity, classify post-placement timeout as indeterminate, require broker reconciliation before retry, and deduplicate fills by true execution identity or cumulative-fill semantics. | 2026-07-12 | |
@@ -43,9 +44,18 @@ This is the task-selection plan, not a second bug tracker. `bugs.md` remains the
 
 ## Current decision
 
-Do not begin the four-week automated paper clock and do not treat current
-backtest results as strategy-selection evidence. The immediate work is Gate 01:
-make the deployed paper system runnable and repair research validity in parallel.
+Gate 01 is complete: 01A was operator-verified live on 2026-07-18 and the 01B
+research-validity baseline (BUG-008/009/010) was delivered on 2026-07-19. Do
+not begin the four-week automated paper clock, and continue to treat current
+backtest results as non-evidence for strategy selection — BUG-070 (row 03B)
+leaves the backtester's price handling contaminated until fixed.
+
+The active front is Gate 02 with the Gate 03 research track running in
+parallel, mirroring the 01A/01B split (platform and research touch disjoint
+systems): 02A is the operator-run no-submit Compose proof (entry condition:
+migration 009 + PIT universe import, still pending from 01B-2), 02B is the
+fail-closed strategy-configuration slice, and 03A/03B are ready for builder
+sequencing. Gate 04 must not start until 02B, 03A, and 03B are all delivered.
 
 ## Delivery execution log (R2 round)
 
