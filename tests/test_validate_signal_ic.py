@@ -13,6 +13,7 @@ from scripts.validate_signal_ic import (
     _add_gate_columns,
     _holdout_start,
     _persist_summary,
+    _validate_provisional_no_universe_methodology_is_honest,
 )
 
 
@@ -124,6 +125,75 @@ def test_persist_summary_stamps_certified_rows_non_provisional():
     assert _persist_summary(engine, summary, research_run_id=42, provisional=False) == 1
     _, records = connection.execute.call_args.args
     assert records[0]["provisional"] is False
+
+
+class TestValidateProvisionalNoUniverseMethodologyIsHonest:
+    """Adversarial-review round 10 self-audit sweep (BUG-008/BUG-009): the
+    same --provisional-no-universe honesty-check pattern built for
+    scripts/backfill_momentum_scores.py, applied here since --persist +
+    --provisional-no-universe + --research-run-id is the identical risk on
+    signal_ic_stats."""
+
+    def _register(self, engine, universe_import_policy, name):
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import MethodologySpec, activate_run, register_methodology, register_run
+
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy=universe_import_policy,
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="score_cutoff_known_at_v1",
+                    realized_return_action_availability_policy="exit_cutoff_known_at_v1",
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run_row = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run_row.id, activated_by="test")
+            session.commit()
+            return run_row.id
+
+    def _engine(self, tmp_path, monkeypatch, name):
+        from sqlalchemy import create_engine
+
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(engine)
+        return engine
+
+    def test_raises_when_methodology_claims_pit_universe(self, tmp_path, monkeypatch) -> None:
+        engine = self._engine(tmp_path, monkeypatch, "claims_pit")
+        run_id = self._register(engine, "pit_universe_effective_dated_v1", "claims_pit_methodology")
+
+        with pytest.raises(ValueError, match="misrepresent"):
+            _validate_provisional_no_universe_methodology_is_honest(run_id)
+
+    def test_passes_when_methodology_honestly_declares_no_pit_filtering(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        engine = self._engine(tmp_path, monkeypatch, "honest_no_pit")
+        run_id = self._register(
+            engine, "legacy_current_membership_no_pit_enforcement", "honest_no_pit_methodology"
+        )
+
+        _validate_provisional_no_universe_methodology_is_honest(run_id)  # must not raise
+
+    def test_raises_on_unknown_run_id(self, tmp_path, monkeypatch) -> None:
+        self._engine(tmp_path, monkeypatch, "empty_db")
+
+        with pytest.raises(ValueError, match="does not exist"):
+            _validate_provisional_no_universe_methodology_is_honest(999999)
 
 
 def test_build_eligibility_frame_matches_lookup(tmp_path):
