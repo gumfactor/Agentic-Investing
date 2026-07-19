@@ -511,6 +511,102 @@ def _combine_scores(**context: Any) -> None:
     )
 
 
+def _adjusted_closes_for_simulation(
+    prices_df: Any,
+    engine: Any,
+    sim_date: date,
+    prev_date: date,
+    today_closes: Any,
+    prev_day_closes: Any,
+) -> tuple[Any, Any]:
+    """Corporate-action-adjusted (ticker -> close) series for sim_date and
+    prev_date, used by :func:`_write_simulation` to compute a close-to-close
+    daily return (BUG-009 section 2.3, adversarial-review round 10
+    self-audit sweep).
+
+    Before this fix, ``_write_simulation`` divided RAW close-to-close
+    prices with no corporate-action adjustment. A split/dividend landing
+    exactly on sim_date (or prev_date) would inject a fabricated single-day
+    loss/gain into a strategy's simulated return -- and because
+    ``simulated_nav`` COMPOUNDS from the prior row (see
+    ``_write_simulation``'s docstring), that one bad day permanently
+    distorts every later NAV row for the strategy, not just the affected
+    day.
+
+    Reuses :func:`data.normalization.corporate_actions
+    .build_realized_total_return_as_of` (the same builder
+    ``signals.research.ic.compute_realized_forward_returns_as_of`` uses)
+    with ``entry_date=prev_date`` and
+    ``exit_cutoff=session_close_cutoff(sim_date)`` -- ``_write_simulation``
+    runs exactly one sim_date per DAG run, so that cutoff is the exact,
+    fully correct per-date cutoff (same reasoning as the ``score_cutoff``
+    comment in ``_load_prices`` for momentum/lowvol, not an approximation).
+    Passes the FULL price history (not just [prev_date, sim_date]) because
+    a dividend's per-share factor is looked up from the close ON ITS OWN
+    ex_date, which is not necessarily prev_date or sim_date -- truncating
+    the price panel would silently drop that dividend's adjustment.
+
+    Non-blocking degrade-to-raw on any adjustment failure (missing
+    corporate_actions table, query error, etc.), consistent with
+    ``_write_simulation``'s existing "log and skip, never abort the
+    pipeline" philosophy -- ``strategy_simulations`` is a
+    diagnostic/dashboard table, not a research_run_id-tagged research
+    result (no such column exists on ``strategy_simulations``), so there is
+    no provenance-honesty claim (BUG-009 section 4) to violate by
+    degrading.
+
+    Args:
+        today_closes, prev_day_closes: the RAW (ticker -> close) fallback
+            series, returned unchanged if adjustment is unavailable.
+
+    Returns:
+        (today_closes, prev_day_closes), each corporate-action-adjusted
+        when adjustment succeeds, otherwise the raw inputs unchanged.
+    """
+    import pandas as pd
+    from sqlalchemy import text as _text
+
+    try:
+        from data.normalization.corporate_actions import build_realized_total_return_as_of
+        from data.universe.calendar import session_close_cutoff
+
+        with engine.connect() as conn:
+            sim_corporate_actions = pd.read_sql(
+                _text(
+                    "SELECT ticker, ex_date, action_type, value, known_at, source_version "
+                    "FROM corporate_actions ORDER BY ticker, ex_date"
+                ),
+                conn,
+            )
+        if sim_corporate_actions.empty:
+            return today_closes, prev_day_closes
+
+        sim_corporate_actions["ex_date"] = pd.to_datetime(sim_corporate_actions["ex_date"]).dt.date
+        sim_corporate_actions["known_at"] = pd.to_datetime(
+            sim_corporate_actions["known_at"], utc=True
+        )
+        adjusted_sim_prices, _adj_meta = build_realized_total_return_as_of(
+            prices_df,
+            sim_corporate_actions,
+            entry_date=prev_date,
+            exit_cutoff=session_close_cutoff(sim_date),
+        )
+        adj_lookup = adjusted_sim_prices.set_index(["ticker", "date"])["adj_close"].astype(float)
+        return adj_lookup.xs(sim_date, level="date"), adj_lookup.xs(prev_date, level="date")
+    except Exception as exc:
+        import structlog as _structlog
+
+        _structlog.get_logger("rqis.airflow").warning(
+            "simulation_corporate_action_adjustment_unavailable",
+            sim_date=str(sim_date),
+            error=str(exc),
+            note="close-to-close simulated_return falls back to RAW prices "
+            "for this run; a split/dividend on sim_date or prev_date may "
+            "distort the simulated return (BUG-009 section 2.3)",
+        )
+        return today_closes, prev_day_closes
+
+
 def _write_simulation(**context: Any) -> dict:
     """Forward-simulate each strategy using today's alpha scores and daily_prices.
 
@@ -594,7 +690,10 @@ def _write_simulation(**context: Any) -> dict:
             "skipped this run (BUG-009 section 4)",
         )
 
-    # Compute close-to-close daily returns from prices for sim_date
+    # Compute close-to-close daily returns from prices for sim_date. See
+    # _adjusted_closes_for_simulation's docstring (BUG-009 section 2.3,
+    # adversarial-review round 10 self-audit sweep) for why this must be
+    # corporate-action-adjusted, not raw.
     today_closes = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
     prev_day_closes: pd.Series = pd.Series(dtype=float)
     prior_dates = prices_df[prices_df["date"] < sim_date]["date"]
@@ -602,6 +701,9 @@ def _write_simulation(**context: Any) -> dict:
         prev_date = prior_dates.max()
         prev_day_closes = (
             prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+        )
+        today_closes, prev_day_closes = _adjusted_closes_for_simulation(
+            prices_df, engine, sim_date, prev_date, today_closes, prev_day_closes
         )
 
     for strategy_id in strategy_ids:

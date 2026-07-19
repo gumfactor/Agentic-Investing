@@ -425,6 +425,135 @@ class TestCorporateActionWiring:
         assert abs(adj_close - 100.0) < 1e-6  # adjusted_prices_json is split-adjusted
 
 
+class TestSimulationCorporateActionAdjustment:
+    """BUG-009 section 2.3 (adversarial-review round 10 self-audit sweep):
+    _write_simulation's close-to-close return, computed by
+    _adjusted_closes_for_simulation, must be corporate-action-adjusted, not
+    raw -- a split/dividend landing on sim_date or prev_date would
+    otherwise inject a fabricated return into the compounding
+    simulated_nav chain, permanently distorting every later NAV row."""
+
+    class _FakeEngine:
+        def connect(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_split_on_sim_date_is_adjusted(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+        from datetime import datetime, timezone
+
+        prev_date = date(2022, 6, 1)
+        sim_date = date(2022, 6, 2)
+        prices_df = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": prev_date, "close": 100.0},
+                {"ticker": "AAA", "date": sim_date, "close": 51.0},  # ~2:1 split + genuine gain
+            ]
+        )
+        actions_frame = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "ex_date": sim_date,
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime(2022, 6, 1, 21, 0, tzinfo=timezone.utc),
+                    "source_version": "test",
+                }
+            ]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return actions_frame.copy()
+
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+
+        raw_today = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+        raw_prev = prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+
+        adj_today, adj_prev = dag_module._adjusted_closes_for_simulation(
+            prices_df, self._FakeEngine(), sim_date, prev_date, raw_today, raw_prev
+        )
+
+        # prev_date is BEFORE the split's ex_date, so it gets back-adjusted
+        # by the split factor (1/2): 100.0 -> 50.0. sim_date is ON the
+        # ex_date, so it stays at its raw close, 51.0 (adj_factor=1 for
+        # dates on/after the most recent action).
+        assert abs(float(adj_prev["AAA"]) - 50.0) < 1e-6
+        assert abs(float(adj_today["AAA"]) - 51.0) < 1e-6
+
+        # The RAW (unadjusted) closes would have implied a fake ~49% LOSS;
+        # the adjusted return is the genuine +2% gain.
+        raw_return = float(raw_today["AAA"]) / float(raw_prev["AAA"]) - 1.0
+        adj_return = float(adj_today["AAA"]) / float(adj_prev["AAA"]) - 1.0
+        assert raw_return < -0.4
+        assert abs(adj_return - 0.02) < 1e-6
+
+    def test_no_corporate_actions_table_degrades_to_raw(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+
+        prev_date = date(2022, 6, 1)
+        sim_date = date(2022, 6, 2)
+        prices_df = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": prev_date, "close": 100.0},
+                {"ticker": "AAA", "date": sim_date, "close": 102.0},
+            ]
+        )
+
+        def _raising_read_sql(query, *a, **k):
+            raise Exception("no such table: corporate_actions")
+
+        monkeypatch.setattr(pd, "read_sql", _raising_read_sql)
+
+        raw_today = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+        raw_prev = prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+
+        adj_today, adj_prev = dag_module._adjusted_closes_for_simulation(
+            prices_df, self._FakeEngine(), sim_date, prev_date, raw_today, raw_prev
+        )
+
+        # Must not raise; degrades to the RAW closes passed in (non-blocking
+        # "log and skip" philosophy, matching _write_simulation elsewhere).
+        assert adj_today.equals(raw_today)
+        assert adj_prev.equals(raw_prev)
+
+    def test_no_actions_returns_raw_unchanged(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+
+        prev_date = date(2022, 6, 1)
+        sim_date = date(2022, 6, 2)
+        prices_df = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": prev_date, "close": 100.0},
+                {"ticker": "AAA", "date": sim_date, "close": 102.0},
+            ]
+        )
+        empty_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return empty_actions.copy()
+
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+
+        raw_today = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+        raw_prev = prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+
+        adj_today, adj_prev = dag_module._adjusted_closes_for_simulation(
+            prices_df, self._FakeEngine(), sim_date, prev_date, raw_today, raw_prev
+        )
+
+        assert adj_today.equals(raw_today)
+        assert adj_prev.equals(raw_prev)
+
+
 class TestComputeQualityPITCrossSection:
     """Codex PR #34 final P2: quality ratios use only fundamentals, so a
     non-member with valid financial_statements rows bypassed the filtered
