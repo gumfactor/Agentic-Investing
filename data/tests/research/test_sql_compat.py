@@ -96,6 +96,160 @@ class TestGetActiveResearchRunId:
         assert sql_result == orm_result.id
 
 
+class TestAssertMethodologyWriteIsHonest:
+    """BUG-009 section 4, adversarial-review round 11: the ONE shared
+    enforcement point every score-writing call site routes through, instead
+    of each maintaining its own ad hoc honesty check (four separate
+    near-duplicate variants existed across rounds 9-11 before this
+    consolidation)."""
+
+    def _register(self, engine, *, universe_import_policy, score_action_availability_policy, name):
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy=universe_import_policy,
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy=score_action_availability_policy,
+                    realized_return_action_availability_policy=score_action_availability_policy,
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run.id, activated_by="test")
+            session.commit()
+            return run.id
+
+    def test_pit_claiming_run_raises_when_pit_not_applied(self, engine) -> None:
+        from data.research.sql_compat import (
+            MethodologyHonestyError,
+            assert_methodology_write_is_honest,
+        )
+
+        run_id = self._register(
+            engine,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            score_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+            name="claims_pit",
+        )
+
+        with pytest.raises(MethodologyHonestyError, match="misrepresent"):
+            assert_methodology_write_is_honest(
+                engine,
+                run_id,
+                pit_universe_applied=False,
+                corporate_action_adjustment_applied=True,
+            )
+
+    def test_pit_claiming_run_passes_when_pit_applied(self, engine) -> None:
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        run_id = self._register(
+            engine,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            score_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+            name="claims_pit_and_true",
+        )
+
+        assert_methodology_write_is_honest(
+            engine,
+            run_id,
+            pit_universe_applied=True,
+            corporate_action_adjustment_applied=True,
+        )  # must not raise
+
+    def test_cutoff_claiming_run_raises_when_adjustment_not_applied(self, engine) -> None:
+        from data.research.sql_compat import (
+            MethodologyHonestyError,
+            assert_methodology_write_is_honest,
+        )
+
+        run_id = self._register(
+            engine,
+            universe_import_policy="legacy_current_membership_no_pit_enforcement",
+            score_action_availability_policy="score_cutoff_known_at_v1",
+            name="claims_cutoff",
+        )
+
+        with pytest.raises(MethodologyHonestyError, match="misrepresent"):
+            assert_methodology_write_is_honest(
+                engine,
+                run_id,
+                pit_universe_applied=False,
+                corporate_action_adjustment_applied=False,
+            )
+
+    def test_cutoff_claiming_run_passes_when_adjustment_applied(self, engine) -> None:
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        run_id = self._register(
+            engine,
+            universe_import_policy="legacy_current_membership_no_pit_enforcement",
+            score_action_availability_policy="score_cutoff_known_at_v1",
+            name="claims_cutoff_and_true",
+        )
+
+        assert_methodology_write_is_honest(
+            engine,
+            run_id,
+            pit_universe_applied=False,
+            corporate_action_adjustment_applied=True,
+        )  # must not raise
+
+    def test_honest_legacy_methodology_never_raises(self, engine) -> None:
+        """A methodology that claims neither PIT nor cutoff-adjustment can
+        never be dishonest on either dimension, regardless of what the
+        caller actually did."""
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        run_id = self._register(
+            engine,
+            universe_import_policy="legacy_current_membership_no_pit_enforcement",
+            score_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+            name="fully_honest_legacy",
+        )
+
+        assert_methodology_write_is_honest(
+            engine, run_id, pit_universe_applied=False, corporate_action_adjustment_applied=False
+        )  # must not raise
+        assert_methodology_write_is_honest(
+            engine, run_id, pit_universe_applied=True, corporate_action_adjustment_applied=True
+        )  # also fine -- doing MORE than claimed is never dishonest
+
+    def test_raises_on_unknown_run_id(self, engine) -> None:
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        with pytest.raises(ValueError, match="does not exist"):
+            assert_methodology_write_is_honest(
+                engine, 999999, pit_universe_applied=True, corporate_action_adjustment_applied=True
+            )
+
+    def test_accepts_url_string_like_get_active_research_run_id(self, tmp_path) -> None:
+        """Same engine_or_url flexibility as get_active_research_run_id."""
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        db_path = tmp_path / "url_string.db"
+        url = f"sqlite:///{db_path}"
+        eng = create_engine(url, future=True)
+        Base.metadata.create_all(eng)
+        run_id = self._register(
+            eng,
+            universe_import_policy="legacy_current_membership_no_pit_enforcement",
+            score_action_availability_policy="raw_unadjusted_no_corporate_action_data",
+            name="url_string_case",
+        )
+
+        assert_methodology_write_is_honest(
+            url, run_id, pit_universe_applied=False, corporate_action_adjustment_applied=False
+        )  # must not raise
+
+
 class TestSqlCompatHasNoOrmImports:
     """The whole point of this module: it must never import the
     SQLAlchemy-2-only ORM (data.research.identity/data.research.models),
