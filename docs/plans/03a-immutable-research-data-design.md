@@ -208,24 +208,61 @@ silently assumed away).
 
 Replace the caller-supplied-date object key
 (`snapshots/{data_type}/{YYYY-MM-DD}/data.parquet`, BUG-038) with a
-content-addressed key computed from the serialized bytes:
+content-addressed key computed from a **canonical logical content hash** of
+the DataFrame, not from the serialized parquet bytes:
 
 ```
 snapshots/{data_type}/sha256/{hash[0:2]}/{hash}/data.parquet
 ```
 
-`ParquetSnapshots.save_snapshot` computes the SHA-256 of the serialized
-parquet bytes *before* upload. If an object already exists at that hash's
-key, the write is skipped (the content is already immutably stored;
-re-pinning the same data is a safe no-op, not an error) — verified with a
-`HEAD`/`stat_object` content-length and hash-suffix match, not merely
-"key exists," so a partial prior upload cannot be trusted as complete. If the
-hash differs from any existing content, it is a genuinely new object and gets
-its own key — nothing is ever overwritten, because two different byte
-contents never map to the same key. This removes the overwrite failure mode
-structurally rather than by convention (an operator can no longer "re-run
-with the same date" and get different bytes at the same path, because there
-is no date in the path).
+**Content identity is logical, not byte-level (PM amendment 1, option a).**
+Parquet byte output is *not* deterministic across runs: the writer/library
+version, footer metadata (e.g. `created_by` strings), compression details,
+and incidental row ordering can all change the serialized bytes even when
+the logical data is identical. A byte-derived key would therefore give two
+pins of identical data two different keys, breaking the idempotency this
+section promises (and §2.5's zero-new-writes acceptance test). Instead, the
+hash is computed from a canonical serialization of the DataFrame's *values*:
+
+1. sort rows by a per-data-type canonical key (e.g. `(score_date, ticker)`
+   for `alpha_scores`, `(ticker, date)` for `daily_prices`/`benchmark`,
+   `(ticker, ex_date, action_type)` for `corporate_actions`);
+2. sort columns by name;
+3. normalize dtypes (e.g. dates to ISO-8601 strings, numerics through one
+   documented canonical string formatting) so pandas/pyarrow dtype drift
+   between environments cannot change the hash of equal values;
+4. hash the resulting canonical row-string stream with SHA-256 — the same
+   sort-then-stringify-then-hash approach the existing
+   `dataset_manifest._alpha_scores_hash` already uses, generalized to all
+   four data types and all columns.
+
+Parquet remains the **carrier format only**: the stored bytes are whatever
+the current writer produces, but the object's identity (its key) is the
+logical hash of what those bytes parse back to.
+
+`ParquetSnapshots.save_snapshot` computes this canonical hash *before*
+upload. If an object already exists at that hash's key, the write is skipped
+(the content is already immutably stored; re-pinning the same logical data is
+a safe no-op, not an error) — verified by downloading/parsing the existing
+object and recomputing its canonical hash (or trusting a prior §2.3-style
+verification recorded in the manifest registry), not merely "key exists," so
+a partial prior upload cannot be trusted as complete. If the hash differs, it
+is genuinely new logical content and gets its own key — nothing is ever
+overwritten, because two different logical contents never map to the same
+key. This removes the overwrite failure mode structurally rather than by
+convention (an operator can no longer "re-run with the same date" and get
+different data at the same path, because there is no date in the path).
+
+**Trade-off (recorded deliberately):** this design provides *logical*-content
+tamper-evidence, not raw-byte tamper-evidence — an attacker or bug that
+rewrote the parquet bytes to a different-but-logically-equal encoding would
+not be detected by the canonical hash. That is acceptable here: the research
+guarantee RQIS needs is "same `data_version` ⇒ same logical inputs," and
+byte-level rewrites that preserve logical equality cannot change a research
+result. As defense-in-depth, `save_snapshot` additionally records the
+SHA-256 of the uploaded bytes as a **secondary, informational**
+`{data_type}_bytes_sha256` manifest field (never part of the key, never a
+load-time gate) so out-of-band byte churn is at least observable.
 
 A human-readable `snapshot_date` remains as **metadata on the manifest**, not
 as part of the object key — reproducibility and browsability are served by
@@ -237,7 +274,8 @@ Extend `DatasetManifest` (`backtesting/dataset_manifest.py`) with:
 
 | New field | Purpose |
 |---|---|
-| `content_sha256` per data type (already partial: `alpha_scores_sha256` covers one of four; extend to all four — `daily_prices_sha256`, `corporate_actions_sha256`, `benchmark_sha256` — using the same canonical sort-then-hash approach) | Tamper-evidence at load time (§2.3), and the source of the content-addressed object key itself (the two should be the *same* hash — the manifest's recorded content hash must equal the object key's hash, checked, not merely asserted). |
+| `content_sha256` per data type (already partial: `alpha_scores_sha256` covers one of four; extend to all four — `daily_prices_sha256`, `corporate_actions_sha256`, `benchmark_sha256` — using the §2.1 canonical logical-hash procedure, which generalizes the existing `_alpha_scores_hash` sort-then-hash approach) | Tamper-evidence at load time (§2.3), and the source of the content-addressed object key itself: the manifest's recorded canonical hash and the object key's hash are the *same value by construction* (both produced by the §2.1 procedure), and `save_manifest` checks that equality rather than merely asserting it. |
+| `{data_type}_bytes_sha256` per data type (informational) | Secondary byte-level hash of the uploaded parquet carrier (§2.1 trade-off note). Never used for keys or load-time gating; recorded so out-of-band byte churn is observable. |
 | `eligibility_batch_id`, `membership_import_batch_id` | Ties the bundle to the exact PIT membership/eligibility batches (§1) used to build it, so a bundle's universe inputs are as versioned as its price/score inputs. |
 | `research_methodology_id` (nullable for non-research bundles) | FK to `data/research/models.py::ResearchMethodology`, unifying the two existing-but-separate versioning schemes (01B's methodology identity and the manifest's data identity) into one queryable link rather than two parallel systems a reviewer has to cross-reference by hand. |
 | `manifest_content_sha256` | Hash of the manifest's own canonical JSON (excluding this field), computed after all other fields are set. This is the value used as MLflow `data_version` going forward — a single opaque, verifiable token rather than a mutable-looking date string. |
@@ -258,8 +296,12 @@ directly as a `data_version`.
 
 `ParquetSnapshots.load_snapshot` (and a new
 `load_snapshot_by_manifest(manifest, data_type)` that callers should prefer)
-recomputes the SHA-256 of the downloaded bytes and compares it to the
+parses the downloaded parquet bytes into a DataFrame, recomputes the §2.1
+**canonical logical hash** of the parsed frame, and compares it to the
 manifest's recorded `{data_type}_sha256` before returning the DataFrame.
+(The byte hash is *not* the gate — consistent with §2.1's logical-identity
+decision — though a caller may optionally compare the informational
+`{data_type}_bytes_sha256` for diagnostics when a logical mismatch is found.)
 Mismatch raises a new `SnapshotIntegrityError` (distinct from
 `FileNotFoundError` — see §4) rather than silently returning corrupted data.
 This closes the gap where BUG-038's mutability made "the manifest says X but
@@ -272,24 +314,37 @@ out-of-band source (manual MinIO edit, bit rot, wrong bucket policy).
 `BacktestLogger.log_run()` and score-backfill call sites pass
 `manifest_content_sha256` (or the full `manifests/{hash}/manifest.json` path,
 for human navigability — both are logged as separate MLflow tags) as
-`data_version`. Because the hash is a function of the actual bytes, two runs
-sharing a `data_version` are now provably using identical inputs — closing
-the specific gap the `DatasetManifest` module's own docstring named
-(Codex finding #1: alpha scores/actions/benchmark previously unversioned) one
-layer further down, at the byte level instead of the path-naming level.
+`data_version`. Because the hash is a function of the canonical logical
+content (§2.1), two runs sharing a `data_version` are now provably using
+logically identical inputs — closing the specific gap the `DatasetManifest`
+module's own docstring named (Codex finding #1: alpha scores/actions/
+benchmark previously unversioned) one layer further down, at the
+content-value level instead of the path-naming level.
 
 ### 2.5 Acceptance tests
 
 - Re-running `pin_snapshot.py` with identical source data produces the same
   manifest hash and writes no new objects (idempotent no-op, verified via
-  MinIO call-count assertions in tests, not just return-value equality).
+  MinIO call-count assertions in tests, not just return-value equality) —
+  **including** when the second run's parquet serialization differs
+  byte-wise from the first (the test forces this with, e.g., a different
+  writer metadata string or row insertion order), proving idempotency rests
+  on the §2.1 canonical logical hash, not on accidental byte determinism.
+- The canonical-hash procedure itself is deterministic across row order,
+  column order, and equivalent dtype representations: shuffling a fixture
+  frame's rows/columns or round-tripping it through parquet yields the same
+  canonical hash, while changing any single value yields a different one.
 - Re-running with even one changed row in any of the four bundled dataframes
   produces a different `manifest_content_sha256` and a new, additional
   object — the previous manifest and its objects remain byte-identical and
   loadable.
-- Manually corrupting one byte of a stored parquet object (test-only,
-  simulated via a fake MinIO client) causes `load_snapshot_by_manifest` to
-  raise `SnapshotIntegrityError`, not return a DataFrame.
+- Tampering with a stored object (test-only, simulated via a fake MinIO
+  client) never returns a DataFrame: replacing the object with a parquet
+  encoding of *different values* raises `SnapshotIntegrityError` (logical
+  hash mismatch, §2.3), and corrupting raw bytes so the parquet no longer
+  parses raises `SnapshotPartialReadError` (§4.1). A byte-different but
+  logically-equal re-encoding loads successfully by design (§2.1 trade-off),
+  with the informational bytes-hash discrepancy available for diagnostics.
 - A manifest referencing an `eligibility_batch_id`/`membership_import_batch_id`
   that does not exist (or is not `published`/`validated` status) fails to
   build rather than pinning a bundle against an unpublished universe import.
@@ -312,6 +367,38 @@ builders (`build_score_price_history_as_of`,
 `build_realized_total_return_as_of`) and the legacy full-history routine,
 since all three call `compute_adjustment_factors` as a shared dependency —
 no separate fix is needed per caller.
+
+**Same-date ordering/convention semantics (PM amendment 2).** "Product of
+all multipliers on that date" is necessary but not sufficient: the
+individual multipliers are only well-defined relative to a stated quoting
+convention. A cash dividend's adjustment factor is
+`(close - dividend_per_share) / close` relative to a reference close, and
+when a split shares the ex-date, the dividend-per-share value may be quoted
+**pre-split** or **post-split** depending on the data source — the two
+conventions produce different (and non-interchangeable) per-action
+multipliers even before any product is taken. The 03A-3 implementer is
+therefore required to:
+
+1. **document** which convention the ingested `corporate_actions` rows
+   actually use for same-date split+dividend pairs (empirically verified
+   against the current yfinance source's behavior, not assumed from its
+   docs), recording the finding in the module docstring and in the
+   `known_at_policy`-style provenance notes;
+2. **normalize** all same-date actions to one declared convention (e.g.
+   convert a pre-split-quoted dividend to its post-split equivalent, or vice
+   versa) *before* computing per-action multipliers and multiplying them —
+   the product is only valid over convention-consistent multipliers; and
+3. **prove** the result with a same-date split+dividend fixture whose
+   expected combined factor is **hand-computed under the stated convention**
+   and asserted as a literal expected value in the test — not derived by
+   running the two rows through the same code under test ("product of
+   whatever the two rows contain" would pass even with a convention error
+   baked in symmetrically).
+
+If the source's convention cannot be determined empirically at
+implementation time, 03A-3 must fail closed for same-date split+dividend
+pairs (raise a named `AmbiguousSameDateActionError` rather than pick a
+convention silently) and record the gap in `bugs.md`.
 
 ### 3.2 Raw preservation into immutable bundles
 
@@ -355,12 +442,19 @@ raw-vs-analytic split's implementation details, and does not fix BUG-070.
 ### 3.4 Acceptance tests
 
 - A synthetic same-date split+dividend fixture produces the correct combined
-  adjustment factor (product of both), not either one alone, through all
-  three callers (`compute_adjustment_factors` directly, and both 01B-3
-  cutoff-aware builders).
+  adjustment factor (product of both convention-normalized multipliers), not
+  either one alone, through all three callers (`compute_adjustment_factors`
+  directly, and both 01B-3 cutoff-aware builders). The expected combined
+  factor is a **hand-computed literal** under the convention documented per
+  §3.1 (with the pre-/post-split dividend quoting explicitly stated in the
+  fixture's comments), not a value derived by running the fixture through
+  the code under test. A second fixture quoting the dividend under the
+  *other* convention verifies the normalization step actually converts it
+  (the two fixtures must converge to the same combined factor).
 - A pinned bundle's `corporate_actions` row count and per-row values match a
   direct `SELECT * FROM corporate_actions` for the same ticker/date range
-  exactly (no aggregation, no loss, byte-identical after the hash check).
+  exactly (no aggregation, no loss, value-identical under the §2.1 canonical
+  hash check).
 - Re-deriving adjustment factors from a previously-pinned bundle after the
   BUG-037 fix ships (i.e., re-running a fixed derivation over old, unchanged
   raw bundle bytes) produces the corrected factors without needing to
@@ -465,7 +559,7 @@ path silently accepts.
 |---|---|---|---|---|
 | **03A-1** | Content-addressed snapshot store + immutable manifest (§2). `ParquetSnapshots.save_snapshot`/`load_snapshot` rewritten; `DatasetManifest` extended with per-data-type hashes and `manifest_content_sha256`; `pin_snapshot.py` updated to use content addressing; legacy-manifest backfill script (§5.1). | L | None (builds on existing `ParquetSnapshots`/`DatasetManifest` code, no schema for §1 needed yet) | §2.5 acceptance tests pass; a re-run of `pin_snapshot.py` against an unchanged DB produces zero new MinIO writes; existing legacy manifests still load and are flagged. |
 | **03A-2** | Fail-closed object-store error taxonomy (§4). Typed exception hierarchy in `data/storage/parquet_snapshots.py`; `backtesting/loader.py` corporate-actions fallback narrowed to explicit opt-in; repo-wide `S3Error`-containment test. | M | 03A-1 (reuses the same module boundary; the integrity-mismatch exception from §2.3 is part of this same hierarchy). | §4.3 acceptance tests pass; simulated timeout/403/corruption tests all abort the run; grep-test confirms no other module catches `S3Error`. |
-| **03A-3** | BUG-037 fix: same-date multi-action adjustment-factor accumulation (§3.1). Narrow change to `compute_adjustment_factors`; regression tests for split+dividend, split+spinoff, and three-action same-date fixtures across all three callers. | S | None (independent of 03A-1/2; can run in parallel). | §3.4's first acceptance test passes for all three callers; existing 01B-3 cutoff-builder tests still pass unchanged. |
+| **03A-3** | BUG-037 fix: same-date multi-action adjustment-factor accumulation (§3.1). Narrow change to `compute_adjustment_factors` plus the §3.1 same-date convention documentation/normalization requirement; regression tests for split+dividend (hand-computed expected factors under the documented convention, both quoting variants), split+spinoff, and three-action same-date fixtures across all three callers. | S | None (independent of 03A-1/2; can run in parallel). | §3.4's first acceptance test (including the hand-computed-literal and dual-convention fixtures) passes for all three callers; the ingested source's same-date quoting convention is documented per §3.1; existing 01B-3 cutoff-builder tests still pass unchanged. |
 | **03A-4** | PIT eligibility-attribute schema and runtime (§1). New migration (`universe_eligibility_attributes`, `universe_eligibility_batches`); `load_eligibility_as_of`/`load_historical_universe_as_of` in `data/universe/runtime.py`; strategy-config `universe.eligibility` section parsing with fail-closed unsupported-filter rejection; daily batch job for `market_cap_usd`/`adv_usd_20d`/`price_usd`; resolution (or explicit `provisional_no_known_at` labeling) of the `shares_outstanding`-availability prerequisite. | XL | 03A-1 for the batch-job's provenance pattern to reuse the manifest/hash conventions consistently (not a hard technical dependency, but keeping conventions aligned reduces rework); otherwise independent of 03A-2/3. | §1.5 acceptance tests pass; full historical backfill of `market_cap_usd`/`adv_usd_20d`/`price_usd` completes with a coverage report (mirroring 01B-2's membership coverage report) showing per-date/per-attribute row counts and any `provisional_no_known_at` gaps. |
 | **03A-5** | Manifest/methodology linkage + `data_version` cutover (§2.2, §2.4). Wire `eligibility_batch_id`/`membership_import_batch_id`/`research_methodology_id` into `DatasetManifest`; update `BacktestLogger.log_run()` and score-backfill call sites to pass `manifest_content_sha256` as `data_version`; reject legacy date-string `data_version` values for new runs. | M | 03A-1 (manifest schema), 03A-4 (batch IDs to link). | §2.5's last two acceptance tests pass; a new backtest run's MLflow record shows a hash-shaped `data_version` resolvable back to a manifest that itself resolves to the exact membership/eligibility batches used. |
 
