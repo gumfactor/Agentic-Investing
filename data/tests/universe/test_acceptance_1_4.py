@@ -394,7 +394,7 @@ class TestTimestampDateNormalization:
         ic_ts = compute_ic_series(scores_ts, prices_ts, "test_score", horizons=[5], universe=lookup)
 
         ic_ts_norm = ic_ts.copy()
-        ic_ts_norm["date"] = pd.to_datetime(ic_ts_norm["date"]).dt.date
+        ic_ts_norm["score_date"] = pd.to_datetime(ic_ts_norm["score_date"]).dt.date
         pd.testing.assert_frame_equal(ic_plain, ic_ts_norm)
 
     def test_runtime_accepts_timestamp_as_of(self, lookup) -> None:

@@ -1,6 +1,6 @@
 """Tests for scripts/validate_signal_ic.py."""
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -8,6 +8,7 @@ import pytest
 
 from scripts.validate_signal_ic import (
     _build_eligibility_frame,
+    _build_score_adjusted_prices,
     _FACTORS,
     _add_gate_columns,
     _holdout_start,
@@ -62,15 +63,41 @@ def test_persist_summary_uses_signal_ic_upsert():
         ]
     )
 
-    assert _persist_summary(engine, summary) == 1
+    assert _persist_summary(engine, summary, research_run_id=42) == 1
     statement, records = connection.execute.call_args.args
     sql = str(statement)
     assert "INSERT INTO signal_ic_stats" in sql
     assert "ON CONFLICT" in sql
+    assert "research_run_id" in sql
     assert records[0]["factor_name"] == "momentum"
+    assert records[0]["research_run_id"] == 42
     # Default is provisional=True (BUG-008 interim marker, migration 010).
     assert records[0]["provisional"] is True
     assert "provisional = EXCLUDED.provisional" in sql
+
+
+def test_persist_summary_requires_research_run_id():
+    """BUG-009 section 4: a persisted row without a research_run_id would
+    fall outside the run-scoped unique constraint added by migration 012."""
+    engine = MagicMock()
+    summary = pd.DataFrame(
+        [
+            {
+                "factor_name": "momentum",
+                "strategy_id": "v1",
+                "eval_date": date(2026, 5, 8),
+                "horizon_days": 21,
+                "ic": 0.09,
+                "rank_ic": 0.02,
+                "ic_tstat": 8.0,
+                "ic_ir": 0.4,
+                "ic_pvalue": 0.0,
+                "n_observations": 356,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="research_run_id"):
+        _persist_summary(engine, summary, research_run_id=None)
 
 
 def test_persist_summary_stamps_certified_rows_non_provisional():
@@ -94,9 +121,102 @@ def test_persist_summary_stamps_certified_rows_non_provisional():
     )
 
     # PIT-enforced run (universe lookup active) stamps provisional=False.
-    assert _persist_summary(engine, summary, provisional=False) == 1
+    assert _persist_summary(engine, summary, research_run_id=42, provisional=False) == 1
     _, records = connection.execute.call_args.args
     assert records[0]["provisional"] is False
+
+
+class TestMainRoutesProvisionalNoUniverseThroughSharedHonestyGate:
+    """Adversarial-review round 11 (BUG-008/BUG-009): main()'s
+    --persist + --provisional-no-universe path now routes through the ONE
+    shared data.research.sql_compat.assert_methodology_write_is_honest gate
+    instead of a script-local variant (direct unit coverage of the shared
+    gate itself lives in data/tests/research/test_sql_compat.py -- this
+    class only proves main() is actually wired to it). The gate runs
+    before any price/DB work beyond resolving DATABASE_URL, so these tests
+    reach it via main()'s real CLI entry point without needing a full
+    prices/fundamentals fixture."""
+
+    def _engine_with_methodology(self, tmp_path, monkeypatch, universe_import_policy, name):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import MethodologySpec, activate_run, register_methodology, register_run
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy=universe_import_policy,
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="score_cutoff_known_at_v1",
+                    realized_return_action_availability_policy="exit_cutoff_known_at_v1",
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run_row = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run_row.id, activated_by="test")
+            session.commit()
+            return run_row.id
+
+    def test_pit_claiming_run_exits_1_with_misrepresent_message(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        from scripts.validate_signal_ic import main
+
+        run_id = self._engine_with_methodology(
+            tmp_path, monkeypatch, "pit_universe_effective_dated_v1", "claims_pit_methodology"
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "validate_signal_ic.py",
+                "--persist",
+                "--provisional-no-universe",
+                "--research-run-id", str(run_id),
+            ],
+        )
+
+        assert main() == 1
+        err = capsys.readouterr().err
+        assert "misrepresent" in err
+
+    def test_unknown_run_id_exits_1_with_does_not_exist_message(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        from scripts.validate_signal_ic import main
+
+        db_path = tmp_path / "empty.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        from sqlalchemy import create_engine
+
+        from data.research.models import Base
+
+        Base.metadata.create_all(create_engine(f"sqlite:///{db_path}"))
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "validate_signal_ic.py",
+                "--persist",
+                "--provisional-no-universe",
+                "--research-run-id", "999999",
+            ],
+        )
+
+        assert main() == 1
+        err = capsys.readouterr().err
+        assert "does not exist" in err
 
 
 def test_build_eligibility_frame_matches_lookup(tmp_path):
@@ -168,3 +288,133 @@ def test_eligibility_limited_to_scored_dates_avoids_coverage_gap(tmp_path):
 
     with _pytest.raises(CoverageGapError):
         _build_eligibility_frame(lookup, all_price_dates)
+
+
+# ─── _build_adjusted_price_series (BUG-009 P0 fix: cutoff-aware wiring) ──────
+
+
+def _business_dates(start: date, n: int) -> list[date]:
+    dates = []
+    d = start
+    while len(dates) < n:
+        if d.weekday() < 5:
+            dates.append(d)
+        d += timedelta(days=1)
+    return dates
+
+
+class TestBuildScoreAdjustedPrices:
+    def _fixture(self):
+        # AAPL: flat 200 for two sessions, then a 2-for-1 split on the third
+        # (raw close halves to 100), matching the module-level parity
+        # fixture's self-consistent no-independent-movement convention.
+        dates = _business_dates(date(2024, 1, 2), 5)
+        prices = pd.DataFrame(
+            [
+                {"ticker": "AAPL", "date": dates[0], "close": 200.0},
+                {"ticker": "AAPL", "date": dates[1], "close": 200.0},
+                {"ticker": "AAPL", "date": dates[2], "close": 100.0},
+                {"ticker": "AAPL", "date": dates[3], "close": 101.0},
+                {"ticker": "AAPL", "date": dates[4], "close": 102.0},
+            ]
+        )
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAPL",
+                    "ex_date": dates[2],
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime.combine(dates[1], datetime.min.time(), tzinfo=timezone.utc)
+                    + timedelta(hours=21),
+                    "source_version": "test-v1",
+                }
+            ]
+        )
+        return prices, corporate_actions, dates
+
+    def test_score_series_applies_known_split_before_ex_date(self):
+        """The whole point of the P0 fix: prices feeding score computation
+        must be split-adjusted, not the raw ~50%-jump series."""
+        prices, corporate_actions, dates = self._fixture()
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
+        row0 = score_series[score_series["date"] == dates[0]].iloc[0]
+        # Raw close is 200; split-adjusted it must be 100 (200 * 0.5).
+        assert abs(row0["close"] - 100.0) < 1e-6
+
+    def test_score_series_differs_from_raw_prices(self):
+        """Regression guard for the P0 finding: the adjusted series actually
+        differs from the raw daily_prices series for a pre-split date — if
+        this ever equals the raw series again, the cutoff-aware builder has
+        silently stopped being wired in."""
+        prices, corporate_actions, dates = self._fixture()
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
+        raw_row = prices[prices["date"] == dates[0]].iloc[0]
+        adj_row = score_series[score_series["date"] == dates[0]].iloc[0]
+        assert abs(adj_row["close"] - raw_row["close"]) > 1.0
+
+    def test_post_split_dates_unchanged(self):
+        """Dates on/after the split ex_date keep their raw close (adj_factor=1)."""
+        prices, corporate_actions, dates = self._fixture()
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
+        row = score_series[score_series["date"] == dates[2]].iloc[0]
+        assert abs(row["close"] - 100.0) < 1e-6
+
+    def test_no_corporate_actions_leaves_prices_unchanged(self):
+        """Empty corporate_actions must not crash and must be a no-op (adj_factor=1)."""
+        prices, _corporate_actions, dates = self._fixture()
+        empty_actions = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"])
+        score_series = _build_score_adjusted_prices(prices, empty_actions, dates)
+        row0 = score_series[score_series["date"] == dates[0]].iloc[0]
+        assert abs(row0["close"] - 200.0) < 1e-6
+
+    def test_output_columns(self):
+        prices, corporate_actions, dates = self._fixture()
+        score_series = _build_score_adjusted_prices(prices, corporate_actions, dates)
+        assert set(score_series.columns) == {"ticker", "date", "close"}
+
+
+# ─── compute_realized_forward_returns_as_of wiring (adversarial review round 4) ──
+
+
+class TestRealizedForwardReturnsWiring:
+    """BUG-009 section 2.3/2.4 round-4 fix: the realized-return leg must use
+    a genuinely per-exit-date-cutoff-correct series, not the single
+    boundary-cutoff approximation _build_score_adjusted_prices still uses
+    for the SCORE leg (safe there via the ratio-cancellation argument;
+    NOT safe for realized returns — see compute_realized_forward_returns_as_of).
+    """
+
+    def test_earlier_exit_unaffected_by_action_unknown_at_its_own_cutoff(self):
+        from signals.research.ic import compute_realized_forward_returns_as_of
+
+        d = _business_dates(date(2024, 2, 1), 5)
+        prices = pd.DataFrame(
+            [
+                {"ticker": "X", "date": d[0], "close": 100.0},
+                {"ticker": "X", "date": d[1], "close": 100.0},  # entry (score_date=d0)
+                {"ticker": "X", "date": d[2], "close": 100.0},  # split ex_date
+                {"ticker": "X", "date": d[3], "close": 50.0},   # exit0 (score_date=d0, h=2)
+                {"ticker": "X", "date": d[4], "close": 51.0},   # exit1 (score_date=d1, h=2)
+            ]
+        )
+        # Known the evening AFTER exit0's own cutoff, but before exit1's.
+        known_at = datetime.combine(d[3], datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=22)
+        corporate_actions = pd.DataFrame(
+            [
+                {
+                    "ticker": "X",
+                    "ex_date": d[2],
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": known_at,
+                    "source_version": "test",
+                }
+            ]
+        )
+        result = compute_realized_forward_returns_as_of(prices, corporate_actions, horizons=[2])
+        row0 = result[result["score_date"] == d[0]].iloc[0]
+        # Must equal the RAW ratio (50/100 - 1): the split is not yet known
+        # by exit0's own cutoff, so it must not adjust this pair at all —
+        # not the distorted 0.0 a shared-boundary-cutoff approach would give.
+        assert abs(row0["forward_return"] - (50.0 / 100.0 - 1.0)) < 1e-9

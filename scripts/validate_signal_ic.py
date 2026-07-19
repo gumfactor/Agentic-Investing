@@ -43,9 +43,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pandas as pd
+import structlog
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
+from data.normalization.corporate_actions import build_score_price_history_as_of
+from data.universe.calendar import session_close_cutoff
 from signals.composites.low_vol_score import compute_lowvol_scores
 from signals.composites.momentum_score import compute_momentum_scores
 from signals.composites.quality_score import compute_quality_scores
@@ -53,12 +56,15 @@ from signals.composites.value_score import compute_value_scores
 from signals.research.ic import (
     compute_factor_turnover,
     compute_ic_series,
+    compute_realized_forward_returns_as_of,
     rolling_ic_summary,
     summarize_ic,
 )
 from signals.research.universe import audit_universe_survivorship
 
 load_dotenv()
+
+logger = structlog.get_logger(__name__)
 
 _DEFAULT_HORIZONS = [21, 63]
 _DEFAULT_STRATEGY_ID = "v1_base_momentum"
@@ -123,16 +129,32 @@ def _build_eligibility_frame(universe_lookup, dates: list) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["ticker", "date"])
 
 
-def _persist_summary(engine, summary: pd.DataFrame, provisional: bool = True) -> int:
+def _persist_summary(
+    engine, summary: pd.DataFrame, research_run_id: int, provisional: bool = True
+) -> int:
     """Persist IC summary rows.
+
+    ``research_run_id`` (BUG-009 section 4 / migration 012) is now part of
+    the table's unique constraint: it is REQUIRED so a new run can never
+    silently overwrite an old methodology's rows via this upsert. Register
+    a methodology/run first with ``data.research.identity`` (or use
+    ``data.research.identity.get_legacy_run_id`` only for tooling that
+    intentionally targets the migrated legacy row — never for a fresh run).
 
     ``provisional`` stamps each row (migration 010): True for runs without
     PIT universe enforcement (--provisional-no-universe and all pre-01B-2
-    rows), False for PIT-enforced runs. Interim marker — superseded by the
-    01B-3 research-run identity (design plan §4).
+    rows), False for PIT-enforced runs. Kept for backward read-compatibility
+    (migration 012 docstring); the authoritative marker is now
+    ``research_runs.status``/``is_active`` reached via ``research_run_id``.
     """
     if summary.empty:
         return 0
+    if not research_run_id:
+        raise ValueError(
+            "research_run_id is required to persist (BUG-009 section 4 / "
+            "migration 012): register a research_methodologies/research_runs "
+            "pair first via data.research.identity."
+        )
 
     records = summary[
         [
@@ -150,14 +172,16 @@ def _persist_summary(engine, summary: pd.DataFrame, provisional: bool = True) ->
     ].to_dict("records")
     for record in records:
         record["provisional"] = provisional
+        record["research_run_id"] = research_run_id
 
     statement = text(
         "INSERT INTO signal_ic_stats "
         "(factor_name, strategy_id, eval_date, horizon_days, ic, rank_ic, "
-        "ic_tstat, ic_ir, ic_pvalue, n_observations, provisional) "
+        "ic_tstat, ic_ir, ic_pvalue, n_observations, provisional, research_run_id) "
         "VALUES (:factor_name, :strategy_id, :eval_date, :horizon_days, :ic, "
-        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations, :provisional) "
-        "ON CONFLICT (factor_name, strategy_id, eval_date, horizon_days) "
+        ":rank_ic, :ic_tstat, :ic_ir, :ic_pvalue, :n_observations, :provisional, "
+        ":research_run_id) "
+        "ON CONFLICT (research_run_id, factor_name, strategy_id, eval_date, horizon_days) "
         "DO UPDATE SET ic = EXCLUDED.ic, rank_ic = EXCLUDED.rank_ic, "
         "ic_tstat = EXCLUDED.ic_tstat, ic_ir = EXCLUDED.ic_ir, "
         "ic_pvalue = EXCLUDED.ic_pvalue, "
@@ -176,6 +200,81 @@ def _load_prices(engine) -> pd.DataFrame:
     )
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
     return prices
+
+
+def _load_corporate_actions(engine) -> pd.DataFrame:
+    """Load corporate_actions with the availability columns (migration 011)
+    the cutoff-aware adjustment builders require."""
+    actions = pd.read_sql(
+        "SELECT ticker, ex_date, action_type, value, known_at, source_version "
+        "FROM corporate_actions ORDER BY ticker, ex_date",
+        engine,
+    )
+    actions["ex_date"] = pd.to_datetime(actions["ex_date"]).dt.date
+    actions["known_at"] = pd.to_datetime(actions["known_at"], utc=True)
+    return actions
+
+
+def _build_score_adjusted_prices(
+    prices: pd.DataFrame,
+    corporate_actions: pd.DataFrame,
+    dates: list,
+) -> pd.DataFrame:
+    """Build the cutoff-aware SCORE price series BUG-009 §2.3 requires: only
+    actions known-and-occurred by the score cutoff may adjust a score
+    feature's inputs. Feeds price-ratio-based factors (momentum, lowvol).
+
+    Single-boundary-cutoff note (BUG-071, re-verified adversarial-review
+    round 4)
+    --------------------------------------------------------------------
+    This backfill computes scores for every holdout date in one vectorized
+    pass rather than looping per score_date. The series below is built
+    from ONE boundary cutoff — the session close of the LATEST available
+    price date — rather than a literal per-score-date cutoff.
+
+    This remains provably safe for a window/ratio-based indicator's SCORE
+    value (which is what every price-ratio factor in this script computes):
+    a uniform multiplicative adjustment factor applied to an entire
+    lookback window cancels out of any price RATIO computed within that
+    window, so an action whose ex_date falls AFTER a given score_date's
+    window has NO effect on that score, uniform-cutoff or per-date-cutoff.
+
+    Round-4 finding and why it does NOT reopen this argument: adversarial
+    review round 4 found the ANALOGOUS single-boundary-cutoff shortcut was
+    unsafe for the REALIZED-RETURN series (fixed below via
+    ``compute_realized_forward_returns_as_of``, which builds a genuinely
+    per-exit-date-cutoff-correct series instead of this approximation).
+    That failure mode was possible because a realized return's two
+    endpoints (entry_date, exit_date) straddle the action in a way that
+    does NOT cancel — one endpoint is before the action's ex_date, the
+    other is not. The score series has no second endpoint: every date in
+    its lookback window is being compared only to ANOTHER date inside that
+    SAME window, both on the SAME side of any action whose ex_date is
+    after the window's own end (the score_date) — the cancellation holds
+    for every pair inside the window, not just the window's two endpoints.
+    The residual gap (documented as BUG-071 in bugs.md, verified still
+    accurate) is unchanged: an action whose ex_date falls exactly ON a
+    score_date, which is a narrow, single-session edge case — not the
+    "zero adjustment happens at all" gap this wiring closes, and not the
+    "future information leaks into a persisted, PIT-safe result across an
+    entire holdout" class of bug round 4 found in the realized-return path.
+    """
+    boundary_cutoff = session_close_cutoff(dates[-1])
+
+    score_adjusted, score_meta = build_score_price_history_as_of(
+        prices, corporate_actions, score_cutoff=boundary_cutoff
+    )
+    logger.info(
+        "score_adjusted_price_series_built",
+        boundary_cutoff=boundary_cutoff.isoformat(),
+        score_actions_considered=score_meta.n_actions_considered,
+        score_actions_excluded_by_cutoff=score_meta.n_actions_excluded_by_cutoff,
+        score_actions_excluded_missing_known_at=score_meta.n_actions_excluded_missing_known_at,
+    )
+
+    out = score_adjusted[["ticker", "date", "adj_close"]].copy()
+    out["close"] = out["adj_close"].astype(float)
+    return out[["ticker", "date", "close"]]
 
 
 def _load_fundamentals(engine) -> pd.DataFrame:
@@ -253,6 +352,14 @@ def main() -> int:
     parser.add_argument("--min-tstat", type=float, default=2.0)
     parser.add_argument("--persist", action="store_true")
     parser.add_argument(
+        "--research-run-id",
+        type=int,
+        default=None,
+        help="research_runs.id (BUG-009 section 4 / migration 012) to tag every "
+        "persisted signal_ic_stats row with. Required when --persist is set. "
+        "Register a methodology/run first via data.research.identity.",
+    )
+    parser.add_argument(
         "--universe-id",
         default="sp500",
         help="Point-in-time universe for membership enforcement (default: sp500).",
@@ -266,10 +373,39 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.persist and not args.research_run_id:
+        print(
+            "ERROR: --persist requires --research-run-id (BUG-009 section 4 / "
+            "migration 012). Register a research_methodologies/research_runs "
+            "pair first via data.research.identity.",
+            file=sys.stderr,
+        )
+        return 1
+
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         print("ERROR: DATABASE_URL is not set.", file=sys.stderr)
         return 1
+
+    if args.persist and args.provisional_no_universe:
+        # Adversarial-review round 11 (BUG-008/BUG-009): routed through the
+        # single shared data.research.sql_compat.assert_methodology_write_is_honest
+        # gate rather than a script-local variant -- this script always
+        # applies corporate-action cutoff adjustment (score_adjusted_prices/
+        # realized_forward_returns below have no raw-price fallback path),
+        # so only the PIT-universe dimension can ever be dishonest here.
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        try:
+            assert_methodology_write_is_honest(
+                database_url,
+                args.research_run_id,
+                pit_universe_applied=False,
+                corporate_action_adjustment_applied=True,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
     engine = create_engine(database_url)
     prices = _load_prices(engine)
@@ -277,6 +413,26 @@ def main() -> int:
     holdout_start = _holdout_start(dates, args.train_fraction)
     audit = audit_universe_survivorship(prices)
     fundamentals = None
+
+    # ── Corporate-action cutoff-aware adjustment (BUG-009 §2.3-2.4) ──────────
+    # score_adjusted_prices feeds price-RATIO-based factors (momentum,
+    # lowvol): only actions known-and-occurred by the cutoff adjust their
+    # inputs (single run-boundary cutoff — safe by the ratio-cancellation
+    # argument documented on _build_score_adjusted_prices / BUG-071).
+    # realized_forward_returns feeds compute_ic_series's forward/realized-
+    # return leg for EVERY factor via a genuinely per-exit-date-cutoff-
+    # correct construction (adversarial-review round 4 fix: a shared
+    # boundary cutoff is NOT safe here, unlike the score series — see
+    # compute_realized_forward_returns_as_of's docstring). Fundamentals-
+    # based factors (value, quality) deliberately keep RAW prices for their
+    # own valuation-ratio inputs (P/E, P/B, ... use the actual traded
+    # price, not a total-return-adjusted synthetic price) — see the
+    # per-factor loop below.
+    corporate_actions = _load_corporate_actions(engine)
+    score_adjusted_prices = _build_score_adjusted_prices(prices, corporate_actions, dates)
+    realized_forward_returns = compute_realized_forward_returns_as_of(
+        prices, corporate_actions, horizons=args.horizons
+    )
 
     # ── Point-in-time universe (BUG-008 / 01B-2) ─────────────────────────────
     # This is a HISTORICAL caller: membership enforcement is required by
@@ -346,6 +502,10 @@ def main() -> int:
             if fundamentals is None:
                 fundamentals = _load_fundamentals(engine)
             holdout_dates = [date for date in dates if date >= holdout_start]
+            # Value/quality use RAW prices deliberately: P/E, P/B, and other
+            # valuation ratios need the actual traded price, not a total-
+            # return-adjusted synthetic price (adjusting for dividend
+            # reinvestment would distort a valuation ratio, not fix it).
             scores = spec.compute(
                 fundamentals,
                 prices,
@@ -353,15 +513,25 @@ def main() -> int:
                 eligibility=eligibility_df,
             )
         else:
-            scores = spec.compute(prices, eligibility=eligibility_df)
+            # Price-ratio-based factors (momentum, lowvol): BUG-009 §2.3 —
+            # only actions known-and-occurred by the score cutoff may adjust
+            # the price history feeding the score.
+            scores = spec.compute(score_adjusted_prices, eligibility=eligibility_df)
         holdout_scores = scores[scores["date"] >= holdout_start].copy()
 
+        # Forward/realized returns for IC use the per-exit-date-cutoff-
+        # correct realized-return series for EVERY factor (BUG-009 §2.3-2.4;
+        # adversarial-review round 4): a return is a return regardless of
+        # what produced the score being evaluated against it, and each
+        # exit's own knowledge cutoff — not a shared boundary — determines
+        # which corporate actions may adjust it.
         ic_series = compute_ic_series(
             holdout_scores,
-            prices,
+            None,
             score_col=spec.score_col,
             horizons=args.horizons,
             universe=universe_lookup,
+            precomputed_forward_returns=realized_forward_returns,
         )
         summary = summarize_ic(
             ic_series,
@@ -383,8 +553,11 @@ def main() -> int:
     passed_tests = int(combined["passes_gate"].sum())
 
     if args.persist:
-        persisted = _persist_summary(engine, combined, provisional=universe_lookup is None)
-        print(f"\nPersisted {persisted} rows to signal_ic_stats.")
+        persisted = _persist_summary(
+            engine, combined, research_run_id=args.research_run_id,
+            provisional=universe_lookup is None,
+        )
+        print(f"\nPersisted {persisted} rows to signal_ic_stats (research_run_id={args.research_run_id}).")
 
     print(
         f"\nGate result: {passed_tests}/{expected_tests} factor-horizon tests pass "

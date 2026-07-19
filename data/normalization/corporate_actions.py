@@ -18,11 +18,40 @@ Adjustment methodology:
 For backtesting, always use adjusted prices derived from this module.
 Never use source_adj_close directly for signal computation — its adjustment
 methodology may differ from ours and is not auditable.
+
+Corporate-action observability contract (BUG-009, design plan §2.3)
+---------------------------------------------------------------------
+``compute_adjustment_factors``/``apply_adjustment_factors`` above are the
+**full-history** routine: given a set of actions, they adjust every date in
+*prices* regardless of when each action became knowable. That is exactly
+correct for the raw execution-price/total-return series used *today* (e.g. a
+tearsheet built at time-of-report over the complete history) — and exactly
+wrong for reconstructing what a score or a realized return could have known
+at some point in the past, because it lets a future split/dividend leak into
+a historical score feature.
+
+Two separate, explicitly named interfaces below wrap the same factor engine
+with an availability cutoff, per design plan §2.3-2.4:
+
+- :func:`build_score_price_history_as_of` — only actions known by the score
+  observation cutoff. The ONLY adjustment path permitted for a score feature
+  at time t.
+- :func:`build_realized_total_return_as_of` — only actions that occurred and
+  were known by the return exit cutoff. Used for realized IC/total-return
+  analytics — never for raw fill/order notional (orders and cash notional
+  always use the raw tradable price; see execution/ for that path, which
+  this module does not touch).
+
+Both require *corporate_actions* to carry a ``known_at`` column (added by
+migration 011); an action whose ``known_at`` is null/missing cannot be used
+by either builder and is dropped with a logged warning rather than silently
+included.
 """
 
 from __future__ import annotations
 
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
@@ -166,3 +195,208 @@ def apply_adjustment_factors(
             )
 
     return df
+
+
+# ─── Cutoff-aware, as-of adjustment interfaces (BUG-009 §2.3) ────────────────
+
+
+@dataclass(frozen=True)
+class AsOfAdjustmentMetadata:
+    """Provenance recorded alongside every cutoff-aware adjusted series.
+
+    Both `build_score_price_history_as_of` and
+    `build_realized_total_return_as_of` return this metadata so the caller
+    (and, ultimately, the research-run/methodology record — §4) can record
+    exactly which action-source snapshot and availability policy produced
+    the series.
+    """
+
+    builder: str  # "build_score_price_history_as_of" | "build_realized_total_return_as_of"
+    cutoff: datetime
+    action_source_versions: tuple[str, ...]
+    availability_policy: str
+    n_actions_considered: int
+    n_actions_excluded_by_cutoff: int
+    n_actions_excluded_missing_known_at: int
+
+
+def _filter_actions_by_cutoff(
+    corporate_actions: pd.DataFrame,
+    cutoff: datetime,
+) -> tuple[pd.DataFrame, int, int]:
+    """Keep only actions that (a) had already occurred (`ex_date <= cutoff`'s
+    date) AND (b) were knowable by `cutoff` (`known_at <= cutoff`). Returns
+    (filtered, n_excluded_by_cutoff, n_excluded_missing).
+
+    Both criteria are required, not just (b): an action that is pre-announced
+    (known_at before its own ex_date — e.g. a split announced two weeks
+    ahead of its effective date) must not adjust historical prices before it
+    has actually occurred, even though it is already "known" in the sense of
+    (b) alone. Requiring (a) as well is what makes `build_realized_total_
+    return_as_of`'s docstring claim of "(a) occurred (ex_date) and (b) known
+    by exit_cutoff" true in the code, not just in prose (adversarial review
+    finding, BUG-009 P2). This is a pure additional restriction — it can
+    only exclude MORE actions than checking (b) alone, never include one
+    that (b)-only filtering would have excluded, so no interface that was
+    already correct under (b)-only regresses.
+
+    An action with a null/missing `known_at` cannot be certified as knowable
+    by any cutoff and is dropped (not silently included) — per §2.3, "an
+    action without a defensible availability timestamp ... cannot be used to
+    qualify historical score inputs."
+    """
+    if corporate_actions.empty:
+        return corporate_actions, 0, 0
+    required = {"known_at", "ex_date"}
+    missing_cols = required - set(corporate_actions.columns)
+    if missing_cols:
+        raise ValueError(
+            f"corporate_actions is missing required column(s) {missing_cols} for "
+            "the cutoff-aware adjustment interfaces (migration 011). The legacy "
+            "compute_adjustment_factors() full-history routine does not enforce "
+            "this and must not be substituted for historical score computation "
+            "(BUG-009 §2.3)."
+        )
+
+    known_at = corporate_actions["known_at"]
+    missing_mask = known_at.isna()
+    n_missing = int(missing_mask.sum())
+    if n_missing:
+        logger.warning(
+            "corporate_actions_missing_known_at_excluded",
+            n_excluded=n_missing,
+            note="actions without a defensible availability timestamp cannot "
+            "qualify historical score/return inputs (BUG-009 section 2.3)",
+        )
+
+    # Normalize known_at to tz-aware UTC for comparison against cutoff.
+    def _as_aware(value):
+        if value is None or pd.isna(value):
+            return None
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts
+
+    cutoff_ts = pd.Timestamp(cutoff)
+    if cutoff_ts.tzinfo is None:
+        cutoff_ts = cutoff_ts.tz_localize("UTC")
+    cutoff_date = cutoff_ts.date()
+
+    known_by_cutoff = known_at.apply(lambda v: (_as_aware(v) is not None) and (_as_aware(v) <= cutoff_ts))
+    occurred_by_cutoff = corporate_actions["ex_date"].apply(
+        lambda d: pd.Timestamp(d).date() <= cutoff_date
+    )
+    knowable_mask = known_by_cutoff & occurred_by_cutoff
+    n_excluded_by_cutoff = int((~missing_mask & ~knowable_mask).sum())
+
+    filtered = corporate_actions[knowable_mask].copy()
+    return filtered, n_excluded_by_cutoff, n_missing
+
+
+def build_score_price_history_as_of(
+    prices: pd.DataFrame,
+    corporate_actions: pd.DataFrame,
+    score_cutoff: datetime,
+) -> tuple[pd.DataFrame, AsOfAdjustmentMetadata]:
+    """Total-return-adjusted price history using only actions that had
+    occurred (`ex_date <= score_cutoff`) AND were known by `score_cutoff`.
+
+    This is the ONLY corporate-action adjustment path permitted for a score
+    feature at time t (design plan §2.3). A future split/dividend — even one
+    that the legacy full-history `compute_adjustment_factors` routine would
+    back-adjust into the past, and even one already pre-announced (known_at
+    before its own ex_date) — is excluded here: a not-yet-effective action
+    must not adjust historical prices before it has actually occurred.
+
+    Args:
+        prices: long-format ticker/date/close (raw, unadjusted).
+        corporate_actions: must include a `known_at` column (migration 011).
+        score_cutoff: the score observation cutoff (typically the session
+            close of the score date, e.g. `data.universe.calendar
+            .session_close_cutoff`).
+
+    Returns:
+        (adjusted_prices, metadata). `adjusted_prices` has the same columns
+        as `apply_adjustment_factors` (`adj_close`, `adj_factor`, ...) plus
+        the original raw columns — never a fill-price source; raw `close`
+        remains available and unmodified.
+    """
+    filtered_actions, n_excluded_cutoff, n_excluded_missing = _filter_actions_by_cutoff(
+        corporate_actions, score_cutoff
+    )
+    factors = compute_adjustment_factors(filtered_actions, prices)
+    adjusted = apply_adjustment_factors(prices, factors)
+
+    versions = tuple(sorted(set(filtered_actions.get("source_version", pd.Series(dtype=str)).dropna())))
+    metadata = AsOfAdjustmentMetadata(
+        builder="build_score_price_history_as_of",
+        cutoff=score_cutoff,
+        action_source_versions=versions,
+        availability_policy="score_cutoff_known_at_v1",
+        n_actions_considered=len(corporate_actions),
+        n_actions_excluded_by_cutoff=n_excluded_cutoff,
+        n_actions_excluded_missing_known_at=n_excluded_missing,
+    )
+    logger.info(
+        "score_price_history_built",
+        score_cutoff=score_cutoff.isoformat(),
+        n_actions_used=len(filtered_actions),
+        n_actions_excluded_by_cutoff=n_excluded_cutoff,
+        n_actions_excluded_missing_known_at=n_excluded_missing,
+    )
+    return adjusted, metadata
+
+
+def build_realized_total_return_as_of(
+    prices: pd.DataFrame,
+    corporate_actions: pd.DataFrame,
+    entry_date: date,
+    exit_cutoff: datetime,
+) -> tuple[pd.DataFrame, AsOfAdjustmentMetadata]:
+    """Total-return-adjusted price history for realized-return analytics.
+
+    Uses only actions that (a) occurred (ex_date) and (b) were known by
+    `exit_cutoff`. Used for realized IC / total-return diagnostics — NEVER
+    for raw fill/order notional, which must stay on the raw tradable price
+    series (design plan §2.2; orders/cash notional are a portfolio/execution
+    concern this module does not implement or touch).
+
+    Args:
+        prices: long-format ticker/date/close (raw, unadjusted).
+        corporate_actions: must include a `known_at` column (migration 011).
+        entry_date: the research entry date (t+1 under the baseline timing
+            policy); recorded in metadata for traceability, not used to
+            filter actions (an action prior to entry is still relevant to
+            total-return construction, matching the semantics of the
+            unrestricted full-history routine within the knowledge cutoff).
+        exit_cutoff: the return exit observation cutoff.
+
+    Returns:
+        (adjusted_prices, metadata).
+    """
+    filtered_actions, n_excluded_cutoff, n_excluded_missing = _filter_actions_by_cutoff(
+        corporate_actions, exit_cutoff
+    )
+    factors = compute_adjustment_factors(filtered_actions, prices)
+    adjusted = apply_adjustment_factors(prices, factors)
+
+    versions = tuple(sorted(set(filtered_actions.get("source_version", pd.Series(dtype=str)).dropna())))
+    metadata = AsOfAdjustmentMetadata(
+        builder="build_realized_total_return_as_of",
+        cutoff=exit_cutoff,
+        action_source_versions=versions,
+        availability_policy="exit_cutoff_known_at_v1",
+        n_actions_considered=len(corporate_actions),
+        n_actions_excluded_by_cutoff=n_excluded_cutoff,
+        n_actions_excluded_missing_known_at=n_excluded_missing,
+    )
+    logger.info(
+        "realized_total_return_built",
+        entry_date=str(entry_date),
+        exit_cutoff=exit_cutoff.isoformat(),
+        n_actions_used=len(filtered_actions),
+        n_actions_excluded_by_cutoff=n_excluded_cutoff,
+        n_actions_excluded_missing_known_at=n_excluded_missing,
+    )
+    return adjusted, metadata

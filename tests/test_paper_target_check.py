@@ -53,7 +53,13 @@ def _engine(
         {"ticker": "NVDA", "score_date": score_date, "strategy_id": strategy_id, "alpha_score": 0.4, "rank": 3, "universe_size": 3},
     ]
     pd.DataFrame(prices).to_sql("daily_prices", engine, index=False)
-    pd.DataFrame(score_rows).to_sql("alpha_scores", engine, index=False)
+
+    from tests._research_run_test_helpers import setup_active_research_run
+
+    run_id = setup_active_research_run(engine)
+    scores_df = pd.DataFrame(score_rows)
+    scores_df["research_run_id"] = run_id
+    scores_df.to_sql("alpha_scores", engine, index=False)
     return engine
 
 

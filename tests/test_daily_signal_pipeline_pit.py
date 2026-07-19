@@ -62,19 +62,35 @@ class TestImportIsolation:
         import ast
 
         tree = ast.parse(_DAG_PATH.read_text(encoding="utf-8"))
-        banned = ("data.universe.runtime", "data.universe.models", "data.universe.import_pipeline")
+        # BUG-009 section 4 follow-up (adversarial review, same-session):
+        # data.research.models/identity are just as SQLAlchemy-2-only as
+        # data.universe.models/runtime (DeclarativeBase/Mapped/mapped_column)
+        # — an earlier draft of the research-run lookup imported
+        # data.research.identity directly and would have raised ImportError
+        # the moment _write_scores actually ran inside the packaged Airflow
+        # image, despite passing every test in this repo's SQLAlchemy-2.x
+        # dev environment. Banned here so a regression fails loudly in CI-
+        # equivalent tests instead of silently in production.
+        banned = (
+            "data.universe.runtime",
+            "data.universe.models",
+            "data.universe.import_pipeline",
+            "data.research.identity",
+            "data.research.models",
+        )
         offenders = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 offenders += [a.name for a in node.names if a.name.startswith(banned)]
             elif isinstance(node, ast.ImportFrom) and node.module:
-                if node.module.startswith(banned) or node.module == "data.universe":
+                if node.module.startswith(banned) or node.module in ("data.universe", "data.research"):
                     offenders.append(node.module)
-        assert offenders == [], f"DAG imports SQLAlchemy-2-only universe modules: {offenders}"
+        assert offenders == [], f"DAG imports SQLAlchemy-2-only modules: {offenders}"
 
     def test_dag_module_imports_cleanly(self, dag_module) -> None:
         assert hasattr(dag_module, "_pit_eligible_tickers_sql")
         assert hasattr(dag_module, "_pit_membership_filter")
+        assert hasattr(dag_module, "_get_active_research_run_id_sql")
 
 
 class TestSemanticParityWithRuntime:
@@ -135,6 +151,80 @@ class TestSemanticParityWithRuntime:
         db_url = f"sqlite:///{tmp_path / 'empty.db'}"
         Base.metadata.create_all(create_engine(db_url, future=True))
         assert dag_module._pit_eligible_tickers_sql(db_url, date(2022, 6, 1)) is None
+
+
+class TestActiveResearchRunLookup:
+    """_get_active_research_run_id_sql must stay in semantic lockstep with
+    data.research.identity.get_active_research_run (BUG-009 section 4 /
+    adversarial-review follow-up): same answer, same fail-closed behavior,
+    without the DAG importing the SQLAlchemy-2-only ORM to get it."""
+
+    @pytest.fixture
+    def research_db(self, tmp_path):
+        from data.research.models import Base
+
+        db_url = f"sqlite:///{tmp_path / 'research.db'}"
+        Base.metadata.create_all(create_engine(db_url, future=True))
+        return db_url
+
+    def _register_and_activate(self, db_url: str, methodology_name: str, activate: bool = True):
+        from sqlalchemy import create_engine as _create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import (
+            MethodologySpec,
+            activate_run,
+            register_methodology,
+            register_run,
+        )
+
+        engine = _create_engine(db_url, future=True)
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=methodology_name,
+                    universe_import_policy="test",
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="score_cutoff_known_at_v1",
+                    realized_return_action_availability_policy="exit_cutoff_known_at_v1",
+                    action_source_version="test",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test",
+                ),
+            )
+            run = register_run(session, methodology.id, data_version="2026-07-18")
+            session.commit()
+            if activate:
+                activate_run(session, run.id, activated_by="test")
+                session.commit()
+            return run.id
+
+    def test_matches_orm_lookup_when_active(self, dag_module, research_db) -> None:
+        from sqlalchemy import create_engine as _create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import get_active_research_run
+
+        run_id = self._register_and_activate(research_db, "dag_test_methodology")
+
+        sql_result = dag_module._get_active_research_run_id_sql(research_db, "dag_test_methodology")
+        assert sql_result == run_id
+
+        engine = _create_engine(research_db, future=True)
+        with Session(engine) as session:
+            orm_result = get_active_research_run(session, "dag_test_methodology")
+        assert sql_result == orm_result.id
+
+    def test_raises_when_no_active_run(self, dag_module, research_db) -> None:
+        self._register_and_activate(research_db, "dag_test_methodology_inactive", activate=False)
+        with pytest.raises(RuntimeError, match="No active research run"):
+            dag_module._get_active_research_run_id_sql(research_db, "dag_test_methodology_inactive")
+
+    def test_raises_when_methodology_unknown(self, dag_module, research_db) -> None:
+        with pytest.raises(RuntimeError, match="No active research run"):
+            dag_module._get_active_research_run_id_sql(research_db, "does_not_exist")
 
 
 class TestFilterDegradation:
@@ -204,8 +294,21 @@ class TestLoadPricesPreFilter:
                 for t in tickers
             ]
         )
+        # BUG-009 section 2.3: _load_prices now also queries corporate_actions
+        # for the cutoff-aware adjustment. A single query-agnostic fake would
+        # answer that second query with the price frame (missing ex_date/
+        # known_at) and crash — distinguish by inspecting the SQL text.
+        empty_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            if "corporate_actions" in str(query):
+                return empty_actions.copy()
+            return frame.copy()
+
         monkeypatch.setenv("DATABASE_URL", db_url)
-        monkeypatch.setattr(pd, "read_sql", lambda *a, **k: frame)
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
         ti = self._FakeTI()
         dag_module._load_prices(
             ti=ti, data_interval_end=self._FakeInterval(score_date)
@@ -247,6 +350,422 @@ class TestLoadPricesPreFilter:
             dag_module, monkeypatch, "sqlite:///:memory:", date(2022, 6, 1), ["AAA", "NOPE"]
         )
         assert tickers == {"AAA", "NOPE"}
+
+    def test_pit_universe_applied_xcom_true_when_universe_available(
+        self, dag_module, universe_db, monkeypatch
+    ) -> None:
+        """Adversarial-review round 11 (BUG-008/BUG-009 section 4):
+        _write_scores needs to know whether PIT filtering actually
+        succeeded for this score_date."""
+        from sqlalchemy import create_engine, text
+
+        eng = create_engine(universe_db, future=True)
+        with eng.begin() as conn:
+            conn.execute(text("UPDATE universe_import_batches SET universe_id='sp500'"))
+            conn.execute(text("UPDATE universe_membership SET universe_id='sp500'"))
+        try:
+            import pandas as pd
+
+            frame = pd.DataFrame([{"ticker": "AAA", "date": date(2022, 6, 1), "close": 100.0}])
+            empty_actions = pd.DataFrame(
+                columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+            )
+
+            def _fake_read_sql(query, *a, **k):
+                return empty_actions.copy() if "corporate_actions" in str(query) else frame.copy()
+
+            monkeypatch.setenv("DATABASE_URL", universe_db)
+            monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+            ti = self._FakeTI()
+            dag_module._load_prices(ti=ti, data_interval_end=self._FakeInterval(date(2022, 6, 1)))
+
+            assert ti.pushed["pit_universe_applied"] is True
+        finally:
+            with eng.begin() as conn:
+                conn.execute(
+                    text("UPDATE universe_import_batches SET universe_id='sp500_fixture'")
+                )
+                conn.execute(
+                    text("UPDATE universe_membership SET universe_id='sp500_fixture'")
+                )
+            eng.dispose()
+
+    def test_pit_universe_applied_xcom_false_when_universe_unavailable(
+        self, dag_module, monkeypatch
+    ) -> None:
+        import pandas as pd
+
+        frame = pd.DataFrame([{"ticker": "AAA", "date": date(2022, 6, 1), "close": 100.0}])
+        empty_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return empty_actions.copy() if "corporate_actions" in str(query) else frame.copy()
+
+        monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+        ti = self._FakeTI()
+        dag_module._load_prices(ti=ti, data_interval_end=self._FakeInterval(date(2022, 6, 1)))
+
+        assert ti.pushed["pit_universe_applied"] is False
+
+
+class TestWriteScoresMethodologyHonesty:
+    """Adversarial-review round 11 (BUG-008/BUG-009 section 4): _write_scores
+    must not tag a degraded (non-PIT-filtered) write with a research_run_id
+    whose methodology claims PIT-universe safety -- routed through the
+    single shared data.research.sql_compat.assert_methodology_write_is_honest
+    gate, called BEFORE any row is written."""
+
+    class _FakeTI:
+        def __init__(self, xcom: dict):
+            self._xcom = xcom
+
+        def xcom_pull(self, key, task_ids=None):
+            return self._xcom.get((task_ids, key))
+
+    def _research_db(self, tmp_path, monkeypatch, *, universe_import_policy, name):
+        from sqlalchemy import create_engine as _create_engine
+        from sqlalchemy.orm import Session
+
+        from data.research.identity import (
+            MethodologySpec,
+            activate_run,
+            register_methodology,
+            register_run,
+        )
+        from data.research.models import Base
+
+        db_path = tmp_path / f"{name}.db"
+        db_url = f"sqlite:///{db_path}"
+        monkeypatch.setenv("DATABASE_URL", db_url)
+        engine = _create_engine(db_url, future=True)
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            methodology = register_methodology(
+                session,
+                MethodologySpec(
+                    name=name,
+                    universe_import_policy=universe_import_policy,
+                    timing_policy_id="t_plus_1_close_v1",
+                    score_action_availability_policy="score_cutoff_known_at_v1",
+                    realized_return_action_availability_policy="exit_cutoff_known_at_v1",
+                    action_source_version="unknown",
+                    return_adjustment_policy="total_return_adjusted_v1",
+                    missing_data_policy="pct_change_fill_none_v1",
+                    code_config_hash="test-hash",
+                ),
+            )
+            session.commit()
+            run = register_run(session, methodology.id, data_version="2026-01-01")
+            session.commit()
+            activate_run(session, run.id, activated_by="test")
+            session.commit()
+        return db_url
+
+    def test_raises_before_any_write_when_pit_degraded_under_pit_claiming_run(
+        self, dag_module, tmp_path, monkeypatch
+    ) -> None:
+        import pandas as pd
+
+        # dag_module._OPERATIONAL_METHODOLOGY_NAME is the fixed methodology
+        # name _write_scores always resolves its active run against.
+        self._research_db(
+            tmp_path,
+            monkeypatch,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            name=dag_module._OPERATIONAL_METHODOLOGY_NAME,
+        )
+        # Deliberately no factor_scores/alpha_scores tables in this DB --
+        # proves the honesty gate raises BEFORE any INSERT is even attempted
+        # (an INSERT against a missing table would raise a different,
+        # SQLAlchemy-generic error, not MethodologyHonestyError).
+        factor_json = pd.DataFrame(
+            [{"ticker": "AAA", "score_date": date(2026, 6, 1), "factor_name": "momentum",
+              "strategy_id": "v1", "z_score": 1.0, "raw_value": 0.1}]
+        ).to_json(orient="records", date_format="iso")
+
+        xcom = {
+            ("combine_scores", "factor_scores_json"): factor_json,
+            ("combine_scores", "alpha_scores_json"): "[]",
+            ("load_prices", "pit_universe_applied"): False,
+            ("compute_quality", "quality_pit_universe_applied"): True,
+        }
+        ti = self._FakeTI(xcom)
+
+        from data.research.sql_compat import MethodologyHonestyError
+
+        with pytest.raises(MethodologyHonestyError, match="misrepresent"):
+            dag_module._write_scores(ti=ti)
+
+    def test_does_not_raise_honesty_error_when_pit_applied(
+        self, dag_module, tmp_path, monkeypatch
+    ) -> None:
+        """Sanity: a fully-PIT-applied write must clear the honesty gate
+        (any later failure must come from the actual INSERT, e.g. a missing
+        table -- proving the gate itself did not block an honest write)."""
+        import pandas as pd
+        from sqlalchemy.exc import SQLAlchemyError
+
+        self._research_db(
+            tmp_path,
+            monkeypatch,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            name=dag_module._OPERATIONAL_METHODOLOGY_NAME,
+        )
+        factor_json = pd.DataFrame(
+            [{"ticker": "AAA", "score_date": date(2026, 6, 1), "factor_name": "momentum",
+              "strategy_id": "v1", "z_score": 1.0, "raw_value": 0.1}]
+        ).to_json(orient="records", date_format="iso")
+
+        xcom = {
+            ("combine_scores", "factor_scores_json"): factor_json,
+            ("combine_scores", "alpha_scores_json"): "[]",
+            ("load_prices", "pit_universe_applied"): True,
+            ("compute_quality", "quality_pit_universe_applied"): True,
+        }
+        ti = self._FakeTI(xcom)
+
+        from data.research.sql_compat import MethodologyHonestyError
+
+        # No factor_scores table exists in this DB, so the INSERT itself
+        # must fail -- but with a generic SQLAlchemy error, never
+        # MethodologyHonestyError, proving the gate cleared this write.
+        with pytest.raises(SQLAlchemyError):
+            dag_module._write_scores(ti=ti)
+
+    def test_missing_pit_flag_xcom_treated_as_not_applied(
+        self, dag_module, tmp_path, monkeypatch
+    ) -> None:
+        """Missing XCom (e.g. an older DAG run without this key) must fail
+        safe -- treated as PIT NOT applied, never assumed successful."""
+        import pandas as pd
+
+        self._research_db(
+            tmp_path,
+            monkeypatch,
+            universe_import_policy="pit_universe_effective_dated_v1",
+            name=dag_module._OPERATIONAL_METHODOLOGY_NAME,
+        )
+        factor_json = pd.DataFrame(
+            [{"ticker": "AAA", "score_date": date(2026, 6, 1), "factor_name": "momentum",
+              "strategy_id": "v1", "z_score": 1.0, "raw_value": 0.1}]
+        ).to_json(orient="records", date_format="iso")
+
+        xcom = {
+            ("combine_scores", "factor_scores_json"): factor_json,
+            ("combine_scores", "alpha_scores_json"): "[]",
+            # pit_universe_applied deliberately absent from XCom.
+        }
+        ti = self._FakeTI(xcom)
+
+        from data.research.sql_compat import MethodologyHonestyError
+
+        with pytest.raises(MethodologyHonestyError, match="misrepresent"):
+            dag_module._write_scores(ti=ti)
+
+
+class TestCorporateActionWiring:
+    """BUG-009 section 2.3 adversarial-review follow-up: momentum/lowvol
+    must receive split/dividend-adjusted prices, not the raw daily_prices
+    values value/quality use."""
+
+    def test_momentum_and_lowvol_read_adjusted_prices_key(self, dag_module) -> None:
+        """Source-level guard: the price-ratio factor tasks must pull
+        adjusted_prices_json, not prices_json, from load_prices' XCom."""
+        import inspect
+
+        momentum_source = inspect.getsource(dag_module._compute_momentum)
+        lowvol_source = inspect.getsource(dag_module._compute_lowvol)
+        value_source = inspect.getsource(dag_module._compute_value)
+        quality_source = inspect.getsource(dag_module._compute_quality)
+
+        assert 'xcom_pull(key="adjusted_prices_json"' in momentum_source
+        assert 'xcom_pull(key="adjusted_prices_json"' in lowvol_source
+        # Value/quality deliberately stay on raw prices (valuation ratios
+        # need the actual traded price, not a total-return-adjusted one).
+        assert 'xcom_pull(key="prices_json"' in value_source
+        assert 'xcom_pull(key="prices_json"' in quality_source
+        assert 'xcom_pull(key="adjusted_prices_json"' not in value_source
+        assert 'xcom_pull(key="adjusted_prices_json"' not in quality_source
+
+    def test_load_prices_pushes_split_adjusted_series(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+        from datetime import datetime, timezone
+
+        score_date = date(2022, 6, 3)
+        pre_split_date = date(2022, 6, 1)
+        raw_frame = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": pre_split_date, "close": 200.0},
+                {"ticker": "AAA", "date": date(2022, 6, 2), "close": 100.0},
+                {"ticker": "AAA", "date": score_date, "close": 101.0},
+            ]
+        )
+        actions_frame = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "ex_date": date(2022, 6, 2),
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime(2022, 6, 1, 21, 0, tzinfo=timezone.utc),
+                    "source_version": "test",
+                }
+            ]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return actions_frame.copy() if "corporate_actions" in str(query) else raw_frame.copy()
+
+        monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+
+        ti = TestLoadPricesPreFilter._FakeTI()
+        dag_module._load_prices(
+            ti=ti, data_interval_end=TestLoadPricesPreFilter._FakeInterval(score_date)
+        )
+
+        raw_pushed = pd.read_json(ti.pushed["prices_json"], orient="records", convert_dates=False)
+        adj_pushed = pd.read_json(ti.pushed["adjusted_prices_json"], orient="records", convert_dates=False)
+        raw_pushed["date"] = pd.to_datetime(raw_pushed["date"]).dt.date
+        adj_pushed["date"] = pd.to_datetime(adj_pushed["date"]).dt.date
+
+        raw_close = float(raw_pushed[raw_pushed["date"] == pre_split_date]["close"].iloc[0])
+        adj_close = float(adj_pushed[adj_pushed["date"] == pre_split_date]["close"].iloc[0])
+
+        assert abs(raw_close - 200.0) < 1e-6  # prices_json stays raw
+        assert abs(adj_close - 100.0) < 1e-6  # adjusted_prices_json is split-adjusted
+
+
+class TestSimulationCorporateActionAdjustment:
+    """BUG-009 section 2.3 (adversarial-review round 10 self-audit sweep):
+    _write_simulation's close-to-close return, computed by
+    _adjusted_closes_for_simulation, must be corporate-action-adjusted, not
+    raw -- a split/dividend landing on sim_date or prev_date would
+    otherwise inject a fabricated return into the compounding
+    simulated_nav chain, permanently distorting every later NAV row."""
+
+    class _FakeEngine:
+        def connect(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_split_on_sim_date_is_adjusted(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+        from datetime import datetime, timezone
+
+        prev_date = date(2022, 6, 1)
+        sim_date = date(2022, 6, 2)
+        prices_df = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": prev_date, "close": 100.0},
+                {"ticker": "AAA", "date": sim_date, "close": 51.0},  # ~2:1 split + genuine gain
+            ]
+        )
+        actions_frame = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "ex_date": sim_date,
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime(2022, 6, 1, 21, 0, tzinfo=timezone.utc),
+                    "source_version": "test",
+                }
+            ]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return actions_frame.copy()
+
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+
+        raw_today = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+        raw_prev = prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+
+        adj_today, adj_prev = dag_module._adjusted_closes_for_simulation(
+            prices_df, self._FakeEngine(), sim_date, prev_date, raw_today, raw_prev
+        )
+
+        # prev_date is BEFORE the split's ex_date, so it gets back-adjusted
+        # by the split factor (1/2): 100.0 -> 50.0. sim_date is ON the
+        # ex_date, so it stays at its raw close, 51.0 (adj_factor=1 for
+        # dates on/after the most recent action).
+        assert abs(float(adj_prev["AAA"]) - 50.0) < 1e-6
+        assert abs(float(adj_today["AAA"]) - 51.0) < 1e-6
+
+        # The RAW (unadjusted) closes would have implied a fake ~49% LOSS;
+        # the adjusted return is the genuine +2% gain.
+        raw_return = float(raw_today["AAA"]) / float(raw_prev["AAA"]) - 1.0
+        adj_return = float(adj_today["AAA"]) / float(adj_prev["AAA"]) - 1.0
+        assert raw_return < -0.4
+        assert abs(adj_return - 0.02) < 1e-6
+
+    def test_no_corporate_actions_table_degrades_to_raw(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+
+        prev_date = date(2022, 6, 1)
+        sim_date = date(2022, 6, 2)
+        prices_df = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": prev_date, "close": 100.0},
+                {"ticker": "AAA", "date": sim_date, "close": 102.0},
+            ]
+        )
+
+        def _raising_read_sql(query, *a, **k):
+            raise Exception("no such table: corporate_actions")
+
+        monkeypatch.setattr(pd, "read_sql", _raising_read_sql)
+
+        raw_today = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+        raw_prev = prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+
+        adj_today, adj_prev = dag_module._adjusted_closes_for_simulation(
+            prices_df, self._FakeEngine(), sim_date, prev_date, raw_today, raw_prev
+        )
+
+        # Must not raise; degrades to the RAW closes passed in (non-blocking
+        # "log and skip" philosophy, matching _write_simulation elsewhere).
+        assert adj_today.equals(raw_today)
+        assert adj_prev.equals(raw_prev)
+
+    def test_no_actions_returns_raw_unchanged(self, dag_module, monkeypatch) -> None:
+        import pandas as pd
+
+        prev_date = date(2022, 6, 1)
+        sim_date = date(2022, 6, 2)
+        prices_df = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": prev_date, "close": 100.0},
+                {"ticker": "AAA", "date": sim_date, "close": 102.0},
+            ]
+        )
+        empty_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return empty_actions.copy()
+
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+
+        raw_today = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+        raw_prev = prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+
+        adj_today, adj_prev = dag_module._adjusted_closes_for_simulation(
+            prices_df, self._FakeEngine(), sim_date, prev_date, raw_today, raw_prev
+        )
+
+        assert adj_today.equals(raw_today)
+        assert adj_prev.equals(raw_prev)
 
 
 class TestComputeQualityPITCrossSection:
@@ -357,3 +876,78 @@ class TestComputeQualityPITCrossSection:
         w = with_whale.sort_values("ticker").reset_index(drop=True)
         wo = without_whale.sort_values("ticker").reset_index(drop=True)
         pd.testing.assert_frame_equal(w, wo)
+
+    def test_quality_pit_universe_applied_xcom_reflects_its_own_lookup(
+        self, dag_module, universe_db, monkeypatch
+    ) -> None:
+        """Adversarial-review round 11 (BUG-008/BUG-009 section 4): quality
+        does its own independent PIT lookup (unlike momentum/lowvol/value,
+        which rely solely on _load_prices' panel filter), so _write_scores
+        needs its degrade state surfaced separately."""
+        from sqlalchemy import text
+
+        score_date = date(2022, 6, 1)
+        members = ["AAA", "CCC"]
+
+        eng = create_engine(universe_db, future=True)
+        with eng.begin() as conn:
+            conn.execute(text("UPDATE universe_import_batches SET universe_id='sp500'"))
+            conn.execute(text("UPDATE universe_membership SET universe_id='sp500'"))
+        try:
+            ti = self._run_compute_quality_ti(
+                dag_module, monkeypatch, universe_db, score_date, self._fundamentals(members)
+            )
+            assert ti.pushed["quality_pit_universe_applied"] is True
+        finally:
+            with eng.begin() as conn:
+                conn.execute(
+                    text("UPDATE universe_import_batches SET universe_id='sp500_fixture'")
+                )
+                conn.execute(
+                    text("UPDATE universe_membership SET universe_id='sp500_fixture'")
+                )
+            eng.dispose()
+
+    def test_quality_pit_universe_applied_xcom_false_when_lookup_unavailable(
+        self, dag_module, monkeypatch, tmp_path
+    ) -> None:
+        # A real file-backed DB (not :memory:) so financial_statements
+        # persists across the setup connection and _compute_quality's own
+        # internal create_engine() call -- :memory: creates a fresh, empty
+        # DB per connection. No research_methodologies/universe tables
+        # exist in this DB at all, so the PIT lookup itself degrades.
+        score_date = date(2022, 6, 1)
+        members = ["AAA", "CCC"]
+        db_url = f"sqlite:///{tmp_path / 'no_universe.db'}"
+        ti = self._run_compute_quality_ti(
+            dag_module, monkeypatch, db_url, score_date, self._fundamentals(members)
+        )
+        assert ti.pushed["quality_pit_universe_applied"] is False
+
+    def _run_compute_quality_ti(self, dag_module, monkeypatch, db_url, score_date, fund):
+        from sqlalchemy import text
+
+        eng = create_engine(db_url, future=True)
+        with eng.begin() as conn:
+            conn.execute(
+                text("CREATE TABLE IF NOT EXISTS financial_statements (id INTEGER)")
+            )
+            conn.execute(text("DELETE FROM financial_statements"))
+            conn.execute(text("INSERT INTO financial_statements (id) VALUES (1)"))
+        eng.dispose()
+
+        monkeypatch.setenv("DATABASE_URL", db_url)
+        monkeypatch.setattr(pd, "read_sql", lambda *a, **k: fund.copy())
+
+        members = ["AAA", "CCC"]
+        prices = pd.DataFrame(
+            [{"ticker": t, "date": str(score_date), "close": 100.0} for t in members]
+        )
+        ti = self._FakeTI(
+            {
+                "score_date": str(score_date),
+                "prices_json": prices.to_json(orient="records", date_format="iso"),
+            }
+        )
+        dag_module._compute_quality(ti=ti)
+        return ti

@@ -26,7 +26,14 @@ date.  It fails closed when no published import exists or when any score date
 falls outside the validated coverage window.  --provisional-no-universe
 skips the membership filter with a loud warning; the resulting scores are
 PROVISIONAL and must not be used for selection, promotion, or paper-trading
-qualification.
+qualification. A LIVE (non-dry-run) write additionally fails closed if
+--research-run-id's registered methodology claims something this run did not
+actually do -- PIT-universe safety (--provisional-no-universe skipped
+membership filtering) or cutoff-adjusted corporate-action handling (the
+snapshot was missing) -- via the single shared
+data.research.sql_compat.assert_methodology_write_is_honest gate
+(adversarial-review round 11; consolidates what used to be two separate
+script-local checks here).
 
 Usage
 ------
@@ -51,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+from typing import Optional
 
 import pandas as pd
 import structlog
@@ -94,6 +102,33 @@ def _parse_args() -> argparse.Namespace:
         "scores are PROVISIONAL: not valid for selection, promotion, or "
         "paper-trading qualification.",
     )
+    p.add_argument(
+        "--research-run-id",
+        type=int,
+        default=None,
+        help="research_runs.id (BUG-009 section 4 / migration 012) tagging every "
+        "written factor_scores/alpha_scores row with the methodology that "
+        "produced it. Register one first with "
+        "data.research.identity.register_methodology/register_run. Optional "
+        "at the CLI level for --dry-run (which never writes); run() still "
+        "hard-requires it for an actual (non-dry-run) write so a new "
+        "backfill can never silently overwrite an old methodology's rows "
+        "via the ON CONFLICT upsert.",
+    )
+    p.add_argument(
+        "--allow-raw-prices-on-missing-actions",
+        action="store_true",
+        help="Explicit opt-in (adversarial-review round 9, BUG-009): a live "
+        "(non-dry-run) write with no corporate_actions snapshot pinned for "
+        "--snapshot-date fails closed by default rather than silently "
+        "persisting raw, unadjusted momentum scores under a research_run_id "
+        "whose methodology claims cutoff-adjustment was applied. Pass this "
+        "flag together with --research-run-id pointing at a run whose "
+        "methodology honestly declares score_action_availability_policy != "
+        "'score_cutoff_known_at_v1' to proceed anyway. --dry-run is always "
+        "permissive (preview only, never persists) and does not need this "
+        "flag.",
+    )
     return p.parse_args()
 
 
@@ -104,10 +139,12 @@ def run(
     strategy_id: str,
     batch_size: int,
     dry_run: bool,
+    research_run_id: Optional[int] = None,
     snapshots=None,  # injectable for testing; None → construct from env vars
     universe_id: str = "sp500",
     provisional_no_universe: bool = False,
     universe_lookup=None,  # injectable for testing; None → construct from DATABASE_URL
+    allow_raw_prices_on_missing_actions: bool = False,
 ) -> None:
     from data.storage.timescale_writer import TimescaleWriter
     from signals.composites.momentum_score import compute_momentum_scores
@@ -156,6 +193,25 @@ def run(
                 "selection, promotion, or paper-trading qualification (BUG-008)"
             ),
         )
+        # Adversarial-review round 10 (BUG-008/BUG-009): --provisional-no-universe
+        # correctly skips PIT membership filtering, but nothing else stops an
+        # operator from tagging the result with a research_run_id whose
+        # methodology claims PIT-universe safety -- downstream readers filter
+        # solely by research_run_id (BUG-072) and would silently consume
+        # current-membership (survivorship-biased) rows believing them
+        # PIT-safe. A dry run never persists, so it stays permissive; a live
+        # write must not lie about its own methodology. The actual honesty
+        # check (round 11: routed through the single shared
+        # data.research.sql_compat.assert_methodology_write_is_honest gate,
+        # not a script-local variant) happens once, below, after the
+        # corporate-action state is also known -- see that call for why.
+        if not dry_run and research_run_id is None:
+            raise ValueError(
+                "--provisional-no-universe on a live (non-dry-run) write "
+                "requires --research-run-id so the run's methodology can "
+                "be validated for honesty before any scores are computed "
+                "(BUG-008/BUG-009)."
+            )
     else:
         import os
 
@@ -179,10 +235,158 @@ def run(
             n_score_dates=len(candidate_dates),
         )
 
+    # ── Corporate-action cutoff-aware adjustment (BUG-009 section 2.3) ───────
+    # Momentum is a pure price-ratio indicator: its score at date t must be
+    # computed from a price history where only actions known-and-occurred by
+    # t's cutoff have adjusted the input prices. This backfill computes every
+    # score date in one vectorized pass rather than looping per date; using
+    # ONE boundary cutoff (session close of --end) rather than a literal
+    # per-score-date cutoff is provably equivalent for a window/ratio-based
+    # indicator like momentum, because a uniform multiplicative adjustment
+    # factor cancels out of any price ratio computed within a lookback window
+    # that lies entirely before the action's ex_date (see
+    # scripts/validate_signal_ic.py::_build_adjusted_price_series for the
+    # full derivation). The one residual gap — an action whose ex_date falls
+    # exactly on a given score_date — is documented as BUG-071 in bugs.md.
+    from data.normalization.corporate_actions import build_score_price_history_as_of
+    from data.universe.calendar import session_close_cutoff
+
+    corporate_actions_snapshot_missing = False
+    try:
+        corporate_actions = snaps.load_snapshot("corporate_actions", snapshot_date)
+    except FileNotFoundError:
+        corporate_actions_snapshot_missing = True
+        # Adversarial-review round 9 (BUG-009): a missing snapshot used to
+        # silently degrade to an empty action set and let the run proceed --
+        # writing raw, unadjusted momentum scores tagged with a
+        # research_run_id whose registered methodology
+        # (score_cutoff_known_at_v1) claims cutoff-adjustment WAS applied.
+        # That is the same "provenance lies about what actually happened"
+        # pattern as the original P0 finding this task exists to prevent,
+        # just reached via a silent degrade instead of missing wiring. A
+        # dry run is still permissive (preview only, never persists); a
+        # live write fails closed unless the caller explicitly opts in via
+        # --allow-raw-prices-on-missing-actions AND supplies a
+        # --research-run-id (the methodology-honesty check itself happens
+        # once, below, after this whole try/except -- round 11: routed
+        # through the single shared
+        # data.research.sql_compat.assert_methodology_write_is_honest gate).
+        if not dry_run:
+            if not allow_raw_prices_on_missing_actions:
+                raise RuntimeError(
+                    f"corporate_actions snapshot is missing for "
+                    f"snapshot_date={snapshot_date} and this is a live "
+                    "(non-dry-run) write. Proceeding would silently persist raw, "
+                    "unadjusted momentum scores under a research_run_id whose "
+                    "methodology may claim cutoff-adjusted corporate-action "
+                    "handling was applied (BUG-009). Either re-pin a "
+                    "corporate_actions snapshot for this snapshot_date "
+                    "(scripts/pin_snapshot.py), run with --dry-run to preview "
+                    "without persisting, or pass "
+                    "--allow-raw-prices-on-missing-actions together with a "
+                    "--research-run-id whose methodology honestly declares "
+                    "score_action_availability_policy != "
+                    "'score_cutoff_known_at_v1'."
+                )
+            if research_run_id is None:
+                raise ValueError(
+                    "--allow-raw-prices-on-missing-actions requires "
+                    "--research-run-id so the run's methodology can be "
+                    "validated for honesty before any scores are computed "
+                    "(BUG-009)."
+                )
+
+        corporate_actions = pd.DataFrame(
+            columns=["ticker", "ex_date", "action_type", "value", "known_at", "source_version"]
+        )
+        logger.warning(
+            "corporate_actions_snapshot_missing",
+            snapshot_date=str(snapshot_date),
+            note="no corporate_actions snapshot pinned for this snapshot_date; "
+            "momentum scores will use raw (unadjusted) prices (BUG-009 section 2.3)",
+        )
+    else:
+        corporate_actions["ex_date"] = pd.to_datetime(corporate_actions["ex_date"]).dt.date
+
+        # BUG-009 P2 (adversarial review round 3): a snapshot pinned before
+        # migration 011 (scripts/pin_snapshot.py did `SELECT *` against
+        # corporate_actions, so its columns mirror whatever the live table
+        # had at pin time) has no known_at/source_version columns at all --
+        # every action it contains is, by construction, a legacy yfinance
+        # date-only record with no announcement timestamp. Synthesize
+        # known_at with the SAME conservative next-session rule migration
+        # 011 used to backfill the live table (no earlier than the close of
+        # the next trading session after ex_date), rather than raising a
+        # bare KeyError or silently skipping adjustment for the whole
+        # snapshot. This is provenance-labeled, not silently assumed: every
+        # synthesized row is tagged with a distinct source_version so a
+        # reader can tell it apart from a genuinely migrated live-table row.
+        if "known_at" not in corporate_actions.columns:
+            from data.universe.calendar import conservative_known_at_for_date_only_source
+
+            logger.warning(
+                "corporate_actions_snapshot_predates_migration_011",
+                snapshot_date=str(snapshot_date),
+                n_actions=len(corporate_actions),
+                note="snapshot has no known_at/source_version columns; synthesizing "
+                "known_at via the conservative next-session rule (BUG-009 section 2.3) "
+                "-- re-pin the snapshot after migration 011 for a live-table-backed "
+                "known_at instead",
+            )
+            corporate_actions["known_at"] = corporate_actions["ex_date"].apply(
+                conservative_known_at_for_date_only_source
+            )
+            corporate_actions["source_version"] = "legacy_pre_migration_011_snapshot"
+        else:
+            corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
+            if "source_version" not in corporate_actions.columns:
+                corporate_actions["source_version"] = "unknown"
+
+    # ── Methodology-honesty gate (BUG-009 section 4, adversarial-review ──────
+    # round 11): ONE consolidated check, replacing the two ad hoc
+    # script-local variants this file used to carry
+    # (_validate_raw_prices_methodology_is_honest,
+    # _validate_provisional_no_universe_methodology_is_honest -- both
+    # removed). Placed here rather than at each degrade point individually
+    # because by this point BOTH dimensions (PIT-universe, corporate-action
+    # adjustment) are already known, and this is still before the
+    # expensive per-date momentum computation below -- no fail-fast benefit
+    # is lost versus checking earlier. Skipped entirely (no DB round-trip)
+    # when nothing is degraded on either dimension, since a fully-honest
+    # write cannot violate either claim regardless of methodology.
+    pit_universe_applied = not provisional_no_universe
+    corporate_action_adjustment_applied = not corporate_actions_snapshot_missing
+    if not dry_run and (not pit_universe_applied or not corporate_action_adjustment_applied):
+        import os
+
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        assert_methodology_write_is_honest(
+            os.environ["DATABASE_URL"],
+            research_run_id,
+            pit_universe_applied=pit_universe_applied,
+            corporate_action_adjustment_applied=corporate_action_adjustment_applied,
+        )
+
+    boundary_cutoff = session_close_cutoff(min(end, prices["date"].max()))
+    adjusted_prices, adj_meta = build_score_price_history_as_of(
+        prices, corporate_actions, score_cutoff=boundary_cutoff
+    )
+    logger.info(
+        "cutoff_adjusted_price_series_built",
+        boundary_cutoff=boundary_cutoff.isoformat(),
+        n_actions_considered=adj_meta.n_actions_considered,
+        n_actions_excluded_by_cutoff=adj_meta.n_actions_excluded_by_cutoff,
+        n_actions_excluded_missing_known_at=adj_meta.n_actions_excluded_missing_known_at,
+    )
+    prices_for_scoring = adjusted_prices[["ticker", "date", "adj_close"]].rename(
+        columns={"adj_close": "close"}
+    )
+    prices_for_scoring["close"] = prices_for_scoring["close"].astype(float)
+
     # ── Compute momentum scores for all dates in one vectorised pass ──────────
-    logger.info("computing_momentum_scores", n_price_rows=len(prices))
-    prices["close"] = prices["close"].astype(float)
-    momentum_df = compute_momentum_scores(prices, eligibility=eligibility_df)
+    logger.info("computing_momentum_scores", n_price_rows=len(prices_for_scoring))
+    momentum_df = compute_momentum_scores(prices_for_scoring, eligibility=eligibility_df)
 
     # Keep "date" column name — combine_factor_scores expects "date", not "score_date".
     # The scorer renames the column internally when building the output DataFrames.
@@ -226,6 +430,13 @@ def run(
         return
 
     # ── Write to DB in batches ────────────────────────────────────────────────
+    if research_run_id is None:
+        raise ValueError(
+            "research_run_id is required for a non-dry-run write (BUG-009 section "
+            "4 / migration 012): register a research_methodologies/research_runs "
+            "pair first via data.research.identity so this backfill's rows are "
+            "attributable and cannot silently overwrite an old methodology's rows."
+        )
     writer = TimescaleWriter()
     total_factor_rows = 0
     total_alpha_rows = 0
@@ -248,6 +459,7 @@ def run(
         )
         factor_rows["factor_name"] = "momentum"
         factor_rows["strategy_id"] = strategy_id
+        factor_rows["research_run_id"] = research_run_id
 
         # combine_factor_scores expects "date" column — pass the original.
         alpha_frames = []
@@ -264,6 +476,8 @@ def run(
             alpha_frames.append(alpha_df)
 
         alpha_combined = pd.concat(alpha_frames, ignore_index=True) if alpha_frames else pd.DataFrame()
+        if not alpha_combined.empty:
+            alpha_combined["research_run_id"] = research_run_id
 
         n_f = writer.upsert_factor_scores(factor_rows)
         n_a = writer.upsert_alpha_scores(alpha_combined) if not alpha_combined.empty else 0
@@ -298,8 +512,10 @@ def main() -> None:
         strategy_id=args.strategy_id,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        research_run_id=args.research_run_id,
         universe_id=args.universe_id,
         provisional_no_universe=args.provisional_no_universe,
+        allow_raw_prices_on_missing_actions=args.allow_raw_prices_on_missing_actions,
     )
 
 

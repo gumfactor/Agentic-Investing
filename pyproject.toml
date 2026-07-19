@@ -14,7 +14,7 @@ include = ["data*", "signals*", "portfolio*", "execution*", "risk*", "backtestin
 
 # ─── Pytest ──────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
-testpaths = ["data/tests", "signals/tests", "portfolio/tests", "execution/tests", "risk/tests", "backtesting/tests", "reporting/tests", "tests", "tests/strategy_registry"]
+testpaths = ["data/tests", "signals/tests", "portfolio/tests", "execution/tests", "risk/tests", "backtesting/tests", "reporting/tests", "tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"

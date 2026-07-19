@@ -116,15 +116,72 @@ def _load_prices(**context: Any) -> None:
             ),
         )
 
+    # ── Corporate-action cutoff-aware adjustment (BUG-009 section 2.3) ───────
+    # Price-ratio-based factors (momentum, lowvol — computed by
+    # _compute_momentum/_compute_lowvol below) must use only actions known-
+    # and-occurred by THIS run's own score_date cutoff (design plan section
+    # 2.3). Unlike scripts/validate_signal_ic.py's backfill (which computes
+    # many score dates in one vectorized pass and therefore documents a
+    # single-run-boundary-cutoff approximation — BUG-071), this DAG scores
+    # exactly ONE date (end_date) per run, so score_cutoff =
+    # session_close_cutoff(end_date) is the exact, fully correct per-date
+    # cutoff with no residual gap. Value/quality (_compute_value/_compute_
+    # quality) deliberately keep pulling raw prices via "prices_json" — a
+    # valuation ratio needs the actual traded price, not a total-return-
+    # adjusted synthetic one (same rationale as validate_signal_ic.py).
+    from data.normalization.corporate_actions import build_score_price_history_as_of
+    from data.universe.calendar import session_close_cutoff
+
+    with engine.connect() as conn:
+        corporate_actions = pd.read_sql(
+            text(
+                "SELECT ticker, ex_date, action_type, value, known_at, source_version "
+                "FROM corporate_actions ORDER BY ticker, ex_date"
+            ),
+            conn,
+        )
+    corporate_actions["ex_date"] = pd.to_datetime(corporate_actions["ex_date"]).dt.date
+    corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
+
+    score_cutoff = session_close_cutoff(end_date)
+    adjusted_df, adj_meta = build_score_price_history_as_of(
+        df, corporate_actions, score_cutoff=score_cutoff
+    )
+    _log.info(
+        "score_price_history_adjusted",
+        score_date=str(end_date),
+        score_cutoff=score_cutoff.isoformat(),
+        n_actions_considered=adj_meta.n_actions_considered,
+        n_actions_excluded_by_cutoff=adj_meta.n_actions_excluded_by_cutoff,
+        n_actions_excluded_missing_known_at=adj_meta.n_actions_excluded_missing_known_at,
+    )
+    adjusted_df = adjusted_df[["ticker", "date", "adj_close"]].rename(columns={"adj_close": "close"})
+    adjusted_df["close"] = adjusted_df["close"].astype(float)
+
     context["ti"].xcom_push(key="prices_json", value=df.to_json(orient="records", date_format="iso"))
+    context["ti"].xcom_push(
+        key="adjusted_prices_json", value=adjusted_df.to_json(orient="records", date_format="iso")
+    )
     context["ti"].xcom_push(key="score_date", value=str(end_date))
+    # Adversarial-review round 11 (BUG-008/BUG-009 section 4): _write_scores
+    # needs to know whether PIT membership filtering actually succeeded for
+    # THIS score_date -- _eligible is None on a degraded run (BUG-069), and
+    # _write_scores must not tag those rows with a research_run_id whose
+    # methodology claims PIT-universe safety. Pushed as an explicit XCom
+    # flag since Airflow tasks are separate invocations with no shared
+    # in-process state.
+    context["ti"].xcom_push(key="pit_universe_applied", value=_eligible is not None)
 
 
 def _compute_momentum(**context: Any) -> None:
     import pandas as pd
     from signals.composites.momentum_score import compute_momentum_scores
 
-    prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
+    # Split/dividend-adjusted (BUG-009 section 2.3): momentum is a pure
+    # price-ratio indicator, so it must use build_score_price_history_as_of's
+    # cutoff-aware series (adjusted_prices_json), not the raw prices_json
+    # value/quality use.
+    prices_json: str = context["ti"].xcom_pull(key="adjusted_prices_json", task_ids="load_prices")
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
@@ -139,7 +196,10 @@ def _compute_lowvol(**context: Any) -> None:
     import pandas as pd
     from signals.composites.low_vol_score import compute_lowvol_scores
 
-    prices_json: str = context["ti"].xcom_pull(key="prices_json", task_ids="load_prices")
+    # Split/dividend-adjusted (BUG-009 section 2.3): low-vol is a pure
+    # price-ratio indicator (volatility of returns), same rationale as
+    # _compute_momentum above.
+    prices_json: str = context["ti"].xcom_pull(key="adjusted_prices_json", task_ids="load_prices")
     prices = pd.read_json(prices_json, orient="records", convert_dates=False)
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
@@ -265,6 +325,12 @@ def _compute_quality(**context: Any) -> None:
         key="quality_scores_json",
         value=scores.to_json(orient="records", date_format="iso") if not scores.empty else "[]",
     )
+    # Adversarial-review round 11 (BUG-008/BUG-009 section 4): quality does
+    # its OWN independent PIT lookup (unlike momentum/lowvol/value, which
+    # all rely solely on _load_prices' single panel filter) -- so its
+    # degrade state must be surfaced to _write_scores separately. See
+    # _load_prices' equivalent "pit_universe_applied" XCom push.
+    context["ti"].xcom_push(key="quality_pit_universe_applied", value=_eligible is not None)
 
 
 def _pit_eligible_tickers_sql(database_url: str, score_date: date) -> set[str] | None:
@@ -459,6 +525,102 @@ def _combine_scores(**context: Any) -> None:
     )
 
 
+def _adjusted_closes_for_simulation(
+    prices_df: Any,
+    engine: Any,
+    sim_date: date,
+    prev_date: date,
+    today_closes: Any,
+    prev_day_closes: Any,
+) -> tuple[Any, Any]:
+    """Corporate-action-adjusted (ticker -> close) series for sim_date and
+    prev_date, used by :func:`_write_simulation` to compute a close-to-close
+    daily return (BUG-009 section 2.3, adversarial-review round 10
+    self-audit sweep).
+
+    Before this fix, ``_write_simulation`` divided RAW close-to-close
+    prices with no corporate-action adjustment. A split/dividend landing
+    exactly on sim_date (or prev_date) would inject a fabricated single-day
+    loss/gain into a strategy's simulated return -- and because
+    ``simulated_nav`` COMPOUNDS from the prior row (see
+    ``_write_simulation``'s docstring), that one bad day permanently
+    distorts every later NAV row for the strategy, not just the affected
+    day.
+
+    Reuses :func:`data.normalization.corporate_actions
+    .build_realized_total_return_as_of` (the same builder
+    ``signals.research.ic.compute_realized_forward_returns_as_of`` uses)
+    with ``entry_date=prev_date`` and
+    ``exit_cutoff=session_close_cutoff(sim_date)`` -- ``_write_simulation``
+    runs exactly one sim_date per DAG run, so that cutoff is the exact,
+    fully correct per-date cutoff (same reasoning as the ``score_cutoff``
+    comment in ``_load_prices`` for momentum/lowvol, not an approximation).
+    Passes the FULL price history (not just [prev_date, sim_date]) because
+    a dividend's per-share factor is looked up from the close ON ITS OWN
+    ex_date, which is not necessarily prev_date or sim_date -- truncating
+    the price panel would silently drop that dividend's adjustment.
+
+    Non-blocking degrade-to-raw on any adjustment failure (missing
+    corporate_actions table, query error, etc.), consistent with
+    ``_write_simulation``'s existing "log and skip, never abort the
+    pipeline" philosophy -- ``strategy_simulations`` is a
+    diagnostic/dashboard table, not a research_run_id-tagged research
+    result (no such column exists on ``strategy_simulations``), so there is
+    no provenance-honesty claim (BUG-009 section 4) to violate by
+    degrading.
+
+    Args:
+        today_closes, prev_day_closes: the RAW (ticker -> close) fallback
+            series, returned unchanged if adjustment is unavailable.
+
+    Returns:
+        (today_closes, prev_day_closes), each corporate-action-adjusted
+        when adjustment succeeds, otherwise the raw inputs unchanged.
+    """
+    import pandas as pd
+    from sqlalchemy import text as _text
+
+    try:
+        from data.normalization.corporate_actions import build_realized_total_return_as_of
+        from data.universe.calendar import session_close_cutoff
+
+        with engine.connect() as conn:
+            sim_corporate_actions = pd.read_sql(
+                _text(
+                    "SELECT ticker, ex_date, action_type, value, known_at, source_version "
+                    "FROM corporate_actions ORDER BY ticker, ex_date"
+                ),
+                conn,
+            )
+        if sim_corporate_actions.empty:
+            return today_closes, prev_day_closes
+
+        sim_corporate_actions["ex_date"] = pd.to_datetime(sim_corporate_actions["ex_date"]).dt.date
+        sim_corporate_actions["known_at"] = pd.to_datetime(
+            sim_corporate_actions["known_at"], utc=True
+        )
+        adjusted_sim_prices, _adj_meta = build_realized_total_return_as_of(
+            prices_df,
+            sim_corporate_actions,
+            entry_date=prev_date,
+            exit_cutoff=session_close_cutoff(sim_date),
+        )
+        adj_lookup = adjusted_sim_prices.set_index(["ticker", "date"])["adj_close"].astype(float)
+        return adj_lookup.xs(sim_date, level="date"), adj_lookup.xs(prev_date, level="date")
+    except Exception as exc:
+        import structlog as _structlog
+
+        _structlog.get_logger("rqis.airflow").warning(
+            "simulation_corporate_action_adjustment_unavailable",
+            sim_date=str(sim_date),
+            error=str(exc),
+            note="close-to-close simulated_return falls back to RAW prices "
+            "for this run; a split/dividend on sim_date or prev_date may "
+            "distort the simulated return (BUG-009 section 2.3)",
+        )
+        return today_closes, prev_day_closes
+
+
 def _write_simulation(**context: Any) -> dict:
     """Forward-simulate each strategy using today's alpha scores and daily_prices.
 
@@ -517,7 +679,35 @@ def _write_simulation(**context: Any) -> dict:
     except Exception:
         strategy_ids = [_DEFAULT_STRATEGY_ID]
 
-    # Compute close-to-close daily returns from prices for sim_date
+    # BUG-009 section 4 (adversarial review round 3): research_run_id is now
+    # part of alpha_scores' identity, so multiple rows can legitimately
+    # coexist for the same (ticker, score_date, strategy_id) across runs
+    # (legacy, superseded, active). The DB fallback query below (for
+    # strategies not present in this run's own XCom) must filter to the
+    # explicitly active run, never read across all of them — non-blocking,
+    # consistent with this function's existing degrade-and-skip philosophy:
+    # if no active run can be resolved, the DB fallback branch is skipped
+    # (that strategy's simulation row is simply not written this run) rather
+    # than aborting the whole task.
+    try:
+        _fallback_research_run_id: int | None = _get_active_research_run_id_sql(
+            database_url, _OPERATIONAL_METHODOLOGY_NAME
+        )
+    except Exception as _exc:
+        _fallback_research_run_id = None
+        import structlog as _structlog
+
+        _structlog.get_logger("rqis.airflow").warning(
+            "simulation_fallback_active_run_unavailable",
+            error=str(_exc),
+            note="DB fallback alpha_scores lookup for other strategies will be "
+            "skipped this run (BUG-009 section 4)",
+        )
+
+    # Compute close-to-close daily returns from prices for sim_date. See
+    # _adjusted_closes_for_simulation's docstring (BUG-009 section 2.3,
+    # adversarial-review round 10 self-audit sweep) for why this must be
+    # corporate-action-adjusted, not raw.
     today_closes = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
     prev_day_closes: pd.Series = pd.Series(dtype=float)
     prior_dates = prices_df[prices_df["date"] < sim_date]["date"]
@@ -525,6 +715,9 @@ def _write_simulation(**context: Any) -> dict:
         prev_date = prior_dates.max()
         prev_day_closes = (
             prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+        )
+        today_closes, prev_day_closes = _adjusted_closes_for_simulation(
+            prices_df, engine, sim_date, prev_date, today_closes, prev_day_closes
         )
 
     for strategy_id in strategy_ids:
@@ -534,18 +727,21 @@ def _write_simulation(**context: Any) -> dict:
             # row on the same sim_date even when only one strategy ran today.
             if not alpha_df.empty and (alpha_df["strategy_id"] == strategy_id).any():
                 strat_scores = alpha_df[alpha_df["strategy_id"] == strategy_id].copy()
-            else:
+            elif _fallback_research_run_id is not None:
                 with engine.connect() as conn:
                     rows = conn.execute(
                         text(
                             "SELECT ticker, rank, alpha_score FROM alpha_scores "
-                            "WHERE strategy_id = :sid AND score_date = :d"
+                            "WHERE strategy_id = :sid AND score_date = :d "
+                            "AND research_run_id = :run_id"
                         ),
-                        {"sid": strategy_id, "d": sim_date},
+                        {"sid": strategy_id, "d": sim_date, "run_id": _fallback_research_run_id},
                     ).fetchall()
                 if not rows:
                     continue
                 strat_scores = pd.DataFrame(rows, columns=["ticker", "rank", "alpha_score"])
+            else:
+                continue
 
             if strat_scores.empty:
                 continue
@@ -629,8 +825,77 @@ def _write_simulation(**context: Any) -> dict:
     return {"simulations_written": written}
 
 
+_OPERATIONAL_METHODOLOGY_NAME = "daily_signal_pipeline_operational"
+
+
+def _get_active_research_run_id_sql(database_url: str, methodology_name: str) -> int:
+    """Resolve the id of the explicitly active research_runs row for
+    ``methodology_name`` via plain SQL, or raise.
+
+    SQLAlchemy-1.4-compatible ON PURPOSE, same reason as
+    ``_pit_eligible_tickers_sql`` above: the packaged Airflow runtime image
+    pins SQLAlchemy 1.4.51 (``infra/docker/Dockerfile.airflow``), while
+    ``data.research.models``/``data.research.identity`` use SQLAlchemy-2-only
+    APIs (``DeclarativeBase``/``Mapped``/``mapped_column``). Importing them
+    here — even lazily, inside a task function — would raise ``ImportError``
+    the moment this task actually executes inside that image, not at DAG
+    parse time.
+
+    Delegates to ``data.research.sql_compat.get_active_research_run_id`` —
+    a shared, plain-``text()``-only implementation (round 5 of the 01B-3 PR's
+    adversarial review found the identical SQLAlchemy-1.4 incompatibility
+    reintroduced at a second call site, ``scripts/paper_inputs_check.py``,
+    because that fix reused the ORM path instead of this one; centralizing
+    the lookup is meant to stop that recurring a third time). That module
+    has no ORM imports of its own, so importing it here is safe — the same
+    way ``data.normalization.corporate_actions``/``data.universe.calendar``
+    are already imported elsewhere in this DAG; the restriction is on the
+    SQLAlchemy-2-only ORM modules specifically, not the whole ``data``
+    package.
+    """
+    from data.research.sql_compat import get_active_research_run_id
+
+    return get_active_research_run_id(database_url, methodology_name)
+
+
 def _write_scores(**context: Any) -> dict:
-    """Persist factor_scores and alpha_scores to TimescaleDB."""
+    """Persist factor_scores and alpha_scores to TimescaleDB.
+
+    BUG-009 section 4 / migration 012: research_run_id is now part of the
+    unique constraint/primary key on both tables, so every row must be
+    tagged with an explicitly approved active research run — never assumed.
+    Fails closed with an actionable error if no run has been activated for
+    ``_OPERATIONAL_METHODOLOGY_NAME`` (an operator runs
+    ``python -m scripts.register_operational_research_run`` once — see
+    ``docs/runbooks/research_run_registration.md`` — a REQUIRED pre-deploy
+    step after migration 012; this DAG never registers or activates a run
+    itself).
+
+    Adversarial-review round 11 (BUG-008/BUG-009 section 4): this DAG's own
+    degrade path had never been routed through a methodology-honesty check
+    (the ad hoc checks built in rounds 9-10 only ever covered standalone
+    scripts). ``_OPERATIONAL_METHODOLOGY_NAME``'s registered methodology
+    claims PIT-universe safety (``universe_import_policy =
+    "pit_universe_effective_dated_v1"``), but ``_load_prices``/
+    ``_compute_quality`` degrade to an unfiltered, provisional cross-section
+    (BUG-069) on a PIT lookup failure with only a log warning -- silently
+    tagging those degraded rows with the PIT-claiming operational run would
+    misrepresent what was actually computed. This now fails closed via the
+    single shared
+    ``data.research.sql_compat.assert_methodology_write_is_honest`` gate
+    before any row is written, superseding BUG-069's "silently write
+    provisional scores" acceptance for the WRITE path specifically (the
+    task now fails loudly instead) -- an operator who wants degraded days to
+    keep persisting must register and activate a run under a distinct
+    methodology that honestly declares no PIT filtering, matching the same
+    pattern used everywhere else in this PR (never done automatically).
+    Corporate-action adjustment has no equivalent degrade path here:
+    ``_load_prices`` has no try/except around its corporate_actions query,
+    so a failure there fails the task outright rather than silently
+    persisting raw prices -- the operational methodology's
+    ``score_cutoff_known_at_v1`` claim is always true for whatever this DAG
+    actually persists.
+    """
     import pandas as pd
     from sqlalchemy import create_engine, text
     import os
@@ -650,7 +915,34 @@ def _write_scores(**context: Any) -> dict:
     if factor_df.empty and alpha_df.empty:
         return {"factor_rows": 0, "alpha_rows": 0}
 
-    engine = create_engine(os.environ["DATABASE_URL"])
+    database_url = os.environ["DATABASE_URL"]
+    research_run_id = _get_active_research_run_id_sql(database_url, _OPERATIONAL_METHODOLOGY_NAME)
+
+    # PIT-universe honesty gate (see docstring above). Two independent PIT
+    # lookups feed this write: _load_prices' panel filter (covers momentum/
+    # lowvol/value) and _compute_quality's own separate lookup (quality
+    # only). Missing XCom (task didn't run / older DAG run) is treated
+    # conservatively as "not applied" -- fail safe, never assume success.
+    load_prices_pit_applied = bool(
+        context["ti"].xcom_pull(key="pit_universe_applied", task_ids="load_prices")
+    )
+    quality_pit_applied_raw = context["ti"].xcom_pull(
+        key="quality_pit_universe_applied", task_ids="compute_quality"
+    )
+    quality_pit_applied = True if quality_pit_applied_raw is None else bool(quality_pit_applied_raw)
+    pit_universe_applied = load_prices_pit_applied and quality_pit_applied
+
+    if not pit_universe_applied:
+        from data.research.sql_compat import assert_methodology_write_is_honest
+
+        assert_methodology_write_is_honest(
+            database_url,
+            research_run_id,
+            pit_universe_applied=False,
+            corporate_action_adjustment_applied=True,
+        )
+
+    engine = create_engine(database_url)
 
     factor_count = 0
     alpha_count = 0
@@ -659,13 +951,15 @@ def _write_scores(**context: Any) -> dict:
     with engine.begin() as conn:
         if not factor_df.empty:
             factor_records = factor_df.to_dict("records")
+            for record in factor_records:
+                record["research_run_id"] = research_run_id
             conn.execute(
                 text(
                     "INSERT INTO factor_scores "
-                    "(ticker, score_date, factor_name, strategy_id, z_score, raw_value) "
+                    "(ticker, score_date, factor_name, strategy_id, research_run_id, z_score, raw_value) "
                     "VALUES (:ticker, :score_date, :factor_name, :strategy_id, "
-                    ":z_score, :raw_value) "
-                    "ON CONFLICT (ticker, score_date, factor_name, strategy_id) "
+                    ":research_run_id, :z_score, :raw_value) "
+                    "ON CONFLICT (ticker, score_date, factor_name, strategy_id, research_run_id) "
                     "DO UPDATE SET z_score = EXCLUDED.z_score, "
                     "raw_value = EXCLUDED.raw_value, "
                     "computed_at = NOW()"
@@ -676,13 +970,15 @@ def _write_scores(**context: Any) -> dict:
 
         if not alpha_df.empty:
             alpha_records = alpha_df.to_dict("records")
+            for record in alpha_records:
+                record["research_run_id"] = research_run_id
             conn.execute(
                 text(
                     "INSERT INTO alpha_scores "
-                    "(ticker, score_date, strategy_id, alpha_score, rank, universe_size) "
-                    "VALUES (:ticker, :score_date, :strategy_id, :alpha_score, "
-                    ":rank, :universe_size) "
-                    "ON CONFLICT (ticker, score_date, strategy_id) "
+                    "(ticker, score_date, strategy_id, research_run_id, alpha_score, rank, universe_size) "
+                    "VALUES (:ticker, :score_date, :strategy_id, :research_run_id, "
+                    ":alpha_score, :rank, :universe_size) "
+                    "ON CONFLICT (ticker, score_date, strategy_id, research_run_id) "
                     "DO UPDATE SET alpha_score = EXCLUDED.alpha_score, "
                     "rank = EXCLUDED.rank, "
                     "universe_size = EXCLUDED.universe_size, "
@@ -692,7 +988,7 @@ def _write_scores(**context: Any) -> dict:
             )
             alpha_count = len(alpha_records)
 
-    return {"factor_rows": factor_count, "alpha_rows": alpha_count}
+    return {"factor_rows": factor_count, "alpha_rows": alpha_count, "research_run_id": research_run_id}
 
 
 # ─── DAG definition ──────────────────────────────────────────────────────────

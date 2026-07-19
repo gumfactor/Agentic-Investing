@@ -82,7 +82,13 @@ def _engine(
         },
     ]
     pd.DataFrame(prices).to_sql("daily_prices", engine, index=False)
-    pd.DataFrame(scores).to_sql("alpha_scores", engine, index=False)
+
+    from tests._research_run_test_helpers import setup_active_research_run
+
+    run_id = setup_active_research_run(engine)
+    scores_df = pd.DataFrame(scores)
+    scores_df["research_run_id"] = run_id
+    scores_df.to_sql("alpha_scores", engine, index=False)
     return engine
 
 

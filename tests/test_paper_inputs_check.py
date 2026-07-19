@@ -36,6 +36,7 @@ def _engine(
     strategy_id: str = "v1",
     prices: list[dict] | None = None,
     scores: list[dict] | None = None,
+    with_active_run: bool = True,
 ):
     engine = create_engine("sqlite://")
     price_rows = prices or [
@@ -49,7 +50,14 @@ def _engine(
         {"ticker": "NVDA", "score_date": score_date, "strategy_id": strategy_id, "alpha_score": 0.5, "rank": 3, "universe_size": 3},
     ]
     pd.DataFrame(price_rows).to_sql("daily_prices", engine, index=False)
-    pd.DataFrame(score_rows).to_sql("alpha_scores", engine, index=False)
+
+    scores_df = pd.DataFrame(score_rows)
+    if with_active_run:
+        from tests._research_run_test_helpers import setup_active_research_run
+
+        run_id = setup_active_research_run(engine)
+        scores_df["research_run_id"] = run_id
+    scores_df.to_sql("alpha_scores", engine, index=False)
     return engine
 
 
@@ -316,3 +324,88 @@ def test_run_allows_min_overlap_override_for_smoke_tests(tmp_path, capsys):
     )
 
     assert result == 0
+
+
+# ─── Active research run filtering (BUG-009 section 4, adversarial round 3) ──
+
+
+def test_run_fails_closed_without_an_active_research_run(tmp_path, capsys):
+    """No research_methodologies/research_runs at all (e.g. a DB where
+    migration 012 has not been paired with a registered operational run)
+    must fail closed with an actionable message, never silently read
+    unfiltered alpha_scores."""
+    config_path = tmp_path / "strategy.yaml"
+    _write_config(config_path)
+    engine = _engine(with_active_run=False)
+
+    result = check.run(
+        ["--strategy-config", str(config_path), "--strategy-id", "v1"],
+        env=_env(),
+        engine_factory=lambda _url: engine,
+        today_fn=lambda: date(2026, 6, 20),
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "No active research run" in out
+
+
+def test_scores_from_a_non_active_run_are_not_read(tmp_path, capsys):
+    """A row tagged with a DIFFERENT (non-active) research_run_id must never
+    be read — proves the fix filters by the active run, not just any run."""
+    config_path = tmp_path / "strategy.yaml"
+    _write_config(config_path)
+    engine = _engine()  # sets up an active run and tags default scores with it
+
+    # Add a second, non-active run and a row under it that would otherwise
+    # collide with / duplicate the active run's rows for the same natural key.
+    from sqlalchemy.orm import Session
+
+    from data.research.identity import MethodologySpec, register_methodology, register_run
+
+    with Session(engine) as session:
+        stale_methodology = register_methodology(
+            session,
+            MethodologySpec(
+                name="stale_methodology",
+                universe_import_policy="test",
+                timing_policy_id="t_plus_1_close_v1",
+                score_action_availability_policy="test",
+                realized_return_action_availability_policy="test",
+                action_source_version="test",
+                return_adjustment_policy="test",
+                missing_data_policy="test",
+                code_config_hash="test",
+            ),
+        )
+        stale_run = register_run(session, stale_methodology.id, data_version="stale")
+        session.commit()
+        stale_run_id = stale_run.id
+
+    stale_row = pd.DataFrame(
+        [
+            {
+                "ticker": "ZZZZ",
+                "score_date": "2026-06-19",
+                "strategy_id": "v1",
+                "alpha_score": 999.0,
+                "rank": 1,
+                "universe_size": 1,
+                "research_run_id": stale_run_id,
+            }
+        ]
+    )
+    stale_row.to_sql("alpha_scores", engine, if_exists="append", index=False)
+
+    result = check.run(
+        ["--strategy-config", str(config_path), "--strategy-id", "v1"],
+        env=_env(),
+        engine_factory=lambda _url: engine,
+        today_fn=lambda: date(2026, 6, 20),
+    )
+
+    out = capsys.readouterr().out
+    assert result == 0
+    # The stale run's ZZZZ row must never appear in the read cross-section.
+    assert "ZZZZ" not in out
+    assert "Top scored tickers: AAPL, MSFT, NVDA" in out

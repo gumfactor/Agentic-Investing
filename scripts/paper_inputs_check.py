@@ -196,11 +196,62 @@ def _load_latest_prices(engine: Engine) -> tuple[Any, list[Mapping[str, Any]]]:
     return latest, rows
 
 
+_OPERATIONAL_METHODOLOGY_NAME = "daily_signal_pipeline_operational"
+
+
+def _resolve_active_research_run_id(engine: Engine) -> int:
+    """The explicitly active research run for the operational methodology
+    (BUG-009 section 4 / migration 012). research_run_id is now part of
+    alpha_scores'/factor_scores' identity: multiple rows can legitimately
+    coexist for the same (ticker, score_date, strategy_id) across runs
+    (legacy, superseded, active). Paper-trading input validation must read
+    only the active run's rows -- never all of them -- or a backfill/run
+    rotation can silently double the score set (or feed a stale/wrong-
+    methodology score into order construction). Fails closed: by the time
+    alpha_scores has any rows written by daily_signal_pipeline.py, an active
+    run for this methodology must already exist (the DAG's own write path
+    requires one -- see scripts/register_operational_research_run.py).
+
+    Uses ``data.research.sql_compat`` (plain ``text()`` SQL, no ORM) rather
+    than ``data.research.identity``'s SQLAlchemy-2-only ORM helper: this
+    module is Airflow-reachable (``airflow/dags/daily_paper_trading.py``'s
+    ``_verify_inputs``/``_construct_target`` import ``run``/``CheckRecorder``/
+    ``load_strategy_config`` from here), and the packaged Airflow image pins
+    SQLAlchemy 1.4.51 (round 5 of the 01B-3 PR's adversarial review found
+    this exact ORM-import regression here — the same class of bug round 2
+    fixed in ``airflow/dags/daily_signal_pipeline.py``, reintroduced at a
+    second call site because this one didn't reuse that fix).
+    """
+    from data.research.sql_compat import get_active_research_run_id
+
+    try:
+        return get_active_research_run_id(engine, _OPERATIONAL_METHODOLOGY_NAME)
+    except Exception as exc:
+        # Broad on purpose: a missing research_methodologies/research_runs
+        # table (e.g. migration 012 not yet applied) raises a raw
+        # SQLAlchemy error rather than get_active_research_run_id's own
+        # RuntimeError; either way, the actionable remediation is the same,
+        # and this path must fail closed rather than silently reading
+        # unfiltered alpha_scores.
+        raise RuntimeError(
+            f"No active research run for methodology "
+            f"{_OPERATIONAL_METHODOLOGY_NAME!r} (BUG-009 section 4 / migration "
+            "012). Run 'python -m scripts.register_operational_research_run' "
+            "once (see docs/runbooks/research_run_registration.md), and confirm "
+            "daily_signal_pipeline has actually written scores, before running "
+            f"paper-trading input checks. Underlying error: {exc}"
+        ) from exc
+
+
 def _load_latest_scores(engine: Engine, strategy_id: str) -> tuple[Any, list[Mapping[str, Any]]]:
+    research_run_id = _resolve_active_research_run_id(engine)
     with engine.connect() as conn:
         latest = conn.execute(
-            text("SELECT MAX(score_date) FROM alpha_scores WHERE strategy_id = :strategy_id"),
-            {"strategy_id": strategy_id},
+            text(
+                "SELECT MAX(score_date) FROM alpha_scores "
+                "WHERE strategy_id = :strategy_id AND research_run_id = :run_id"
+            ),
+            {"strategy_id": strategy_id, "run_id": research_run_id},
         ).scalar()
         if latest is None:
             return None, []
@@ -211,10 +262,11 @@ def _load_latest_scores(engine: Engine, strategy_id: str) -> tuple[Any, list[Map
                 FROM alpha_scores
                 WHERE strategy_id = :strategy_id
                   AND score_date = :score_date
+                  AND research_run_id = :run_id
                 ORDER BY ticker
                 """
             ),
-            {"strategy_id": strategy_id, "score_date": latest},
+            {"strategy_id": strategy_id, "score_date": latest, "run_id": research_run_id},
         ).mappings().all()
     return latest, rows
 

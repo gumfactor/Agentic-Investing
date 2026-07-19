@@ -16,6 +16,21 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
 
+# BUG-009 section 4 / BUG-072 (adversarial review): research_run_id is part
+# of alpha_scores'/factor_scores' identity (migration 012) -- more than one
+# row can legitimately exist for the same (ticker, score_date, strategy_id)
+# across runs (legacy, superseded, active). Every dashboard query below
+# filters to the explicitly active daily_signal_pipeline_operational run via
+# this subquery rather than reading across all of them. If no run is active,
+# the subquery evaluates to NULL and "research_run_id = NULL" matches
+# nothing -- an empty result, not a crash (dashboards should stay up).
+_ACTIVE_RUN_SUBQUERY = """(
+    SELECT rr.id FROM research_runs rr
+    JOIN research_methodologies rm ON rm.id = rr.methodology_id
+    WHERE rm.name = 'daily_signal_pipeline_operational' AND rr.is_active = TRUE
+)"""
+
+
 # ---------------------------------------------------------------------------
 # Blotter approval queries (Sprint 1 — Page 4)
 # ---------------------------------------------------------------------------
@@ -196,14 +211,23 @@ def nav_history(
 
 
 def pipeline_health(engine: "Engine") -> dict:
-    """Infer pipeline health from data recency (D3 decision)."""
+    """Infer pipeline health from data recency (D3 decision).
+
+    BUG-009 section 4 / BUG-072 (adversarial review round 6): the signals
+    recency check must be scoped to the active daily_signal_pipeline_
+    operational run, same as latest_alpha_scores/bottom_alpha_scores/
+    factor_scores_for_ticker above -- otherwise a fresher row left behind
+    by an inactive/superseded run (post-backfill or run rotation) can make
+    the dashboard report the pipeline as healthy while the ACTIVE run is
+    actually stale or has never written anything.
+    """
     now = datetime.now(timezone.utc)
     with engine.connect() as conn:
         prices_ts = conn.execute(
             text("SELECT MAX(ingested_at) FROM daily_prices")
         ).scalar()
         scores_ts = conn.execute(
-            text("SELECT MAX(computed_at) FROM alpha_scores")
+            text(f"SELECT MAX(computed_at) FROM alpha_scores WHERE research_run_id = {_ACTIVE_RUN_SUBQUERY}")
         ).scalar()
         try:
             sim_ts = conn.execute(
@@ -212,9 +236,17 @@ def pipeline_health(engine: "Engine") -> dict:
         except (sa_exc.OperationalError, sa_exc.ProgrammingError):
             sim_ts = None
 
-    def _age(ts: datetime | None) -> timedelta | None:
+    def _age(ts) -> timedelta | None:
         if ts is None:
             return None
+        if isinstance(ts, str):
+            # SQLite's MAX() aggregate loses the declared column type (a
+            # sqlite3/pysqlite quirk with detect_types over aggregates), so
+            # a TIMESTAMP column can come back as a plain ISO-format string
+            # here in tests even though the production Postgres driver
+            # always returns a real datetime. Parse defensively rather than
+            # assuming one driver's behavior.
+            ts = datetime.fromisoformat(ts)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         return now - ts
@@ -325,14 +357,15 @@ def latest_alpha_scores(
 ) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT ticker, alpha_score, rank, universe_size
                 FROM alpha_scores
                 WHERE score_date = (
                     SELECT MAX(score_date) FROM alpha_scores
-                    WHERE strategy_id = :sid
+                    WHERE strategy_id = :sid AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 )
                 AND strategy_id = :sid
+                AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY rank ASC
                 LIMIT :lim
             """),
@@ -347,14 +380,15 @@ def bottom_alpha_scores(
     """Return bottom-ranked alpha scores for the latest score_date."""
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT ticker, alpha_score, rank, universe_size
                 FROM alpha_scores
                 WHERE score_date = (
                     SELECT MAX(score_date) FROM alpha_scores
-                    WHERE strategy_id = :sid
+                    WHERE strategy_id = :sid AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 )
                 AND strategy_id = :sid
+                AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY rank DESC
                 LIMIT :lim
             """),
@@ -369,11 +403,12 @@ def factor_scores_for_ticker(
     cutoff = date.today() - timedelta(days=lookback_days)
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT score_date, factor_name, z_score, raw_value
                 FROM factor_scores
                 WHERE ticker = :ticker AND strategy_id = :sid
                   AND score_date >= :cutoff
+                  AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY score_date ASC, factor_name ASC
             """),
             conn,
@@ -512,11 +547,12 @@ def alpha_score_at_fill_date(
     """Return the alpha score for a ticker on or before a fill date."""
     with engine.connect() as conn:
         row = conn.execute(
-            text("""
+            text(f"""
                 SELECT alpha_score, rank, universe_size, score_date
                 FROM alpha_scores
                 WHERE ticker = :ticker AND strategy_id = :sid
                   AND score_date <= :fdate
+                  AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                 ORDER BY score_date DESC
                 LIMIT 1
             """),
@@ -531,15 +567,17 @@ def factor_scores_at_fill_date(
     """Return factor scores for a ticker on the latest score_date <= fill_date."""
     with engine.connect() as conn:
         return pd.read_sql_query(
-            text("""
+            text(f"""
                 SELECT factor_name, z_score, raw_value, score_date
                 FROM factor_scores
                 WHERE ticker = :ticker AND strategy_id = :sid
                   AND score_date <= :fdate
+                  AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                   AND score_date = (
                       SELECT MAX(score_date) FROM factor_scores
                       WHERE ticker = :ticker AND strategy_id = :sid
                         AND score_date <= :fdate
+                        AND research_run_id = {_ACTIVE_RUN_SUBQUERY}
                   )
                 ORDER BY factor_name ASC
             """),
