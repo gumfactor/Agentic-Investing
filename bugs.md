@@ -38,7 +38,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-006 | Trading Safety | P0 | F0 | Fixed | Corrupt reconciliation artifacts can cause duplicate orders. |
 | BUG-007 | Risk | P0 | F0 | Fixed | Risk dashboard can report zero/incorrect risk from schema mismatch. |
 | BUG-008 | Research/Signals | P0 | F0 | Fixed | Current-membership universe creates survivorship leakage. |
-| BUG-009 | Research/Signals | P0 | F0 | In Review | Same-close signal/return timing can introduce lookahead. |
+| BUG-009 | Research/Signals | P0 | F0 | Fixed | Same-close signal/return timing can introduce lookahead. |
 | BUG-010 | Research/Signals | P0 | F0 | Fixed | `pct_change()` defaults can distort many indicators. |
 | BUG-011 | Security/Auth | P1 | F1 | Open | Approval gate trusts any matching DB row. |
 | BUG-012 | Trading Safety | P1 | F1 | Open | Circuit breaker is UI-local and not enforced by Airflow submission. |
@@ -102,6 +102,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-071 | Research/Signals | P2 | F2 | Open | IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff (documented residual). |
 | BUG-072 | Dashboard/API | P2 | F2 | Fixed | All alpha/factor-score readers (dashboards, `scripts/indicator_diagnostic.py`) now filter to the active research run by default; `--all-runs`/`--research-run-id` are the only documented explicit opt-ins for cross-run reads. |
 | BUG-073 | Packaging/CI | P1 | F1 | Fixed | `pyproject.toml`'s pytest `testpaths` silently excluded ~412 tests (all of `tests/reporting/dashboards/`, `tests/infra/`) from every "full suite" run whenever a subdirectory (`tests/strategy_registry`) was also listed as its own testpath entry. |
+| BUG-074 | Research/Signals | P2 | F2 | Open | Registered operational methodology labels action_source_version as plain "unknown", imprecise for a DB with migrated legacy corporate_actions rows tagged "legacy_unknown". |
 
 #### Long-term / lower-risk backlog
 
@@ -371,9 +372,15 @@ checksum-tamper detection is now covered by tests.
 
 **Suggested direction:** Shift signals or forward-return windows to the next executable bar, or enforce timestamped market-on-close assumptions.
 
-**Status:** In review. Implemented on branch `dev/R2-01B3-timing-contract`
-(roadmap item 01B-3, scoped to `docs/plans/01b-research-validity-design.md`
-§2 and §4), not yet merged. Delivered: `signals/research/timing.py`
+**Status:** Fixed. Merged to `dev/R2-phase1` via PR #35 (`71e6636`), branch
+`dev/R2-01B3-timing-contract` (roadmap item 01B-3, scoped to
+`docs/plans/01b-research-validity-design.md` §2 and §4). Review history: one
+internal adversarial round plus 11 Codex review rounds — every P0/P1 finding
+resolved and verified before merge, including a genuine PIT lookahead leak in
+the realized-return series (round 3/critical) and a consolidated
+methodology-honesty enforcement point replacing four ad hoc per-site checks
+(round 11). One P2 finding (BUG-074) arrived 8 minutes before merge and was
+not triaged before the operator merged; filed as a follow-up. Delivered: `signals/research/timing.py`
 (`TimingPolicy`, `build_return_series`, `reject_same_date`) enforcing the
 baseline `score_date < entry_date < exit_date` (t+1 close) convention on each
 ticker's own trading calendar; `signals/research/ic.py`
@@ -1468,6 +1475,36 @@ AlertManager hook or DAG-level SLA/telemetry when the filter degrades
 (now at least partially superseded by the write failure itself acting as
 an alert), and an Airflow maintenance task that re-runs the universe
 import on a schedule.
+
+### BUG-074: Registered operational methodology mislabels legacy corporate-action source version
+
+**Severity:** P2 / research provenance precision
+
+**Status:** Open. Codex review comment on PR #35 arrived 2026-07-19 05:14Z,
+8 minutes before the operator merged the PR; never triaged or routed to a
+fix before merge.
+
+**Evidence:** Migration 011 backfills existing `corporate_actions` rows with
+`source_version = 'legacy_unknown'` for a database with prior data, but
+`scripts/register_operational_research_run.py` registers the operational
+methodology's `action_source_version` as plain `"unknown"`. The daily scorer
+reads the full action history (including migrated legacy rows) for its
+adjusted price panel, so any score whose lookback touches a migrated
+split/dividend row is produced with a mix of `legacy_unknown` and current
+ingestion-sourced actions, but the run's registered methodology only claims
+`"unknown"` — imprecise, not a safety violation (both labels correctly
+convey "not a real vendor version string"), but not fully truthful either.
+
+**Impact:** Low. This is a metadata-precision gap, not a data-integrity or
+lookahead issue — no incorrect adjustment or lookahead results from it. It
+affects only how precisely the run's provenance record describes its inputs.
+
+**Suggested direction:** Either register the methodology with a value that
+covers both `legacy_unknown` and the current ingestion source (e.g.
+`"mixed(legacy_unknown,yfinance-current)"`), or normalize/backfill the
+migrated legacy rows to the same source_version convention before activating
+the operational run, whichever better matches the intended long-term
+provenance model.
 
 ### BUG-070: Backtester uses a single full-history adjusted price series for both scoring and execution
 
