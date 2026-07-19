@@ -11,6 +11,91 @@ Every session must append a dated entry. Every significant decision, trade-off, 
 
 ---
 
+## 2026-07-19
+
+### Session — R2 PM: 01B-3 (BUG-009) merged; Gate 01B research-validity baseline complete
+
+**Operator:** mshane@thecanadalist.ca
+**Role:** PM session (Claude — Sonnet 5 by this point in the session, after
+switches from Fable 5 → Opus 4.8 → Sonnet 5 across the round)
+**Branch:** `dev/R2-phase1`
+
+#### What was done
+
+- **01B-3 (BUG-009 signal-timing/corporate-action contract + research
+  identity)** completed the longest review cycle of the R2 round: one
+  internal adversarial round plus 11 Codex review rounds on PR #35. Every
+  P0/P1 finding was resolved and verified before merge, including:
+  - a genuine PIT lookahead leak in the realized-return series (round 3,
+    treated as critical) — a single global boundary cutoff was safe for the
+    score series' ratio-cancellation argument but not for realized returns,
+    fixed with a per-exit-date cutoff rebuild;
+  - a self-caught production-breaking SQLAlchemy 1.4-vs-2.0 incompatibility
+    that recurred at a second call site in a later round, ultimately fixed
+    by extracting a shared `data/research/sql_compat.py` module plus a
+    repo-wide static import-isolation test;
+  - a "methodology honesty" defect class (a research run's provenance
+    record claiming adjustment/PIT-safety it didn't actually apply) that
+    recurred four times across scripts and the DAG before being closed with
+    one shared `assert_methodology_write_is_honest` enforcement point that
+    every score-writing call site now routes through, replacing four ad hoc
+    per-site checks;
+  - a pytest `testpaths` config bug (BUG-073, predating this round,
+    introduced 2026-06-23) that silently excluded ~412 tests from every
+    "full suite" run across this entire R2 round — independently verified
+    by the PM (reproduced the old/new collection counts, ran the previously
+    invisible subtrees), confirmed no regression was hiding behind the gap.
+  - **PR #35 was merged by the operator (`71e6636`) before one final P2**
+    (metadata precision on legacy corporate-action source versioning,
+    arrived 8 minutes before merge) was triaged — filed as BUG-074, low
+    severity, not a data-integrity issue.
+- With BUG-008/009/010 all `Fixed`, marked "Repair research-validity
+  baseline" Delivered on the roadmap and unblocked 02B (unsupported
+  strategy config) and Gate 03 (immutable PIT-complete research data) from
+  Blocked to Ready.
+
+#### Decisions
+
+- `[DECISION]` **BUG-069 write-path partial reversal, operator-confirmed
+  2026-07-19:** round 11's methodology-honesty gate makes
+  `daily_signal_pipeline`'s write task fail closed (visible Airflow task
+  failure) instead of warn-and-persist when the PIT universe lookup
+  degrades — a deliberate, documented reversal of half of the 2026-07-18
+  BUG-069 acceptance, scoped to the write path only (reads/dashboards
+  unaffected). Presented explicitly as a choice before merge; operator
+  chose to accept fail-closed on write as-is over reverting to
+  warn-and-persist under an honestly-labeled provisional methodology.
+- `[DECISION]` Operator-set PR babysit stop condition (2026-07-19): two
+  consecutive Codex review rounds with no new P0/P1 is sufficient to report
+  ready, rather than requiring a fully empty round — established after the
+  operator noted the PM had defaulted to the older, stricter rule without
+  confirming it still applied.
+- `[DECISION]` Operator declined a proposed edit to the global
+  `project-manager` skill file (reverted) — process lessons from this round
+  are captured in PM session memory and this Worklog instead, not by
+  modifying the standing skill document.
+
+#### Process note
+
+- `[SAFETY]`/process: several P1s in this PR's review cycle were the same
+  defect class recurring at additional call sites, found one at a time
+  across multiple rounds instead of swept comprehensively when first
+  identified (operator flagged this directly as a real process gap, not
+  just review thoroughness). A comprehensive self-audit was run mid-cycle
+  and found three further real gaps before Codex did; a fourth instance of
+  the honesty-check class still surfaced in the DAG in the following round,
+  which is what prompted the architectural consolidation into one shared
+  enforcement function rather than continuing point-fixes.
+
+#### Next steps
+
+- BUG-074 (legacy corporate-action source-version labeling precision) is
+  open, low severity, not urgent.
+- Gate 02B and Gate 03 are now `Ready` on the roadmap; next PM session
+  should pick up sequencing there.
+
+---
+
 ## 2026-07-18
 
 ### Session — Gate 01A operator live verification complete; BUG-001..004 Fixed
