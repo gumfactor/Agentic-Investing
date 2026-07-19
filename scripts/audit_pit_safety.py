@@ -40,6 +40,7 @@ import argparse
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -71,6 +72,14 @@ def _parse_args() -> argparse.Namespace:
     source = p.add_argument_group("data source (choose one mode)")
     source.add_argument("--prices-file",  help="Path to daily_prices parquet file.")
     source.add_argument("--scores-file",  help="Path to factor_scores parquet file.")
+    source.add_argument(
+        "--corporate-actions-file",
+        help="Optional path to a corporate_actions parquet file (BUG-009 section 2.3, "
+        "adversarial-review round 10). The backfill writes scores from a "
+        "cutoff-adjusted price series, not raw close -- without this, the "
+        "empirical audit recomputes from raw prices and will false-positive "
+        "on any audited window that crosses a split/dividend.",
+    )
     source.add_argument("--snapshot-date", help="MinIO snapshot date (YYYY-MM-DD).")
     source.add_argument("--strategy-id",   default="v1", help="strategy_id to filter (default v1).")
 
@@ -98,14 +107,21 @@ def _parse_args() -> argparse.Namespace:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _load_from_files(prices_file: str, scores_file: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _load_from_files(
+    prices_file: str, scores_file: str, corporate_actions_file: Optional[str] = None
+) -> tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
     logger.info("loading_from_parquet", prices=prices_file, scores=scores_file)
     prices = pd.read_parquet(prices_file)
     scores = pd.read_parquet(scores_file)
-    return prices, scores
+    corporate_actions = None
+    if corporate_actions_file:
+        corporate_actions = pd.read_parquet(corporate_actions_file)
+    return prices, scores, corporate_actions
 
 
-def _load_from_snapshot(snapshot_date: date, strategy_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _load_from_snapshot(
+    snapshot_date: date, strategy_id: str
+) -> tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
     from data.storage.parquet_snapshots import ParquetSnapshots
     snaps = ParquetSnapshots()
     logger.info("loading_from_minio", snapshot_date=str(snapshot_date))
@@ -126,10 +142,32 @@ def _load_from_snapshot(snapshot_date: date, strategy_id: str) -> tuple[pd.DataF
         )
     if "strategy_id" in scores.columns:
         scores = scores[scores["strategy_id"] == strategy_id].reset_index(drop=True)
-    return prices, scores
+
+    # BUG-009 round 10: same optional-but-best-effort load as the backfill's
+    # missing-snapshot handling, except this is a read-only diagnostic tool
+    # (not a persist path), so there is nothing to fail closed on -- a
+    # missing snapshot here just means the empirical audit degrades to raw
+    # (unadjusted) recomputation and main() prints a loud caveat.
+    try:
+        corporate_actions = snaps.load_snapshot("corporate_actions", snapshot_date)
+    except FileNotFoundError:
+        corporate_actions = None
+        logger.warning(
+            "corporate_actions_snapshot_missing",
+            snapshot_date=str(snapshot_date),
+            note="empirical audit will recompute from RAW prices; any audited "
+            "window crossing a split/dividend may show a false-positive "
+            "mismatch against the cutoff-adjusted stored score (BUG-009 "
+            "section 2.3)",
+        )
+    return prices, scores, corporate_actions
 
 
-def _normalise(prices: pd.DataFrame, scores: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _normalise(
+    prices: pd.DataFrame,
+    scores: pd.DataFrame,
+    corporate_actions: Optional[pd.DataFrame] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
     """Cast date columns to ``datetime.date`` objects."""
     for col in ("date",):
         if col in prices.columns:
@@ -141,7 +179,11 @@ def _normalise(prices: pd.DataFrame, scores: pd.DataFrame) -> tuple[pd.DataFrame
             scores = scores.copy()
             scores[col] = pd.to_datetime(scores[col]).dt.date
 
-    return prices, scores
+    if corporate_actions is not None and "ex_date" in corporate_actions.columns:
+        corporate_actions = corporate_actions.copy()
+        corporate_actions["ex_date"] = pd.to_datetime(corporate_actions["ex_date"]).dt.date
+
+    return prices, scores, corporate_actions
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +259,60 @@ def _structural_audit_timing_contract() -> list[str]:
 # Empirical audit
 # ---------------------------------------------------------------------------
 
+def _adjusted_prices_for_audit(
+    prices_close: pd.DataFrame, corporate_actions: pd.DataFrame
+) -> pd.DataFrame:
+    """Rebuild the SAME cutoff-adjusted scoring input the backfill actually
+    wrote scores from (adversarial-review round 10, BUG-009 section 2.3):
+    ``scripts/backfill_momentum_scores.py`` scores momentum from
+    ``adj_close``, not raw ``close``, since round 4/9. Recomputing the
+    empirical audit from raw prices makes the audit tool itself unreliable
+    on exactly the windows that matter most — any audited window crossing a
+    split/dividend would show a spurious mismatch against the correctly
+    adjusted stored score.
+
+    Uses ``session_close_cutoff(max(prices date))`` as the single boundary
+    cutoff — always on/after every audited score_date — which is safe by
+    the same ratio-cancellation argument already established for the
+    backfill's own single-boundary-cutoff approximation (BUG-071): a
+    uniform multiplicative adjustment factor cancels out of any price ratio
+    computed within a lookback window that lies entirely before the
+    action's ex_date, so the exact cutoff position (as long as it is on or
+    after the window) does not change the resulting momentum ratio.
+    """
+    from data.normalization.corporate_actions import build_score_price_history_as_of
+    from data.universe.calendar import conservative_known_at_for_date_only_source, session_close_cutoff
+
+    corporate_actions = corporate_actions.copy()
+    if "known_at" not in corporate_actions.columns:
+        # Same legacy-snapshot fallback as scripts/backfill_momentum_scores.py
+        # (BUG-009 round 3): a pre-migration-011 snapshot has no
+        # known_at/source_version columns. Synthesize conservatively rather
+        # than crashing or silently skipping adjustment.
+        corporate_actions["known_at"] = corporate_actions["ex_date"].apply(
+            conservative_known_at_for_date_only_source
+        )
+        corporate_actions["source_version"] = "legacy_pre_migration_011_snapshot"
+    else:
+        corporate_actions["known_at"] = pd.to_datetime(corporate_actions["known_at"], utc=True)
+        if "source_version" not in corporate_actions.columns:
+            corporate_actions["source_version"] = "unknown"
+
+    cutoff = session_close_cutoff(prices_close["date"].max())
+    adjusted, _meta = build_score_price_history_as_of(prices_close, corporate_actions, score_cutoff=cutoff)
+    return (
+        adjusted[["ticker", "date", "adj_close"]]
+        .rename(columns={"adj_close": "close"})
+        .assign(close=lambda df: df["close"].astype(float))
+    )
+
+
 def _empirical_audit(
     prices: pd.DataFrame,
     scores: pd.DataFrame,
     sample_size: int,
     seed: int,
+    corporate_actions: Optional[pd.DataFrame] = None,
 ) -> tuple[int, int, list[dict]]:
     """Re-compute momentum scores per sampled (ticker, score_date) and compare.
 
@@ -235,6 +326,14 @@ def _empirical_audit(
     A mismatch means the stored score cannot be reproduced from the price data:
     it was either computed with different prices, a different code version, or
     future price data (look-ahead bias).
+
+    Args:
+        corporate_actions: when supplied, the recomputation is built from the
+            same cutoff-adjusted price series the backfill actually scores
+            from (BUG-009 section 2.3, round 10). When ``None`` (no snapshot
+            available), the recomputation falls back to raw prices and a
+            caller-visible caveat should be printed — see
+            ``main()`` / ``_load_from_snapshot``.
 
     Returns:
         (n_checked, n_violations, violation_records)
@@ -282,7 +381,13 @@ def _empirical_audit(
     prices_close = prices[["ticker", "date", "close"]].copy()
     prices_close["date"] = pd.to_datetime(prices_close["date"]).dt.date
     prices_close["close"] = prices_close["close"].astype(float)
-    all_recomputed = compute_momentum_scores(prices_close)
+
+    if corporate_actions is not None and not corporate_actions.empty:
+        scoring_prices = _adjusted_prices_for_audit(prices_close, corporate_actions)
+    else:
+        scoring_prices = prices_close
+
+    all_recomputed = compute_momentum_scores(scoring_prices)
 
     tickers_with_prices = set(prices_close["ticker"].unique())
 
@@ -402,10 +507,12 @@ def main() -> None:
 
     # ── Load data ──────────────────────────────────────────────────────────
     if args.prices_file and args.scores_file:
-        prices, scores = _load_from_files(args.prices_file, args.scores_file)
+        prices, scores, corporate_actions = _load_from_files(
+            args.prices_file, args.scores_file, args.corporate_actions_file
+        )
     elif args.snapshot_date:
         snap_date = date.fromisoformat(args.snapshot_date)
-        prices, scores = _load_from_snapshot(snap_date, args.strategy_id)
+        prices, scores, corporate_actions = _load_from_snapshot(snap_date, args.strategy_id)
     else:
         print(
             "ERROR: specify either (--prices-file + --scores-file) or --snapshot-date",
@@ -413,7 +520,7 @@ def main() -> None:
         )
         sys.exit(2)
 
-    prices, scores = _normalise(prices, scores)
+    prices, scores, corporate_actions = _normalise(prices, scores, corporate_actions)
 
     print(f"\n{'='*60}")
     print(f"  PIT Safety Audit - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -422,6 +529,14 @@ def main() -> None:
     print(f"  Score rows    : {len(scores):,}")
     print(f"  Sample size   : {args.sample_size}")
     print(f"  Seed          : {args.seed}")
+    if corporate_actions is not None and not corporate_actions.empty:
+        print(f"  Corp. actions : {len(corporate_actions):,} rows (cutoff-adjusted recomputation)")
+    else:
+        print(
+            "  Corp. actions : none loaded -- empirical audit recomputes from RAW "
+            "prices; a mismatch on a window crossing a split/dividend may be a "
+            "false positive, not real look-ahead bias (BUG-009 section 2.3)"
+        )
     print()
 
     # ── Structural audit ──────────────────────────────────────────────────
@@ -442,7 +557,7 @@ def main() -> None:
     else:
         print("-- 2. Empirical re-computation checks -------------------")
         n_checked, n_violations, violations = _empirical_audit(
-            prices, scores, args.sample_size, args.seed
+            prices, scores, args.sample_size, args.seed, corporate_actions=corporate_actions
         )
         print(f"  Pairs checked : {n_checked:,}")
         print(f"  Violations    : {n_violations:,}")

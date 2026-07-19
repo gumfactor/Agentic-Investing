@@ -964,14 +964,17 @@ def test_audit_snapshot_falls_back_to_v1_alpha_scores(monkeypatch):
                 raise FileNotFoundError
             if data_type == "alpha_scores":
                 return alpha_df
+            if data_type == "corporate_actions":
+                raise FileNotFoundError
             raise AssertionError(data_type)
 
     monkeypatch.setattr(parquet_snapshots, "ParquetSnapshots", _Snapshots)
 
-    prices, scores = audit._load_from_snapshot(date(2026, 6, 14), "v1")
+    prices, scores, corporate_actions = audit._load_from_snapshot(date(2026, 6, 14), "v1")
 
     assert prices is prices_df
     assert scores.equals(alpha_df)
+    assert corporate_actions is None
 
 
 def test_audit_empirical_detects_corrupted_scores(tmp_path):
@@ -997,3 +1000,76 @@ def test_audit_empirical_detects_corrupted_scores(tmp_path):
     assert n_violations >= 5, (
         f"Expected at least 5 violations for 5 corrupted rows; got {n_violations}"
     )
+
+
+def test_audit_empirical_false_positives_without_corporate_actions_but_clean_with_them():
+    """Adversarial-review round 10 (BUG-009 section 2.3): the backfill scores
+    momentum from a cutoff-adjusted price series (round 4/9), not raw close.
+    Reproduces the exact failure mode -- without corporate_actions supplied,
+    the empirical audit recomputes from raw prices and false-positives on a
+    window crossing a split; with corporate_actions supplied, it rebuilds
+    the same adjusted series the backfill actually scored from and reports
+    zero violations."""
+    import importlib
+
+    from data.normalization.corporate_actions import build_score_price_history_as_of
+    from data.universe.calendar import session_close_cutoff
+    from signals.composites.momentum_score import compute_momentum_scores
+
+    audit = importlib.import_module("scripts.audit_pit_safety")
+
+    # Cross-sectional z-scoring requires more than one ticker per date; only
+    # AAPL is split-adjusted, GOOG/MSFT are unaffected controls.
+    prices_df = _make_audit_prices(n_days=700, tickers=["AAPL", "GOOG", "MSFT"])
+    split_ex_date = sorted(prices_df["date"].unique())[300]
+
+    corporate_actions = pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "ex_date": split_ex_date,
+                "action_type": "split",
+                "value": 2.0,
+                "known_at": pd.Timestamp(split_ex_date, tz="UTC"),
+                "source_version": "test",
+            }
+        ]
+    )
+
+    # Mirror exactly what scripts/backfill_momentum_scores.py does: score
+    # from the cutoff-adjusted series, using a boundary cutoff at/after the
+    # full price history (same reasoning as BUG-071's ratio-cancellation
+    # argument).
+    cutoff = session_close_cutoff(prices_df["date"].max())
+    adjusted, _meta = build_score_price_history_as_of(prices_df, corporate_actions, score_cutoff=cutoff)
+    adjusted_for_scoring = (
+        adjusted[["ticker", "date", "adj_close"]]
+        .rename(columns={"adj_close": "close"})
+        .assign(close=lambda df: df["close"].astype(float))
+    )
+    stored_scores = compute_momentum_scores(adjusted_for_scoring).rename(
+        columns={"date": "score_date", "momentum_score": "z_score"}
+    )
+    stored_scores["factor_name"] = "momentum"
+    stored_scores["strategy_id"] = "v1"
+
+    # Without corporate_actions: recomputes from RAW prices -- must
+    # reproduce the round-10 false-positive (the pre-split window's stored
+    # score, built from adjusted prices, will not match a raw recomputation).
+    n_checked_raw, n_violations_raw, _ = audit._empirical_audit(
+        prices_df, stored_scores, sample_size=len(stored_scores), seed=0
+    )
+    assert n_violations_raw > 0, (
+        "Expected the pre-fix raw recomputation to false-positive across the "
+        "split window -- if this is 0, the split fixture may not actually "
+        "straddle any audited lookback window."
+    )
+
+    # With corporate_actions supplied: rebuilds the same adjusted series the
+    # backfill scored from -- zero violations.
+    n_checked_adj, n_violations_adj, violations_adj = audit._empirical_audit(
+        prices_df, stored_scores, sample_size=len(stored_scores), seed=0,
+        corporate_actions=corporate_actions,
+    )
+    assert n_checked_adj > 0
+    assert n_violations_adj == 0, f"Unexpected violations with corporate_actions supplied: {violations_adj}"
