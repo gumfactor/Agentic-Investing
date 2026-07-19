@@ -64,6 +64,28 @@ Task branches are named `dev/R2-<order>-<slug>`. Each phased slice is one
 commit; each roadmap job (or sub-job below) is one PR into `dev/R2-phase1`.
 Token figures are reported as `<agent/effort>: <tokens>`.
 
+**PM decisions (2026-07-19, wave 2):**
+
+- **02B and 03A launched in parallel** (02B code build; 03A Phase 0 design doc
+  only, disjoint files). **03B is queued behind 02B's merge** — both touch
+  `backtesting/` and `bugs.md`.
+- **02B scope decision:** the slice builds one shared consumed-field contract +
+  fail-closed validator for the backtest path and a per-key conformance test;
+  it does NOT implement MVO/risk-parity in the backtester (would balloon L to
+  XL and collide with 03B loader work).
+- **03A is phased per its design plan**
+  ([docs/plans/03a-immutable-research-data-design.md](docs/plans/03a-immutable-research-data-design.md),
+  branch `dev/R2-03A-immutable-research-data`): 03A-1 (L, content-addressed
+  snapshots), 03A-2 (M, fail-closed object-store taxonomy, starts from 03A-1),
+  03A-3 (S, BUG-037 same-date multi-action fix, parallel-safe), 03A-4 (XL, PIT
+  eligibility attributes), 03A-5 (M, manifest/methodology linkage +
+  `data_version` cutover, last). The design doc gets no standalone PR — it
+  merges with the first 03A implementation PR. Implementation phases are
+  gated on operator answers to the doc's §6 open questions
+  (shares_outstanding `known_at` source, ADV definition, security_type
+  curation, legacy snapshot retention, MinIO WORM follow-up,
+  `allow_missing_corporate_actions` blast radius).
+
 **PM decisions (2026-07-16):**
 
 - **01B is delivered as three PRs**, in this order, because a single XL
@@ -85,6 +107,7 @@ Token figures are reported as `<agent/effort>: <tokens>`.
 | 01A | `dev/R2-01A-compose-runtime` | [#33](https://github.com/gumfactor/Agentic-Investing/pull/33) | **Merged 2026-07-16** (`3e37bb5`); **operator live verification complete 2026-07-18** — BUG-001..004 all `Fixed`. Gate 01A done; Gate 02A (no-submit DAG run) unblocked | Sonnet 5 medium: 284K (builder incl. fix + review rounds) + 122K (adversarial reviewer) | Fable 5: ~50K |
 | 01B-1 | `dev/R2-01B1-missing-data` | [#32](https://github.com/gumfactor/Agentic-Investing/pull/32) | **Merged 2026-07-16** (`65e1b72`) | Sonnet 5 medium: 342K (builder incl. fix + review rounds) + 124K (adversarial reviewer) | Fable 5: ~45K |
 | 01B-2 | `dev/R2-01B2-pit-universe` | [#34](https://github.com/gumfactor/Agentic-Investing/pull/34) | **Merged 2026-07-18** (`1df242e`) — BUG-008/BUG-067 Fixed; BUG-068/BUG-069 filed as residual data-quality/monitoring items (BUG-069 deferred, operator-accepted warn-degrade). Operator DB steps (migration 009 + universe import) still pending | Sonnet 5 medium: 494K (builder incl. all review rounds) + 167K (adversarial reviewer); PM completed final fix | Fable 5: ~75K |
+| 03A-0 | `dev/R2-03A-immutable-research-data` | none (design doc rides with first 03A implementation PR) | **Design plan delivered 2026-07-19** (`0d266e4` + PM-amendment commit `62d7add`: canonical logical content hash for object keys/manifests, same-date corporate-action convention normalization). PM approved; implementation gated on operator §6 answers | Sonnet 5 medium: 155K (incl. amendment round) | Fable 5: ~20K |
 | 01B-3 | `dev/R2-01B3-timing-contract` | [#35](https://github.com/gumfactor/Agentic-Investing/pull/35) | **Merged 2026-07-19** (`71e6636`) — BUG-009 Fixed after 11 Codex review rounds; every P0/P1 resolved and verified (incl. a genuine realized-return PIT lookahead leak, round 3, and a consolidated methodology-honesty enforcement point, round 11). Operator merged before one final P2 (BUG-074, metadata precision) was triaged; filed as follow-up. Operator explicitly signed off on the BUG-069 write-path fail-closed behavior change | Sonnet 5 medium: 505K+ (builder incl. all 11 fix rounds) + 158K (adversarial reviewer) | Fable 5/Opus/Sonnet: ~130K |
 
 Both adversarial reviews returned APPROVE-WITH-FIXES with confirmed findings
