@@ -127,6 +127,56 @@ def test_get_object_bytes_translates_connection_failure() -> None:
         get_object_bytes(client, "bucket", "key")
 
 
+def test_get_object_bytes_mid_read_incomplete_read_is_partial_and_closes() -> None:
+    """P1 read-path leak fix: a failure DURING response.read() (truncated
+    body -> http.client.IncompleteRead) must surface as a typed
+    SnapshotPartialReadError, never a raw http.client error, and the stream
+    must still be closed/released on that path."""
+    import http.client
+
+    client = MagicMock()
+    resp = MagicMock()
+    resp.read.side_effect = http.client.IncompleteRead(partial=b"ab", expected=100)
+    client.get_object.return_value = resp
+
+    with pytest.raises(SnapshotPartialReadError):
+        get_object_bytes(client, "bucket", "key")
+    resp.close.assert_called_once()
+    resp.release_conn.assert_called_once()
+
+
+def test_get_object_bytes_mid_read_protocol_error_wrapping_incomplete_is_partial() -> None:
+    """A urllib3 ProtocolError that wraps an IncompleteRead is a truncated
+    body -> SnapshotPartialReadError."""
+    import http.client
+
+    client = MagicMock()
+    resp = MagicMock()
+    inner = http.client.IncompleteRead(partial=b"ab", expected=100)
+    resp.read.side_effect = urllib3.exceptions.ProtocolError("Connection broken", inner)
+    client.get_object.return_value = resp
+
+    with pytest.raises(SnapshotPartialReadError):
+        get_object_bytes(client, "bucket", "key")
+    resp.close.assert_called_once()
+    resp.release_conn.assert_called_once()
+
+
+def test_get_object_bytes_mid_read_dropped_connection_is_store_unavailable() -> None:
+    """A plain ProtocolError (dropped connection, not a truncated body)
+    raised mid-read surfaces as SnapshotStoreUnavailableError -- still typed,
+    never a raw urllib3 error."""
+    client = MagicMock()
+    resp = MagicMock()
+    resp.read.side_effect = urllib3.exceptions.ProtocolError("Connection aborted")
+    client.get_object.return_value = resp
+
+    with pytest.raises(SnapshotStoreUnavailableError):
+        get_object_bytes(client, "bucket", "key")
+    resp.close.assert_called_once()
+    resp.release_conn.assert_called_once()
+
+
 # ─── ParquetSnapshots.load_snapshot / load_snapshot_legacy end-to-end ──────
 
 @pytest.fixture

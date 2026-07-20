@@ -25,6 +25,7 @@ as part of the object key.
 
 from __future__ import annotations
 
+import http.client
 import io
 import os
 import socket
@@ -107,11 +108,11 @@ def translate_object_store_error(exc: Exception, context: str) -> Exception:
             the bucket/key), included in the translated error message.
 
     Returns:
-        A `SnapshotNotFoundError`, `SnapshotAccessDeniedError`, or
-        `SnapshotStoreUnavailableError` instance. Never returns
-        `SnapshotIntegrityError`/`SnapshotPartialReadError` -- those are
-        raised directly by the caller from post-download validation, not
-        from this translation step.
+        A `SnapshotNotFoundError`, `SnapshotAccessDeniedError`,
+        `SnapshotStoreUnavailableError`, or (for a truncated/incomplete body
+        read) `SnapshotPartialReadError` instance. Never returns
+        `SnapshotIntegrityError` -- that is raised directly by the caller
+        from post-download hash validation, not from this translation step.
     """
     if isinstance(exc, S3Error):
         code = exc.code
@@ -127,6 +128,21 @@ def translate_object_store_error(exc: Exception, context: str) -> Exception:
         return SnapshotStoreUnavailableError(
             f"{context}: object store returned an unexpected error ({code})."
         )
+    # A truncated/incomplete response body raised MID-READ surfaces as
+    # http.client.IncompleteRead (the low-level marker that fewer bytes
+    # arrived than the server promised). Semantically this is a partial
+    # transfer, so classify it as SnapshotPartialReadError -- the same type
+    # the explicit byte-count/Content-Length check emits -- rather than
+    # store-unavailable. urllib3.exceptions.ProtocolError sometimes wraps an
+    # IncompleteRead; treat that wrapper as partial too.
+    if isinstance(exc, http.client.IncompleteRead) or (
+        isinstance(exc, urllib3.exceptions.ProtocolError)
+        and _wraps_incomplete_read(exc)
+    ):
+        return SnapshotPartialReadError(
+            f"{context}: response body ended before the full object was read "
+            f"({type(exc).__name__}: {exc}); truncated/corrupt transfer."
+        )
     if isinstance(exc, _CONNECTION_ERROR_TYPES):
         return SnapshotStoreUnavailableError(
             f"{context}: could not reach object store ({type(exc).__name__}: {exc})."
@@ -136,6 +152,18 @@ def translate_object_store_error(exc: Exception, context: str) -> Exception:
     return SnapshotStoreUnavailableError(
         f"{context}: unexpected object-store error ({type(exc).__name__}: {exc})."
     )
+
+
+def _wraps_incomplete_read(exc: BaseException) -> bool:
+    """True if a urllib3 ProtocolError was raised from / carries an
+    http.client.IncompleteRead (a truncated body), rather than a generic
+    dropped-connection ProtocolError."""
+    if isinstance(exc.__cause__, http.client.IncompleteRead) or isinstance(
+        exc.__context__, http.client.IncompleteRead
+    ):
+        return True
+    # ProtocolError commonly carries the underlying error as a positional arg.
+    return any(isinstance(arg, http.client.IncompleteRead) for arg in exc.args)
 
 
 def get_object_bytes(minio_client: Minio, bucket: str, key: str) -> bytes:
@@ -154,9 +182,12 @@ def get_object_bytes(minio_client: Minio, bucket: str, key: str) -> bytes:
         SnapshotNotFoundError: object/bucket does not exist.
         SnapshotAccessDeniedError: auth/authorization failure.
         SnapshotStoreUnavailableError: connection/timeout/DNS/TLS failure or
-            any other unexpected object-store error.
+            any other unexpected object-store error (including a
+            dropped-connection ProtocolError raised mid-read).
         SnapshotPartialReadError: downloaded byte count does not match the
-            response's reported Content-Length.
+            response's reported Content-Length, or the body read failed
+            mid-transfer with a truncated-body marker
+            (http.client.IncompleteRead / a ProtocolError wrapping one).
     """
     context = f"{bucket}/{key}"
     try:
@@ -165,7 +196,17 @@ def get_object_bytes(minio_client: Minio, bucket: str, key: str) -> bytes:
         raise translate_object_store_error(exc, context) from exc
 
     try:
-        data = response.read()
+        try:
+            data = response.read()
+        except Exception as exc:  # noqa: BLE001 - translated immediately below
+            # A failure DURING the body read (truncated body / dropped
+            # connection mid-transfer -- http.client.IncompleteRead,
+            # urllib3 ProtocolError, socket errors) must surface as a typed,
+            # fail-closed exception like every other object-store failure,
+            # never as a raw urllib3/http.client error escaping the module
+            # boundary (that leak is exactly the BUG-039 class this slice
+            # eliminates).
+            raise translate_object_store_error(exc, context) from exc
         headers = getattr(response, "headers", None)
         expected_length = headers.get("Content-Length") if headers else None
     finally:
