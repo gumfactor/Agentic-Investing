@@ -606,6 +606,33 @@ come last, after -1 and -4 both land.
   §1.4, not solved here beyond the `shares_outstanding` prerequisite named
   for `market_cap_usd`).
 
+### Operator answers (2026-07-20)
+
+Recorded by the PM session from direct operator responses; these are binding
+on the 03A implementation phases.
+
+1. **`shares_outstanding`:** the only data source is yfinance, which provides
+   no filing-dated (`known_at`) shares-outstanding series — its share-count
+   data carries Yahoo observation timing, not filing provenance, and so fails
+   §1.4's certification bar. **`market_cap_usd` is dropped from the certified
+   eligibility filter set for 03A.** Strategy configs declaring
+   `min_market_cap_usd` must fail closed at config load (per §1.3's
+   unsupported-filter rule) until a dated fundamentals source lands.
+   Shipping a `provisional_no_known_at`-labeled series is optional and only
+   if trivially cheap inside 03A-4; certified market-cap filtering is out of
+   scope.
+2. **ADV definition:** `adv_usd_20d` (20-session dollar-volume average)
+   confirmed as the single default. No additional windows in 03A.
+3. **`security_type` curation:** hand-curated historical changes approved,
+   with `universe_import_batches`-style provenance per §5.1.
+4. **Legacy snapshot retention:** retain-forever in local MinIO accepted for
+   now; no archival policy in 03A.
+5. **MinIO Object Lock / WORM:** pending — operator requested a fuller
+   explanation before deciding; not a blocker for any 03A phase.
+6. **`allow_missing_corporate_actions`:** extend the explicit opt-in
+   treatment to the research scripts (`scripts/validate_signal_ic.py` and
+   sibling 01B-3 callers) **inside 03A-2**, not as a follow-up.
+
 ### Open questions requiring operator input before implementation
 
 1. **`shares_outstanding` source and its `known_at` semantics.** §1.4 makes
