@@ -580,6 +580,10 @@ def _adjusted_closes_for_simulation(
     import pandas as pd
     from sqlalchemy import text as _text
 
+    # Imported before the try so the fail-closed same-date-action exception is
+    # nameable in the except clauses even if the in-try import path changes.
+    from data.normalization.corporate_actions import AmbiguousSameDateActionError
+
     try:
         from data.normalization.corporate_actions import build_realized_total_return_as_of
         from data.universe.calendar import session_close_cutoff
@@ -607,6 +611,30 @@ def _adjusted_closes_for_simulation(
         )
         adj_lookup = adjusted_sim_prices.set_index(["ticker", "date"])["adj_close"].astype(float)
         return adj_lookup.xs(sim_date, level="date"), adj_lookup.xs(prev_date, level="date")
+    except AmbiguousSameDateActionError as exc:
+        # BUG-037/BUG-076: an unresolvable same-date corporate-action quoting
+        # convention is a DATA-CORRECTNESS fail-closed signal, not an
+        # infrastructure failure. The broad `except Exception` below would
+        # otherwise degrade to raw prices under the generic
+        # "simulation_corporate_action_adjustment_unavailable" event, making
+        # it indistinguishable from a DB/connection outage in monitoring
+        # (the BUG-039 shape). Emit a distinguishable event name so it is
+        # observable as a data problem. This diagnostic strategy_simulations
+        # path is intentionally kept non-blocking (falls back to raw prices)
+        # — the correctly fail-closed SCORE path is a separate call site and
+        # is NOT swallowed here.
+        import structlog as _structlog
+
+        _structlog.get_logger("rqis.airflow").warning(
+            "simulation_ambiguous_same_date_action",
+            sim_date=str(sim_date),
+            error=str(exc),
+            note="a same-date corporate-action set could not be normalized to "
+            "one quoting convention (BUG-037); the diagnostic simulated_return "
+            "falls back to RAW prices for this run. This is a DATA-correctness "
+            "signal distinct from an infra outage — see BUG-076.",
+        )
+        return today_closes, prev_day_closes
     except Exception as exc:
         import structlog as _structlog
 

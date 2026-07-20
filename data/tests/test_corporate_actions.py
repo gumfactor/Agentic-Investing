@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from data.normalization.corporate_actions import (
+    AmbiguousSameDateActionError,
     apply_adjustment_factors,
     build_realized_total_return_as_of,
     build_score_price_history_as_of,
@@ -381,3 +382,244 @@ class TestSplitDividendPortfolioAccountingParity:
         assert adjusted[adjusted["date"] == d0].iloc[0]["close"] == raw_entry_price
         assert adjusted[adjusted["date"] == d3].iloc[0]["close"] == raw_exit_price
         assert metadata.builder == "build_realized_total_return_as_of"
+
+
+# ─── BUG-037: same-date multi-action accumulation (design plan §3.1/§3.4) ────
+#
+# Fixture geometry shared by this section: a 2-for-1 split and a $1/share
+# cash dividend share ex_date 2024-01-05, whose close is 50 (post-split
+# scale — the split already took effect that trading day, so 50 is the
+# correct reference close for the dividend factor regardless of dividend
+# quoting convention). Prior date 2024-01-04 must be adjusted by BOTH
+# actions; 2024-01-05 (on/after the ex_date) is unadjusted (factor = 1).
+#
+# Hand-computed expected combined factor (NOT derived by running the
+# fixture through the code under test):
+#   split multiplier   = 1 / 2                = 0.5
+#   dividend multiplier = (ex_close - div) / ex_close
+#                       = (50 - 1) / 50 = 49/50 = 0.98
+#   combined            = 0.5 * 0.98 = 0.49
+_EXPECTED_SPLIT_DIVIDEND_FACTOR = Decimal("0.49000000")  # quantized to FACTOR_PRECISION
+
+
+class TestSameDateSplitDividendAccumulation:
+    def test_post_split_convention_combines_split_and_dividend(self) -> None:
+        """Default/typical case: the dividend value is already post-split
+        (the empirically-verified yfinance convention documented in the
+        module docstring). No normalization scaling is applied."""
+        prices = _prices([
+            ("SDX", "2024-01-04", 100),
+            ("SDX", "2024-01-05", 50),   # ex-date: post-split reference close
+            ("SDX", "2024-01-06", 49),
+        ])
+        actions = _actions([
+            ("SDX", "2024-01-05", "split", 2.0),
+            ("SDX", "2024-01-05", "dividend", 1.0),  # post-split $1/share
+        ])
+
+        factors = compute_adjustment_factors(actions, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+        assert factor_map[date(2024, 1, 5)] == Decimal("1")
+
+    def test_pre_split_convention_normalizes_and_converges_to_same_factor(self) -> None:
+        """Same underlying economics, but the dividend row is quoted in
+        PRE-split terms ($2/share pre-split == $1/share post-split, since
+        the split doubles share count). The explicit
+        dividend_quoting_convention='pre_split' override must trigger
+        normalization (divide by the net same-date split ratio) so this
+        fixture converges to the SAME combined factor as the post-split
+        fixture above — proving normalization actually runs, not just that
+        multiplication happens."""
+        prices = _prices([
+            ("SDY", "2024-01-04", 100),
+            ("SDY", "2024-01-05", 50),
+            ("SDY", "2024-01-06", 49),
+        ])
+        actions = pd.DataFrame([
+            {"ticker": "SDY", "ex_date": date(2024, 1, 5), "action_type": "split", "value": Decimal("2.0")},
+            {
+                "ticker": "SDY",
+                "ex_date": date(2024, 1, 5),
+                "action_type": "dividend",
+                "value": Decimal("2.0"),  # pre-split $2/share == post-split $1/share
+                "dividend_quoting_convention": "pre_split",
+            },
+        ])
+
+        factors = compute_adjustment_factors(actions, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+
+    def test_split_and_spinoff_same_date_spinoff_contributes_nothing(self) -> None:
+        prices = _prices([
+            ("SPX", "2024-01-04", 100),
+            ("SPX", "2024-01-05", 50),
+        ])
+        actions = _actions([
+            ("SPX", "2024-01-05", "split", 2.0),
+            ("SPX", "2024-01-05", "spinoff", 10.0),
+        ])
+
+        factors = compute_adjustment_factors(actions, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+
+        # Spinoff is not implemented and must not overwrite or blank out the
+        # split's multiplier (the pre-fix bug pattern this guards against).
+        assert factor_map[date(2024, 1, 4)] == Decimal("0.5")
+
+    def test_three_same_date_actions_split_dividend_spinoff(self) -> None:
+        prices = _prices([
+            ("TRX", "2024-01-04", 100),
+            ("TRX", "2024-01-05", 50),
+        ])
+        actions = _actions([
+            ("TRX", "2024-01-05", "split", 2.0),
+            ("TRX", "2024-01-05", "dividend", 1.0),
+            ("TRX", "2024-01-05", "spinoff", 10.0),
+        ])
+
+        factors = compute_adjustment_factors(actions, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+
+        # Spinoff still contributes nothing; split*dividend combine exactly
+        # as in the two-action fixture.
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+
+    def test_unrecognized_dividend_quoting_convention_raises(self) -> None:
+        prices = _prices([("BAD", "2024-01-04", 100), ("BAD", "2024-01-05", 50)])
+        actions = pd.DataFrame([
+            {"ticker": "BAD", "ex_date": date(2024, 1, 5), "action_type": "split", "value": Decimal("2.0")},
+            {
+                "ticker": "BAD",
+                "ex_date": date(2024, 1, 5),
+                "action_type": "dividend",
+                "value": Decimal("1.0"),
+                "dividend_quoting_convention": "mid_split",  # unrecognized
+            },
+        ])
+        with pytest.raises(AmbiguousSameDateActionError):
+            compute_adjustment_factors(actions, prices)
+
+    def test_pre_split_dividend_without_same_date_split_raises(self) -> None:
+        """A dividend claiming to be pre-split-quoted with no same-date
+        split to normalize against has no well-defined post-split value —
+        fail closed rather than guess."""
+        prices = _prices([("BAD2", "2024-01-04", 100), ("BAD2", "2024-01-05", 50)])
+        actions = pd.DataFrame([
+            {
+                "ticker": "BAD2",
+                "ex_date": date(2024, 1, 5),
+                "action_type": "dividend",
+                "value": Decimal("1.0"),
+                "dividend_quoting_convention": "pre_split",
+            },
+        ])
+        with pytest.raises(AmbiguousSameDateActionError):
+            compute_adjustment_factors(actions, prices)
+
+    def test_nullable_string_dtype_pd_na_defaults_to_post_split(self) -> None:
+        """Codex review round-1 P2 regression: when the optional
+        `dividend_quoting_convention` column uses pandas' NULLABLE string
+        dtype, missing cells arrive as `pd.NA` (not float NaN). The convention
+        guard must treat `pd.NA` uniformly as absent -> default `post_split`,
+        not let it fall through to a membership/comparison that raises
+        'boolean value of NA is ambiguous' and break adjustment for otherwise
+        valid rows whenever the override column is mostly empty."""
+        prices = _prices([
+            ("NA1", "2024-01-04", 100),
+            ("NA1", "2024-01-05", 50),
+            ("NA1", "2024-01-06", 49),
+        ])
+        actions = pd.DataFrame(
+            {
+                "ticker": ["NA1", "NA1"],
+                "ex_date": [date(2024, 1, 5), date(2024, 1, 5)],
+                "action_type": ["split", "dividend"],
+                "value": [Decimal("2.0"), Decimal("1.0")],
+                # Nullable "string" dtype with pd.NA missing values.
+                "dividend_quoting_convention": pd.array([pd.NA, pd.NA], dtype="string"),
+            }
+        )
+        assert actions["dividend_quoting_convention"].dtype == "string"
+
+        factors = compute_adjustment_factors(actions, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+        # Same hand-computed post_split combined factor as the explicit fixture.
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+
+    def test_parquet_round_trip_pd_na_convention_defaults_to_post_split(self, tmp_path) -> None:
+        """Prove the nullable-dtype path end-to-end: write the actions to
+        parquet and read them back (the real ingestion/snapshot path), which
+        materializes the empty override column as nullable string with pd.NA,
+        then confirm adjustment still defaults to post_split."""
+        prices = _prices([
+            ("NA2", "2024-01-04", 100),
+            ("NA2", "2024-01-05", 50),
+        ])
+        actions = pd.DataFrame(
+            {
+                "ticker": ["NA2", "NA2"],
+                "ex_date": [date(2024, 1, 5), date(2024, 1, 5)],
+                "action_type": ["split", "dividend"],
+                "value": ["2.0", "1.0"],  # parquet can't store Decimal natively
+                "dividend_quoting_convention": pd.array([pd.NA, pd.NA], dtype="string"),
+            }
+        )
+        path = tmp_path / "actions.parquet"
+        actions.to_parquet(path)
+        loaded = pd.read_parquet(path)
+        # Restore Decimal/date shapes the way the ingestion layer would.
+        loaded["value"] = loaded["value"].map(lambda v: Decimal(str(v)))
+        loaded["ex_date"] = loaded["ex_date"].map(
+            lambda d: d if isinstance(d, date) else pd.Timestamp(d).date()
+        )
+
+        factors = compute_adjustment_factors(loaded, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+
+
+class TestSameDateAccumulationFlowsThroughAllThreeCallers:
+    """§3.4 acceptance test: the BUG-037 fix is shared automatically by
+    compute_adjustment_factors and both 01B-3 cutoff-aware builders, since
+    all three call the same shared accumulation logic."""
+
+    def _fixture(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        prices = _prices([
+            ("FLW", "2024-01-04", 100),
+            ("FLW", "2024-01-05", 50),
+        ])
+        actions = _actions_with_known_at([
+            ("FLW", "2024-01-05", "split", 2.0,
+             datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc), "v1"),
+            ("FLW", "2024-01-05", "dividend", 1.0,
+             datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc), "v1"),
+        ])
+        return prices, actions
+
+    def test_compute_adjustment_factors_direct(self) -> None:
+        prices, actions = self._fixture()
+        factors = compute_adjustment_factors(actions, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+
+    def test_build_score_price_history_as_of(self) -> None:
+        prices, actions = self._fixture()
+        cutoff = datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc)
+        adjusted, _ = build_score_price_history_as_of(prices, actions, cutoff)
+        row = adjusted[adjusted["date"] == date(2024, 1, 4)].iloc[0]
+        expected_adj_close = (Decimal("100") * _EXPECTED_SPLIT_DIVIDEND_FACTOR).quantize(Decimal("0.000001"))
+        assert row["adj_close"] == expected_adj_close
+
+    def test_build_realized_total_return_as_of(self) -> None:
+        prices, actions = self._fixture()
+        exit_cutoff = datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc)
+        adjusted, _ = build_realized_total_return_as_of(
+            prices, actions, entry_date=date(2024, 1, 4), exit_cutoff=exit_cutoff
+        )
+        row = adjusted[adjusted["date"] == date(2024, 1, 4)].iloc[0]
+        expected_adj_close = (Decimal("100") * _EXPECTED_SPLIT_DIVIDEND_FACTOR).quantize(Decimal("0.000001"))
+        assert row["adj_close"] == expected_adj_close

@@ -46,6 +46,64 @@ Both require *corporate_actions* to carry a ``known_at`` column (added by
 migration 011); an action whose ``known_at`` is null/missing cannot be used
 by either builder and is dropped with a logged warning rather than silently
 included.
+
+Same-date multi-action accumulation and quoting convention (BUG-037, design
+plan §3.1)
+---------------------------------------------------------------------------
+``compute_adjustment_factors`` accumulates the **product** of every action's
+per-action multiplier for a given ``(ticker, ex_date)``, regardless of how
+many actions or which ``action_type`` values share that date — not the
+last-write-wins single multiplier the pre-fix implementation kept. This is
+shared automatically by both cutoff-aware builders below and the legacy
+full-history routine, since all three call this function.
+
+A same-date split and cash dividend cannot simply be multiplied together
+without first agreeing on a quoting convention: a dividend's adjustment
+factor is ``(ex_close - dividend_per_share) / ex_close``, and
+``dividend_per_share`` is only well-defined relative to a share-count basis
+— *pre-split* (dollars per share before the same-day split takes effect) or
+*post-split* (dollars per share after it). The two bases are not
+interchangeable and must be normalized to one convention before the product
+is taken.
+
+**Empirically verified convention for this project's ingestion source
+(yfinance, `data/ingestion/market/yfinance_client.py`): POST_SPLIT.**
+Verification method: `yfinance.Ticker.dividends` is not a raw as-declared
+series — it is retroactively normalized against a ticker's *entire* split
+history, including splits that occur strictly *after* the dividend's own
+ex-date. Confirmed against AAPL: the $2.65/share dividend actually declared
+on 2012-08-09 (pre-split) is returned by `yf.Ticker("AAPL").dividends` as
+``0.094643 == 2.65 / (7 * 4)`` — divided by the combined ratio of the 2014
+7-for-1 split *and* the 2020 4-for-1 split, both of which post-date
+2012-08-09. This proves yfinance dividend values are always expressed in
+*current* (maximally post-split) share-count terms, not the basis in effect
+on the dividend's own ex-date.
+
+At the exact same-ex-date boundary specifically, an S&P 500-constituent-wide
+historical scan of `Ticker.dividends`/`Ticker.splits` date collisions (21
+tickers found, e.g. DHR 2016-07-05, IRM 2014-09-26, TMUS 2013-05-01, EXPE
+2011-12-21) turned up only spinoff-modeling artifacts — Yahoo represents a
+spinoff as one large one-time "dividend" plus a compensating "split"-labeled
+ratio — never a genuine simultaneous ordinary stock split + ordinary
+periodic cash dividend. No same-date ordinary-split/ordinary-dividend pair
+exists anywhere in that sample to test the boundary directly against a real
+row. Given (a) the general retroactive-normalization behavior demonstrated
+above holds uniformly across the whole dividend series with no documented or
+observed boundary exception, and (b) yfinance is the only ingestion source
+this project is configured for, this module adopts **POST_SPLIT** as the
+declared convention: a same-date dividend `value` is assumed to already
+reflect the post-split (i.e. inclusive of the same-day split) share count
+and needs no further scaling before being combined with the split
+multiplier.
+
+This assumption is enforced defensively, not silently. Each corporate-action
+row may optionally carry a ``dividend_quoting_convention`` column with value
+``"post_split"`` (default/assumed when the column or value is absent) or
+``"pre_split"`` (the row's dividend value is stated in the pre-split share
+basis and is normalized — divided by the same-date net split ratio — before
+its factor is computed). Any other non-null value, or a same-date dividend
+whose net split ratio cannot be resolved to a well-defined positive number,
+raises :class:`AmbiguousSameDateActionError` rather than guessing.
 """
 
 from __future__ import annotations
@@ -62,6 +120,169 @@ logger = structlog.get_logger(__name__)
 
 # Precision for adjustment factors — 8 decimal places matches Bloomberg convention.
 FACTOR_PRECISION = Decimal("0.00000001")
+
+# Declared same-date dividend quoting convention (see module docstring for the
+# empirical verification against yfinance). This is the convention assumed
+# when a corporate-action row does not carry an explicit
+# ``dividend_quoting_convention`` override.
+DEFAULT_DIVIDEND_QUOTING_CONVENTION = "post_split"
+_KNOWN_DIVIDEND_QUOTING_CONVENTIONS = ("post_split", "pre_split")
+
+
+class AmbiguousSameDateActionError(ValueError):
+    """Raised when a same-date group of corporate actions cannot be safely
+    normalized to one quoting convention before combining their multipliers
+    (BUG-037, design plan §3.1).
+
+    Raised when:
+      - a same-date dividend row carries a ``dividend_quoting_convention``
+        value other than ``"post_split"``/``"pre_split"``/null, or
+      - a same-date dividend is quoted ``"pre_split"`` but the same-date net
+        split ratio is missing, zero, or negative (there is no well-defined
+        factor to normalize by).
+
+    This module never silently guesses a convention in these cases — the
+    caller must fix the ingested data or supply an explicit, recognized
+    convention.
+    """
+
+
+def _combine_same_date_action_multipliers(
+    ticker: str,
+    ex_dt: date,
+    day_actions: pd.DataFrame,
+    ex_close: object,
+) -> Optional[Decimal]:
+    """Combine every action's multiplier for one (ticker, ex_date) into a
+    single product (BUG-037, design plan §3.1).
+
+    Splits are combined first into one net split ratio for the date, so
+    that a same-date dividend can be normalized to the declared
+    ``POST_SPLIT`` convention (or an explicit per-row ``pre_split``
+    override) before its own factor is computed. Spinoffs are logged as
+    not-implemented and contribute no multiplier, matching pre-existing
+    behavior. Returns ``None`` if no action on the date produced a usable
+    multiplier.
+    """
+    splits = day_actions[day_actions["action_type"] == "split"]
+    dividends = day_actions[day_actions["action_type"] == "dividend"]
+    spinoffs = day_actions[day_actions["action_type"] == "spinoff"]
+
+    for atype in set(day_actions["action_type"]) - {"split", "dividend", "spinoff"}:
+        logger.warning(
+            "unrecognized_action_type_ignored",
+            ticker=ticker,
+            ex_date=str(ex_dt),
+            action_type=atype,
+        )
+
+    if not spinoffs.empty:
+        logger.warning(
+            "spinoff_not_implemented",
+            ticker=ticker,
+            ex_date=str(ex_dt),
+        )
+
+    # Net split ratio for the date: product of every same-date split value.
+    # A same-date dividend is normalized against this combined ratio, not
+    # any single split in isolation, so a triple-split-plus-dividend day
+    # still normalizes correctly.
+    net_split_ratio = Decimal("1")
+    has_split = False
+    for _, action in splits.iterrows():
+        value = Decimal(str(action["value"]))
+        if value != 0:
+            net_split_ratio *= value
+            has_split = True
+
+    combined = Decimal("1")
+    has_component = False
+
+    if has_split:
+        # Prior prices / split_ratio = adjusted price.
+        combined *= Decimal("1") / net_split_ratio
+        has_component = True
+
+    if not dividends.empty and ex_close is not None and ex_close != 0:
+        ex_close_d = Decimal(str(ex_close))
+        for _, action in dividends.iterrows():
+            raw_value = Decimal(str(action["value"]))
+            # NOTE (reachability, BUG-076): `dividend_quoting_convention` is a
+            # FORWARD-LOOKING hook. It is NOT selected by any live DB read path
+            # today — the Airflow score/simulation queries and
+            # scripts/validate_signal_ic.py select only ticker, ex_date,
+            # action_type, value, known_at, source_version, and no migration or
+            # writer creates this column. So for every DB-sourced row the
+            # convention is absent -> the POST_SPLIT default (operator
+            # signed-off 2026-07-20), and the `pre_split` normalization and
+            # AmbiguousSameDateActionError branches are exercised ONLY by
+            # explicit in-memory callers/tests. Wiring this to real data (a
+            # column migration + query updates + an actual dated pre_split
+            # source) is tracked as future work in BUG-076; do not treat this
+            # override as active on DB rows until then.
+            convention = action.get("dividend_quoting_convention") if hasattr(action, "get") else None
+            # Treat every "absent" marker uniformly as default (post_split):
+            # None, float NaN, AND pandas' pd.NA (the missing-value sentinel of
+            # the nullable "string"/StringDtype column that arrives after a
+            # parquet round-trip). A bare `pd.NA in (...)`/`pd.NA not in (...)`
+            # membership or comparison raises "boolean value of NA is
+            # ambiguous", so guard with a scalar pd.isna() check — `convention`
+            # is always a single cell value here, never an array.
+            if convention is not None and pd.api.types.is_scalar(convention) and pd.isna(convention):
+                convention = None
+            normalized_value = _normalize_dividend_value(
+                ticker=ticker,
+                ex_dt=ex_dt,
+                raw_value=raw_value,
+                convention=convention,
+                net_split_ratio=net_split_ratio if has_split else None,
+            )
+            # Factor = (ex_close - normalized_dividend) / ex_close
+            factor = (ex_close_d - normalized_value) / ex_close_d
+            if factor > 0:
+                combined *= factor
+                has_component = True
+
+    return combined if has_component else None
+
+
+def _normalize_dividend_value(
+    ticker: str,
+    ex_dt: date,
+    raw_value: Decimal,
+    convention: Optional[str],
+    net_split_ratio: Optional[Decimal],
+) -> Decimal:
+    """Normalize one same-date dividend's per-share value to the declared
+    ``POST_SPLIT`` convention (BUG-037, design plan §3.1) before its factor
+    is combined with any same-date split.
+
+    ``convention`` is the row's optional ``dividend_quoting_convention``
+    override; ``None``/``"post_split"`` means the value already reflects
+    the post-split share count (the empirically-verified default for this
+    project's yfinance ingestion — see module docstring) and is returned
+    unchanged. ``"pre_split"`` means the value is stated in the pre-split
+    share basis and must be divided by the same-date net split ratio to
+    convert it to post-split terms before use.
+    """
+    if convention is None:
+        convention = DEFAULT_DIVIDEND_QUOTING_CONVENTION
+    if convention not in _KNOWN_DIVIDEND_QUOTING_CONVENTIONS:
+        raise AmbiguousSameDateActionError(
+            f"{ticker} {ex_dt}: unrecognized dividend_quoting_convention "
+            f"{convention!r}; expected one of {_KNOWN_DIVIDEND_QUOTING_CONVENTIONS} "
+            "or null. Refusing to guess a normalization (BUG-037, design plan §3.1)."
+        )
+    if convention == "post_split":
+        return raw_value
+    # convention == "pre_split"
+    if net_split_ratio is None or net_split_ratio <= 0:
+        raise AmbiguousSameDateActionError(
+            f"{ticker} {ex_dt}: dividend quoted 'pre_split' but no positive "
+            "same-date net split ratio is available to normalize it against. "
+            "Refusing to guess a normalization (BUG-037, design plan §3.1)."
+        )
+    return raw_value / net_split_ratio
 
 
 def compute_adjustment_factors(
@@ -108,37 +329,22 @@ def compute_adjustment_factors(
         dates = price_group["date"].values
         closes = {row["date"]: row["close"] for _, row in price_group.iterrows()}
 
-        # Build a dict of ex_date -> cumulative multiplier
-        # Walking forward through actions, each multiplier applies to all
-        # dates strictly before the ex_date.
+        # Build a dict of ex_date -> cumulative multiplier, where the
+        # multiplier for a given ex_date is the PRODUCT of every action's
+        # individual multiplier on that date (BUG-037) — not the multiplier
+        # of whichever action happened to be iterated last. Each date's
+        # multiplier applies to all price dates strictly before the ex_date.
         multipliers: dict[date, Decimal] = {}
 
-        for _, action in ca_group.iterrows():
-            ex_dt = action["ex_date"]
-            atype = action["action_type"]
-            value = Decimal(str(action["value"]))
-
-            if atype == "split":
-                # Prior prices / split_ratio = adjusted price
-                # So factor for dates before ex_date = 1 / split_ratio
-                if value != 0:
-                    multipliers[ex_dt] = Decimal("1") / value
-            elif atype == "dividend":
-                # Look up the closing price on the ex_date
-                ex_close = closes.get(ex_dt)
-                if ex_close is not None and ex_close != 0:
-                    ex_close_d = Decimal(str(ex_close))
-                    # Factor = (close - dividend) / close
-                    factor = (ex_close_d - value) / ex_close_d
-                    if factor > 0:
-                        multipliers[ex_dt] = factor
-            # Spinoffs: not implemented in Phase 1
-            elif atype == "spinoff":
-                logger.warning(
-                    "spinoff_not_implemented",
-                    ticker=ticker,
-                    ex_date=str(ex_dt),
-                )
+        for ex_dt, day_actions in ca_group.groupby("ex_date"):
+            day_multiplier = _combine_same_date_action_multipliers(
+                ticker=ticker,
+                ex_dt=ex_dt,
+                day_actions=day_actions,
+                ex_close=closes.get(ex_dt),
+            )
+            if day_multiplier is not None:
+                multipliers[ex_dt] = day_multiplier
 
         # Apply multipliers: for each date, the adj_factor is the product
         # of all multipliers for actions with ex_date > date (i.e., things
