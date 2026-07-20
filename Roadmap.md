@@ -64,6 +64,22 @@ Task branches are named `dev/R2-<order>-<slug>`. Each phased slice is one
 commit; each roadmap job (or sub-job below) is one PR into `dev/R2-phase1`.
 Token figures are reported as `<agent/effort>: <tokens>`.
 
+**PM decisions (2026-07-20, wave 2 cont.):**
+
+- **Codex review gate waived under rate limits (operator):** Codex hit its
+  usage limits mid-round and returned only limit messages (no review). Operator
+  authorized proceeding on internal adversarial review + PM certification for
+  PRs with strong internal coverage (full REJECT→fix→re-review cycle), rather
+  than stalling. PM still blocks merge on any internal-review P0/P1. Applies
+  while Codex capacity is unavailable.
+- **Hostile third-pass review is now standard for integrity-critical slices:**
+  an operator-requested hostile review of 03A-1 (PR #38) found a P0
+  (`load_manifest` did no integrity verification — the manifest root-of-trust,
+  whose hash is the C7 `data_version`, was never re-hashed on load) plus a P1
+  hash-collision (non-injective canonical row encoding) that the prior two
+  reviews missed. Content-addressing/hashing/fail-closed slices get a hostile,
+  execute-the-attack review before merge.
+
 **PM decisions (2026-07-19, wave 2):**
 
 - **02B and 03A launched in parallel** (02B code build; 03A Phase 0 design doc
