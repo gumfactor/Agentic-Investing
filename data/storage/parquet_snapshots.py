@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import os
+import socket
 from datetime import date
 from typing import Optional
 
@@ -34,22 +35,165 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import structlog
+import urllib3.exceptions
 from minio import Minio
 from minio.error import S3Error
 
 from data.storage.canonical_hash import bytes_sha256, canonical_content_sha256
 
-# SnapshotIntegrityError is defined in data.storage.errors so both this module
-# and backtesting.dataset_manifest can raise it without a circular import.
-# Re-exported here for backward compatibility with existing
+# The typed object-store error hierarchy lives in data.storage.errors so both
+# this module and backtesting.dataset_manifest can raise/import the same
+# types without a circular import. Re-exported here for backward
+# compatibility with existing
 # `from data.storage.parquet_snapshots import SnapshotIntegrityError` callers.
-from data.storage.errors import SnapshotIntegrityError
+from data.storage.errors import (
+    SnapshotAccessDeniedError,
+    SnapshotIntegrityError,
+    SnapshotNotFoundError,
+    SnapshotPartialReadError,
+    SnapshotStoreUnavailableError,
+)
 
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_BUCKET = os.environ.get("MINIO_BUCKET_SNAPSHOTS", "rqis-snapshots")
 
-__all__ = ["ParquetSnapshots", "SnapshotIntegrityError"]
+__all__ = [
+    "ParquetSnapshots",
+    "SnapshotIntegrityError",
+    "SnapshotNotFoundError",
+    "SnapshotStoreUnavailableError",
+    "SnapshotAccessDeniedError",
+    "SnapshotPartialReadError",
+    "translate_object_store_error",
+    "get_object_bytes",
+]
+
+# S3 error codes that mean "the object/bucket genuinely does not exist" --
+# the ONLY condition that may ever become SnapshotNotFoundError. Every other
+# S3Error code (auth failures, bucket policy, throttling, internal errors,
+# etc.) is treated conservatively as store-unavailable/access-denied so it
+# can never be silently swallowed as "no data" (design plan section 4.1).
+_NOT_FOUND_CODES = frozenset({"NoSuchKey", "NoSuchBucket"})
+_ACCESS_DENIED_CODES = frozenset(
+    {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "Forbidden"}
+)
+
+# Lower-level connection failures (MinIO/urllib3 not reachable at all --
+# connection refused, timeout, DNS failure, TLS failure) never surface as
+# S3Error; they surface as urllib3/socket/OS-level exceptions instead.
+_CONNECTION_ERROR_TYPES = (
+    urllib3.exceptions.HTTPError,
+    ConnectionError,
+    TimeoutError,
+    socket.gaierror,
+    OSError,
+)
+
+
+def translate_object_store_error(exc: Exception, context: str) -> Exception:
+    """Translate a raw MinIO/urllib3 exception into the typed, fail-closed
+    object-store error hierarchy (data.storage.errors).
+
+    This is THE single translation boundary (design plan section 4.2): no
+    other module should catch `minio.error.S3Error` directly. Callers in
+    this module (and `backtesting.dataset_manifest`, via `get_object_bytes`)
+    call this from an `except` block and raise the returned exception with
+    `from exc`.
+
+    Args:
+        exc: The caught MinIO/urllib3/OS-level exception.
+        context: Human-readable description of the failed operation (e.g.
+            the bucket/key), included in the translated error message.
+
+    Returns:
+        A `SnapshotNotFoundError`, `SnapshotAccessDeniedError`, or
+        `SnapshotStoreUnavailableError` instance. Never returns
+        `SnapshotIntegrityError`/`SnapshotPartialReadError` -- those are
+        raised directly by the caller from post-download validation, not
+        from this translation step.
+    """
+    if isinstance(exc, S3Error):
+        code = exc.code
+        if code in _NOT_FOUND_CODES:
+            return SnapshotNotFoundError(f"{context}: object not found ({code}).")
+        if code in _ACCESS_DENIED_CODES:
+            return SnapshotAccessDeniedError(
+                f"{context}: access denied by object store ({code})."
+            )
+        # Any other S3 error code (throttling, internal server error,
+        # bucket-policy denial not covered above, etc.) is conservatively
+        # treated as store-unavailable: never "no data".
+        return SnapshotStoreUnavailableError(
+            f"{context}: object store returned an unexpected error ({code})."
+        )
+    if isinstance(exc, _CONNECTION_ERROR_TYPES):
+        return SnapshotStoreUnavailableError(
+            f"{context}: could not reach object store ({type(exc).__name__}: {exc})."
+        )
+    # Unknown exception shape: fail closed as store-unavailable rather than
+    # letting it escape untyped or be mistaken for "not found".
+    return SnapshotStoreUnavailableError(
+        f"{context}: unexpected object-store error ({type(exc).__name__}: {exc})."
+    )
+
+
+def get_object_bytes(minio_client: Minio, bucket: str, key: str) -> bytes:
+    """Download an object's raw bytes, translating any MinIO/connection
+    failure into the typed error hierarchy and verifying the byte count
+    against the response's reported `Content-Length` (SnapshotPartialReadError
+    on mismatch).
+
+    This is the shared low-level primitive used by every read path in this
+    module, and by `backtesting.dataset_manifest.load_manifest` (which reads
+    manifest.json objects with the same `minio_client`/`bucket` shape but
+    lives outside this module and therefore must not catch `S3Error`
+    directly itself).
+
+    Raises:
+        SnapshotNotFoundError: object/bucket does not exist.
+        SnapshotAccessDeniedError: auth/authorization failure.
+        SnapshotStoreUnavailableError: connection/timeout/DNS/TLS failure or
+            any other unexpected object-store error.
+        SnapshotPartialReadError: downloaded byte count does not match the
+            response's reported Content-Length.
+    """
+    context = f"{bucket}/{key}"
+    try:
+        response = minio_client.get_object(bucket, key)
+    except Exception as exc:  # noqa: BLE001 - translated immediately below
+        raise translate_object_store_error(exc, context) from exc
+
+    try:
+        data = response.read()
+        headers = getattr(response, "headers", None)
+        expected_length = headers.get("Content-Length") if headers else None
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+        release_conn = getattr(response, "release_conn", None)
+        if callable(release_conn):
+            release_conn()
+
+    # Real MinIO responses report Content-Length as a header string (or
+    # plain int for a hand-built fake). Anything else -- including a header
+    # store that itself yields a non-numeric-string placeholder -- is
+    # treated as "no reported length" rather than risking a false-positive
+    # SnapshotPartialReadError against a value that was never a real byte
+    # count to begin with.
+    if isinstance(expected_length, (str, bytes, int)):
+        try:
+            expected_bytes = int(expected_length)
+        except (TypeError, ValueError):
+            expected_bytes = None
+        if expected_bytes is not None and len(data) != expected_bytes:
+            raise SnapshotPartialReadError(
+                f"{context}: read {len(data)} bytes but Content-Length "
+                f"reported {expected_bytes}; truncated/corrupt transfer."
+            )
+
+    return data
 
 
 def _content_key(data_type: str, content_sha256: str) -> str:
@@ -182,20 +326,31 @@ class ParquetSnapshots:
         the requested key already encodes the expected hash.
 
         Raises:
-            FileNotFoundError: if no snapshot exists at that content key.
+            SnapshotNotFoundError: if no snapshot exists at that content key
+                (also catchable as `FileNotFoundError` for one deprecation
+                cycle -- see `data.storage.errors`).
+            SnapshotStoreUnavailableError: connection/timeout/DNS/TLS failure
+                or any other unexpected object-store error.
+            SnapshotAccessDeniedError: auth/authorization failure.
+            SnapshotPartialReadError: downloaded byte count did not match the
+                response's Content-Length, or the parquet footer failed to
+                parse.
             SnapshotIntegrityError: if the downloaded content's recomputed
                 hash does not match `content_sha256`.
         """
         key = _content_key(data_type, content_sha256)
+        data = get_object_bytes(self._client, self._bucket, key)
+
         try:
-            response = self._client.get_object(self._bucket, key)
-            buffer = io.BytesIO(response.read())
-        except S3Error as exc:
-            raise FileNotFoundError(
-                f"No snapshot found at {self._bucket}/{key}"
+            df = pd.read_parquet(io.BytesIO(data))
+        except Exception as exc:  # noqa: BLE001 - any parquet parse failure
+            # is a partial/corrupt read, regardless of the underlying
+            # pyarrow/pandas exception type raised.
+            raise SnapshotPartialReadError(
+                f"{self._bucket}/{key}: downloaded bytes failed to parse as "
+                f"parquet ({type(exc).__name__}: {exc})."
             ) from exc
 
-        df = pd.read_parquet(buffer)
         actual_hash = canonical_content_sha256(df, data_type)
         if actual_hash != content_sha256:
             raise SnapshotIntegrityError(
@@ -220,14 +375,17 @@ class ParquetSnapshots:
         canonical source of "what hash was this bundle built from."
 
         Raises:
-            FileNotFoundError: if the manifest has no object_path/hash for
-                `data_type`, or if no snapshot exists at that content key.
+            SnapshotNotFoundError: if the manifest has no object_path/hash
+                for `data_type`, or if no snapshot exists at that content
+                key.
+            SnapshotStoreUnavailableError / SnapshotAccessDeniedError /
+                SnapshotPartialReadError: see `load_snapshot`.
             SnapshotIntegrityError: if the downloaded content does not match
                 the manifest's recorded hash.
         """
         content_hash = manifest.content_sha256.get(data_type) if manifest.content_sha256 else None
         if not content_hash:
-            raise FileNotFoundError(
+            raise SnapshotNotFoundError(
                 f"Manifest has no recorded content_sha256 for data_type={data_type!r}"
             )
         return self.load_snapshot(data_type, content_hash)
@@ -245,18 +403,29 @@ class ParquetSnapshots:
         any per-object logical hash existed.
 
         Raises:
-            FileNotFoundError: if no legacy snapshot exists for that date.
+            SnapshotNotFoundError: if no legacy snapshot exists for that date
+                (also catchable as `FileNotFoundError` for one deprecation
+                cycle -- see `data.storage.errors`).
+            SnapshotStoreUnavailableError: connection/timeout/DNS/TLS failure
+                or any other unexpected object-store error.
+            SnapshotAccessDeniedError: auth/authorization failure.
+            SnapshotPartialReadError: downloaded byte count did not match the
+                response's Content-Length, or the parquet footer failed to
+                parse.
         """
         key = f"snapshots/{data_type}/{snapshot_date}/data.parquet"
+        data = get_object_bytes(self._client, self._bucket, key)
+
         try:
-            response = self._client.get_object(self._bucket, key)
-            buffer = io.BytesIO(response.read())
-        except S3Error as exc:
-            raise FileNotFoundError(
-                f"No legacy snapshot found at {self._bucket}/{key}"
+            df = pd.read_parquet(io.BytesIO(data))
+        except Exception as exc:  # noqa: BLE001 - any parquet parse failure
+            # is a partial/corrupt read, regardless of the underlying
+            # pyarrow/pandas exception type raised.
+            raise SnapshotPartialReadError(
+                f"{self._bucket}/{key}: downloaded bytes failed to parse as "
+                f"parquet ({type(exc).__name__}: {exc})."
             ) from exc
 
-        df = pd.read_parquet(buffer)
         logger.info(
             "snapshot_loaded_legacy",
             path=f"{self._bucket}/{key}",
@@ -289,19 +458,29 @@ class ParquetSnapshots:
     # ─── Content-addressing internals ──────────────────────────────────────
 
     def _object_exists(self, key: str) -> bool:
+        """Return whether an object exists at `key`.
+
+        Only a genuine not-found is treated as "does not exist" (returns
+        False); any other failure (store unreachable, auth denied, etc.) is
+        translated and raised rather than silently reported as absent --
+        this method feeds `save_snapshot`'s idempotent-skip decision, and a
+        transient infra failure must never be mistaken for "safe to write."
+        """
         try:
             self._client.stat_object(self._bucket, key)
             return True
-        except S3Error:
-            return False
+        except Exception as exc:  # noqa: BLE001 - translated immediately below
+            translated = translate_object_store_error(exc, f"{self._bucket}/{key}")
+            if isinstance(translated, SnapshotNotFoundError):
+                return False
+            raise translated from exc
 
     def _read_object_bytes(self, key: str) -> bytes:
         """Download the raw bytes of an already-present object, so its
         canonical hash can be recomputed (verification, not trusting "key
         exists" alone -- section 2.1) and its informational bytes hash
         recorded."""
-        response = self._client.get_object(self._bucket, key)
-        return response.read()
+        return get_object_bytes(self._client, self._bucket, key)
 
     def save_dataset_manifest(self, manifest) -> str:
         """Save a DatasetManifest alongside this snapshot collection."""
