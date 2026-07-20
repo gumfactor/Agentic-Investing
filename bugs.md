@@ -48,7 +48,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-016 | Dashboard/API | P1 | F1 | Open | Blotter UI does not validate full schema before approval. |
 | BUG-017 | Trading Safety | P1 | F1 | Fixed | Quantity reduction updates one field while validation checks another. |
 | BUG-036 | Packaging/CI | P0 | F0 | Fixed | Invalid PEP 517 backend blocks package builds. |
-| BUG-037 | Data/Storage | P1 | F1 | Implemented-pending-review | Same-date corporate actions overwrite one another. Fix on branch `dev/R2-03A3-samedate-actions`. |
+| BUG-037 | Data/Storage | P1 | F1 | Fixed (PR #37, merged 2026-07-20) | Same-date corporate actions overwrite one another. Fixed: product-of-multipliers accumulation + POST_SPLIT convention (operator-signed-off). Residuals tracked in BUG-076. |
 | BUG-038 | Data/Storage | P1 | F1 | Open | Snapshot version paths are mutable. |
 | BUG-039 | Backtesting | P1 | F1 | Open | Object-store failures can become unadjusted backtests. |
 | BUG-040 | Trading Safety | P1 | F1 | Fixed | Wash-sale guard checks the wrong order direction. |
