@@ -65,12 +65,16 @@ def _mock_snapshots(prices: pd.DataFrame) -> MagicMock:
     run() degrades to raw (unadjusted) prices with a logged warning."""
     mock_snaps = MagicMock()
 
+    # 03A-1: scripts/backfill_momentum_scores.py reads pre-03A-1 date-keyed
+    # snapshots via ParquetSnapshots.load_snapshot_legacy(data_type, date)
+    # (load_snapshot's second arg is now a content hash). This is a date-keyed
+    # legacy read path, unchanged in behavior -- only the method name moved.
     def _load_snapshot(data_type: str, snapshot_date: date):
         if data_type == "daily_prices":
             return prices
         raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
 
-    mock_snaps.load_snapshot.side_effect = _load_snapshot
+    mock_snaps.load_snapshot_legacy.side_effect = _load_snapshot
     return mock_snaps
 
 
@@ -225,7 +229,7 @@ class TestBackfillCorporateActionWiring:
                 return corporate_actions
             raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
 
-        mock_snaps.load_snapshot.side_effect = _load_snapshot
+        mock_snaps.load_snapshot_legacy.side_effect = _load_snapshot
         return mock_snaps
 
     def test_split_adjusted_prices_reach_compute_momentum_scores(self, lookup, monkeypatch) -> None:

@@ -602,22 +602,47 @@ def test_manifest_alpha_hash_empty():
 # ------------------------------------------------------------------
 
 def _mock_snapshots(prices, alpha, benchmark):
-    """Build a MagicMock ParquetSnapshots that serves pre-loaded DataFrames.
+    """Build a MagicMock ParquetSnapshots that serves pre-loaded DataFrames
+    through the 03A-1 content-addressed, manifest-driven read path.
 
     corporate_actions raises FileNotFoundError (optional snapshot) so the
     loader falls back to an empty frame, matching the production default.
+    The manifest resolution (load_manifest) is satisfied by a fake _client
+    that returns a minimal valid manifest JSON.
     """
+    import json
+    from dataclasses import asdict
     from unittest.mock import MagicMock
+
+    from backtesting.dataset_manifest import DatasetManifest
 
     data = {"daily_prices": prices, "alpha_scores": alpha, "benchmark": benchmark}
 
-    def _load(data_type, _snap_date):
+    def _load_by_manifest(_manifest, data_type):
         if data_type == "corporate_actions":
             raise FileNotFoundError("no corp actions snapshot in test")
         return data[data_type]
 
     mock = MagicMock()
-    mock.load_snapshot.side_effect = _load
+    mock.load_snapshot_by_manifest.side_effect = _load_by_manifest
+
+    manifest = DatasetManifest(
+        version="test",
+        created_at="",
+        git_commit="",
+        strategy_id="v1",
+        snapshot_dates={},
+        object_paths={},
+        row_counts={},
+        date_ranges={},
+        schema_hashes={},
+        content_sha256={k: "0" * 64 for k in ("daily_prices", "alpha_scores", "corporate_actions", "benchmark")},
+        manifest_content_sha256="0" * 64,
+    )
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(asdict(manifest)).encode()
+    mock._client.get_object.return_value = resp
+    mock._bucket = "test-bucket"
     return mock
 
 
@@ -743,7 +768,7 @@ def test_backfill_raises_on_insufficient_history():
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
     mock_snaps = MagicMock()
-    mock_snaps.load_snapshot.return_value = prices
+    mock_snaps.load_snapshot_legacy.return_value = prices
 
     with pytest.raises(ValueError, match="Insufficient price history"):
         run(
@@ -775,7 +800,7 @@ def test_backfill_passes_with_sufficient_history():
             return prices_all
         raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
 
-    mock_snaps.load_snapshot.side_effect = _load_snapshot
+    mock_snaps.load_snapshot_legacy.side_effect = _load_snapshot
 
     # dry_run=True exits before DB writes; should not raise.
     # provisional_no_universe=True: this test exercises the lookback guard
@@ -971,7 +996,7 @@ def test_audit_snapshot_falls_back_to_v1_alpha_scores(monkeypatch):
     )
 
     class _Snapshots:
-        def load_snapshot(self, data_type, snapshot_date):
+        def load_snapshot_legacy(self, data_type, snapshot_date):
             assert snapshot_date == date(2026, 6, 14)
             if data_type == "daily_prices":
                 return prices_df

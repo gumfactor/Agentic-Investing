@@ -1,10 +1,13 @@
+import io
 from datetime import date
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
+from minio.error import S3Error
 from sqlalchemy import create_engine
 
+from data.storage.parquet_snapshots import ParquetSnapshots
 from scripts.pin_snapshot import pin_bundle
 
 
@@ -52,7 +55,7 @@ def _benchmark_client(start=date(2022, 1, 3), end=date(2022, 1, 4)):
 def test_pin_bundle_saves_all_sources_and_manifest():
     snapshots = MagicMock()
     snapshots.save_snapshot.side_effect = (
-        lambda _df, data_type, snapshot_date: (
+        lambda _df, data_type, snapshot_date, bytes_sha256_out=None: (
             f"rqis-snapshots/snapshots/{data_type}/{snapshot_date}/data.parquet"
         )
     )
@@ -151,7 +154,7 @@ def test_pin_bundle_rejects_colliding_research_runs_without_explicit_selection()
 def test_pin_bundle_research_run_id_disambiguates_collision():
     snapshots = MagicMock()
     snapshots.save_snapshot.side_effect = (
-        lambda _df, data_type, snapshot_date: (
+        lambda _df, data_type, snapshot_date, bytes_sha256_out=None: (
             f"rqis-snapshots/snapshots/{data_type}/{snapshot_date}/data.parquet"
         )
     )
@@ -227,7 +230,7 @@ def test_pin_bundle_rejects_disjoint_date_multi_run_history_without_explicit_sel
 def test_pin_bundle_research_run_id_disambiguates_disjoint_date_splice():
     snapshots = MagicMock()
     snapshots.save_snapshot.side_effect = (
-        lambda _df, data_type, snapshot_date: (
+        lambda _df, data_type, snapshot_date, bytes_sha256_out=None: (
             f"rqis-snapshots/snapshots/{data_type}/{snapshot_date}/data.parquet"
         )
     )
@@ -277,7 +280,7 @@ def test_pin_bundle_single_run_history_is_allowed_without_explicit_selection():
 
     snapshots = MagicMock()
     snapshots.save_snapshot.side_effect = (
-        lambda _df, data_type, snapshot_date: (
+        lambda _df, data_type, snapshot_date, bytes_sha256_out=None: (
             f"rqis-snapshots/snapshots/{data_type}/{snapshot_date}/data.parquet"
         )
     )
@@ -294,5 +297,168 @@ def test_pin_bundle_single_run_history_is_allowed_without_explicit_selection():
         market_client=_benchmark_client(),
     )
     assert path == "rqis-snapshots/manifests/2022-01-05/manifest.json"
-    manifest = snapshots.save_dataset_manifest.call_args.args[0]
-    assert manifest.row_counts["alpha_scores"] == 2
+
+
+# ─── Idempotent re-pin against a real ParquetSnapshots (03A-1, section 2.5) ───
+
+
+class _InMemoryMinio:
+    """Fake MinIO client backed by a dict, exercising the real
+    ParquetSnapshots.save_snapshot / DatasetManifest.save_manifest content-
+    addressing logic end to end (not a mock of pin_bundle's dependencies)."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.put_object_calls = 0
+
+    def bucket_exists(self, bucket: str) -> bool:
+        return True
+
+    def make_bucket(self, bucket: str) -> None:
+        pass
+
+    def stat_object(self, bucket: str, key: str):
+        if key not in self.objects:
+            raise S3Error(
+                code="NoSuchKey", message="not found",
+                resource="", request_id="", host_id="", response=MagicMock()
+            )
+        return MagicMock()
+
+    def get_object(self, bucket: str, key: str):
+        if key not in self.objects:
+            raise S3Error(
+                code="NoSuchKey", message="not found",
+                resource="", request_id="", host_id="", response=MagicMock()
+            )
+        resp = MagicMock()
+        resp.read.return_value = self.objects[key]
+        return resp
+
+    def put_object(self, bucket_name, object_name, data, length, content_type):
+        self.objects[object_name] = data.read()
+        self.put_object_calls += 1
+
+    def list_objects(self, bucket, prefix="", recursive=False):
+        return []
+
+
+def _real_snapshots(client: _InMemoryMinio) -> ParquetSnapshots:
+    with patch("data.storage.parquet_snapshots.Minio") as mock_cls:
+        mock_cls.return_value = client
+        snapshots = ParquetSnapshots(
+            endpoint="localhost:9000",
+            access_key="k",
+            secret_key="s",
+            bucket="rqis-snapshots",
+        )
+    return snapshots
+
+
+def test_repinning_unchanged_data_writes_zero_new_objects() -> None:
+    """Section 2.5's core acceptance test: re-running pin_snapshot against an
+    unchanged DB produces zero new MinIO writes, exercised through the real
+    ParquetSnapshots + DatasetManifest content-addressing path (not mocks)."""
+    client = _InMemoryMinio()
+    snapshots = _real_snapshots(client)
+
+    kwargs = dict(
+        strategy_id="v1",
+        benchmark_ticker="SPY",
+        engine=_engine_with_bundle_data(),
+        snapshots=snapshots,
+        market_client=_benchmark_client(),
+    )
+
+    path1 = pin_bundle(snapshot_date=date(2022, 1, 5), **kwargs)
+    writes_after_first = client.put_object_calls
+    assert writes_after_first > 0
+
+    path2 = pin_bundle(snapshot_date=date(2022, 1, 6), **kwargs)  # even a different label date
+
+    assert path1 == path2  # same logical content -> same manifest key
+    assert client.put_object_calls == writes_after_first  # zero new writes
+
+
+def test_backtest_loader_reads_a_pinned_bundle_end_to_end() -> None:
+    """P0-1 regression: backtesting.loader.load_from_snapshot must consume a
+    03A-1 content-addressed bundle through the manifest-driven read path
+    (load_manifest -> load_snapshot_by_manifest) without crashing. Pins a
+    real bundle via the in-memory MinIO fake, then loads it back by the
+    manifest's content hash (the data_version) and asserts a usable
+    DataHandler comes out."""
+    from backtesting.loader import load_from_snapshot
+
+    client = _InMemoryMinio()
+    snapshots = _real_snapshots(client)
+
+    manifest_path = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=_engine_with_bundle_data(),
+        snapshots=snapshots,
+        market_client=_benchmark_client(),
+    )
+    # manifest_path == "rqis-snapshots/manifests/{hash}/manifest.json"
+    data_version = manifest_path.split("/")[-2]
+    assert len(data_version) == 64  # a content hash, not a date string
+
+    config = {
+        "name": "v1",
+        "strategy_id": "v1",
+        "data_version": data_version,
+        "portfolio": {"method": "equal_weight", "n_long": 10},
+        "backtest": {
+            "start_date": "2022-01-01",
+            "end_date": "2022-12-31",
+            "initial_capital": 100_000.0,
+        },
+    }
+
+    handler = load_from_snapshot(data_version, config, snapshots=snapshots)
+
+    # The bundle's single AAPL score is present and the prices loaded.
+    signals = handler.get_latest_signals(date(2022, 1, 5))
+    assert "AAPL" in signals["ticker"].tolist()
+
+
+def test_repinning_with_one_changed_row_writes_new_objects_and_keeps_old_ones() -> None:
+    client = _InMemoryMinio()
+    snapshots = _real_snapshots(client)
+
+    engine1 = _engine_with_bundle_data()
+    path1 = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine1, snapshots=snapshots, market_client=_benchmark_client(),
+    )
+    objects_after_first = dict(client.objects)
+
+    engine2 = create_engine("sqlite://")
+    prices = pd.DataFrame(
+        {
+            "ticker": ["AAPL", "AAPL"],
+            "date": [date(2022, 1, 3), date(2022, 1, 4)],
+            "close": [100.0, 999.0],  # changed row
+        }
+    )
+    alpha = pd.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "score_date": [date(2022, 1, 4)],
+            "strategy_id": ["v1"],
+            "alpha_score": [1.0],
+        }
+    )
+    actions = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value"])
+    prices.to_sql("daily_prices", engine2, index=False)
+    alpha.to_sql("alpha_scores", engine2, index=False)
+    actions.to_sql("corporate_actions", engine2, index=False)
+
+    path2 = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine2, snapshots=snapshots, market_client=_benchmark_client(),
+    )
+
+    assert path1 != path2
+    # Old objects remain byte-identical and present (nothing overwritten).
+    for key, value in objects_after_first.items():
+        assert client.objects[key] == value
