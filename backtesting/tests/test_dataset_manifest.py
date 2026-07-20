@@ -141,6 +141,43 @@ class TestBuildManifest:
             )
 
 
+class TestBytesSha256:
+    def test_bytes_sha256_populated_when_provided(self) -> None:
+        dataframes = _dataframes()
+        byte_hashes = {dt: f"deadbeef{dt}" for dt in dataframes}
+        manifest = build_manifest(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+            bytes_sha256=byte_hashes,
+        )
+        assert manifest.bytes_sha256 == byte_hashes
+
+    def test_bytes_sha256_excluded_from_manifest_identity(self) -> None:
+        """The nondeterministic byte hash must NOT influence
+        manifest_content_sha256, or two pins of identical logical data with
+        different parquet bytes would mint different manifest hashes and
+        break idempotency (P1-5)."""
+        from backtesting.dataset_manifest import _manifest_content_sha256
+
+        dataframes = _dataframes()
+        common = dict(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+        m1 = build_manifest(**common, bytes_sha256={dt: "aaaa" for dt in dataframes})
+        m2 = build_manifest(**common, bytes_sha256={dt: "bbbb" for dt in dataframes})
+
+        assert m1.bytes_sha256 != m2.bytes_sha256  # genuinely different byte hashes
+        assert _manifest_content_sha256(m1) == _manifest_content_sha256(m2)
+        assert m1.manifest_content_sha256 == m2.manifest_content_sha256
+
+
 class TestSaveLoadManifestRoundTrip:
     def test_save_then_load_round_trips(self) -> None:
         dataframes = _dataframes()

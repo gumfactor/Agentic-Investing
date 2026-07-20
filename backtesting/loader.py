@@ -8,23 +8,29 @@ DataHandler so the backtest engine always operates on split- and
 dividend-adjusted closes.  Using unadjusted prices in a backtest produces
 fictitious P&L wherever a split occurs (Codex finding #3).
 
-Snapshot convention
--------------------
-All data types share a single snapshot date (the data_version), which is the
-date the snapshots were pinned.  The MinIO paths are:
+Snapshot convention (03A-1, content-addressed)
+----------------------------------------------
+`data_version` is a `DatasetManifest.manifest_content_sha256` -- the content
+hash of the pinned bundle's manifest (`manifests/{data_version}/manifest.json`).
+The manifest records, per data type, the canonical LOGICAL content hash of
+that dataframe; the loader resolves the manifest and loads each data type by
+its manifest-recorded content hash via
+`ParquetSnapshots.load_snapshot_by_manifest`, which re-verifies the
+downloaded content's hash on the way in (tamper-evidence, section 2.3).
 
-    rqis-snapshots/snapshots/daily_prices/{data_version}/data.parquet
-    rqis-snapshots/snapshots/corporate_actions/{data_version}/data.parquet
-    rqis-snapshots/snapshots/alpha_scores/{data_version}/data.parquet
-    rqis-snapshots/snapshots/benchmark/{data_version}/data.parquet
+    rqis-snapshots/manifests/{data_version}/manifest.json
+    rqis-snapshots/snapshots/{data_type}/sha256/{h2}/{content_hash}/data.parquet
 
-The corporate_actions snapshot is optional: if absent, an empty frame is
-used and all adj_factors default to 1.0 (no adjustment).
+The corporate_actions snapshot is optional: if the manifest has no
+corporate_actions entry, or the referenced object is absent, an empty frame
+is used and all adj_factors default to 1.0 (no adjustment). (Narrowing this
+optional path to only genuine not-found errors -- so an infra/auth failure
+can no longer masquerade as "no corporate actions" -- is BUG-039's fix,
+scoped to 03A-2; 03A-1 preserves the existing optional-frame behavior.)
 """
 
 from __future__ import annotations
 
-from datetime import date
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -51,8 +57,10 @@ def load_from_snapshot(
     """Load a DataHandler from versioned MinIO snapshots with price adjustment.
 
     Args:
-        data_version: Snapshot date string ('YYYY-MM-DD').  All required data
-            types must have a snapshot pinned on this date.
+        data_version: A ``DatasetManifest.manifest_content_sha256`` -- the
+            content hash identifying the pinned bundle's manifest. All
+            required data types are loaded by the content hash the manifest
+            records for them.
         config: Strategy config dict. Used to filter alpha_scores by
             ``strategy_id``, then ``name``, or ``"v1"`` as fallback.
         snapshots: ParquetSnapshots instance.  If None, one is created from
@@ -86,7 +94,6 @@ def load_from_snapshot(
 
         snapshots = ParquetSnapshots()
     snaps = snapshots
-    snap_date = date.fromisoformat(data_version)
     strategy_id = config.get("strategy_id", config.get("name", "v1"))
 
     logger.info(
@@ -95,11 +102,17 @@ def load_from_snapshot(
         strategy_id=strategy_id,
     )
 
+    # ── Resolve the bundle manifest, then load each data type by the content
+    #    hash the manifest recorded for it (03A-1 content addressing). ─────────
+    from backtesting.dataset_manifest import load_manifest  # lazy: avoids minio
+
+    manifest = load_manifest(data_version, snaps._client, snaps._bucket)
+
     # ── Load raw snapshots ────────────────────────────────────────────────────
-    prices_raw = snaps.load_snapshot("daily_prices", snap_date)
+    prices_raw = snaps.load_snapshot_by_manifest(manifest, "daily_prices")
 
     try:
-        corp_actions = snaps.load_snapshot("corporate_actions", snap_date)
+        corp_actions = snaps.load_snapshot_by_manifest(manifest, "corporate_actions")
     except FileNotFoundError:
         logger.warning(
             "loader_no_corp_actions",
@@ -110,8 +123,8 @@ def load_from_snapshot(
             columns=["ticker", "ex_date", "action_type", "value"]
         )
 
-    alpha_scores = snaps.load_snapshot("alpha_scores", snap_date)
-    benchmark = snaps.load_snapshot("benchmark", snap_date)
+    alpha_scores = snaps.load_snapshot_by_manifest(manifest, "alpha_scores")
+    benchmark = snaps.load_snapshot_by_manifest(manifest, "benchmark")
 
     # ── Filter alpha_scores to this strategy ─────────────────────────────────
     # The strategy_id column is required by the alpha_scores schema (migration 002).

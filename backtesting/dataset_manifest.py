@@ -142,6 +142,7 @@ def build_manifest(
     dataframes: dict[str, pd.DataFrame],
     object_paths: dict[str, str],
     snapshot_dates: dict[str, date],
+    bytes_sha256: Optional[dict[str, str]] = None,
 ) -> DatasetManifest:
     """Build a DatasetManifest from already-loaded DataFrames.
 
@@ -151,6 +152,12 @@ def build_manifest(
         dataframes: Mapping of data_type → loaded DataFrame.
         object_paths: Mapping of data_type → MinIO object path.
         snapshot_dates: Mapping of data_type → snapshot date (``date`` object).
+        bytes_sha256: Optional mapping of data_type → SHA-256 of the stored
+            parquet carrier bytes, as emitted by
+            ``ParquetSnapshots.save_snapshot(..., bytes_sha256_out=...)``.
+            Informational only (section 2.1 trade-off): recorded on the
+            manifest so out-of-band byte churn is observable, but excluded
+            from ``manifest_content_sha256`` because it is nondeterministic.
 
     Returns:
         DatasetManifest ready to save via save_manifest().
@@ -206,6 +213,7 @@ def build_manifest(
         schema_hashes=schema_hashes,
         alpha_scores_sha256=scores_hash,
         content_sha256=content_hashes,
+        bytes_sha256=dict(bytes_sha256) if bytes_sha256 else {},
     )
     manifest.manifest_content_sha256 = _manifest_content_sha256(manifest)
     return manifest
@@ -227,6 +235,12 @@ _IDENTITY_EXCLUDED_FIELDS = frozenset(
         "snapshot_dates",
         "legacy_mutable",
         "manifest_content_sha256",
+        # bytes_sha256 is a NONDETERMINISTIC parquet-byte hash (writer
+        # version/footer/compression vary run-to-run). It MUST stay out of
+        # the manifest identity hash: including it would give two pins of
+        # identical logical data two different manifest_content_sha256
+        # values, silently destroying the section 2.5 idempotency guarantee.
+        "bytes_sha256",
     }
 )
 

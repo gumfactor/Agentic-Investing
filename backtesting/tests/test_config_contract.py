@@ -345,11 +345,52 @@ def test_engine_run_rejects_execution_mismatch() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _fake_manifest_client():
+    """A fake MinIO client whose get_object returns a minimal valid manifest
+    JSON, so backtesting.loader's manifest resolution (load_manifest) succeeds
+    without a live object store. The manifest's content hashes are unused here
+    because load_snapshot_by_manifest is stubbed to serve frames directly."""
+    import json
+    from dataclasses import asdict
+    from unittest.mock import MagicMock
+
+    from backtesting.dataset_manifest import DatasetManifest
+
+    manifest = DatasetManifest(
+        version="test",
+        created_at="",
+        git_commit="",
+        strategy_id="v1",
+        snapshot_dates={},
+        object_paths={},
+        row_counts={},
+        date_ranges={},
+        schema_hashes={},
+        content_sha256={
+            "daily_prices": "0" * 64,
+            "alpha_scores": "0" * 64,
+            "corporate_actions": "0" * 64,
+            "benchmark": "0" * 64,
+        },
+        manifest_content_sha256="0" * 64,
+    )
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(asdict(manifest)).encode()
+    client = MagicMock()
+    client.get_object.return_value = resp
+    return client
+
+
 class _StubSnapshots:
     """Minimal ParquetSnapshots stand-in for loader fail-closed tests."""
 
     def __init__(self, alpha_scores: "pd.DataFrame") -> None:
         self._alpha_scores = alpha_scores
+        self._client = _fake_manifest_client()
+        self._bucket = "test-bucket"
+
+    def load_snapshot_by_manifest(self, _manifest, data_type: str) -> "pd.DataFrame":
+        return self.load_snapshot(data_type, None)
 
     def load_snapshot(self, data_type: str, snap_date: Any) -> "pd.DataFrame":
         import pandas as pd
