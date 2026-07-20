@@ -49,7 +49,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-017 | Trading Safety | P1 | F1 | Fixed | Quantity reduction updates one field while validation checks another. |
 | BUG-036 | Packaging/CI | P0 | F0 | Fixed | Invalid PEP 517 backend blocks package builds. |
 | BUG-037 | Data/Storage | P1 | F1 | Fixed (PR #37, merged 2026-07-20) | Same-date corporate actions overwrite one another. Fixed: product-of-multipliers accumulation + POST_SPLIT convention (operator-signed-off). Residuals tracked in BUG-076. |
-| BUG-038 | Data/Storage | P1 | F1 | Implemented-pending-review | Snapshot version paths are mutable. |
+| BUG-038 | Data/Storage | P1 | F1 | Fixed (PR #38, merged 2026-07-20) | Snapshot version paths are mutable. Fixed: content-addressed canonical-logical-hash object keys + immutable manifest + load-time integrity verification (manifest and leaf). Hostile review hardened injective encoding + manifest-root verification. |
 | BUG-039 | Backtesting | P1 | F1 | Open | Object-store failures can become unadjusted backtests. |
 | BUG-040 | Trading Safety | P1 | F1 | Fixed | Wash-sale guard checks the wrong order direction. |
 | BUG-055 | Trading Safety | P0 | F0 | Fixed | prices_json=None crashes _write_simulation before error handler, blocking ExternalTaskSensor. |
@@ -105,6 +105,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-074 | Research/Signals | P2 | F2 | Open | Registered operational methodology labels action_source_version as plain "unknown", imprecise for a DB with migrated legacy corporate_actions rows tagged "legacy_unknown". |
 | BUG-075 | Backtesting | P0 | F0 | Fixed (PR #36, merged 2026-07-20) | Backtest path silently ignored strategy-config fields it does not implement (`portfolio.method: mvo`/`risk_parity`, `optimizer_mode`, `constraints`, `risk_model`, live-only `execution` fields) instead of rejecting them — a backtest labeled "mvo with sector caps" was actually an uncapped equal-weight backtest. |
 | BUG-076 | Data/Storage | P2 | F2 | Open | Residual of BUG-037: same-date ordinary split+dividend boundary untested against a real row; Yahoo spinoffs modeled as same-date split+dividend rows are normalized as ordinary split+dividend. Includes P2 sub-notes on silently-ignored NaN dividend/zero split ratio and the §2.3×§3.1 cutoff/convention interaction. |
+| BUG-077 | Data/Storage | P3 | F3 | Open (fold into 03A-2) | `load_manifest`'s content-addressed predicate is `^[0-9a-f]{64}$`, so an uppercase-hex or 64-char-non-hex `data_version` silently drops to the legacy unverified path. Not exploitable (pipeline emits only lowercase hexdigest; MinIO keys are case-sensitive so an uppercase key cannot alias the genuine object). Harden by rejecting non-canonical-hex versions rather than treating them as legacy. Found by 03A-1 hostile re-verification (PR #38). |
 
 #### Long-term / lower-risk backlog
 
