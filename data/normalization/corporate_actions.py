@@ -207,6 +207,19 @@ def _combine_same_date_action_multipliers(
         ex_close_d = Decimal(str(ex_close))
         for _, action in dividends.iterrows():
             raw_value = Decimal(str(action["value"]))
+            # NOTE (reachability, BUG-076): `dividend_quoting_convention` is a
+            # FORWARD-LOOKING hook. It is NOT selected by any live DB read path
+            # today — the Airflow score/simulation queries and
+            # scripts/validate_signal_ic.py select only ticker, ex_date,
+            # action_type, value, known_at, source_version, and no migration or
+            # writer creates this column. So for every DB-sourced row the
+            # convention is absent -> the POST_SPLIT default (operator
+            # signed-off 2026-07-20), and the `pre_split` normalization and
+            # AmbiguousSameDateActionError branches are exercised ONLY by
+            # explicit in-memory callers/tests. Wiring this to real data (a
+            # column migration + query updates + an actual dated pre_split
+            # source) is tracked as future work in BUG-076; do not treat this
+            # override as active on DB rows until then.
             convention = action.get("dividend_quoting_convention") if hasattr(action, "get") else None
             # Treat every "absent" marker uniformly as default (post_split):
             # None, float NaN, AND pandas' pd.NA (the missing-value sentinel of

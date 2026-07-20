@@ -1238,6 +1238,28 @@ does NOT swallow the exception (verified by reviewer). See BUG-076 P2 note.
 **Also tracked here (P2 sub-notes, pre-existing / future-work, no code change
 on the 03A-3 branch):**
 
+- **The `dividend_quoting_convention` override is not wired to any DB read
+  path** (Codex review round-2 P2, 2026-07-20). The optional
+  `dividend_quoting_convention` column that drives `pre_split` normalization
+  and the `AmbiguousSameDateActionError` fail-closed branch is a
+  **forward-looking hook only**: it is never `SELECT`ed by the live DB read
+  paths (the Airflow score/simulation queries in
+  `airflow/dags/daily_signal_pipeline.py` and
+  `scripts/validate_signal_ic.py` all select only `ticker, ex_date,
+  action_type, value, known_at, source_version`), and no migration or writer
+  creates the column. Consequently, for every real DB-sourced row the
+  convention is always absent -> the `POST_SPLIT` default (operator
+  signed-off 2026-07-20), and the `pre_split` and
+  `AmbiguousSameDateActionError` branches are exercised only by explicit
+  in-memory callers and tests. This is intentional for this slice — no
+  `pre_split` data source exists yet, so gold-plating a migration + query
+  changes now would be speculative. Fully activating the override (a column
+  migration, updated SELECTs across all read paths, a writer, and a real
+  dated `pre_split` source to justify it) is tracked future work. A code
+  comment at the convention-lookup site in
+  `data/normalization/corporate_actions.py` records the same reachability
+  gap so it is not mistaken for an active DB-wired path.
+
 - **NaN dividend / zero-or-negative split ratio are silently ignored**
   (adversarial review P2-3, pre-existing, not a regression). In
   `_combine_same_date_action_multipliers` / `compute_adjustment_factors`, a
