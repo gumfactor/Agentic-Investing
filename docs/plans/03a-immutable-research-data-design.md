@@ -627,8 +627,11 @@ on the 03A implementation phases.
    with `universe_import_batches`-style provenance per §5.1.
 4. **Legacy snapshot retention:** retain-forever in local MinIO accepted for
    now; no archival policy in 03A.
-5. **MinIO Object Lock / WORM:** pending — operator requested a fuller
-   explanation before deciding; not a blocker for any 03A phase.
+5. **MinIO Object Lock / WORM:** deferred to the independent live-readiness
+   security review (roadmap row 12), per operator decision 2026-07-20 after a
+   full trade-off explanation. 03A's application-level immutability
+   (content-addressed keys + load-time hash verification) is accepted as
+   sufficient until then; no locked-bucket migration inside 03A.
 6. **`allow_missing_corporate_actions`:** extend the explicit opt-in
    treatment to the research scripts (`scripts/validate_signal_ic.py` and
    sibling 01B-3 callers) **inside 03A-2**, not as a follow-up.
