@@ -14,10 +14,22 @@ unversioned — a run could be "reproduced" with stale or corrected signals
 while appearing to use the same data_version.  The manifest bundles all four
 sources into a single versioned object.
 
-Manifest path convention
-------------------------
-    {bucket}/manifests/{version}/manifest.json
-    e.g. rqis-snapshots/manifests/2026-06-10/manifest.json
+Manifest path convention (03A-1, content-addressed — BUG-038)
+---------------------------------------------------------------
+    {bucket}/manifests/{manifest_content_sha256}/manifest.json
+    e.g. rqis-snapshots/manifests/3fae.../manifest.json
+
+`manifest_content_sha256` is the SHA-256 of the manifest's own canonical JSON
+(every field except itself); it is the value passed as MLflow `data_version`
+going forward (C7), replacing the old caller-supplied date string. A mutable
+advisory pointer, `manifests/latest/{strategy_id}.json`, may point at the
+newest manifest for a strategy but is never itself a `data_version`.
+
+Legacy manifests written before 03A-1 used a caller-supplied `version` date
+string as both the manifest key and the (mutable) snapshot object keys; those
+objects/manifests are left in place read-only and load as before, but must be
+flagged `legacy_mutable` (see `scripts/backfill_legacy_manifests.py`) and are
+never eligible to be produced by `build_manifest`/`save_manifest` again.
 
 Usage
 -----
@@ -29,11 +41,11 @@ Usage
         object_paths={"daily_prices": "rqis-snapshots/snapshots/...", ...},
         snapshot_dates={"daily_prices": date(2026, 6, 10), ...},
     )
-    manifest_path = save_manifest(manifest, minio_client)
+    manifest_path = save_manifest(manifest, minio_client, bucket)
+    data_version = manifest.manifest_content_sha256  # pass to BacktestLogger.log_run()
 
     # When loading for a backtest:
-    manifest = load_manifest("2026-06-10", minio_client)
-    data_version = manifest_path  # pass to BacktestLogger.log_run()
+    manifest = load_manifest(data_version, minio_client, bucket)
 """
 
 from __future__ import annotations
@@ -41,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
@@ -48,6 +61,8 @@ from typing import Optional
 
 import pandas as pd
 import structlog
+
+from data.storage.canonical_hash import canonical_content_sha256
 
 logger = structlog.get_logger(__name__)
 
@@ -62,11 +77,24 @@ _DATE_COL = {
     "benchmark": "date",
 }
 
+# Matches the content-addressed key produced by ParquetSnapshots._content_key,
+# used to cross-check that an object_path's embedded hash agrees with the
+# manifest's independently-computed content_sha256 (section 2.2: "the
+# manifest's recorded canonical hash and the object key's hash are the same
+# value by construction ... save_manifest checks that equality rather than
+# merely asserting it").
+_CONTENT_KEY_RE = re.compile(r"/sha256/[0-9a-f]{2}/([0-9a-f]{64})/data\.parquet$")
+
+
+def _extract_key_hash(object_path: str) -> Optional[str]:
+    match = _CONTENT_KEY_RE.search(object_path)
+    return match.group(1) if match else None
+
 
 @dataclass
 class DatasetManifest:
     """Complete record of all data sources used in one backtest run."""
-    version: str                         # snapshot date, e.g. "2026-06-10"
+    version: str                         # human-readable label, e.g. "2026-06-10"
     created_at: str                      # ISO 8601 UTC timestamp
     git_commit: str                      # HEAD sha or "unknown"
     strategy_id: str
@@ -76,8 +104,36 @@ class DatasetManifest:
     date_ranges: dict[str, list[str]]    # data_type → [min_date, max_date]
     schema_hashes: dict[str, str]        # data_type → sha256[:16] of sorted columns
     # SHA-256 of (score_date, ticker, alpha_score) rows sorted deterministically.
-    # Detects any post-snapshot mutation of score values; "" for legacy manifests.
+    # Kept for backward compatibility with legacy manifests; content_sha256
+    # ["alpha_scores"] is the same value going forward. "" for legacy manifests
+    # that predate this field.
     alpha_scores_sha256: str = ""
+    # 03A-1: canonical LOGICAL content hash (section 2.1) per data type, for
+    # all four bundle types -- generalizes alpha_scores_sha256 to the whole
+    # bundle. This is also the hash embedded in each object's content-
+    # addressed key.
+    content_sha256: dict[str, str] = field(default_factory=dict)
+    # 03A-1: secondary, informational SHA-256 of the uploaded parquet bytes
+    # per data type. Never used for keys or load-time gating (section 2.1
+    # trade-off) -- recorded only so out-of-band byte churn is observable.
+    bytes_sha256: dict[str, str] = field(default_factory=dict)
+    # 03A-5 (not wired in this phase): FKs linking this bundle to the exact
+    # PIT membership/eligibility batches used to build it. Nullable/unused
+    # until 03A-4/03A-5 land.
+    eligibility_batch_id: Optional[int] = None
+    membership_import_batch_id: Optional[int] = None
+    research_methodology_id: Optional[int] = None
+    # 03A-1: True only for manifests written before content addressing
+    # (backfilled by scripts/backfill_legacy_manifests.py), or manifests
+    # built under legacy_mutable=True explicitly. False for all manifests
+    # produced by this module going forward.
+    legacy_mutable: bool = False
+    # 03A-1: SHA-256 of this manifest's own canonical JSON (every field
+    # except this one). This is the value used as MLflow data_version and as
+    # the manifest object key (manifests/{manifest_content_sha256}/manifest.json).
+    # "" until save_manifest/build_manifest compute it; legacy manifests use
+    # their date-string `version` as their key instead and leave this "".
+    manifest_content_sha256: str = ""
 
 
 def build_manifest(
@@ -102,6 +158,7 @@ def build_manifest(
     row_counts: dict[str, int] = {}
     date_ranges: dict[str, list[str]] = {}
     schema_hashes: dict[str, str] = {}
+    content_hashes: dict[str, str] = {}
 
     for data_type, df in dataframes.items():
         row_counts[data_type] = len(df)
@@ -115,11 +172,29 @@ def build_manifest(
         schema_hashes[data_type] = hashlib.sha256(
             "|".join(sorted(df.columns)).encode()
         ).hexdigest()[:16]
+        content_hashes[data_type] = canonical_content_sha256(df, data_type)
+
+        # section 2.2: the manifest's independently-computed content hash and
+        # the hash embedded in the object's content-addressed key must be the
+        # same value by construction; check that equality rather than merely
+        # asserting it.
+        object_path = object_paths.get(data_type)
+        if object_path:
+            key_hash = _extract_key_hash(object_path)
+            if key_hash is not None and key_hash != content_hashes[data_type]:
+                raise ValueError(
+                    f"Content hash mismatch for data_type={data_type!r}: "
+                    f"object_path {object_path!r} encodes hash {key_hash}, "
+                    f"but the dataframe's canonical content hash is "
+                    f"{content_hashes[data_type]}. Refusing to build a "
+                    "manifest whose recorded hash disagrees with the object "
+                    "it points at."
+                )
 
     alpha_df = dataframes.get("alpha_scores", pd.DataFrame())
-    scores_hash = _alpha_scores_hash(alpha_df)
+    scores_hash = content_hashes.get("alpha_scores") or _alpha_scores_hash(alpha_df)
 
-    return DatasetManifest(
+    manifest = DatasetManifest(
         version=version,
         created_at=datetime.now(timezone.utc).isoformat(),
         git_commit=_git_commit(),
@@ -130,11 +205,24 @@ def build_manifest(
         date_ranges=date_ranges,
         schema_hashes=schema_hashes,
         alpha_scores_sha256=scores_hash,
+        content_sha256=content_hashes,
     )
+    manifest.manifest_content_sha256 = _manifest_content_sha256(manifest)
+    return manifest
+
+
+def _manifest_content_sha256(manifest: DatasetManifest) -> str:
+    """SHA-256 of the manifest's canonical JSON, excluding the
+    `manifest_content_sha256` field itself (section 2.2)."""
+    payload = asdict(manifest)
+    payload.pop("manifest_content_sha256", None)
+    canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
-    """Serialise and write manifest to MinIO.
+    """Serialise and write manifest to MinIO, content-addressed by
+    `manifest_content_sha256` (03A-1 -- BUG-038).
 
     Args:
         manifest: Built by build_manifest().
@@ -142,10 +230,57 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
         bucket: Target bucket (e.g. "rqis-snapshots").
 
     Returns:
-        Full MinIO path "bucket/manifests/{version}/manifest.json".
+        Full MinIO path "bucket/manifests/{manifest_content_sha256}/manifest.json"
+        (or, for a manifest explicitly marked `legacy_mutable`, the legacy
+        "bucket/manifests/{version}/manifest.json" path).
+
+    Raises:
+        ValueError: if `manifest.manifest_content_sha256` is unset/empty for
+            a non-legacy manifest (build_manifest always sets it; a manifest
+            constructed by hand without going through build_manifest must
+            call `_manifest_content_sha256` itself first), or if an object
+            already exists at the computed key with *different* bytes
+            (should be structurally impossible since the key derives from
+            the hash; this is defense against a hash-collision-shaped bug).
     """
-    key = f"manifests/{manifest.version}/manifest.json"
+    if manifest.legacy_mutable:
+        key = f"manifests/{manifest.version}/manifest.json"
+    else:
+        if not manifest.manifest_content_sha256:
+            raise ValueError(
+                "manifest.manifest_content_sha256 is unset; build the "
+                "manifest via build_manifest() or compute it explicitly "
+                "before calling save_manifest()."
+            )
+        key = f"manifests/{manifest.manifest_content_sha256}/manifest.json"
+
     payload = json.dumps(asdict(manifest), indent=2).encode()
+
+    existing_bytes: Optional[bytes] = None
+    try:
+        existing = minio_client.get_object(bucket, key)
+        existing_bytes = existing.read()
+    except Exception:  # noqa: BLE001 - broad: any "not found"-shaped client
+        # error means the object doesn't exist yet; fall through to write it.
+        # minio.error.S3Error is the real-world case, but tests use a variety
+        # of fake-client exception types for "not found".
+        existing_bytes = None
+
+    if existing_bytes is not None:
+        if existing_bytes == payload:
+            logger.info("manifest_write_skipped_content_exists", path=f"{bucket}/{key}")
+            return f"{bucket}/{key}"
+        if not manifest.legacy_mutable:
+            raise ValueError(
+                f"Object already exists at content-addressed manifest key "
+                f"{bucket}/{key} with different bytes than the manifest "
+                "being saved. This should be structurally impossible since "
+                "the key derives from the manifest's own content hash; "
+                "refusing to overwrite."
+            )
+        # legacy_mutable manifests intentionally keep pre-03A-1 overwrite
+        # semantics at this key (date-string keyed), so fall through.
+
     buf = io.BytesIO(payload)
     minio_client.put_object(
         bucket_name=bucket,
@@ -155,12 +290,23 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
         content_type="application/json",
     )
     path = f"{bucket}/{key}"
-    logger.info("manifest_saved", path=path, version=manifest.version)
+    logger.info(
+        "manifest_saved",
+        path=path,
+        version=manifest.version,
+        manifest_content_sha256=manifest.manifest_content_sha256,
+    )
     return path
 
 
 def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
-    """Load a manifest from MinIO by version string.
+    """Load a manifest from MinIO by its key.
+
+    For manifests produced by this module's `build_manifest`/`save_manifest`
+    (03A-1 onward), `version` must be the manifest's `manifest_content_sha256`
+    (i.e. the MLflow `data_version` value) — that is the manifest's actual
+    object key going forward. For pre-03A-1 `legacy_mutable` manifests,
+    `version` is still the original caller-supplied date string.
 
     Raises:
         FileNotFoundError: if no manifest exists for version.
