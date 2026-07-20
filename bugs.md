@@ -103,7 +103,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-072 | Dashboard/API | P2 | F2 | Fixed | All alpha/factor-score readers (dashboards, `scripts/indicator_diagnostic.py`) now filter to the active research run by default; `--all-runs`/`--research-run-id` are the only documented explicit opt-ins for cross-run reads. |
 | BUG-073 | Packaging/CI | P1 | F1 | Fixed | `pyproject.toml`'s pytest `testpaths` silently excluded ~412 tests (all of `tests/reporting/dashboards/`, `tests/infra/`) from every "full suite" run whenever a subdirectory (`tests/strategy_registry`) was also listed as its own testpath entry. |
 | BUG-074 | Research/Signals | P2 | F2 | Open | Registered operational methodology labels action_source_version as plain "unknown", imprecise for a DB with migrated legacy corporate_actions rows tagged "legacy_unknown". |
-| BUG-075 | Backtesting | P0 | F0 | Implemented — pending review (branch `dev/R2-02B-config-failclosed`) | Backtest path silently ignored strategy-config fields it does not implement (`portfolio.method: mvo`/`risk_parity`, `optimizer_mode`, `constraints`, `risk_model`, live-only `execution` fields) instead of rejecting them — a backtest labeled "mvo with sector caps" was actually an uncapped equal-weight backtest. |
+| BUG-075 | Backtesting | P0 | F0 | Fixed (PR #36, merged 2026-07-20) | Backtest path silently ignored strategy-config fields it does not implement (`portfolio.method: mvo`/`risk_parity`, `optimizer_mode`, `constraints`, `risk_model`, live-only `execution` fields) instead of rejecting them — a backtest labeled "mvo with sector caps" was actually an uncapped equal-weight backtest. |
 
 #### Long-term / lower-risk backlog
 
