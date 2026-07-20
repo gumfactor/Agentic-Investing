@@ -52,6 +52,34 @@ canonical case: ``portfolio.method`` set to anything other than
 ``"equal_weight"``, since ``_select_equal_weight`` is the only construction
 method the engine actually runs).
 
+What counts as "read" (adversarial-review sweep, 02B round 2)
+-------------------------------------------------------------
+Every classification below was audited against the actual keyed reads in
+``backtesting/loader.py``, ``backtesting/engine/event_loop.py``,
+``backtesting/experiment_tracking/mlflow_logger.py``,
+``backtesting/validation/walk_forward.py``, and
+``backtesting/validation/parameter_sensitivity.py``. A field is CONSUMED
+iff some backtest-path code reads it BY KEY -- whether to change behavior
+(``portfolio.n_long``) or to individually label a persisted record
+(``version`` -> the ``strategy_version`` MLflow tag). Bulk verbatim
+recording does NOT count: ``_log_params_flat``, the ``config.json`` MLflow
+artifact, and ``config_hash`` copy the ENTIRE config without interpreting
+any specific key, so "it appears in the params dump" is true of every
+field and distinguishes nothing. INFORMATIONAL therefore means: no keyed
+read anywhere in the backtest path (verified by grep for each field), only
+possibly the verbatim bulk copies.
+
+``execution.*`` is a special case: no backtest-path code reads
+``config["execution"]`` to CONSTRUCT the ``FillSimulator`` (callers build
+it directly and pass it in). Classifying it CONSUMED is made true not by a
+construction-time read but by :func:`assert_fill_simulator_matches_config`,
+which ``BacktestEngine.run`` calls to fail closed whenever a config
+declares ``execution:`` parameters that differ from what the passed
+simulator will actually apply. Relabeling it INFORMATIONAL instead was
+explicitly rejected: declared cost parameters that may silently not match
+the simulator is exactly the mislabeling defect this module exists to
+kill.
+
 Call sites (Roadmap 02B inventory, backtest path only -- the live/paper
 execution path in ``execution/``/``portfolio/`` already implements MVO etc.
 and is out of scope here):
@@ -93,12 +121,36 @@ class UnsupportedStrategyConfigError(Exception):
     """
 
 
+class ExecutionConfigMismatchError(UnsupportedStrategyConfigError):
+    """Raised by :func:`assert_fill_simulator_matches_config` when a config
+    declares ``execution:`` cost parameters that differ from what the
+    ``FillSimulator`` instance actually about to run will apply (02B
+    round-2 P0-1). Subclasses :class:`UnsupportedStrategyConfigError` so it
+    inherits the same cannot-be-swallowed propagation semantics.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Top-level scalar fields (no nested walk).
 # ---------------------------------------------------------------------------
 _TOP_LEVEL_FIELDS: dict[str, str] = {
-    "name": INFORMATIONAL,
-    "version": INFORMATIONAL,
+    # CONSUMED (02B round-2 P0-2): backtesting/loader.py uses `name` as the
+    # alpha_scores strategy_id filter fallback
+    # (`config.get("strategy_id", config.get("name", "v1"))`), and
+    # BacktestLogger reads it for the `strategy_name` MLflow tag. A wrong
+    # `name` therefore changes WHICH SCORES the backtest trades, not just a
+    # label. The fallback is kept (rather than requiring an explicit
+    # `strategy_id` in every config) because v1_base_momentum.yaml must
+    # keep working unchanged and its stored score rows are keyed by its
+    # display name; the loader now fails closed when the resolved id
+    # matches zero score rows, so a name/stored-id mismatch can no longer
+    # silently produce a cash-only backtest. Prefer declaring an explicit
+    # top-level `strategy_id` in new configs.
+    "name": CONSUMED,
+    # CONSUMED (02B round-2 sweep): read by key in BacktestLogger for the
+    # `strategy_version` MLflow tag -- a record-labeling read, but a keyed
+    # read nonetheless; a wrong version misattributes every logged run.
+    "version": CONSUMED,
     "description": INFORMATIONAL,
     "created": INFORMATIONAL,
     # Top-level data_version: read directly by BacktestEngine.run
@@ -143,8 +195,12 @@ _SUPPORTED_PORTFOLIO_METHOD = "equal_weight"
 
 # ---------------------------------------------------------------------------
 # `execution:` section -- maps 1:1 to FillSimulator's constructor kwargs
-# (see backtesting/engine/fill_simulator.py and the documented wiring in
-# .claude/skills/backtest.md's "Programmatic usage" section).
+# (see backtesting/engine/fill_simulator.py). CONSUMED is made true by
+# assert_fill_simulator_matches_config (called from BacktestEngine.run),
+# NOT by any construction-time read: callers build the FillSimulator
+# directly and pass it in, so without that assertion the declared values
+# were unverifiable claims (02B round-2 P0-1). The dict values are the
+# FillSimulator attribute names each declared key must match.
 # ---------------------------------------------------------------------------
 _EXECUTION_FIELDS: dict[str, str] = {
     "fill_model": CONSUMED,
@@ -152,6 +208,21 @@ _EXECUTION_FIELDS: dict[str, str] = {
     "market_impact_coeff": CONSUMED,
     "commission_per_share": CONSUMED,
 }
+
+# Declared `execution:` key -> FillSimulator introspection attribute whose
+# actual value it must equal. Keys here must stay in lockstep with
+# _EXECUTION_FIELDS' CONSUMED entries.
+_EXECUTION_KEY_TO_SIM_ATTR: dict[str, str] = {
+    "fill_model": "fill_model",
+    "bid_ask_spread_bps": "bid_ask_spread_bps",
+    "market_impact_coeff": "market_impact_coeff",
+    "commission_per_share": "commission_per_share",
+}
+
+# Relative tolerance for numeric declared-vs-actual comparison. Tight
+# enough that any real configuration difference fails; loose enough that a
+# YAML float's repr round-trip cannot.
+_EXECUTION_NUMERIC_RTOL = 1e-9
 
 # ---------------------------------------------------------------------------
 # `backtest:` section.
@@ -248,6 +319,96 @@ def validate_backtest_config(config: Mapping[str, Any]) -> None:
         )
 
 
+def assert_fill_simulator_matches_config(
+    config: Mapping[str, Any], fill_simulator: Any
+) -> None:
+    """Fail closed unless every ``execution:`` parameter a config declares
+    matches what ``fill_simulator`` will actually apply (02B round-2 P0-1).
+
+    ``BacktestEngine.run`` calls this right after
+    :func:`validate_backtest_config`. Because callers construct the
+    ``FillSimulator`` themselves and pass it in, nothing else guarantees
+    the declared cost parameters describe the simulator actually used --
+    without this check a config declaring ``fill_model: transaction_cost``
+    with 10 bps of spread could silently run (and be MLflow-logged) against
+    a zero-cost ``perfect`` simulator, or vice versa. Only the keys the
+    config actually declares are checked; a config with no ``execution:``
+    section declares nothing about costs and passes vacuously.
+
+    Args:
+        config: Strategy config dict (already contract-validated, so any
+            ``execution`` section contains only known keys).
+        fill_simulator: The simulator instance about to be used. Must
+            expose the read-only introspection properties added to
+            ``FillSimulator`` (``fill_model``, ``bid_ask_spread_bps``,
+            ``market_impact_coeff``, ``commission_per_share``); an object
+            that does not is rejected rather than trusted blind.
+
+    Raises:
+        ExecutionConfigMismatchError: a declared parameter differs from the
+            simulator's actual value, or the simulator does not expose the
+            attribute needed to verify a declared parameter.
+    """
+    execution_cfg = config.get("execution")
+    if not execution_cfg:
+        return
+
+    mismatches: list[str] = []
+    for key, value in execution_cfg.items():
+        attr = _EXECUTION_KEY_TO_SIM_ATTR.get(key)
+        if attr is None:
+            # validate_backtest_config already rejects unknown execution
+            # keys; reaching here means it was not called first. Fail
+            # closed anyway rather than skipping silently.
+            mismatches.append(
+                f"execution.{key} is declared but has no known FillSimulator "
+                "attribute mapping -- run validate_backtest_config first."
+            )
+            continue
+        try:
+            actual = getattr(fill_simulator, attr)
+        except AttributeError:
+            mismatches.append(
+                f"execution.{key}={value!r} is declared but the supplied "
+                f"fill simulator ({type(fill_simulator).__name__}) does not "
+                f"expose a readable '{attr}' attribute, so the declaration "
+                "cannot be verified. Unverifiable is treated as mismatched."
+            )
+            continue
+        if not _execution_values_equal(value, actual):
+            mismatches.append(
+                f"execution.{key}: config declares {value!r} but the "
+                f"supplied fill simulator will actually apply {actual!r}."
+            )
+
+    if mismatches:
+        raise ExecutionConfigMismatchError(
+            "Strategy config's declared execution parameters do not match "
+            "the FillSimulator actually about to run (Roadmap 02B / BUG-075 "
+            "P0-1, fail-closed). A backtest must never carry cost-model "
+            "labels that differ from the costs actually simulated:\n"
+            + "\n".join(f"  - {m}" for m in mismatches)
+        )
+
+
+def _execution_values_equal(declared: Any, actual: Any) -> bool:
+    """Compare a declared execution value with the simulator's actual one.
+
+    Numerics compare with a tight relative tolerance (YAML float repr
+    round-trips must not fail; real config differences must); everything
+    else compares by equality.
+    """
+    import math
+
+    if isinstance(declared, bool) or isinstance(actual, bool):
+        return declared == actual
+    if isinstance(declared, (int, float)) and isinstance(actual, (int, float)):
+        return math.isclose(
+            float(declared), float(actual), rel_tol=_EXECUTION_NUMERIC_RTOL, abs_tol=1e-12
+        )
+    return bool(declared == actual)
+
+
 def _validate_section(
     section_name: str, value: Any, allowed: dict[str, str]
 ) -> list[str]:
@@ -306,6 +467,12 @@ def field_status(dot_path: str) -> str:
       supported (currently only ``portfolio.method``); the caller must still
       check the actual value via :func:`validate_backtest_config`.
     * ``"informational"`` -- accepted, but not read by the backtest path.
+    * ``"section"`` -- the bare name of a known enumerated section
+      (``portfolio``, ``execution``, ``backtest``) rather than a field
+      inside it. The section name itself carries no classification --
+      consumed/informational status lives at the sub-key level -- so it
+      gets this distinct status instead of being mislabeled
+      "informational" (02B round-2 P2-3).
     * ``"rejected"`` -- explicitly unsupported; any presence fails closed.
     * ``"unknown"`` -- neither classified as consumed/informational nor as
       an explicitly rejected section/key. This is the status a genuinely
@@ -324,9 +491,10 @@ def field_status(dot_path: str) -> str:
             return "rejected"
         if top in _KNOWN_SECTION_VALIDATORS:
             # A known section itself (not one of its sub-keys) carries no
-            # independent meaning -- classification lives at the sub-key
-            # level below.
-            return INFORMATIONAL
+            # independent classification -- that lives at the sub-key level
+            # -- so return the distinct "section" status rather than
+            # mislabeling the bare name informational (P2-3).
+            return "section"
         return "unknown"
 
     if top in _WILDCARD_INFORMATIONAL_SECTIONS:

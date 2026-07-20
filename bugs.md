@@ -1821,6 +1821,43 @@ validation unchanged (no code change to that file was required);
 `v2_mvo_momentum.yaml` is now rejected with all nine of its unsupported
 fields/sections listed in a single error instead of silently downgrading.
 
+**Adversarial-review round-2 fixes (APPROVE-WITH-FIXES, 2026-07-19):** two
+P0 findings, both instances of "contract classification doesn't match
+actual code reads", fixed on the same branch:
+
+1. *P0-1 — `execution.*` was classified CONSUMED but nothing read it.*
+   `BacktestEngine.run` takes an already-constructed `FillSimulator`; no
+   committed code built it from `config["execution"]` (only a
+   documentation example in `.claude/skills/backtest.md`), so declared
+   cost params were unverifiable claims. Fixed by adding read-only
+   introspection properties to `FillSimulator` and a new
+   `assert_fill_simulator_matches_config()` in `config_contract.py`
+   (raising `ExecutionConfigMismatchError`, a subclass of
+   `UnsupportedStrategyConfigError`) which `BacktestEngine.run` calls to
+   fail closed whenever declared `execution:` params differ from the
+   simulator's actual params. One pre-existing engine test was itself
+   carrying this exact mismatch (declared `fill_model: perfect`, ran a
+   `transaction_cost` simulator) and was corrected.
+2. *P0-2 — `name` was classified INFORMATIONAL but the loader consumes it*
+   as the alpha_scores strategy_id fallback, and a name/stored-id mismatch
+   filtered scores to EMPTY with only a warning — a silent cash-only
+   backtest under the strategy's declared name. Fixed both ways:
+   `name` reclassified CONSUMED (fallback kept so v1 works unchanged,
+   explicit `strategy_id` documented as preferred), and
+   `load_from_snapshot` now RAISES when zero score rows match the
+   resolved strategy_id.
+
+Post-fix sweep re-audited every classification against every keyed config
+read in the five backtest-path modules: `version` was also reclassified
+CONSUMED (read for the MLflow `strategy_version` tag);
+`created`/`description`/`backtest.benchmark`/`universe.*`/`indicators.*`/
+`reporting.*`/`portfolio.target_volatility` confirmed unread by any keyed
+read (bulk verbatim recording via `_log_params_flat`/config.json/
+config_hash interprets no specific key and does not count). P2 fixes:
+`field_status()` now returns a distinct `"section"` status for bare known
+section names, and the conformance test documents the flattening
+depth-cap invariant.
+
 **Scope note:** This fix does NOT implement MVO/risk-parity/beta-constraint
 semantics inside the backtest engine -- that remains explicitly out of
 scope here (and would collide with the separate Roadmap 03B loader work,

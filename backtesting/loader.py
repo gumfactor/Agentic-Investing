@@ -64,7 +64,10 @@ def load_from_snapshot(
     Raises:
         FileNotFoundError: if daily_prices, alpha_scores, or benchmark snapshots
             are absent for data_version.
-        ValueError: if a required column is missing from a loaded snapshot.
+        ValueError: if a required column is missing from a loaded snapshot,
+            or if zero alpha_scores rows match the resolved strategy_id
+            (fail-closed -- a silent cash-only backtest mislabeled with the
+            strategy's name is never acceptable; 02B round-2 P0-2).
         UnsupportedStrategyConfigError: ``config`` declares a field, section,
             or value the backtest path does not implement (Roadmap 02B /
             BUG-075, fail-closed -- see ``backtesting/config_contract.py``).
@@ -125,11 +128,24 @@ def load_from_snapshot(
     ].reset_index(drop=True)
 
     if alpha_scores.empty:
-        logger.warning(
-            "loader_no_alpha_scores_for_strategy",
-            data_version=data_version,
-            strategy_id=strategy_id,
-            note="backtest will hold only cash — verify backfill has been run for this strategy_id",
+        # Fail closed (02B round-2 P0-2): an empty post-filter frame means
+        # the resolved strategy_id matched ZERO stored score rows -- almost
+        # always a strategy_id/name mismatch (stored score IDs can differ
+        # from YAML display names, which is exactly why the paper-path
+        # scripts require an explicit --strategy-id). Continuing here used
+        # to produce a silent cash-only backtest labeled with the
+        # strategy's declared name -- a mislabeled result, not a degraded
+        # one.
+        raise ValueError(
+            f"alpha_scores snapshot for data_version={data_version!r} contains "
+            f"zero rows for strategy_id={strategy_id!r} (resolved from "
+            "config['strategy_id'], falling back to config['name'], then 'v1'). "
+            "Running would produce a cash-only backtest silently labeled as "
+            f"{strategy_id!r}. Either the strategy_id/name in the config does "
+            "not match the id the scores were stored under, or the score "
+            "backfill has not been run for this strategy on this snapshot. "
+            "Set an explicit top-level strategy_id in the config matching the "
+            "stored score rows, or re-pin/backfill the snapshot."
         )
 
     # ── Apply price adjustment ────────────────────────────────────────────────
