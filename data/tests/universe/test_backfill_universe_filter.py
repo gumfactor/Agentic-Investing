@@ -21,6 +21,7 @@ from data.universe.providers.fixture_provider import (
     FIXTURE_UNIVERSE_ID,
     FixtureSP500Provider,
 )
+from data.storage.errors import SnapshotNotFoundError
 from data.universe.runtime import CoverageGapError, PITUniverseLookup
 from scripts.backfill_momentum_scores import _parse_args, run
 
@@ -60,9 +61,11 @@ def _mock_snapshots(prices: pd.DataFrame) -> MagicMock:
     wiring means run() now also loads a "corporate_actions" snapshot; a
     single-return_value mock would answer that call with the prices frame
     (missing ex_date/known_at) and crash. No corporate_actions snapshot is
-    pinned in these fixtures, so the call raises FileNotFoundError, matching
-    the real ParquetSnapshots behavior for a snapshot that was never saved —
-    run() degrades to raw (unadjusted) prices with a logged warning."""
+    pinned in these fixtures, so the call raises SnapshotNotFoundError
+    (03A-2; subclasses FileNotFoundError for one deprecation cycle),
+    matching the real ParquetSnapshots behavior for a snapshot that was
+    never saved — run() degrades to raw (unadjusted) prices with a logged
+    warning."""
     mock_snaps = MagicMock()
 
     # 03A-1: scripts/backfill_momentum_scores.py reads pre-03A-1 date-keyed
@@ -72,7 +75,7 @@ def _mock_snapshots(prices: pd.DataFrame) -> MagicMock:
     def _load_snapshot(data_type: str, snapshot_date: date):
         if data_type == "daily_prices":
             return prices
-        raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
+        raise SnapshotNotFoundError(f"no snapshot pinned for {data_type!r}")
 
     mock_snaps.load_snapshot_legacy.side_effect = _load_snapshot
     return mock_snaps
@@ -227,7 +230,7 @@ class TestBackfillCorporateActionWiring:
                 return prices
             if data_type == "corporate_actions":
                 return corporate_actions
-            raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
+            raise SnapshotNotFoundError(f"no snapshot pinned for {data_type!r}")
 
         mock_snaps.load_snapshot_legacy.side_effect = _load_snapshot
         return mock_snaps
