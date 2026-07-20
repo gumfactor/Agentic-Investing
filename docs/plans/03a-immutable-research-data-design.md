@@ -400,6 +400,18 @@ implementation time, 03A-3 must fail closed for same-date split+dividend
 pairs (raise a named `AmbiguousSameDateActionError` rather than pick a
 convention silently) and record the gap in `bugs.md`.
 
+**Operator sign-off (2026-07-20).** The operator accepted the `POST_SPLIT`
+same-date quoting convention as the default for 03A-3 rather than the
+fail-closed `AmbiguousSameDateActionError` path: general yfinance evidence
+for post-split dividend quoting on same-date split+dividend rows is strong,
+so a blanket fail-closed was rejected as overly conservative. The exact
+boundary behavior remains untested (yfinance can also emit spinoff-artifact
+rows on the same ex-date whose convention was not individually verified), so
+the `POST_SPLIT` default ships documented-but-not-boundary-proven, and 03A-3
+still records the residual boundary gap in `bugs.md`. This note keeps the
+spec consistent with the 03A-3 code decision; the amendment-1/2 text above is
+unchanged.
+
 ### 3.2 Raw preservation into immutable bundles
 
 `corporate_actions` is already retained losslessly at the *database* level

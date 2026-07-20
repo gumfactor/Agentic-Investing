@@ -125,16 +125,16 @@ def _load_from_snapshot(
     from data.storage.parquet_snapshots import ParquetSnapshots
     snaps = ParquetSnapshots()
     logger.info("loading_from_minio", snapshot_date=str(snapshot_date))
-    prices = snaps.load_snapshot("daily_prices", snapshot_date)
+    prices = snaps.load_snapshot_legacy("daily_prices", snapshot_date)
     try:
-        scores = snaps.load_snapshot("factor_scores", snapshot_date)
+        scores = snaps.load_snapshot_legacy("factor_scores", snapshot_date)
     except FileNotFoundError as exc:
         if strategy_id != "v1":
             raise ValueError(
                 "factor_scores snapshot is missing and alpha_scores fallback is "
                 "only validated for the momentum-only strategy_id='v1'"
             ) from exc
-        scores = snaps.load_snapshot("alpha_scores", snapshot_date)
+        scores = snaps.load_snapshot_legacy("alpha_scores", snapshot_date)
         logger.warning(
             "using_alpha_scores_fallback",
             reason="factor_scores snapshot is not part of the backtest bundle",
@@ -149,7 +149,7 @@ def _load_from_snapshot(
     # missing snapshot here just means the empirical audit degrades to raw
     # (unadjusted) recomputation and main() prints a loud caveat.
     try:
-        corporate_actions = snaps.load_snapshot("corporate_actions", snapshot_date)
+        corporate_actions = snaps.load_snapshot_legacy("corporate_actions", snapshot_date)
     except FileNotFoundError:
         corporate_actions = None
         logger.warning(

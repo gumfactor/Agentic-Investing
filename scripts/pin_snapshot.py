@@ -194,11 +194,13 @@ def pin_bundle(
         "corporate_actions": corporate_actions,
         "benchmark": benchmark,
     }
+    bytes_hashes: dict[str, str] = {}
     object_paths = {
         data_type: snapshots.save_snapshot(
             df,
             data_type=data_type,
             snapshot_date=snapshot_date,
+            bytes_sha256_out=bytes_hashes,
         )
         for data_type, df in dataframes.items()
     }
@@ -209,6 +211,7 @@ def pin_bundle(
         dataframes=dataframes,
         object_paths=object_paths,
         snapshot_dates=snapshot_dates,
+        bytes_sha256=bytes_hashes,
     )
     return snapshots.save_dataset_manifest(manifest)
 

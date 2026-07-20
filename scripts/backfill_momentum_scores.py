@@ -157,7 +157,7 @@ def run(
 
     # ── Load price snapshot ───────────────────────────────────────────────────
     logger.info("loading_price_snapshot", snapshot_date=str(snapshot_date))
-    prices = snaps.load_snapshot("daily_prices", snapshot_date)
+    prices = snaps.load_snapshot_legacy("daily_prices", snapshot_date)
 
     prices["date"] = pd.to_datetime(prices["date"]).dt.date
 
@@ -253,7 +253,7 @@ def run(
 
     corporate_actions_snapshot_missing = False
     try:
-        corporate_actions = snaps.load_snapshot("corporate_actions", snapshot_date)
+        corporate_actions = snaps.load_snapshot_legacy("corporate_actions", snapshot_date)
     except FileNotFoundError:
         corporate_actions_snapshot_missing = True
         # Adversarial-review round 9 (BUG-009): a missing snapshot used to
