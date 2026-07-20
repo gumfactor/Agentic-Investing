@@ -422,3 +422,44 @@ class TestLoadManifestIntegrity:
         client = self._client_serving({key: json.dumps(payload).encode()})
         with pytest.raises(SnapshotIntegrityError, match="legacy_mutable"):
             load_manifest(fake_hash, client, "rqis-snapshots")
+
+    def test_uppercase_hex_version_is_rejected_not_treated_as_legacy(self) -> None:
+        """BUG-077: a 64-character version that is NOT canonical lowercase
+        hex (e.g. upper-cased sha256 hex) must be rejected outright, not
+        silently fall through to the unverified legacy_mutable path just
+        because it fails the strict lowercase-hex regex."""
+        mixed_case_version = ("A" * 64)
+        client = MagicMock()  # must never be called: reject before any I/O
+        with pytest.raises(ValueError, match="not canonical lowercase sha256 hex"):
+            load_manifest(mixed_case_version, client, "rqis-snapshots")
+        client.get_object.assert_not_called()
+
+    def test_64_char_non_hex_version_is_rejected_not_treated_as_legacy(self) -> None:
+        """BUG-077: a 64-character version containing non-hex characters
+        must also be rejected outright rather than silently treated as an
+        unverified legacy manifest."""
+        non_hex_version = "z" * 64
+        client = MagicMock()
+        with pytest.raises(ValueError, match="not canonical lowercase sha256 hex"):
+            load_manifest(non_hex_version, client, "rqis-snapshots")
+        client.get_object.assert_not_called()
+
+    def test_genuine_legacy_date_version_is_unaffected_by_bug_077_guard(self) -> None:
+        """BUG-077's hardening must not regress the genuine legacy date-string
+        path -- only 64-character versions are scrutinized."""
+        legacy_payload = {
+            "version": "2026-06-14",
+            "created_at": "2026-06-14T00:00:00+00:00",
+            "git_commit": "abc123",
+            "strategy_id": "v1",
+            "snapshot_dates": {},
+            "object_paths": {},
+            "row_counts": {},
+            "date_ranges": {},
+            "schema_hashes": {},
+            "legacy_mutable": True,
+        }
+        key = "manifests/2026-06-14/manifest.json"
+        client = self._client_serving({key: json.dumps(legacy_payload).encode()})
+        loaded = load_manifest("2026-06-14", client, "rqis-snapshots")
+        assert loaded.legacy_mutable is True
