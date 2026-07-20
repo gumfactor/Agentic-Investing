@@ -121,6 +121,17 @@ class UnsupportedStrategyConfigError(Exception):
     """
 
 
+class ConfigProvenanceMismatchError(UnsupportedStrategyConfigError):
+    """Raised by ``BacktestLogger`` when the config it validated is not the
+    config whose derivatives (``config_hash``, ``data_version``) it is
+    about to persist (02B round-3 P2-2). A validated-looking MLflow record
+    must never carry provenance computed from a different -- possibly
+    unvalidated -- config object. Subclasses
+    :class:`UnsupportedStrategyConfigError` for the same cannot-be-swallowed
+    propagation semantics.
+    """
+
+
 class ExecutionConfigMismatchError(UnsupportedStrategyConfigError):
     """Raised by :func:`assert_fill_simulator_matches_config` when a config
     declares ``execution:`` cost parameters that differ from what the
@@ -168,7 +179,10 @@ _TOP_LEVEL_FIELDS: dict[str, str] = {
 # they describe a DIFFERENT subsystem's already-tracked methodology (the
 # upstream signal/universe pipeline), not the backtest engine's own
 # computation. Any nested structure is accepted.
-_WILDCARD_INFORMATIONAL_SECTIONS = {"universe", "indicators", "reporting"}
+# (`reporting` was originally wildcard-informational too; 02B round-3 P2-1
+# moved it to a known enumerated section because BacktestLogger.log_run now
+# genuinely consumes its keys -- see _REPORTING_FIELDS.)
+_WILDCARD_INFORMATIONAL_SECTIONS = {"universe", "indicators"}
 
 # ---------------------------------------------------------------------------
 # `portfolio:` section.
@@ -258,10 +272,27 @@ _REJECTED_SECTIONS = {
     "risk_model",
 }
 
+# ---------------------------------------------------------------------------
+# `reporting:` section (02B round-3 P2-1). Both keys are genuinely consumed
+# by BacktestLogger.log_run's artifact block: `save_trades` gates the
+# trades.csv artifact (defaults to True when absent, preserving the
+# previously-unconditional behavior) and `save_positions` gates a
+# positions.csv artifact built from BacktestResult.positions (defaults to
+# False when absent, preserving the previous no-positions-artifact
+# behavior). Before this, the section was wildcard-informational while
+# v1_base_momentum.yaml declared both keys and the logger ignored them --
+# the same classification-vs-actual-reads defect class as round 2's P0s.
+# ---------------------------------------------------------------------------
+_REPORTING_FIELDS: dict[str, str] = {
+    "save_positions": CONSUMED,
+    "save_trades": CONSUMED,
+}
+
 _KNOWN_SECTION_VALIDATORS: dict[str, dict[str, str]] = {
     "portfolio": _PORTFOLIO_FIELDS,
     "execution": _EXECUTION_FIELDS,
     "backtest": _BACKTEST_FIELDS,
+    "reporting": _REPORTING_FIELDS,
 }
 
 

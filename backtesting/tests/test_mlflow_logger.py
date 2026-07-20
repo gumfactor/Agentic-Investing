@@ -8,25 +8,10 @@ from unittest.mock import MagicMock, patch, call
 import pandas as pd
 import pytest
 
+from backtesting.config_contract import ConfigProvenanceMismatchError
 from backtesting.engine.event_loop import BacktestResult
-from backtesting.experiment_tracking.mlflow_logger import BacktestLogger
+from backtesting.experiment_tracking.mlflow_logger import BacktestLogger, _hash_config
 from backtesting.validation.survival_funnel import FunnelGate, SurvivalFunnelResult
-
-
-def _make_result(data_version: str = "snapshot-v1") -> BacktestResult:
-    returns = pd.Series([0.001, 0.002, -0.001], index=[date(2023, 1, d) for d in [3, 4, 5]])
-    bm_returns = pd.Series([0.001, 0.001, -0.001], index=[date(2023, 1, d) for d in [3, 4, 5]])
-    return BacktestResult(
-        nav_series=pd.Series([100_000.0, 100_100.0, 100_300.0]),
-        returns=returns,
-        benchmark_returns=bm_returns,
-        positions=pd.DataFrame(),
-        trades=pd.DataFrame(),
-        metrics={"sharpe": 1.2, "cagr": 0.12, "max_drawdown": -0.05},
-        config={"name": "test", "data_version": data_version},
-        data_version=data_version,
-        config_hash="abc123",
-    )
 
 
 def _make_config(data_version: str = "snapshot-v1") -> dict:
@@ -37,6 +22,28 @@ def _make_config(data_version: str = "snapshot-v1") -> dict:
         "portfolio": {"n_long": 50},
         "backtest": {"start_date": "2023-01-02", "end_date": "2023-12-31"},
     }
+
+
+def _make_result(data_version: str = "snapshot-v1") -> BacktestResult:
+    # config/config_hash must be consistent with what _make_config(same
+    # data_version) produces: log_run now fails closed when the passed
+    # config's hash differs from result.config_hash (02B round-3
+    # provenance check) -- the old fixture ("abc123", a different config
+    # dict) modeled exactly the divergence that check closes.
+    config = _make_config(data_version)
+    returns = pd.Series([0.001, 0.002, -0.001], index=[date(2023, 1, d) for d in [3, 4, 5]])
+    bm_returns = pd.Series([0.001, 0.001, -0.001], index=[date(2023, 1, d) for d in [3, 4, 5]])
+    return BacktestResult(
+        nav_series=pd.Series([100_000.0, 100_100.0, 100_300.0]),
+        returns=returns,
+        benchmark_returns=bm_returns,
+        positions=pd.DataFrame(),
+        trades=pd.DataFrame(),
+        metrics={"sharpe": 1.2, "cagr": 0.12, "max_drawdown": -0.05},
+        config=config,
+        data_version=data_version,
+        config_hash=_hash_config(config),
+    )
 
 
 # ------------------------------------------------------------------
@@ -60,12 +67,15 @@ def test_log_run_raises_on_whitespace_data_version():
 
 
 def test_log_run_raises_when_only_config_empty():
-    """data_version from BacktestResult takes priority; empty result triggers error."""
+    """A config declaring a data_version the result lacks can only arise
+    from a config/result mismatch, so since the 02B round-3 provenance
+    check it fails closed as a provenance error (an honest pair with an
+    empty data_version still hits the C7 ValueError -- see the tests
+    above)."""
     logger = BacktestLogger(tracking_uri="./test_mlruns")
     result = _make_result(data_version="")
     config = _make_config(data_version="snapshot-from-config")
-    # result.data_version is empty → should raise
-    with pytest.raises(ValueError, match="data_version"):
+    with pytest.raises(ConfigProvenanceMismatchError):
         logger.log_run(config, result, experiment_name="test/exp")
 
 
@@ -154,6 +164,7 @@ def test_log_run_nan_metrics_excluded(mock_mlflow):
     mock_mlflow.start_run.return_value.__enter__ = lambda s: run_mock
     mock_mlflow.start_run.return_value.__exit__ = lambda *a: False
 
+    config = _make_config("v1")
     result = BacktestResult(
         nav_series=pd.Series([100_000.0]),
         returns=pd.Series([], dtype=float),
@@ -161,11 +172,10 @@ def test_log_run_nan_metrics_excluded(mock_mlflow):
         positions=pd.DataFrame(),
         trades=pd.DataFrame(),
         metrics={"sharpe": float("nan"), "cagr": 0.1},
-        config={"name": "test", "data_version": "v1"},
+        config=config,
         data_version="v1",
-        config_hash="abc",
+        config_hash=_hash_config(config),
     )
-    config = _make_config("v1")
     BacktestLogger(tracking_uri="./test_mlruns").log_run(config, result, experiment_name="exp")
 
     logged_metrics = [args[0] for args, _ in mock_mlflow.log_metric.call_args_list]
@@ -274,3 +284,120 @@ def test_log_walk_forward_run_with_funnel_and_stress(mock_mlflow):
     logged_metrics = [args[0] for args, _ in mock_mlflow.log_metric.call_args_list]
     assert "stress.drawdown_p5" in logged_metrics
     assert "stress.worst_case_drawdown" in logged_metrics
+
+
+# ------------------------------------------------------------------
+# 02B round-3: config provenance checks + reporting.* consumption
+# ------------------------------------------------------------------
+
+def test_log_run_rejects_config_hash_provenance_mismatch():
+    """Passing a different config than the one the engine ran must fail
+    closed -- the persisted config_hash/data_version tags would otherwise
+    describe an object other than the one just validated."""
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    result = _make_result("v1")
+    divergent = _make_config("v1")
+    divergent["portfolio"]["n_long"] = 999  # not what the engine ran
+    with pytest.raises(ConfigProvenanceMismatchError):
+        logger.log_run(divergent, result, experiment_name="exp")
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_log_walk_forward_run_rejects_divergent_wf_config(mock_mlflow):
+    """wf_result.config diverging from the passed config must fail closed
+    (02B round-3 P2-2) -- a swapped wf_result.config could otherwise
+    smuggle unvalidated provenance into a validated-looking run."""
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    wf = _make_wf_result("v1")
+    passed = dict(wf.config)
+    passed["version"] = 999  # diverges from wf_result.config
+    with pytest.raises(ConfigProvenanceMismatchError):
+        logger.log_walk_forward_run(config=passed, wf_result=wf, experiment_name="exp")
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_log_walk_forward_run_validates_wf_result_config(mock_mlflow):
+    """wf_result.config itself is contract-validated, so an unsupported
+    field there cannot ride along even if it matched the passed config."""
+    from backtesting.config_contract import UnsupportedStrategyConfigError
+
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    wf = _make_wf_result("v1")
+    wf.config = {**wf.config, "constraints": {"max_portfolio_beta": 1.5}}
+    with pytest.raises(UnsupportedStrategyConfigError):
+        logger.log_walk_forward_run(config=wf.config, wf_result=wf, experiment_name="exp")
+
+
+def _result_with_history(config: dict) -> BacktestResult:
+    trades = pd.DataFrame({"ticker": ["AAPL"], "direction": ["BUY"], "notional": [100.0]})
+    positions = pd.DataFrame(
+        {"AAPL": [0.5, 0.5]}, index=[date(2023, 1, 3), date(2023, 1, 4)]
+    )
+    return BacktestResult(
+        nav_series=pd.Series([100_000.0, 100_100.0]),
+        returns=pd.Series([0.001], index=[date(2023, 1, 4)]),
+        benchmark_returns=pd.Series([0.001], index=[date(2023, 1, 4)]),
+        positions=positions,
+        trades=trades,
+        metrics={"sharpe": 1.0},
+        config=config,
+        data_version=config["data_version"],
+        config_hash=_hash_config(config),
+    )
+
+
+def _logged_artifact_names(mock_mlflow) -> list[str]:
+    import os
+
+    return [os.path.basename(args[0]) for args, _ in mock_mlflow.log_artifact.call_args_list]
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_reporting_save_trades_false_skips_trades_artifact(mock_mlflow):
+    run_mock = MagicMock()
+    run_mock.info.run_id = "r"
+    mock_mlflow.start_run.return_value.__enter__ = lambda s: run_mock
+    mock_mlflow.start_run.return_value.__exit__ = lambda *a: False
+
+    config = _make_config("v1")
+    config["reporting"] = {"save_trades": False}
+    result = _result_with_history(config)
+    BacktestLogger(tracking_uri="./test_mlruns").log_run(config, result, experiment_name="exp")
+
+    names = _logged_artifact_names(mock_mlflow)
+    assert "trades.csv" not in names
+    assert "positions.csv" not in names  # save_positions defaults False
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_reporting_save_positions_true_writes_positions_artifact(mock_mlflow):
+    run_mock = MagicMock()
+    run_mock.info.run_id = "r"
+    mock_mlflow.start_run.return_value.__enter__ = lambda s: run_mock
+    mock_mlflow.start_run.return_value.__exit__ = lambda *a: False
+
+    config = _make_config("v1")
+    config["reporting"] = {"save_positions": True, "save_trades": True}
+    result = _result_with_history(config)
+    BacktestLogger(tracking_uri="./test_mlruns").log_run(config, result, experiment_name="exp")
+
+    names = _logged_artifact_names(mock_mlflow)
+    assert "positions.csv" in names
+    assert "trades.csv" in names
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_reporting_absent_keeps_prior_artifact_behavior(mock_mlflow):
+    """No reporting section: trades logged (as before), no positions."""
+    run_mock = MagicMock()
+    run_mock.info.run_id = "r"
+    mock_mlflow.start_run.return_value.__enter__ = lambda s: run_mock
+    mock_mlflow.start_run.return_value.__exit__ = lambda *a: False
+
+    config = _make_config("v1")
+    result = _result_with_history(config)
+    BacktestLogger(tracking_uri="./test_mlruns").log_run(config, result, experiment_name="exp")
+
+    names = _logged_artifact_names(mock_mlflow)
+    assert "trades.csv" in names
+    assert "positions.csv" not in names

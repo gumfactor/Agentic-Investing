@@ -49,10 +49,10 @@ def _flatten_dot_paths(config: dict, max_depth: int = 2) -> set[str]:
 
     Depth is capped at 2 because that is all ``field_status``/
     ``validate_backtest_config`` ever inspect -- classification for a
-    wildcard-informational section (``universe``, ``indicators``,
-    ``reporting``) is the same regardless of how deeply it is nested, and
-    every known section (``portfolio``, ``execution``, ``backtest``) is
-    exactly one level deep in both shipped configs.
+    wildcard-informational section (``universe``, ``indicators``) is the
+    same regardless of how deeply it is nested, and every known section
+    (``portfolio``, ``execution``, ``backtest``, ``reporting``) is exactly
+    one level deep in both shipped configs.
 
     Depth-cap invariant (02B round-2 P2-4): capping at 2 cannot hide an
     unclassified deeper key, because rejection happens at the PARENT level
@@ -417,7 +417,7 @@ def test_loader_strategy_id_falls_back_to_name() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("section", ["portfolio", "execution", "backtest"])
+@pytest.mark.parametrize("section", ["portfolio", "execution", "backtest", "reporting"])
 def test_bare_known_section_name_has_distinct_status(section: str) -> None:
     assert field_status(section) == "section"
 

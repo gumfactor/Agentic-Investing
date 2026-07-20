@@ -27,7 +27,10 @@ from typing import TYPE_CHECKING, Optional
 import mlflow
 import structlog
 
-from backtesting.config_contract import validate_backtest_config
+from backtesting.config_contract import (
+    ConfigProvenanceMismatchError,
+    validate_backtest_config,
+)
 from backtesting.engine.event_loop import BacktestResult
 
 if TYPE_CHECKING:
@@ -85,8 +88,36 @@ class BacktestLogger:
                 just at the engine that produced ``result``, so a config
                 swapped out between running and logging cannot mislabel a
                 persisted MLflow record.
+            ConfigProvenanceMismatchError: the passed ``config`` is not the
+                config the engine actually ran (``result.config_hash``
+                differs from this config's hash) -- the persisted
+                ``config_hash``/``data_version`` tags would otherwise be
+                derived from a different object than the one just
+                validated (02B round-3 sweep).
         """
         validate_backtest_config(config)
+
+        # Provenance check (02B round-3 sweep): everything persisted below
+        # -- params, config.json artifact, strategy_name/version tags --
+        # comes from the `config` argument just validated, but the
+        # data_version and config_hash TAGS come from `result`, which the
+        # engine derived from the config it actually ran. If those are two
+        # different configs, the record lies about its own provenance.
+        # Hash equality implies dict equality (same canonical JSON-SHA256
+        # as the engine's _hash_config), which also transitively guarantees
+        # config["data_version"] == result.data_version.
+        passed_hash = _hash_config(config)
+        if passed_hash != result.config_hash:
+            raise ConfigProvenanceMismatchError(
+                "The config passed to log_run is not the config this "
+                "BacktestResult was produced from: hash of the passed "
+                f"config is {passed_hash} but result.config_hash is "
+                f"{result.config_hash}. Logging would persist "
+                "data_version/config_hash tags derived from a different "
+                "(possibly unvalidated) config than the one just "
+                "validated and recorded in config.json. Pass the exact "
+                "config dict the engine ran."
+            )
 
         data_version = (result.data_version or "").strip()
         if not data_version:
@@ -138,10 +169,25 @@ class BacktestLogger:
                 metrics_path.write_text(json.dumps(result.metrics, indent=2, default=str))
                 mlflow.log_artifact(str(metrics_path), "data")
 
-                if not result.trades.empty:
+                # reporting.* consumption (02B round-3 P2-1): save_trades
+                # gates the trades artifact (default True when absent --
+                # preserves the previously-unconditional behavior);
+                # save_positions gates a positions artifact (default False
+                # when absent -- no positions artifact was ever written
+                # before, so absence keeps prior behavior).
+                reporting_cfg = config.get("reporting") or {}
+                save_trades = bool(reporting_cfg.get("save_trades", True))
+                save_positions = bool(reporting_cfg.get("save_positions", False))
+
+                if save_trades and not result.trades.empty:
                     trades_path = tmp_path / "trades.csv"
                     result.trades.to_csv(trades_path, index=False)
                     mlflow.log_artifact(str(trades_path), "data")
+
+                if save_positions and not result.positions.empty:
+                    positions_path = tmp_path / "positions.csv"
+                    result.positions.to_csv(positions_path)
+                    mlflow.log_artifact(str(positions_path), "data")
 
             run_id = run.info.run_id
             logger.info(
@@ -188,8 +234,34 @@ class BacktestLogger:
                 section, or value the backtest path does not implement
                 (Roadmap 02B / BUG-075, fail-closed -- see
                 ``backtesting/config_contract.py``).
+            ConfigProvenanceMismatchError: ``wf_result.config`` differs
+                from the passed ``config`` (02B round-3 P2-2) -- the
+                persisted ``data_version``/``config_hash`` are derived
+                from ``wf_result.config``, so a mutated or swapped
+                ``wf_result.config`` could otherwise smuggle unvalidated
+                provenance into a validated-looking run.
         """
         validate_backtest_config(config)
+
+        # Provenance check (02B round-3 P2-2): the tags persisted below mix
+        # sources -- data_version and config_hash come from wf_result.config
+        # while params and name/version tags come from `config`. Validate
+        # wf_result.config too, and require the two to be identical (hash
+        # equality of the same canonical serialisation), failing closed on
+        # divergence.
+        validate_backtest_config(wf_result.config)
+        passed_hash = _hash_config(config)
+        wf_hash = _hash_config(wf_result.config)
+        if passed_hash != wf_hash:
+            raise ConfigProvenanceMismatchError(
+                "The config passed to log_walk_forward_run differs from "
+                f"wf_result.config (hashes {passed_hash} vs {wf_hash}). "
+                "data_version/config_hash are persisted from "
+                "wf_result.config while params/tags come from the passed "
+                "config; logging a divergent pair would record mixed "
+                "provenance. Pass the exact config the walk-forward run "
+                "was produced from."
+            )
 
         # data_version for walk-forward runs lives in the config dict (via
         # BacktestEngine, which reads config["data_version"] and stores it on
