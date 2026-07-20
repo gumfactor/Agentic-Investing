@@ -30,6 +30,10 @@ import numpy as np
 import pandas as pd
 import structlog
 
+from backtesting.config_contract import (
+    assert_fill_simulator_matches_config,
+    validate_backtest_config,
+)
 from backtesting.engine.data_handler import DataHandler
 from backtesting.engine.fill_simulator import Fill, FillSimulator, Order, compute_orders
 
@@ -118,7 +122,21 @@ class BacktestEngine:
 
         Returns:
             BacktestResult with full performance history and metrics.
+
+        Raises:
+            UnsupportedStrategyConfigError: ``config`` declares a field,
+                section, or value the backtest path does not implement
+                (Roadmap 02B / BUG-075, fail-closed -- see
+                ``backtesting/config_contract.py``).
+            ExecutionConfigMismatchError: ``config`` declares ``execution:``
+                cost parameters that differ from what ``fill_simulator``
+                will actually apply (02B round-2 P0-1) -- a backtest must
+                never carry cost-model labels that differ from the costs
+                actually simulated.
         """
+        validate_backtest_config(config)
+        assert_fill_simulator_matches_config(config, fill_simulator)
+
         bt_cfg = config["backtest"]
         port_cfg = config["portfolio"]
 

@@ -18,6 +18,7 @@ from typing import Literal, Optional
 import pandas as pd
 import structlog
 
+from backtesting.config_contract import validate_backtest_config
 from backtesting.engine.data_handler import DataHandler
 from backtesting.engine.event_loop import BacktestEngine, BacktestResult
 from backtesting.engine.fill_simulator import FillSimulator
@@ -84,8 +85,18 @@ class WalkForwardValidator:
 
         Returns:
             WalkForwardResult with per-fold and aggregate OOS metrics.
+
+        Raises:
+            UnsupportedStrategyConfigError: ``config`` declares a field,
+                section, or value the backtest path does not implement
+                (Roadmap 02B / BUG-075, fail-closed -- see
+                ``backtesting/config_contract.py``). Raised here, before any
+                fold runs, so a rejected config never silently produces
+                partial fold results.
         """
         from backtesting.engine.event_loop import _compute_metrics  # avoid circular
+
+        validate_backtest_config(config)
 
         bt_cfg = config["backtest"]
         full_start = _parse_date(bt_cfg["start_date"])

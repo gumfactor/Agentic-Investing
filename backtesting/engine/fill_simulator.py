@@ -78,6 +78,36 @@ class FillSimulator:
         self._fill_model = fill_model
         self._default_vol = default_daily_vol
 
+    # ------------------------------------------------------------------
+    # Read-only parameter introspection (Roadmap 02B / BUG-075 P0-1).
+    # These exist so backtesting.config_contract.assert_fill_simulator_
+    # matches_config can verify that a strategy config's declared
+    # `execution:` cost parameters match what this simulator will ACTUALLY
+    # apply -- without them the declared params were unverifiable and a
+    # backtest could silently run with different costs than its config
+    # (and its MLflow record) claimed.
+    # ------------------------------------------------------------------
+
+    @property
+    def bid_ask_spread_bps(self) -> float:
+        """One-way bid-ask spread in basis points actually applied."""
+        return self._spread_bps
+
+    @property
+    def market_impact_coeff(self) -> float:
+        """Square-root impact model coefficient actually applied."""
+        return self._impact_coeff
+
+    @property
+    def commission_per_share(self) -> float:
+        """Flat USD-per-share commission actually applied."""
+        return self._commission
+
+    @property
+    def fill_model(self) -> str:
+        """Fill model actually applied ('transaction_cost' or 'perfect')."""
+        return self._fill_model
+
     def simulate_fills(
         self,
         orders: list[Order],

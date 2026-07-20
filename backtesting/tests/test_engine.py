@@ -230,6 +230,16 @@ def test_engine_cash_never_negative():
     handler = DataHandler(prices, signals, benchmark)
 
     config = _make_config("2023-01-02", "2023-03-15")
+    # Declared execution params must match the simulator actually passed
+    # (02B round-2 P0-1): this test previously declared fill_model
+    # "perfect" while running a transaction_cost simulator -- exactly the
+    # config/simulator mismatch the contract now fails closed on.
+    config["execution"] = {
+        "fill_model": "transaction_cost",
+        "bid_ask_spread_bps": 20.0,
+        "market_impact_coeff": 0.5,
+        "commission_per_share": 0.01,
+    }
     fill_sim = FillSimulator(
         bid_ask_spread_bps=20.0,
         market_impact_coeff=0.5,
@@ -655,8 +665,13 @@ def test_loader_raises_if_strategy_id_column_absent():
         )
 
 
-def test_loader_warns_when_no_scores_for_strategy():
-    """load_from_snapshot returns a DataHandler with empty signals when strategy filter yields nothing."""
+def test_loader_fails_closed_when_no_scores_for_strategy():
+    """load_from_snapshot must RAISE when the strategy filter yields nothing.
+
+    02B round-2 P0-2: this test previously asserted the old warn-and-continue
+    behavior (an empty-signals DataHandler), which produced a silent
+    cash-only backtest labeled with the strategy's declared name.
+    """
     from backtesting.loader import load_from_snapshot
 
     prices = _make_loader_prices(["AAPL"])
@@ -668,11 +683,11 @@ def test_loader_warns_when_no_scores_for_strategy():
     })
     benchmark = pd.DataFrame({"date": [date(2023, 1, 2)], "close": [400.0]})
 
-    handler = load_from_snapshot(
-        "2023-01-02", {"name": "v1"},
-        snapshots=_mock_snapshots(prices, alpha_wrong_sid, benchmark),
-    )
-    assert handler.get_latest_signals(date(2023, 1, 3)).empty
+    with pytest.raises(ValueError, match="zero rows for strategy_id='v1'"):
+        load_from_snapshot(
+            "2023-01-02", {"name": "v1"},
+            snapshots=_mock_snapshots(prices, alpha_wrong_sid, benchmark),
+        )
 
 
 def test_loader_prefers_explicit_strategy_id_over_display_name():
