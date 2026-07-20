@@ -605,22 +605,26 @@ def _mock_snapshots(prices, alpha, benchmark):
     """Build a MagicMock ParquetSnapshots that serves pre-loaded DataFrames
     through the 03A-1 content-addressed, manifest-driven read path.
 
-    corporate_actions raises FileNotFoundError (optional snapshot) so the
-    loader falls back to an empty frame, matching the production default.
-    The manifest resolution (load_manifest) is satisfied by a fake _client
-    that returns a minimal valid manifest JSON.
+    corporate_actions raises SnapshotNotFoundError (optional snapshot, 03A-2)
+    so callers that pass allow_missing_corporate_actions=True fall back to an
+    empty frame. Callers using this fixture that do NOT pass that flag are
+    exercising the (now default) fail-closed path and are expected to let
+    SnapshotNotFoundError propagate. The manifest resolution (load_manifest)
+    is satisfied by a fake _client that returns a minimal valid manifest
+    JSON.
     """
     import json
     from dataclasses import asdict
     from unittest.mock import MagicMock
 
     from backtesting.dataset_manifest import DatasetManifest
+    from data.storage.errors import SnapshotNotFoundError
 
     data = {"daily_prices": prices, "alpha_scores": alpha, "benchmark": benchmark}
 
     def _load_by_manifest(_manifest, data_type):
         if data_type == "corporate_actions":
-            raise FileNotFoundError("no corp actions snapshot in test")
+            raise SnapshotNotFoundError("no corp actions snapshot in test")
         return data[data_type]
 
     mock = MagicMock()
@@ -687,6 +691,7 @@ def test_loader_raises_if_strategy_id_column_absent():
         load_from_snapshot(
             "2023-01-02", {"name": "v1"},
             snapshots=_mock_snapshots(prices, alpha_no_sid, benchmark),
+            allow_missing_corporate_actions=True,
         )
 
 
@@ -712,6 +717,7 @@ def test_loader_fails_closed_when_no_scores_for_strategy():
         load_from_snapshot(
             "2023-01-02", {"name": "v1"},
             snapshots=_mock_snapshots(prices, alpha_wrong_sid, benchmark),
+            allow_missing_corporate_actions=True,
         )
 
 
@@ -732,10 +738,71 @@ def test_loader_prefers_explicit_strategy_id_over_display_name():
         "2023-01-02",
         {"name": "base_momentum", "strategy_id": "v1"},
         snapshots=_mock_snapshots(prices, alpha, benchmark),
+        allow_missing_corporate_actions=True,
     )
 
     signals = handler.get_latest_signals(date(2023, 1, 3))
     assert signals["ticker"].tolist() == ["AAPL"]
+
+
+def test_loader_aborts_on_missing_corporate_actions_by_default():
+    """BUG-039 / 03A-2: a missing corporate_actions snapshot must abort
+    backtest construction by default (allow_missing_corporate_actions=False)
+    -- an unadjusted backtest must never be a silent default."""
+    from backtesting.loader import load_from_snapshot
+    from data.storage.errors import SnapshotNotFoundError
+
+    prices = _make_loader_prices(["AAPL"])
+    alpha = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "score_date": [date(2023, 1, 2)],
+        "strategy_id": ["v1"],
+        "alpha_score": [1.0],
+    })
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 2)], "close": [400.0]})
+
+    with pytest.raises(SnapshotNotFoundError):
+        load_from_snapshot(
+            "2023-01-02",
+            {"name": "base_momentum", "strategy_id": "v1"},
+            snapshots=_mock_snapshots(prices, alpha, benchmark),
+        )
+
+
+def test_loader_non_not_found_corp_actions_error_aborts_even_when_opted_in():
+    """A store-unavailable/access-denied/integrity error while loading
+    corporate_actions must always abort, even with
+    allow_missing_corporate_actions=True -- only a genuine
+    SnapshotNotFoundError may be treated as 'no corporate actions'."""
+    from backtesting.loader import load_from_snapshot
+    from data.storage.errors import SnapshotStoreUnavailableError
+
+    prices = _make_loader_prices(["AAPL"])
+    alpha = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "score_date": [date(2023, 1, 2)],
+        "strategy_id": ["v1"],
+        "alpha_score": [1.0],
+    })
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 2)], "close": [400.0]})
+
+    mock = _mock_snapshots(prices, alpha, benchmark)
+    data = {"daily_prices": prices, "alpha_scores": alpha, "benchmark": benchmark}
+
+    def _load_by_manifest(_manifest, data_type):
+        if data_type == "corporate_actions":
+            raise SnapshotStoreUnavailableError("minio unreachable")
+        return data[data_type]
+
+    mock.load_snapshot_by_manifest.side_effect = _load_by_manifest
+
+    with pytest.raises(SnapshotStoreUnavailableError):
+        load_from_snapshot(
+            "2023-01-02",
+            {"name": "base_momentum", "strategy_id": "v1"},
+            snapshots=mock,
+            allow_missing_corporate_actions=True,
+        )
 
 
 # ------------------------------------------------------------------
@@ -798,7 +865,9 @@ def test_backfill_passes_with_sufficient_history():
     def _load_snapshot(data_type, snapshot_date):
         if data_type == "daily_prices":
             return prices_all
-        raise FileNotFoundError(f"no snapshot pinned for {data_type!r}")
+        from data.storage.errors import SnapshotNotFoundError
+
+        raise SnapshotNotFoundError(f"no snapshot pinned for {data_type!r}")
 
     mock_snaps.load_snapshot_legacy.side_effect = _load_snapshot
 
@@ -997,15 +1066,17 @@ def test_audit_snapshot_falls_back_to_v1_alpha_scores(monkeypatch):
 
     class _Snapshots:
         def load_snapshot_legacy(self, data_type, snapshot_date):
+            from data.storage.errors import SnapshotNotFoundError
+
             assert snapshot_date == date(2026, 6, 14)
             if data_type == "daily_prices":
                 return prices_df
             if data_type == "factor_scores":
-                raise FileNotFoundError
+                raise SnapshotNotFoundError
             if data_type == "alpha_scores":
                 return alpha_df
             if data_type == "corporate_actions":
-                raise FileNotFoundError
+                raise SnapshotNotFoundError
             raise AssertionError(data_type)
 
     monkeypatch.setattr(parquet_snapshots, "ParquetSnapshots", _Snapshots)

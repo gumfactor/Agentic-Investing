@@ -249,12 +249,18 @@ def run(
     # full derivation). The one residual gap — an action whose ex_date falls
     # exactly on a given score_date — is documented as BUG-071 in bugs.md.
     from data.normalization.corporate_actions import build_score_price_history_as_of
+    from data.storage.errors import SnapshotNotFoundError
     from data.universe.calendar import session_close_cutoff
 
     corporate_actions_snapshot_missing = False
     try:
         corporate_actions = snaps.load_snapshot_legacy("corporate_actions", snapshot_date)
-    except FileNotFoundError:
+    except SnapshotNotFoundError:
+        # 03A-2 / BUG-039: narrowed from bare FileNotFoundError so an
+        # infra/auth/corruption failure while loading corporate_actions can
+        # no longer masquerade as "no snapshot pinned" and silently degrade
+        # to the raw-prices path below -- only a confirmed-absent object
+        # does.
         corporate_actions_snapshot_missing = True
         # Adversarial-review round 9 (BUG-009): a missing snapshot used to
         # silently degrade to an empty action set and let the run proceed --
