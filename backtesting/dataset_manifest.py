@@ -63,7 +63,11 @@ import pandas as pd
 import structlog
 
 from data.storage.canonical_hash import canonical_content_sha256
-from data.storage.errors import SnapshotIntegrityError, SnapshotPartialReadError
+from data.storage.errors import (
+    SnapshotIntegrityError,
+    SnapshotNotFoundError,
+    SnapshotPartialReadError,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -295,14 +299,22 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
 
     payload = json.dumps(asdict(manifest), indent=2).encode()
 
+    # 03A-2 (adversarial-review follow-up): this write-path existence probe
+    # must route through the SAME single translation boundary as every read
+    # path (data.storage.parquet_snapshots.get_object_bytes), not do a bare
+    # `except Exception` around a direct minio get_object. A previous bare
+    # except swallowed a transient store-unavailable/access-denied failure as
+    # "object doesn't exist yet" and fell through to put_object -- a
+    # write-path fail-OPEN that violates the invariant this slice
+    # establishes. Only a genuine SnapshotNotFoundError means "not written
+    # yet"; every other error (store unavailable, access denied, partial
+    # read, integrity) propagates and aborts the save.
+    from data.storage.parquet_snapshots import get_object_bytes
+
     existing_bytes: Optional[bytes] = None
     try:
-        existing = minio_client.get_object(bucket, key)
-        existing_bytes = existing.read()
-    except Exception:  # noqa: BLE001 - broad: any "not found"-shaped client
-        # error means the object doesn't exist yet; fall through to write it.
-        # minio.error.S3Error is the real-world case, but tests use a variety
-        # of fake-client exception types for "not found".
+        existing_bytes = get_object_bytes(minio_client, bucket, key)
+    except SnapshotNotFoundError:
         existing_bytes = None
 
     if existing_bytes is not None and not manifest.legacy_mutable:

@@ -19,14 +19,41 @@ from backtesting.dataset_manifest import (
 from data.storage.canonical_hash import canonical_content_sha256
 
 
-class _NotFound(Exception):
-    pass
+def _s3_not_found(key: str = "") -> "S3Error":
+    """A genuine minio.error.S3Error with the NoSuchKey code -- the only
+    error shape that save_manifest/load_manifest's translation boundary
+    (03A-2) accepts as 'object not written yet'. Fakes must use this rather
+    than an arbitrary exception type, since a non-S3 exception now
+    (correctly) translates to a fail-closed SnapshotStoreUnavailableError."""
+    from minio.error import S3Error
+
+    return S3Error(
+        code="NoSuchKey", message="not found",
+        resource=key, request_id="", host_id="", response=MagicMock()
+    )
+
+
+# Back-compat alias for the previous custom not-found sentinel used by a few
+# tests; now maps onto a genuine S3 NoSuchKey error so the 03A-2 translation
+# boundary classifies it as SnapshotNotFoundError.
+def _NotFound(key: str = "") -> "S3Error":  # noqa: N802 - kept as a factory
+    return _s3_not_found(key)
+
+
+def _s3_error(code: str) -> "S3Error":
+    from minio.error import S3Error
+
+    return S3Error(
+        code=code, message="boom",
+        resource="", request_id="", host_id="", response=MagicMock()
+    )
 
 
 def _fake_minio_empty() -> MagicMock:
-    """A fake client where every get_object raises (nothing stored yet)."""
+    """A fake client where every get_object raises a genuine S3 NoSuchKey
+    (nothing stored yet)."""
     client = MagicMock()
-    client.get_object.side_effect = _NotFound("not found")
+    client.get_object.side_effect = _s3_not_found()
     return client
 
 
@@ -247,6 +274,51 @@ class TestSaveLoadManifestRoundTrip:
         client.get_object.return_value = resp
 
         save_manifest(manifest, client, "rqis-snapshots")
+        assert not client.put_object.called
+
+    def test_save_aborts_on_store_unavailable_never_writes(self) -> None:
+        """03A-2 write-path fail-closed (adversarial-review follow-up): a
+        transient store-unavailable error during save_manifest's existence
+        probe must ABORT the save, not be swallowed as 'doesn't exist yet'
+        and fall through to put_object."""
+        import urllib3.exceptions
+
+        from data.storage.errors import SnapshotStoreUnavailableError
+
+        dataframes = _dataframes()
+        manifest = build_manifest(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+        client = MagicMock()
+        client.get_object.side_effect = urllib3.exceptions.MaxRetryError(
+            pool=MagicMock(), url="http://minio"
+        )
+
+        with pytest.raises(SnapshotStoreUnavailableError):
+            save_manifest(manifest, client, "rqis-snapshots")
+        assert not client.put_object.called
+
+    def test_save_aborts_on_access_denied_never_writes(self) -> None:
+        """A 403 during the existence probe must likewise abort the save."""
+        from data.storage.errors import SnapshotAccessDeniedError
+
+        dataframes = _dataframes()
+        manifest = build_manifest(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+        client = MagicMock()
+        client.get_object.side_effect = _s3_error("AccessDenied")
+
+        with pytest.raises(SnapshotAccessDeniedError):
+            save_manifest(manifest, client, "rqis-snapshots")
         assert not client.put_object.called
 
     def test_differing_bytes_at_same_content_key_refused(self) -> None:
