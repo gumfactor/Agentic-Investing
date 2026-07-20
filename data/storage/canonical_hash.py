@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import math
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 import numpy as np
@@ -53,6 +54,20 @@ _ROW_SEP = "\x1e"
 EMPTY_CONTENT_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
+def _normalize_float(value: float) -> str:
+    """Canonical string for a floating value.
+
+    Normalizes negative zero to positive zero so that `0.0` and `-0.0`
+    (which compare equal but ``repr`` differently, e.g. from ``0.1 - 0.1``)
+    hash identically -- a spec-named determinism requirement (section 2.1).
+    """
+    if math.isnan(value):
+        return ""
+    if value == 0:  # collapses both 0.0 and -0.0
+        value = 0.0
+    return repr(float(value))
+
+
 def _normalize_value(value: Any) -> str:
     """Render one cell to its canonical string form."""
     if value is None:
@@ -60,9 +75,16 @@ def _normalize_value(value: Any) -> str:
     if isinstance(value, (bool, np.bool_)):
         return "true" if value else "false"
     if isinstance(value, (float, np.floating)):
-        if math.isnan(value):
+        return _normalize_float(float(value))
+    if isinstance(value, Decimal):
+        # Prices are stored NUMERIC(18,6); pandas may hand us Decimal objects
+        # (e.g. when read without coerce_float). Route through the float
+        # canonicalization so Decimal("100.500000") and float 100.5 -- the
+        # same logical value -- produce the same canonical string. NaN
+        # Decimals are treated as missing, mirroring the float path.
+        if value.is_nan():
             return ""
-        return repr(float(value))
+        return _normalize_float(float(value))
     if isinstance(value, (int, np.integer)):
         return str(int(value))
     if isinstance(value, pd.Timestamp):
@@ -94,13 +116,24 @@ def canonical_content_sha256(df: pd.DataFrame | None, data_type: str) -> str:
 
     normalized = df.apply(lambda col: col.map(_normalize_value))
 
-    sort_cols = [c for c in CANONICAL_SORT_KEYS.get(data_type, []) if c in normalized.columns]
-    if not sort_cols:
-        sort_cols = sorted(normalized.columns)
-
+    # Column order is always the alphabetical column ordering, so equal
+    # values hash identically regardless of the source frame's column order.
     ordered_cols = sorted(normalized.columns)
     normalized = normalized[ordered_cols]
-    normalized = normalized.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+    # Row order must be a pure function of content. Sort by the declared
+    # per-data-type key first, then break ties on ALL remaining columns, so
+    # rows sharing a declared sort key (e.g. two corporate actions with the
+    # same (ticker, ex_date, action_type)) still order deterministically
+    # instead of inheriting the input frame's incidental row order. For an
+    # unknown data_type (P2 note) the fallback sorts on the full set of
+    # normalized-STRING columns lexicographically -- not on the original
+    # typed values -- which is fine since identity here is defined over the
+    # canonical string forms, not the source dtypes.
+    declared = [c for c in CANONICAL_SORT_KEYS.get(data_type, []) if c in ordered_cols]
+    tiebreak = [c for c in ordered_cols if c not in declared]
+    full_sort_cols = declared + tiebreak
+    normalized = normalized.sort_values(full_sort_cols, kind="mergesort").reset_index(drop=True)
 
     rows = normalized.apply(lambda row: _FIELD_SEP.join(row), axis=1)
     return hashlib.sha256(_ROW_SEP.join(rows).encode("utf-8")).hexdigest()

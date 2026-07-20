@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 from datetime import date
+from decimal import Decimal
 
 import pandas as pd
 import pyarrow as pa
@@ -98,6 +99,56 @@ class TestDeterminism:
         h1 = canonical_content_sha256(prices_df, "daily_prices")
         h2 = canonical_content_sha256(prices_df, "benchmark")
         assert isinstance(h1, str) and isinstance(h2, str)
+
+
+class TestNormalizationEdgeCases:
+    def test_negative_zero_hashes_same_as_positive_zero(self) -> None:
+        """0.0 and -0.0 compare equal but repr differently; they must hash
+        identically (P0-2)."""
+        pos = pd.DataFrame({"ticker": ["AAPL"], "date": [date(2024, 1, 2)], "x": [0.0]})
+        neg = pd.DataFrame({"ticker": ["AAPL"], "date": [date(2024, 1, 2)], "x": [-0.0]})
+        # sanity: they are genuinely different repr but equal value
+        assert repr(0.0) != repr(-0.0)
+        assert canonical_content_sha256(pos, "daily_prices") == canonical_content_sha256(
+            neg, "daily_prices"
+        )
+
+    def test_computed_negative_zero_matches(self) -> None:
+        computed = 0.1 - 0.1  # yields 0.0, but guard against -0.0 arithmetic paths
+        df1 = pd.DataFrame({"ticker": ["A"], "date": [date(2024, 1, 2)], "x": [computed]})
+        df2 = pd.DataFrame({"ticker": ["A"], "date": [date(2024, 1, 2)], "x": [-0.0]})
+        assert canonical_content_sha256(df1, "daily_prices") == canonical_content_sha256(
+            df2, "daily_prices"
+        )
+
+    def test_decimal_matches_equal_float(self) -> None:
+        """NUMERIC(18,6) columns can arrive as Decimal; Decimal('100.500000')
+        must hash identically to float 100.5 (P0-4)."""
+        dec = pd.DataFrame(
+            {"ticker": ["AAPL"], "date": [date(2024, 1, 2)], "close": [Decimal("100.500000")]}
+        )
+        flt = pd.DataFrame(
+            {"ticker": ["AAPL"], "date": [date(2024, 1, 2)], "close": [100.5]}
+        )
+        assert canonical_content_sha256(dec, "daily_prices") == canonical_content_sha256(
+            flt, "daily_prices"
+        )
+
+    def test_duplicate_sort_key_order_independent(self) -> None:
+        """Rows sharing the full declared sort key must order deterministically
+        by their remaining content, not by incidental input order (P0-3)."""
+        df = pd.DataFrame(
+            {
+                "ticker": ["AAPL", "AAPL"],
+                "ex_date": [date(2024, 1, 2), date(2024, 1, 2)],
+                "action_type": ["dividend", "dividend"],  # identical declared key
+                "value": [0.24, 0.99],  # differ only in a non-key column
+            }
+        )
+        shuffled = df.iloc[::-1].reset_index(drop=True)
+        assert canonical_content_sha256(df, "corporate_actions") == canonical_content_sha256(
+            shuffled, "corporate_actions"
+        )
 
 
 class TestPerDataTypeSortKeys:

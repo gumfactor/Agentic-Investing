@@ -37,7 +37,7 @@ import structlog
 from minio import Minio
 from minio.error import S3Error
 
-from data.storage.canonical_hash import canonical_content_sha256
+from data.storage.canonical_hash import bytes_sha256, canonical_content_sha256
 
 logger = structlog.get_logger(__name__)
 
@@ -103,6 +103,8 @@ class ParquetSnapshots:
         df: pd.DataFrame,
         data_type: str,
         snapshot_date: Optional[date] = None,
+        *,
+        bytes_sha256_out: Optional[dict[str, str]] = None,
     ) -> str:
         """Save a DataFrame as a content-addressed parquet snapshot (03A-1).
 
@@ -121,6 +123,14 @@ class ParquetSnapshots:
             snapshot_date: Optional human-readable label recorded only in
                             logs/caller-side manifest metadata -- no longer
                             part of the object key (BUG-038).
+            bytes_sha256_out: Optional caller-supplied dict. When provided,
+                            the SHA-256 of the actually-stored parquet bytes
+                            (the freshly-uploaded payload, or the existing
+                            object's bytes on an idempotent skip) is recorded
+                            under `data_type`. This is the secondary,
+                            INFORMATIONAL byte hash (section 2.1 trade-off):
+                            it is nondeterministic across writer versions and
+                            must never be used as a key or a load-time gate.
 
         Returns:
             The MinIO object path (bucket/key) — store this (or the
@@ -132,7 +142,10 @@ class ParquetSnapshots:
         path = f"{self._bucket}/{key}"
 
         if self._object_exists(key):
-            if self._verify_existing_object(key, data_type, content_hash):
+            existing_bytes = self._read_object_bytes(key)
+            if canonical_content_sha256(pd.read_parquet(io.BytesIO(existing_bytes)), data_type) == content_hash:
+                if bytes_sha256_out is not None:
+                    bytes_sha256_out[data_type] = bytes_sha256(existing_bytes)
                 logger.info(
                     "snapshot_write_skipped_content_exists",
                     path=path,
@@ -150,6 +163,9 @@ class ParquetSnapshots:
         table = pa.Table.from_pandas(df, preserve_index=False)
         buffer = io.BytesIO()
         pq.write_table(table, buffer, compression="snappy")
+        payload = buffer.getvalue()
+        if bytes_sha256_out is not None:
+            bytes_sha256_out[data_type] = bytes_sha256(payload)
         buffer.seek(0)
 
         self._client.put_object(
@@ -230,6 +246,40 @@ class ParquetSnapshots:
             )
         return self.load_snapshot(data_type, content_hash)
 
+    def load_snapshot_legacy(self, data_type: str, snapshot_date: date) -> pd.DataFrame:
+        """Read a pre-03A-1 date-keyed snapshot object.
+
+        03A-1 content-addresses new snapshot objects, but pre-existing
+        date-keyed objects (`snapshots/{data_type}/{YYYY-MM-DD}/data.parquet`)
+        are retained read-only (design section 5.1). Scripts that still
+        consume those legacy objects by date -- `backfill_momentum_scores.py`,
+        `audit_pit_safety.py` -- use this method rather than `load_snapshot`,
+        whose second argument is now a content hash. No content-hash
+        verification is performed because legacy objects were written before
+        any per-object logical hash existed.
+
+        Raises:
+            FileNotFoundError: if no legacy snapshot exists for that date.
+        """
+        key = f"snapshots/{data_type}/{snapshot_date}/data.parquet"
+        try:
+            response = self._client.get_object(self._bucket, key)
+            buffer = io.BytesIO(response.read())
+        except S3Error as exc:
+            raise FileNotFoundError(
+                f"No legacy snapshot found at {self._bucket}/{key}"
+            ) from exc
+
+        df = pd.read_parquet(buffer)
+        logger.info(
+            "snapshot_loaded_legacy",
+            path=f"{self._bucket}/{key}",
+            rows=len(df),
+            data_type=data_type,
+            snapshot_date=str(snapshot_date),
+        )
+        return df
+
     def list_snapshots(self, data_type: str) -> list[str]:
         """List content-addressed snapshot hashes available for a data_type.
 
@@ -259,13 +309,13 @@ class ParquetSnapshots:
         except S3Error:
             return False
 
-    def _verify_existing_object(self, key: str, data_type: str, expected_hash: str) -> bool:
-        """Download and recompute the canonical hash of an already-present
-        object rather than trusting "key exists" alone (section 2.1)."""
+    def _read_object_bytes(self, key: str) -> bytes:
+        """Download the raw bytes of an already-present object, so its
+        canonical hash can be recomputed (verification, not trusting "key
+        exists" alone -- section 2.1) and its informational bytes hash
+        recorded."""
         response = self._client.get_object(self._bucket, key)
-        buffer = io.BytesIO(response.read())
-        df = pd.read_parquet(buffer)
-        return canonical_content_sha256(df, data_type) == expected_hash
+        return response.read()
 
     def save_dataset_manifest(self, manifest) -> str:
         """Save a DatasetManifest alongside this snapshot collection."""
