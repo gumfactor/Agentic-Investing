@@ -48,7 +48,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-016 | Dashboard/API | P1 | F1 | Open | Blotter UI does not validate full schema before approval. |
 | BUG-017 | Trading Safety | P1 | F1 | Fixed | Quantity reduction updates one field while validation checks another. |
 | BUG-036 | Packaging/CI | P0 | F0 | Fixed | Invalid PEP 517 backend blocks package builds. |
-| BUG-037 | Data/Storage | P1 | F1 | Open | Same-date corporate actions overwrite one another. |
+| BUG-037 | Data/Storage | P1 | F1 | Implemented-pending-review | Same-date corporate actions overwrite one another. Fix on branch `dev/R2-03A3-samedate-actions`. |
 | BUG-038 | Data/Storage | P1 | F1 | Open | Snapshot version paths are mutable. |
 | BUG-039 | Backtesting | P1 | F1 | Open | Object-store failures can become unadjusted backtests. |
 | BUG-040 | Trading Safety | P1 | F1 | Fixed | Wash-sale guard checks the wrong order direction. |
@@ -1133,6 +1133,42 @@ The following findings were added after a second adversarial pass focused on gap
 **Impact:** A same-day split plus dividend can drop one adjustment, materially corrupting adjusted historical prices, backtests, and signal returns.
 
 **Suggested direction:** Accumulate all action multipliers per ex-date and multiply them together, or key by `(ex_date, action_type)` before aggregating.
+
+**Status (2026-07-20, branch `dev/R2-03A3-samedate-actions`, implemented-pending-review):**
+`compute_adjustment_factors` (`data/normalization/corporate_actions.py`) now
+accumulates the PRODUCT of every action's per-action multiplier for a given
+`(ticker, ex_date)`, regardless of `action_type`, via a new
+`_combine_same_date_action_multipliers` helper — shared automatically by
+`build_score_price_history_as_of` and `build_realized_total_return_as_of`
+(both 01B-3 cutoff-aware builders call the same function).
+
+Same-date split+dividend quoting convention was verified empirically, not
+assumed: yfinance's `Ticker.dividends` is confirmed (via AAPL, whose
+2012-08-09 pre-split $2.65/share dividend is returned as $0.094643 == 2.65 /
+(7*4), divided by the 2014 and 2020 splits that occurred strictly after that
+date) to retroactively normalize dividend values against a ticker's full
+split history — i.e. dividend values are always expressed in current/
+post-split share-count terms. A 21-ticker S&P 500 same-date
+`dividends`/`splits` collision scan (DHR, IRM, TMUS, EXPE, etc.) found only
+spinoff-modeling artifacts, not genuine simultaneous ordinary split+dividend
+rows, so the boundary case itself could not be tested against a real row;
+the module adopts `POST_SPLIT` as the declared default convention based on
+the general retroactive-normalization evidence, documented in the module
+docstring. An optional per-row `dividend_quoting_convention` column
+(`"post_split"`/`"pre_split"`) allows explicit override/normalization; any
+other value, or a `"pre_split"` dividend with no resolvable same-date net
+split ratio, raises a new `AmbiguousSameDateActionError` (fail closed rather
+than guess).
+
+New tests in `data/tests/test_corporate_actions.py`
+(`TestSameDateSplitDividendAccumulation`,
+`TestSameDateAccumulationFlowsThroughAllThreeCallers`) cover: a hand-computed
+post-split split+dividend fixture, a pre-split-quoted fixture that converges
+to the same combined factor after normalization, split+spinoff, a
+three-same-date-action fixture, both `AmbiguousSameDateActionError` paths,
+and that the fix flows through all three callers. All prior
+`test_corporate_actions.py` and `backtesting/tests/test_engine.py` tests pass
+unchanged.
 
 ### BUG-038: Snapshot versions are mutable because date-only object keys are overwritten
 
