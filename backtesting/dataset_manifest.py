@@ -211,11 +211,35 @@ def build_manifest(
     return manifest
 
 
+# Fields excluded from manifest_content_sha256 because they are provenance/
+# labeling metadata, not logical bundle identity: `created_at` and
+# `git_commit` vary run-to-run even when the underlying data is unchanged,
+# and `version`/`snapshot_dates` are the human-readable date labels section
+# 2.1 explicitly demotes to metadata (re-pinning the same content under a
+# different --snapshot-date label must still be recognized as the same
+# bundle). `legacy_mutable` and `manifest_content_sha256` itself are also
+# excluded (identity/labeling flags, not content).
+_IDENTITY_EXCLUDED_FIELDS = frozenset(
+    {
+        "created_at",
+        "git_commit",
+        "version",
+        "snapshot_dates",
+        "legacy_mutable",
+        "manifest_content_sha256",
+    }
+)
+
+
 def _manifest_content_sha256(manifest: DatasetManifest) -> str:
-    """SHA-256 of the manifest's canonical JSON, excluding the
-    `manifest_content_sha256` field itself (section 2.2)."""
-    payload = asdict(manifest)
-    payload.pop("manifest_content_sha256", None)
+    """SHA-256 of the manifest's canonical JSON, excluding
+    `manifest_content_sha256` and other provenance/labeling-only fields
+    (section 2.2's "same data_version => same logical inputs" guarantee
+    requires this hash to be a pure function of the bundle's content, not of
+    when/under-which-label it was pinned)."""
+    payload = {
+        k: v for k, v in asdict(manifest).items() if k not in _IDENTITY_EXCLUDED_FIELDS
+    }
     canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
@@ -266,20 +290,38 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
         # of fake-client exception types for "not found".
         existing_bytes = None
 
-    if existing_bytes is not None:
-        if existing_bytes == payload:
+    if existing_bytes is not None and not manifest.legacy_mutable:
+        # Identity check, not a raw byte comparison: two manifests built
+        # from identical bundle content can still differ byte-for-byte in
+        # provenance-only fields (created_at, git_commit, the human
+        # version/snapshot_dates label) while sharing the same
+        # manifest_content_sha256 -- that IS the identical-content, safe
+        # no-op case (section 2.5: re-pinning under a different
+        # --snapshot-date label is still a no-op). Only a stored object at
+        # this key whose OWN manifest_content_sha256 disagrees is a genuine
+        # problem (should be structurally impossible since the key derives
+        # from the hash; defense against a hash-collision-shaped bug).
+        try:
+            existing_manifest = json.loads(existing_bytes)
+            existing_identity = existing_manifest.get("manifest_content_sha256")
+        except (json.JSONDecodeError, AttributeError):
+            existing_identity = None
+
+        if existing_identity == manifest.manifest_content_sha256:
             logger.info("manifest_write_skipped_content_exists", path=f"{bucket}/{key}")
             return f"{bucket}/{key}"
-        if not manifest.legacy_mutable:
-            raise ValueError(
-                f"Object already exists at content-addressed manifest key "
-                f"{bucket}/{key} with different bytes than the manifest "
-                "being saved. This should be structurally impossible since "
-                "the key derives from the manifest's own content hash; "
-                "refusing to overwrite."
-            )
+        raise ValueError(
+            f"Object already exists at content-addressed manifest key "
+            f"{bucket}/{key} whose own manifest_content_sha256 "
+            f"({existing_identity!r}) disagrees with the manifest being "
+            f"saved ({manifest.manifest_content_sha256!r}). This should be "
+            "structurally impossible since the key derives from the hash; "
+            "refusing to overwrite."
+        )
+    elif existing_bytes is not None and manifest.legacy_mutable:
         # legacy_mutable manifests intentionally keep pre-03A-1 overwrite
-        # semantics at this key (date-string keyed), so fall through.
+        # semantics at this key (date-string keyed): always write through.
+        pass
 
     buf = io.BytesIO(payload)
     minio_client.put_object(

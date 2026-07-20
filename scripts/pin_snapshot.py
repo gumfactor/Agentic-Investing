@@ -1,8 +1,21 @@
 """Pin a complete, versioned backtest dataset bundle in MinIO.
 
 The bundle contains daily prices, strategy-specific alpha scores, corporate
-actions, and benchmark prices under one snapshot date. A manifest records the
-object paths, row counts, date ranges, schema hashes, and producing git commit.
+actions, and benchmark prices. Each dataframe is written to a content-
+addressed object (03A-1 -- BUG-038): ParquetSnapshots.save_snapshot keys the
+object by the canonical LOGICAL content hash of the dataframe, not the
+caller-supplied `--snapshot-date`, so re-running this script against
+unchanged source data is a safe no-op that writes zero new MinIO objects.
+`--snapshot-date` remains only as a human-readable label recorded on the
+manifest, not as any object's identity.
+
+The manifest records the object paths, row counts, date ranges, schema
+hashes, per-data-type content hashes, and producing git commit, and is itself
+stored at a content-addressed key
+(manifests/{manifest_content_sha256}/manifest.json). Use
+`manifest.manifest_content_sha256` -- printed below -- as the MLflow
+data_version (C7); it is a single opaque, verifiable token, not a mutable-
+looking date string.
 
 Usage:
     python -m scripts.pin_snapshot --strategy-id v1 --benchmark SPY
