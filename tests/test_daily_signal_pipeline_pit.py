@@ -737,6 +737,87 @@ class TestSimulationCorporateActionAdjustment:
         assert adj_today.equals(raw_today)
         assert adj_prev.equals(raw_prev)
 
+    def test_ambiguous_same_date_action_logs_distinguishable_event_and_degrades(
+        self, dag_module, monkeypatch
+    ) -> None:
+        """BUG-037/BUG-076 (adversarial review P1-2): an unresolvable same-date
+        quoting convention (AmbiguousSameDateActionError, a ValueError
+        subclass) must be caught with its OWN distinguishable structlog event
+        name, not degrade under the generic infra-failure event that the
+        broad `except Exception` emits — otherwise a data-correctness fail is
+        indistinguishable from a DB outage in monitoring (the BUG-039 shape).
+        The diagnostic table stays non-blocking (raw fallback, no raise)."""
+        import pandas as pd
+        import structlog
+        from datetime import datetime, timezone
+
+        prev_date = date(2022, 6, 1)
+        sim_date = date(2022, 6, 2)
+        prices_df = pd.DataFrame(
+            [
+                {"ticker": "AAA", "date": prev_date, "close": 100.0},
+                {"ticker": "AAA", "date": sim_date, "close": 50.0},
+            ]
+        )
+        # Same-date split + a dividend quoted 'pre_split' but with an
+        # unrecognized-by-normalization setup is hard to force through the
+        # frame path; instead use an explicitly invalid convention value,
+        # which raises AmbiguousSameDateActionError deterministically.
+        actions_frame = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "ex_date": sim_date,
+                    "action_type": "split",
+                    "value": 2.0,
+                    "known_at": datetime(2022, 6, 1, 21, 0, tzinfo=timezone.utc),
+                    "source_version": "test",
+                    "dividend_quoting_convention": None,
+                },
+                {
+                    "ticker": "AAA",
+                    "ex_date": sim_date,
+                    "action_type": "dividend",
+                    "value": 1.0,
+                    "known_at": datetime(2022, 6, 1, 21, 0, tzinfo=timezone.utc),
+                    "source_version": "test",
+                    "dividend_quoting_convention": "mid_split",  # unrecognized -> raises
+                },
+            ]
+        )
+
+        def _fake_read_sql(query, *a, **k):
+            return actions_frame.copy()
+
+        monkeypatch.setattr(pd, "read_sql", _fake_read_sql)
+
+        captured: list[dict] = []
+
+        def _capture(logger, method_name, event_dict):
+            captured.append(dict(event_dict))
+            raise structlog.DropEvent
+
+        structlog.configure(processors=[_capture])
+        try:
+            raw_today = prices_df[prices_df["date"] == sim_date].set_index("ticker")["close"]
+            raw_prev = prices_df[prices_df["date"] == prev_date].set_index("ticker")["close"]
+
+            adj_today, adj_prev = dag_module._adjusted_closes_for_simulation(
+                prices_df, self._FakeEngine(), sim_date, prev_date, raw_today, raw_prev
+            )
+        finally:
+            structlog.reset_defaults()
+
+        # Non-blocking: raw fallback, no raise.
+        assert adj_today.equals(raw_today)
+        assert adj_prev.equals(raw_prev)
+
+        # The distinguishable data-correctness event was emitted, NOT the
+        # generic infra-failure event.
+        events = [c.get("event") for c in captured]
+        assert "simulation_ambiguous_same_date_action" in events
+        assert "simulation_corporate_action_adjustment_unavailable" not in events
+
     def test_no_actions_returns_raw_unchanged(self, dag_module, monkeypatch) -> None:
         import pandas as pd
 

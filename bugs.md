@@ -104,6 +104,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-073 | Packaging/CI | P1 | F1 | Fixed | `pyproject.toml`'s pytest `testpaths` silently excluded ~412 tests (all of `tests/reporting/dashboards/`, `tests/infra/`) from every "full suite" run whenever a subdirectory (`tests/strategy_registry`) was also listed as its own testpath entry. |
 | BUG-074 | Research/Signals | P2 | F2 | Open | Registered operational methodology labels action_source_version as plain "unknown", imprecise for a DB with migrated legacy corporate_actions rows tagged "legacy_unknown". |
 | BUG-075 | Backtesting | P0 | F0 | Fixed (PR #36, merged 2026-07-20) | Backtest path silently ignored strategy-config fields it does not implement (`portfolio.method: mvo`/`risk_parity`, `optimizer_mode`, `constraints`, `risk_model`, live-only `execution` fields) instead of rejecting them — a backtest labeled "mvo with sector caps" was actually an uncapped equal-weight backtest. |
+| BUG-076 | Data/Storage | P2 | F2 | Open | Residual of BUG-037: same-date ordinary split+dividend boundary untested against a real row; Yahoo spinoffs modeled as same-date split+dividend rows are normalized as ordinary split+dividend. Includes P2 sub-notes on silently-ignored NaN dividend/zero split ratio and the §2.3×§3.1 cutoff/convention interaction. |
 
 #### Long-term / lower-risk backlog
 
@@ -1169,6 +1170,97 @@ three-same-date-action fixture, both `AmbiguousSameDateActionError` paths,
 and that the fix flows through all three callers. All prior
 `test_corporate_actions.py` and `backtesting/tests/test_engine.py` tests pass
 unchanged.
+
+**Operator sign-off on the POST_SPLIT default (2026-07-20, adversarial
+review P1-1 resolution).** The operator reviewed and signed off on KEEPING
+`POST_SPLIT` as the default convention rather than failing closed on all
+same-date split+dividend rows. Rationale (operator): the ~21 real same-date
+`dividends`/`splits` collisions found in the S&P 500 scan are Yahoo
+spinoff-modeling artifacts stored as split+dividend row pairs, not genuine
+ordinary simultaneous split+dividend events; a hard fail-closed default
+would therefore break scoring today for those tickers with no genuine
+ordinary same-date split+dividend case existing to justify it. The strong
+general yfinance retroactive-normalization evidence (the AAPL 2012-08-09
+demonstration above, holding uniformly across the whole dividend series) is
+accepted as satisfying design-plan §3.1's "empirically determined"
+requirement, even though the exact same-date boundary is untested against a
+real row because no such row exists in the available universe. The two
+untested residuals this leaves are tracked as BUG-076. (The design-doc-side
+record of this sign-off is landed separately on branch 03A-1, which owns the
+design plan; this ledger entry is the code-branch-side record.)
+
+**Reachability note (adversarial review P1-2, fixed on this branch).**
+`AmbiguousSameDateActionError` is a `ValueError` subclass and was reachable
+by the pre-existing broad `except Exception` in `_write_simulation`'s
+corporate-action adjustment helper in
+`airflow/dags/daily_signal_pipeline.py` (the diagnostic
+`strategy_simulations` path), which would degrade to raw prices under the
+generic `simulation_corporate_action_adjustment_unavailable` event —
+indistinguishable from an infra outage (the BUG-039 shape). Fixed by
+special-casing the exception with a distinguishable
+`simulation_ambiguous_same_date_action` structlog event before the broad
+handler; the diagnostic table is intentionally kept non-blocking (still
+falls back to raw prices), only made observable. The SCORE path
+(`build_score_price_history_as_of`) is a separate call site and correctly
+does NOT swallow the exception (verified by reviewer). See BUG-076 P2 note.
+
+### BUG-076: Same-date corporate-action convention residuals (boundary untested; Yahoo spinoffs normalized as ordinary split+dividend)
+
+**Severity:** P2 / data correctness (residual of BUG-037)
+**Fix priority:** F2
+**Status:** Open (tracked residual; operator-accepted for now per BUG-037 sign-off)
+
+**Context:** Filed as the tracked residual of the BUG-037 fix
+(`dev/R2-03A3-samedate-actions`) after the operator signed off on keeping the
+`POST_SPLIT` default rather than failing closed. Two distinct residuals:
+
+1. **The same-date ordinary split+dividend boundary is unverified against a
+   real row.** The `POST_SPLIT` convention rests on strong *general* yfinance
+   retroactive-normalization evidence, but no genuine simultaneous ordinary
+   stock split + ordinary periodic cash dividend row exists anywhere in the
+   available S&P 500 universe to test the exact boundary directly. If such a
+   row ever appears (new data source, index change, or a non-yfinance
+   Phase 2+ vendor), the assumed post-split dividend basis must be
+   re-verified for that source before trusting the combined factor.
+
+2. **Yahoo spinoffs modeled as same-date split+dividend rows are normalized
+   as ordinary split+dividend, not as spinoffs.** The ~21 real same-date
+   collisions (DHR 2016-07-05, IRM 2014-09-26, TMUS 2013-05-01, EXPE
+   2011-12-21, etc.) are Yahoo's spinoff-modeling artifacts — one large
+   one-time "dividend" plus a compensating "split"-labeled ratio — which the
+   BUG-037 accumulator now multiplies together as if they were an ordinary
+   split and an ordinary cash dividend. This can misstate the adjustment for
+   those specific dates. Proper spinoff handling remains unimplemented
+   (module docstring already flags spinoffs as not-implemented and requires a
+   paid data source). Until then, adjusted prices on those exact dates should
+   be treated as approximate.
+
+**Also tracked here (P2 sub-notes, pre-existing / future-work, no code change
+on the 03A-3 branch):**
+
+- **NaN dividend / zero-or-negative split ratio are silently ignored**
+  (adversarial review P2-3, pre-existing, not a regression). In
+  `_combine_same_date_action_multipliers` / `compute_adjustment_factors`, a
+  same-date split with `value == 0` contributes no multiplier, and a computed
+  dividend factor `<= 0` is skipped; a NaN dividend `value` would flow into
+  the Decimal factor as NaN and be dropped by the `factor > 0` guard rather
+  than raising. These are silently no-op'd rather than surfaced. Acceptable
+  for now (matches long-standing behavior) but should become an explicit
+  validation/warning in a future data-quality pass.
+
+- **Cutoff-filtering (§2.3) × convention-normalization (§3.1) interaction
+  edge case** (adversarial review P2-4, future 03B/03C work). If a same-date
+  split is excluded by the `known_at` availability cutoff while its same-date
+  dividend survives the cutoff, a `pre_split`-quoted dividend would have no
+  surviving same-date split ratio to normalize against and would raise
+  `AmbiguousSameDateActionError` (fail closed) — or, under the default
+  `post_split` assumption, be applied without the split context. The
+  cutoff-aware builders filter actions *before* calling
+  `compute_adjustment_factors`, so the convention-normalization step sees
+  only the surviving subset. This interaction is benign under the current
+  `POST_SPLIT` default but must be revisited when 03B/03C build the
+  raw-execution vs analytic split, since the surviving-subset composition can
+  differ between the two legs.
 
 ### BUG-038: Snapshot versions are mutable because date-only object keys are overwritten
 
