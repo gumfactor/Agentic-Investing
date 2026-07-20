@@ -520,6 +520,67 @@ class TestSameDateSplitDividendAccumulation:
         with pytest.raises(AmbiguousSameDateActionError):
             compute_adjustment_factors(actions, prices)
 
+    def test_nullable_string_dtype_pd_na_defaults_to_post_split(self) -> None:
+        """Codex review round-1 P2 regression: when the optional
+        `dividend_quoting_convention` column uses pandas' NULLABLE string
+        dtype, missing cells arrive as `pd.NA` (not float NaN). The convention
+        guard must treat `pd.NA` uniformly as absent -> default `post_split`,
+        not let it fall through to a membership/comparison that raises
+        'boolean value of NA is ambiguous' and break adjustment for otherwise
+        valid rows whenever the override column is mostly empty."""
+        prices = _prices([
+            ("NA1", "2024-01-04", 100),
+            ("NA1", "2024-01-05", 50),
+            ("NA1", "2024-01-06", 49),
+        ])
+        actions = pd.DataFrame(
+            {
+                "ticker": ["NA1", "NA1"],
+                "ex_date": [date(2024, 1, 5), date(2024, 1, 5)],
+                "action_type": ["split", "dividend"],
+                "value": [Decimal("2.0"), Decimal("1.0")],
+                # Nullable "string" dtype with pd.NA missing values.
+                "dividend_quoting_convention": pd.array([pd.NA, pd.NA], dtype="string"),
+            }
+        )
+        assert actions["dividend_quoting_convention"].dtype == "string"
+
+        factors = compute_adjustment_factors(actions, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+        # Same hand-computed post_split combined factor as the explicit fixture.
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+
+    def test_parquet_round_trip_pd_na_convention_defaults_to_post_split(self, tmp_path) -> None:
+        """Prove the nullable-dtype path end-to-end: write the actions to
+        parquet and read them back (the real ingestion/snapshot path), which
+        materializes the empty override column as nullable string with pd.NA,
+        then confirm adjustment still defaults to post_split."""
+        prices = _prices([
+            ("NA2", "2024-01-04", 100),
+            ("NA2", "2024-01-05", 50),
+        ])
+        actions = pd.DataFrame(
+            {
+                "ticker": ["NA2", "NA2"],
+                "ex_date": [date(2024, 1, 5), date(2024, 1, 5)],
+                "action_type": ["split", "dividend"],
+                "value": ["2.0", "1.0"],  # parquet can't store Decimal natively
+                "dividend_quoting_convention": pd.array([pd.NA, pd.NA], dtype="string"),
+            }
+        )
+        path = tmp_path / "actions.parquet"
+        actions.to_parquet(path)
+        loaded = pd.read_parquet(path)
+        # Restore Decimal/date shapes the way the ingestion layer would.
+        loaded["value"] = loaded["value"].map(lambda v: Decimal(str(v)))
+        loaded["ex_date"] = loaded["ex_date"].map(
+            lambda d: d if isinstance(d, date) else pd.Timestamp(d).date()
+        )
+
+        factors = compute_adjustment_factors(loaded, prices)
+        factor_map = dict(zip(factors["date"], factors["adj_factor"]))
+        assert factor_map[date(2024, 1, 4)] == _EXPECTED_SPLIT_DIVIDEND_FACTOR
+
 
 class TestSameDateAccumulationFlowsThroughAllThreeCallers:
     """§3.4 acceptance test: the BUG-037 fix is shared automatically by

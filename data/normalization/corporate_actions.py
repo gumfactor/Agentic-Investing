@@ -208,7 +208,14 @@ def _combine_same_date_action_multipliers(
         for _, action in dividends.iterrows():
             raw_value = Decimal(str(action["value"]))
             convention = action.get("dividend_quoting_convention") if hasattr(action, "get") else None
-            if convention is not None and (isinstance(convention, float) and pd.isna(convention)):
+            # Treat every "absent" marker uniformly as default (post_split):
+            # None, float NaN, AND pandas' pd.NA (the missing-value sentinel of
+            # the nullable "string"/StringDtype column that arrives after a
+            # parquet round-trip). A bare `pd.NA in (...)`/`pd.NA not in (...)`
+            # membership or comparison raises "boolean value of NA is
+            # ambiguous", so guard with a scalar pd.isna() check — `convention`
+            # is always a single cell value here, never an array.
+            if convention is not None and pd.api.types.is_scalar(convention) and pd.isna(convention):
                 convention = None
             normalized_value = _normalize_dividend_value(
                 ticker=ticker,
