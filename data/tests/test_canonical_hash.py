@@ -151,6 +151,36 @@ class TestNormalizationEdgeCases:
         )
 
 
+class TestEncodingInjectivity:
+    def test_embedded_field_separator_does_not_collide(self) -> None:
+        """A cell containing the field separator byte (\\x1f) must not shift
+        column boundaries and collide with a different logical frame
+        (finding-1). Length-prefixed fields make the encoding injective."""
+        sep = "\x1f"
+        df1 = pd.DataFrame({"ticker": [f"AAPL{sep}XYZ"], "note": ["foo"]})
+        df2 = pd.DataFrame({"ticker": ["XYZ"], "note": [f"foo{sep}AAPL"]})
+        assert canonical_content_sha256(df1, "unknown") != canonical_content_sha256(
+            df2, "unknown"
+        )
+
+    def test_embedded_row_separator_does_not_collide(self) -> None:
+        rowsep = "\x1e"
+        df1 = pd.DataFrame({"a": [f"x{rowsep}y"], "b": ["z"]})
+        df2 = pd.DataFrame({"a": ["x"], "b": [f"y{rowsep}z"]})
+        assert canonical_content_sha256(df1, "unknown") != canonical_content_sha256(
+            df2, "unknown"
+        )
+
+    def test_length_prefix_boundary_case(self) -> None:
+        """Values whose length digits could be confused with content must
+        still be distinguished (e.g. "1:x" as a literal cell)."""
+        df1 = pd.DataFrame({"a": ["1:x"], "b": ["y"]})
+        df2 = pd.DataFrame({"a": ["1"], "b": [":xy"]})
+        assert canonical_content_sha256(df1, "unknown") != canonical_content_sha256(
+            df2, "unknown"
+        )
+
+
 class TestPerDataTypeSortKeys:
     def test_alpha_scores_sorts_by_score_date_ticker(self) -> None:
         df = pd.DataFrame(

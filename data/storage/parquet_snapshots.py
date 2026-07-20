@@ -39,31 +39,17 @@ from minio.error import S3Error
 
 from data.storage.canonical_hash import bytes_sha256, canonical_content_sha256
 
+# SnapshotIntegrityError is defined in data.storage.errors so both this module
+# and backtesting.dataset_manifest can raise it without a circular import.
+# Re-exported here for backward compatibility with existing
+# `from data.storage.parquet_snapshots import SnapshotIntegrityError` callers.
+from data.storage.errors import SnapshotIntegrityError
+
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_BUCKET = os.environ.get("MINIO_BUCKET_SNAPSHOTS", "rqis-snapshots")
 
-
-class SnapshotIntegrityError(Exception):
-    """Raised when stored/downloaded snapshot content does not match its
-    expected canonical content hash.
-
-    Covers two situations, both fail-closed:
-      - load time (section 2.3): a downloaded object's parsed DataFrame does
-        not hash to the value recorded in the manifest (or encoded in the
-        object's own content-addressed key) -- corruption or tampering.
-      - save time (section 2.1): an object already exists at the computed
-        content-addressed key, but re-downloading and re-hashing it does not
-        match the hash that produced the key -- should be structurally
-        impossible (the key derives from the hash), so this is defense
-        against a hash-collision-shaped bug or manual tampering, not an
-        expected code path.
-
-    The full fail-closed object-store error taxonomy (SnapshotStoreUnavailable
-    Error, SnapshotAccessDeniedError, SnapshotPartialReadError, and narrowing
-    `FileNotFoundError` to a proper `SnapshotNotFoundError`) is 03A-2's scope;
-    this exception only covers the content-integrity check needed here.
-    """
+__all__ = ["ParquetSnapshots", "SnapshotIntegrityError"]
 
 
 def _content_key(data_type: str, content_sha256: str) -> str:

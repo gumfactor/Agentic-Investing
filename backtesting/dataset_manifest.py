@@ -63,6 +63,7 @@ import pandas as pd
 import structlog
 
 from data.storage.canonical_hash import canonical_content_sha256
+from data.storage.errors import SnapshotIntegrityError
 
 logger = structlog.get_logger(__name__)
 
@@ -355,17 +356,36 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
     return path
 
 
+# A content-addressed manifest version is exactly a SHA-256 hex digest;
+# anything else (a `YYYY-MM-DD` date string) is a legacy mutable key.
+_MANIFEST_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
-    """Load a manifest from MinIO by its key.
+    """Load a manifest from MinIO by its key, verifying integrity for
+    content-addressed loads (03A-1 finding-3 fix).
 
     For manifests produced by this module's `build_manifest`/`save_manifest`
     (03A-1 onward), `version` must be the manifest's `manifest_content_sha256`
     (i.e. the MLflow `data_version` value) — that is the manifest's actual
-    object key going forward. For pre-03A-1 `legacy_mutable` manifests,
-    `version` is still the original caller-supplied date string.
+    object key going forward. Because that hash IS the C7 `data_version` root
+    and every leaf dataframe is trusted against the hashes THIS manifest
+    records, the manifest itself must be verified: after parsing, its own
+    canonical content hash is recomputed and required to equal `version`.
+    A tampered or bit-rotted manifest at the expected key therefore fails
+    closed with `SnapshotIntegrityError` instead of being trusted blindly
+    (mirrors `ParquetSnapshots.load_snapshot`).
+
+    For pre-03A-1 `legacy_mutable` manifests, `version` is still the original
+    caller-supplied date string; those are NOT content-addressed and load
+    without hash verification. A date-string `version` can never masquerade
+    as a verified-immutable load, and a manifest that claims `legacy_mutable`
+    while sitting at a content-addressed key is itself an integrity failure.
 
     Raises:
         FileNotFoundError: if no manifest exists for version.
+        SnapshotIntegrityError: if a content-addressed manifest does not hash
+            to its key, or claims legacy_mutable at a content-addressed key.
     """
     from minio.error import S3Error  # lazy import to keep module importable without minio
 
@@ -378,7 +398,26 @@ def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
     # Filter to known fields so manifests written by a newer code version
     # (with extra fields) can still be loaded by older code without TypeError.
     known = DatasetManifest.__dataclass_fields__
-    return DatasetManifest(**{k: v for k, v in data.items() if k in known})
+    manifest = DatasetManifest(**{k: v for k, v in data.items() if k in known})
+
+    is_content_addressed = bool(_MANIFEST_HASH_RE.match(version))
+    if is_content_addressed:
+        if manifest.legacy_mutable:
+            raise SnapshotIntegrityError(
+                f"Manifest at content-addressed key {bucket}/{key} claims "
+                "legacy_mutable=true; a legacy mutable manifest can never "
+                "legitimately live at a content-addressed hash key. Refusing "
+                "to trust it as a verified-immutable data_version."
+            )
+        recomputed = _manifest_content_sha256(manifest)
+        if recomputed != version:
+            raise SnapshotIntegrityError(
+                f"Manifest at {bucket}/{key} does not match its content-"
+                f"addressed hash: expected {version}, recomputed {recomputed}. "
+                "The manifest has been tampered with or corrupted; refusing "
+                "to use it as a C7 data_version."
+            )
+    return manifest
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -135,8 +135,23 @@ def canonical_content_sha256(df: pd.DataFrame | None, data_type: str) -> str:
     full_sort_cols = declared + tiebreak
     normalized = normalized.sort_values(full_sort_cols, kind="mergesort").reset_index(drop=True)
 
-    rows = normalized.apply(lambda row: _FIELD_SEP.join(row), axis=1)
-    return hashlib.sha256(_ROW_SEP.join(rows).encode("utf-8")).hexdigest()
+    # Length-prefix every field and every row so the encoding is INJECTIVE:
+    # a raw `_FIELD_SEP.join(row)` shifts column boundaries whenever a cell
+    # value itself contains the separator byte, letting two logically-distinct
+    # frames collide to the same hash (e.g. ticker="AAPL\x1fXYZ",note="foo"
+    # vs ticker="XYZ",note="foo\x1fAAPL"). A `{len}:{value}` prefix makes each
+    # field self-delimiting, so no cell contents can forge a boundary. Column
+    # count is fixed per frame, so prefixing fields suffices for row
+    # injectivity; rows are additionally length-prefixed for defence in depth.
+    rows = normalized.apply(_encode_row, axis=1)
+    stream = "".join(f"{len(r)}{_ROW_SEP}{r}" for r in rows)
+    return hashlib.sha256(stream.encode("utf-8")).hexdigest()
+
+
+def _encode_row(row) -> str:
+    """Injectively encode one row: each field as `{char_len}:{value}` so the
+    separator byte can never be forged by a cell's own contents."""
+    return _FIELD_SEP.join(f"{len(v)}:{v}" for v in row)
 
 
 def bytes_sha256(payload: bytes) -> str:

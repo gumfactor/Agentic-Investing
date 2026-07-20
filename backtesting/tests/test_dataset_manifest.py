@@ -314,3 +314,111 @@ class TestLegacyManifest:
         client = _fake_minio_empty()
         path = save_manifest(manifest, client, "rqis-snapshots")
         assert path == "rqis-snapshots/manifests/2026-06-14/manifest.json"
+
+
+class TestLoadManifestIntegrity:
+    """finding-3: load_manifest must verify a content-addressed manifest's
+    own hash, mirroring load_snapshot, so a tampered C7 data_version root is
+    not trusted blindly."""
+
+    def _client_serving(self, payload_by_key: dict) -> MagicMock:
+        from minio.error import S3Error
+
+        client = MagicMock()
+
+        def _get(bucket, key):
+            if key not in payload_by_key:
+                raise S3Error(
+                    code="NoSuchKey", message="not found",
+                    resource="", request_id="", host_id="", response=MagicMock()
+                )
+            resp = MagicMock()
+            resp.read.return_value = payload_by_key[key]
+            return resp
+
+        client.get_object.side_effect = _get
+        return client
+
+    def test_tampered_content_addressed_manifest_raises(self) -> None:
+        from data.storage.errors import SnapshotIntegrityError
+
+        dataframes = _dataframes()
+        real = build_manifest(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+        good_key = f"manifests/{real.manifest_content_sha256}/manifest.json"
+
+        # Tamper: swap in a manifest whose recorded strategy_id differs, but
+        # store it under the ORIGINAL hash key (a bit-rot / swap attack).
+        tampered = __import__("dataclasses").asdict(real)
+        tampered["strategy_id"] = "attacker_swapped"
+        client = self._client_serving({good_key: json.dumps(tampered).encode()})
+
+        with pytest.raises(SnapshotIntegrityError, match="does not match its content"):
+            load_manifest(real.manifest_content_sha256, client, "rqis-snapshots")
+
+    def test_untampered_content_addressed_manifest_loads(self) -> None:
+        dataframes = _dataframes()
+        real = build_manifest(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+        key = f"manifests/{real.manifest_content_sha256}/manifest.json"
+        client = self._client_serving(
+            {key: json.dumps(__import__("dataclasses").asdict(real)).encode()}
+        )
+        loaded = load_manifest(real.manifest_content_sha256, client, "rqis-snapshots")
+        assert loaded.manifest_content_sha256 == real.manifest_content_sha256
+
+    def test_legacy_date_string_version_loads_without_verification(self) -> None:
+        """A plain date-string version is the legacy_mutable path -- it must
+        load with no hash check and no raise (and cannot masquerade as a
+        verified-immutable load)."""
+        legacy_payload = {
+            "version": "2026-06-14",
+            "created_at": "2026-06-14T00:00:00+00:00",
+            "git_commit": "abc123",
+            "strategy_id": "v1",
+            "snapshot_dates": {},
+            "object_paths": {},
+            "row_counts": {},
+            "date_ranges": {},
+            "schema_hashes": {},
+            "legacy_mutable": True,
+        }
+        key = "manifests/2026-06-14/manifest.json"
+        client = self._client_serving({key: json.dumps(legacy_payload).encode()})
+        loaded = load_manifest("2026-06-14", client, "rqis-snapshots")
+        assert loaded.version == "2026-06-14"
+        assert loaded.legacy_mutable is True
+
+    def test_legacy_mutable_at_content_key_is_rejected(self) -> None:
+        """A manifest claiming legacy_mutable while sitting at a content-
+        addressed key is itself an integrity failure (closes the bypass where
+        an attacker sets legacy_mutable=true to skip verification)."""
+        from data.storage.errors import SnapshotIntegrityError
+
+        fake_hash = "a" * 64
+        payload = {
+            "version": fake_hash,
+            "created_at": "",
+            "git_commit": "",
+            "strategy_id": "v1",
+            "snapshot_dates": {},
+            "object_paths": {},
+            "row_counts": {},
+            "date_ranges": {},
+            "schema_hashes": {},
+            "legacy_mutable": True,
+        }
+        key = f"manifests/{fake_hash}/manifest.json"
+        client = self._client_serving({key: json.dumps(payload).encode()})
+        with pytest.raises(SnapshotIntegrityError, match="legacy_mutable"):
+            load_manifest(fake_hash, client, "rqis-snapshots")
