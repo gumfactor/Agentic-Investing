@@ -19,14 +19,41 @@ from backtesting.dataset_manifest import (
 from data.storage.canonical_hash import canonical_content_sha256
 
 
-class _NotFound(Exception):
-    pass
+def _s3_not_found(key: str = "") -> "S3Error":
+    """A genuine minio.error.S3Error with the NoSuchKey code -- the only
+    error shape that save_manifest/load_manifest's translation boundary
+    (03A-2) accepts as 'object not written yet'. Fakes must use this rather
+    than an arbitrary exception type, since a non-S3 exception now
+    (correctly) translates to a fail-closed SnapshotStoreUnavailableError."""
+    from minio.error import S3Error
+
+    return S3Error(
+        code="NoSuchKey", message="not found",
+        resource=key, request_id="", host_id="", response=MagicMock()
+    )
+
+
+# Back-compat alias for the previous custom not-found sentinel used by a few
+# tests; now maps onto a genuine S3 NoSuchKey error so the 03A-2 translation
+# boundary classifies it as SnapshotNotFoundError.
+def _NotFound(key: str = "") -> "S3Error":  # noqa: N802 - kept as a factory
+    return _s3_not_found(key)
+
+
+def _s3_error(code: str) -> "S3Error":
+    from minio.error import S3Error
+
+    return S3Error(
+        code=code, message="boom",
+        resource="", request_id="", host_id="", response=MagicMock()
+    )
 
 
 def _fake_minio_empty() -> MagicMock:
-    """A fake client where every get_object raises (nothing stored yet)."""
+    """A fake client where every get_object raises a genuine S3 NoSuchKey
+    (nothing stored yet)."""
     client = MagicMock()
-    client.get_object.side_effect = _NotFound("not found")
+    client.get_object.side_effect = _s3_not_found()
     return client
 
 
@@ -249,6 +276,51 @@ class TestSaveLoadManifestRoundTrip:
         save_manifest(manifest, client, "rqis-snapshots")
         assert not client.put_object.called
 
+    def test_save_aborts_on_store_unavailable_never_writes(self) -> None:
+        """03A-2 write-path fail-closed (adversarial-review follow-up): a
+        transient store-unavailable error during save_manifest's existence
+        probe must ABORT the save, not be swallowed as 'doesn't exist yet'
+        and fall through to put_object."""
+        import urllib3.exceptions
+
+        from data.storage.errors import SnapshotStoreUnavailableError
+
+        dataframes = _dataframes()
+        manifest = build_manifest(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+        client = MagicMock()
+        client.get_object.side_effect = urllib3.exceptions.MaxRetryError(
+            pool=MagicMock(), url="http://minio"
+        )
+
+        with pytest.raises(SnapshotStoreUnavailableError):
+            save_manifest(manifest, client, "rqis-snapshots")
+        assert not client.put_object.called
+
+    def test_save_aborts_on_access_denied_never_writes(self) -> None:
+        """A 403 during the existence probe must likewise abort the save."""
+        from data.storage.errors import SnapshotAccessDeniedError
+
+        dataframes = _dataframes()
+        manifest = build_manifest(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+        client = MagicMock()
+        client.get_object.side_effect = _s3_error("AccessDenied")
+
+        with pytest.raises(SnapshotAccessDeniedError):
+            save_manifest(manifest, client, "rqis-snapshots")
+        assert not client.put_object.called
+
     def test_differing_bytes_at_same_content_key_refused(self) -> None:
         """Should be structurally impossible (key derives from the hash),
         but save_manifest must fail closed rather than silently overwrite."""
@@ -422,3 +494,44 @@ class TestLoadManifestIntegrity:
         client = self._client_serving({key: json.dumps(payload).encode()})
         with pytest.raises(SnapshotIntegrityError, match="legacy_mutable"):
             load_manifest(fake_hash, client, "rqis-snapshots")
+
+    def test_uppercase_hex_version_is_rejected_not_treated_as_legacy(self) -> None:
+        """BUG-077: a 64-character version that is NOT canonical lowercase
+        hex (e.g. upper-cased sha256 hex) must be rejected outright, not
+        silently fall through to the unverified legacy_mutable path just
+        because it fails the strict lowercase-hex regex."""
+        mixed_case_version = ("A" * 64)
+        client = MagicMock()  # must never be called: reject before any I/O
+        with pytest.raises(ValueError, match="not canonical lowercase sha256 hex"):
+            load_manifest(mixed_case_version, client, "rqis-snapshots")
+        client.get_object.assert_not_called()
+
+    def test_64_char_non_hex_version_is_rejected_not_treated_as_legacy(self) -> None:
+        """BUG-077: a 64-character version containing non-hex characters
+        must also be rejected outright rather than silently treated as an
+        unverified legacy manifest."""
+        non_hex_version = "z" * 64
+        client = MagicMock()
+        with pytest.raises(ValueError, match="not canonical lowercase sha256 hex"):
+            load_manifest(non_hex_version, client, "rqis-snapshots")
+        client.get_object.assert_not_called()
+
+    def test_genuine_legacy_date_version_is_unaffected_by_bug_077_guard(self) -> None:
+        """BUG-077's hardening must not regress the genuine legacy date-string
+        path -- only 64-character versions are scrutinized."""
+        legacy_payload = {
+            "version": "2026-06-14",
+            "created_at": "2026-06-14T00:00:00+00:00",
+            "git_commit": "abc123",
+            "strategy_id": "v1",
+            "snapshot_dates": {},
+            "object_paths": {},
+            "row_counts": {},
+            "date_ranges": {},
+            "schema_hashes": {},
+            "legacy_mutable": True,
+        }
+        key = "manifests/2026-06-14/manifest.json"
+        client = self._client_serving({key: json.dumps(legacy_payload).encode()})
+        loaded = load_manifest("2026-06-14", client, "rqis-snapshots")
+        assert loaded.legacy_mutable is True

@@ -122,13 +122,14 @@ def _load_from_files(
 def _load_from_snapshot(
     snapshot_date: date, strategy_id: str
 ) -> tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
+    from data.storage.errors import SnapshotNotFoundError
     from data.storage.parquet_snapshots import ParquetSnapshots
     snaps = ParquetSnapshots()
     logger.info("loading_from_minio", snapshot_date=str(snapshot_date))
     prices = snaps.load_snapshot_legacy("daily_prices", snapshot_date)
     try:
         scores = snaps.load_snapshot_legacy("factor_scores", snapshot_date)
-    except FileNotFoundError as exc:
+    except SnapshotNotFoundError as exc:
         if strategy_id != "v1":
             raise ValueError(
                 "factor_scores snapshot is missing and alpha_scores fallback is "
@@ -147,10 +148,14 @@ def _load_from_snapshot(
     # missing-snapshot handling, except this is a read-only diagnostic tool
     # (not a persist path), so there is nothing to fail closed on -- a
     # missing snapshot here just means the empirical audit degrades to raw
-    # (unadjusted) recomputation and main() prints a loud caveat.
+    # (unadjusted) recomputation and main() prints a loud caveat. 03A-2:
+    # narrowed to SnapshotNotFoundError specifically (BUG-039) -- an
+    # infra/auth/corruption failure while loading corporate_actions must
+    # still surface as a hard error even in this best-effort diagnostic
+    # path, not be silently folded into "no corporate actions."
     try:
         corporate_actions = snaps.load_snapshot_legacy("corporate_actions", snapshot_date)
-    except FileNotFoundError:
+    except SnapshotNotFoundError:
         corporate_actions = None
         logger.warning(
             "corporate_actions_snapshot_missing",

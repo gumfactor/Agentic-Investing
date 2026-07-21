@@ -21,12 +21,17 @@ downloaded content's hash on the way in (tamper-evidence, section 2.3).
     rqis-snapshots/manifests/{data_version}/manifest.json
     rqis-snapshots/snapshots/{data_type}/sha256/{h2}/{content_hash}/data.parquet
 
-The corporate_actions snapshot is optional: if the manifest has no
-corporate_actions entry, or the referenced object is absent, an empty frame
-is used and all adj_factors default to 1.0 (no adjustment). (Narrowing this
-optional path to only genuine not-found errors -- so an infra/auth failure
-can no longer masquerade as "no corporate actions" -- is BUG-039's fix,
-scoped to 03A-2; 03A-1 preserves the existing optional-frame behavior.)
+The corporate_actions snapshot is optional ONLY when the caller explicitly
+passes ``allow_missing_corporate_actions=True`` AND the underlying error is a
+genuine not-found (``SnapshotNotFoundError``) -- meaning the manifest has no
+corporate_actions entry, or the referenced object is confirmed absent from
+the store. In that opt-in case, an empty frame is used and all adj_factors
+default to 1.0 (no adjustment). By default (``allow_missing_corporate_actions
+=False``), a missing corporate_actions snapshot aborts backtest construction
+-- an unadjusted backtest must never be a silent default (BUG-039). Any
+non-not-found error (store unavailable, access denied, partial read, content
+integrity) always aborts regardless of the flag; it is never eligible to be
+treated as "no data" (design plan section 4.2).
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from data.normalization.corporate_actions import (
     apply_adjustment_factors,
     compute_adjustment_factors,
 )
+from data.storage.errors import SnapshotNotFoundError
 
 if TYPE_CHECKING:
     from data.storage.parquet_snapshots import ParquetSnapshots
@@ -53,6 +59,8 @@ def load_from_snapshot(
     data_version: str,
     config: dict,
     snapshots: ParquetSnapshots | None = None,
+    *,
+    allow_missing_corporate_actions: bool = False,
 ) -> DataHandler:
     """Load a DataHandler from versioned MinIO snapshots with price adjustment.
 
@@ -65,13 +73,36 @@ def load_from_snapshot(
             ``strategy_id``, then ``name``, or ``"v1"`` as fallback.
         snapshots: ParquetSnapshots instance.  If None, one is created from
             MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY env vars.
+        allow_missing_corporate_actions: Explicit opt-in (default False) for
+            treating a genuinely absent corporate_actions snapshot
+            (``SnapshotNotFoundError``) as "no corporate actions" -- an empty
+            frame with all adj_factors defaulting to 1.0. Default False means
+            a missing corporate_actions snapshot aborts backtest construction
+            (BUG-039): an unadjusted backtest must never be a silent default
+            for the standard path. Any non-not-found error always aborts
+            regardless of this flag.
 
     Returns:
         DataHandler ready for use in BacktestEngine.run().
 
     Raises:
-        FileNotFoundError: if daily_prices, alpha_scores, or benchmark snapshots
-            are absent for data_version.
+        SnapshotNotFoundError: if daily_prices, alpha_scores, or benchmark
+            snapshots are absent for data_version; or if corporate_actions is
+            absent and ``allow_missing_corporate_actions`` is False (also
+            catchable as ``FileNotFoundError`` for one deprecation cycle --
+            see ``data.storage.errors``).
+        SnapshotStoreUnavailableError: object store unreachable (connection/
+            timeout/DNS/TLS failure) while loading any snapshot, including
+            corporate_actions regardless of
+            ``allow_missing_corporate_actions``.
+        SnapshotAccessDeniedError: auth/authorization failure while loading
+            any snapshot, including corporate_actions regardless of
+            ``allow_missing_corporate_actions``.
+        SnapshotPartialReadError: a downloaded snapshot's byte count did not
+            match its reported Content-Length, or its parquet footer failed
+            to parse.
+        SnapshotIntegrityError: a downloaded snapshot's recomputed content
+            hash did not match the manifest's recorded hash.
         ValueError: if a required column is missing from a loaded snapshot,
             or if zero alpha_scores rows match the resolved strategy_id
             (fail-closed -- a silent cash-only backtest mislabeled with the
@@ -111,17 +142,28 @@ def load_from_snapshot(
     # ── Load raw snapshots ────────────────────────────────────────────────────
     prices_raw = snaps.load_snapshot_by_manifest(manifest, "daily_prices")
 
-    try:
+    if allow_missing_corporate_actions:
+        try:
+            corp_actions = snaps.load_snapshot_by_manifest(manifest, "corporate_actions")
+        except SnapshotNotFoundError:
+            logger.warning(
+                "loader_no_corp_actions",
+                data_version=data_version,
+                note="allow_missing_corporate_actions=True; all adj_factors default to 1.0",
+            )
+            corp_actions = pd.DataFrame(
+                columns=["ticker", "ex_date", "action_type", "value"]
+            )
+        # Any other exception (store unavailable, access denied, partial
+        # read, integrity mismatch) is NOT caught here -- it always aborts,
+        # regardless of allow_missing_corporate_actions (BUG-039 / design
+        # plan section 4.2).
+    else:
+        # Default path: a missing corporate_actions snapshot aborts. This is
+        # not wrapped in a narrower try/except -- SnapshotNotFoundError (and
+        # every other snapshot error) propagates uncaught, exactly like
+        # daily_prices/alpha_scores/benchmark below.
         corp_actions = snaps.load_snapshot_by_manifest(manifest, "corporate_actions")
-    except FileNotFoundError:
-        logger.warning(
-            "loader_no_corp_actions",
-            data_version=data_version,
-            note="all adj_factors default to 1.0",
-        )
-        corp_actions = pd.DataFrame(
-            columns=["ticker", "ex_date", "action_type", "value"]
-        )
 
     alpha_scores = snaps.load_snapshot_by_manifest(manifest, "alpha_scores")
     benchmark = snaps.load_snapshot_by_manifest(manifest, "benchmark")

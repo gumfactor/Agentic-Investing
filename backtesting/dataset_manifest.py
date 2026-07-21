@@ -63,7 +63,11 @@ import pandas as pd
 import structlog
 
 from data.storage.canonical_hash import canonical_content_sha256
-from data.storage.errors import SnapshotIntegrityError
+from data.storage.errors import (
+    SnapshotIntegrityError,
+    SnapshotNotFoundError,
+    SnapshotPartialReadError,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -295,14 +299,22 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
 
     payload = json.dumps(asdict(manifest), indent=2).encode()
 
+    # 03A-2 (adversarial-review follow-up): this write-path existence probe
+    # must route through the SAME single translation boundary as every read
+    # path (data.storage.parquet_snapshots.get_object_bytes), not do a bare
+    # `except Exception` around a direct minio get_object. A previous bare
+    # except swallowed a transient store-unavailable/access-denied failure as
+    # "object doesn't exist yet" and fell through to put_object -- a
+    # write-path fail-OPEN that violates the invariant this slice
+    # establishes. Only a genuine SnapshotNotFoundError means "not written
+    # yet"; every other error (store unavailable, access denied, partial
+    # read, integrity) propagates and aborts the save.
+    from data.storage.parquet_snapshots import get_object_bytes
+
     existing_bytes: Optional[bytes] = None
     try:
-        existing = minio_client.get_object(bucket, key)
-        existing_bytes = existing.read()
-    except Exception:  # noqa: BLE001 - broad: any "not found"-shaped client
-        # error means the object doesn't exist yet; fall through to write it.
-        # minio.error.S3Error is the real-world case, but tests use a variety
-        # of fake-client exception types for "not found".
+        existing_bytes = get_object_bytes(minio_client, bucket, key)
+    except SnapshotNotFoundError:
         existing_bytes = None
 
     if existing_bytes is not None and not manifest.legacy_mutable:
@@ -361,6 +373,23 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
 _MANIFEST_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _is_malformed_hash_version(version: str) -> bool:
+    """BUG-077: a `version` that is 64 characters long but does NOT match
+    the canonical lowercase-hex form (`_MANIFEST_HASH_RE`) -- e.g.
+    upper/mixed-case hex, or a 64-character non-hex string -- must never be
+    silently treated as a legacy date-string version. Only the *length*
+    coincidentally matching a real legacy date string is what made the old
+    `is_content_addressed = bool(_MANIFEST_HASH_RE.match(version))` check
+    unsafe: anything failing the regex fell through to the "legacy,
+    unverified" branch with no further scrutiny, including strings that were
+    clearly *meant* to be a sha256 hex digest but got mangled (e.g.
+    upper-cased by some intermediate system). Genuine legacy versions are
+    short `YYYY-MM-DD` date strings (10 characters) and are unaffected by
+    this check.
+    """
+    return len(version) == 64 and not _MANIFEST_HASH_RE.match(version)
+
+
 def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
     """Load a manifest from MinIO by its key, verifying integrity for
     content-addressed loads (03A-1 finding-3 fix).
@@ -383,18 +412,45 @@ def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
     while sitting at a content-addressed key is itself an integrity failure.
 
     Raises:
-        FileNotFoundError: if no manifest exists for version.
+        SnapshotNotFoundError: if no manifest exists for version (also
+            catchable as `FileNotFoundError` for one deprecation cycle --
+            see `data.storage.errors`).
+        SnapshotStoreUnavailableError: connection/timeout/DNS/TLS failure or
+            any other unexpected object-store error.
+        SnapshotAccessDeniedError: auth/authorization failure.
+        SnapshotPartialReadError: downloaded byte count did not match the
+            response's Content-Length, or the JSON payload failed to parse.
         SnapshotIntegrityError: if a content-addressed manifest does not hash
             to its key, or claims legacy_mutable at a content-addressed key.
     """
-    from minio.error import S3Error  # lazy import to keep module importable without minio
+    # `data.storage.parquet_snapshots.get_object_bytes` is the single
+    # translation boundary from `minio.error.S3Error` to the typed error
+    # hierarchy (design plan section 4.2); this module must not catch
+    # `S3Error` directly. Imported lazily to avoid a module-level circular
+    # import between `backtesting.dataset_manifest` and
+    # `data.storage.parquet_snapshots` (the latter imports
+    # `backtesting.dataset_manifest.save_manifest` inside a method body for
+    # the same reason).
+    from data.storage.parquet_snapshots import get_object_bytes
+
+    if _is_malformed_hash_version(version):
+        raise ValueError(
+            f"version {version!r} is 64 characters long but is not "
+            "canonical lowercase sha256 hex; refusing to silently load it "
+            "as an unverified legacy manifest (BUG-077). If this is meant "
+            "to be a content-addressed data_version, it must be exactly 64 "
+            "lowercase hex characters ([0-9a-f])."
+        )
 
     key = f"manifests/{version}/manifest.json"
+    raw = get_object_bytes(minio_client, bucket, key)
     try:
-        response = minio_client.get_object(bucket, key)
-        data = json.loads(response.read())
-    except S3Error as exc:
-        raise FileNotFoundError(f"No manifest at {bucket}/{key}") from exc
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SnapshotPartialReadError(
+            f"{bucket}/{key}: downloaded bytes failed to parse as JSON "
+            f"({exc})."
+        ) from exc
     # Filter to known fields so manifests written by a newer code version
     # (with extra fields) can still be loaded by older code without TypeError.
     known = DatasetManifest.__dataclass_fields__
