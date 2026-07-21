@@ -33,7 +33,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from data.universe.calendar import session_close_cutoff
-from data.universe.models import SymbolHistory, UniverseImportBatch, UniverseMembership
+from data.universe.models import (
+    SymbolHistory,
+    UniverseEligibilityAttribute,
+    UniverseEligibilityBatch,
+    UniverseImportBatch,
+    UniverseMembership,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -432,3 +438,419 @@ def load_current_universe() -> CurrentUniverseSnapshot:
         fetched_at=datetime.now(tz=timezone.utc),
         source="config.universe_loader (current membership)",
     )
+
+
+# ─── PIT eligibility attributes (03A-4a, design plan §1.3) ────────────────────
+#
+# A second, independent PIT axis alongside membership above: a ticker can be
+# a member on a date and still fail a strategy-declared eligibility filter
+# (ADV, price, security type) on that same date. This section adds the
+# runtime READ API only; the daily batch job that populates
+# universe_eligibility_attributes (adv_usd_20d, price_usd) and the
+# security_type curation backfill are Phase B (03A-4b).
+
+
+class EligibilityFilterOp(str, enum.Enum):
+    GTE = "gte"
+    LTE = "lte"
+    EQ = "eq"
+    IN = "in"
+
+
+class EligibilityExclusionReason(str, enum.Enum):
+    MISSING_ATTRIBUTE = "missing_attribute"
+    STALE_ATTRIBUTE = "stale_attribute"
+    BELOW_THRESHOLD = "below_threshold"
+    WRONG_TYPE = "wrong_type"
+
+
+class EligibilityError(UniverseError):
+    """Base class for point-in-time eligibility-attribute failures."""
+
+
+class NoEligibilityDataError(EligibilityError):
+    """No eligibility-attribute rows exist at all for the requested universe_id.
+
+    Distinct from a per-ticker ``missing_attribute`` exclusion (a normal,
+    expected outcome for individual tickers): this is a whole-universe
+    configuration problem -- Phase B's batch job has never run for this
+    universe_id -- and callers should treat it as a hard failure, not a
+    per-ticker exclusion reason, so it cannot be silently absorbed into an
+    "everyone excluded" result that looks like a legitimate illiquid
+    universe.
+    """
+
+
+@dataclass(frozen=True)
+class FilterSpec:
+    """One strategy-declared eligibility filter, parsed from the strategy
+    YAML's ``universe.eligibility`` block (§1.3). ``threshold`` is a float
+    for ``GTE``/``LTE``/``EQ`` against a numeric attribute, or a tuple of
+    strings for ``IN`` against a text attribute (e.g. ``security_type``).
+
+    ``max_staleness_days``, when set, additionally excludes a ticker whose
+    matching attribute row's ``source_data_asof`` is older than
+    ``as_of_date - max_staleness_days`` with ``stale_attribute`` -- even
+    though the row nominally covers the date -- catching the case where a
+    batch stopped being recomputed but its last row's open interval still
+    technically covers every later date.
+    """
+
+    attribute_name: str
+    op: EligibilityFilterOp
+    threshold: Union[float, tuple[str, ...]]
+    max_staleness_days: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class EligibilityExclusion:
+    ticker: str
+    attribute_name: str
+    reason: EligibilityExclusionReason
+    detail: str
+
+
+@dataclass(frozen=True)
+class EligibilityResult:
+    """Per-filter pass/fail outcome for every ticker considered, as of a date.
+
+    ``passing_tickers`` satisfied every filter in ``filters`` (an empty
+    ``filters`` dict makes every considered ticker pass vacuously).
+    ``exclusions`` carries one entry per (ticker, failed filter) so a
+    reviewer can distinguish "member but illiquid" from "member but no
+    eligibility data" (§1.5's combined-exclusion acceptance test) -- a
+    ticker can appear multiple times if it fails more than one filter.
+    """
+
+    universe_id: str
+    as_of_date: date
+    filters: dict[str, FilterSpec]
+    passing_tickers: tuple[str, ...]
+    exclusions: tuple[EligibilityExclusion, ...]
+
+    def __contains__(self, ticker: str) -> bool:
+        return ticker in set(self.passing_tickers)
+
+
+class PITEligibilityLookup:
+    """In-memory as-of eligibility-attribute lookup for one universe_id.
+
+    Loads every ``universe_eligibility_attributes`` row for ``universe_id``
+    (across all computation batches) once, then answers per-date filter
+    evaluation without further DB round trips. When more than one batch has
+    a row covering the same ticker/attribute/date, the row from the batch
+    with the latest ``computed_at`` wins (§1.2: "correcting a bad
+    computation publishes a new batch rather than mutating rows in place";
+    the newest batch's row is authoritative for any date it covers).
+
+    Fails closed at construction when no eligibility-attribute rows exist at
+    all for ``universe_id`` (:class:`NoEligibilityDataError`) -- distinct
+    from the normal, expected per-ticker ``missing_attribute`` exclusion.
+    """
+
+    def __init__(self, engine: Union[Engine, str], universe_id: str) -> None:
+        if isinstance(engine, str):
+            engine = create_engine(engine)
+        self._universe_id = universe_id
+
+        with Session(engine) as session:
+            rows = session.execute(
+                select(UniverseEligibilityAttribute, UniverseEligibilityBatch.computed_at)
+                .join(
+                    UniverseEligibilityBatch,
+                    UniverseEligibilityAttribute.computation_batch_id
+                    == UniverseEligibilityBatch.id,
+                )
+                .where(UniverseEligibilityAttribute.universe_id == universe_id)
+            ).all()
+            if not rows:
+                raise NoEligibilityDataError(
+                    f"No universe_eligibility_attributes rows exist for "
+                    f"universe_id={universe_id!r}. The Phase B eligibility batch "
+                    "job has not populated this universe yet; historical "
+                    "eligibility evaluation fails closed rather than treating "
+                    "every ticker as passing (03A-4a)."
+                )
+
+            # (ticker, attribute_name) -> list of (row, batch_computed_at)
+            self._rows: dict[tuple[str, str], list[tuple[UniverseEligibilityAttribute, datetime]]] = {}
+            for row, computed_at in rows:
+                if computed_at.tzinfo is None:
+                    computed_at = computed_at.replace(tzinfo=timezone.utc)
+                self._rows.setdefault((row.ticker, row.attribute_name), []).append(
+                    (row, computed_at)
+                )
+            self._all_tickers = sorted({r.ticker for r, _ in rows})
+
+    @property
+    def universe_id(self) -> str:
+        return self._universe_id
+
+    def _resolve_attribute(
+        self, ticker: str, attribute_name: str, as_of_date: date
+    ) -> Optional[tuple[UniverseEligibilityAttribute, datetime]]:
+        """Return the (row, batch_computed_at) covering ``as_of_date`` from
+        the latest-computed batch that has a covering row, or ``None``."""
+        candidates = [
+            (row, computed_at)
+            for row, computed_at in self._rows.get((ticker, attribute_name), ())
+            if row.effective_start <= as_of_date
+            and (row.effective_end is None or as_of_date < row.effective_end)
+        ]
+        if not candidates:
+            return None
+        # "Latest batch wins" (§1.2). Break computed_at ties deterministically
+        # on computation_batch_id (higher id = later-created batch): two
+        # batches can share an identical computed_at (second-precision
+        # wall-clock, or a corrective script reusing a fixed timestamp), and
+        # max()'s first-maximal-element behavior would otherwise silently
+        # degrade the invariant to "DB insert order" and let a stale/bad row
+        # outrank its correction.
+        return max(candidates, key=lambda pair: (pair[1], pair[0].computation_batch_id))
+
+    def evaluate(
+        self,
+        as_of_date: date,
+        filters: dict[str, FilterSpec],
+        tickers: Optional[list[str]] = None,
+    ) -> EligibilityResult:
+        """Evaluate every filter in ``filters`` for ``tickers`` (defaults to
+        every ticker with any eligibility row) as of ``as_of_date``."""
+        candidate_tickers = tickers if tickers is not None else self._all_tickers
+        exclusions: list[EligibilityExclusion] = []
+        passing: list[str] = []
+
+        for ticker in candidate_tickers:
+            ticker_ok = True
+            for filter_name, spec in filters.items():
+                resolved = self._resolve_attribute(ticker, spec.attribute_name, as_of_date)
+                if resolved is None:
+                    exclusions.append(
+                        EligibilityExclusion(
+                            ticker=ticker,
+                            attribute_name=spec.attribute_name,
+                            reason=EligibilityExclusionReason.MISSING_ATTRIBUTE,
+                            detail=(
+                                f"no {spec.attribute_name} eligibility row covers "
+                                f"{as_of_date} for {ticker}"
+                            ),
+                        )
+                    )
+                    ticker_ok = False
+                    continue
+                row, _ = resolved
+
+                if (
+                    spec.max_staleness_days is not None
+                    and (as_of_date - row.source_data_asof).days > spec.max_staleness_days
+                ):
+                    exclusions.append(
+                        EligibilityExclusion(
+                            ticker=ticker,
+                            attribute_name=spec.attribute_name,
+                            reason=EligibilityExclusionReason.STALE_ATTRIBUTE,
+                            detail=(
+                                f"{spec.attribute_name} source_data_asof "
+                                f"{row.source_data_asof} is more than "
+                                f"{spec.max_staleness_days} days before {as_of_date}"
+                            ),
+                        )
+                    )
+                    ticker_ok = False
+                    continue
+
+                ok, reason, detail = _evaluate_filter_value(row, spec)
+                if not ok:
+                    exclusions.append(
+                        EligibilityExclusion(
+                            ticker=ticker,
+                            attribute_name=spec.attribute_name,
+                            reason=reason,  # type: ignore[arg-type]
+                            detail=detail,
+                        )
+                    )
+                    ticker_ok = False
+
+            if ticker_ok:
+                passing.append(ticker)
+
+        passing.sort()
+        logger.debug(
+            "eligibility_evaluated_as_of",
+            universe_id=self._universe_id,
+            as_of_date=str(as_of_date),
+            n_filters=len(filters),
+            n_passing=len(passing),
+            n_exclusions=len(exclusions),
+        )
+        return EligibilityResult(
+            universe_id=self._universe_id,
+            as_of_date=as_of_date,
+            filters=dict(filters),
+            passing_tickers=tuple(passing),
+            exclusions=tuple(exclusions),
+        )
+
+
+def _evaluate_filter_value(
+    row: UniverseEligibilityAttribute, spec: FilterSpec
+) -> tuple[bool, Optional[EligibilityExclusionReason], str]:
+    """Compare a resolved attribute row's value against ``spec``.
+
+    Returns ``(passes, reason_if_failed, detail)``. A type mismatch between
+    the filter's expected value shape (numeric op vs. text ``IN`` op) and
+    what the row actually stores is a ``wrong_type`` exclusion, not a
+    crash -- defensive against a future attribute whose declared type does
+    not match what a caller's ``FilterSpec`` assumed.
+    """
+    if spec.op is EligibilityFilterOp.IN:
+        if row.attribute_value_text is None:
+            return (
+                False,
+                EligibilityExclusionReason.WRONG_TYPE,
+                f"{spec.attribute_name} row has no text value for an IN filter "
+                f"(attribute_value_text is NULL)",
+            )
+        if not isinstance(spec.threshold, tuple):
+            return (
+                False,
+                EligibilityExclusionReason.WRONG_TYPE,
+                f"{spec.attribute_name} IN filter threshold must be a tuple of "
+                f"strings, got {type(spec.threshold).__name__}",
+            )
+        if row.attribute_value_text in spec.threshold:
+            return True, None, ""
+        return (
+            False,
+            EligibilityExclusionReason.BELOW_THRESHOLD,
+            f"{spec.attribute_name}={row.attribute_value_text!r} not in "
+            f"{spec.threshold!r}",
+        )
+
+    if row.attribute_value_numeric is None:
+        return (
+            False,
+            EligibilityExclusionReason.WRONG_TYPE,
+            f"{spec.attribute_name} row has no numeric value for a "
+            f"{spec.op.value} filter (attribute_value_numeric is NULL)",
+        )
+    if not isinstance(spec.threshold, (int, float)):
+        return (
+            False,
+            EligibilityExclusionReason.WRONG_TYPE,
+            f"{spec.attribute_name} {spec.op.value} filter threshold must be "
+            f"numeric, got {type(spec.threshold).__name__}",
+        )
+    value = float(row.attribute_value_numeric)
+    threshold = float(spec.threshold)
+    if spec.op is EligibilityFilterOp.GTE:
+        passed = value >= threshold
+    elif spec.op is EligibilityFilterOp.LTE:
+        passed = value <= threshold
+    elif spec.op is EligibilityFilterOp.EQ:
+        # Exact float equality is fragile, but EQ is only reachable via the
+        # explicit universe.eligibility block and is intended for
+        # discrete/integer-valued attributes, not continuous ones.
+        passed = value == threshold
+    else:  # pragma: no cover - exhaustive over EligibilityFilterOp
+        raise AssertionError(f"unhandled EligibilityFilterOp {spec.op!r}")
+    if passed:
+        return True, None, ""
+    return (
+        False,
+        EligibilityExclusionReason.BELOW_THRESHOLD,
+        f"{spec.attribute_name}={value} does not satisfy {spec.op.value} {threshold}",
+    )
+
+
+def load_eligibility_as_of(
+    universe_id: str,
+    as_of_date: date,
+    filters: dict[str, FilterSpec],
+    *,
+    engine: Union[Engine, str],
+    tickers: Optional[list[str]] = None,
+) -> EligibilityResult:
+    """Single-call form of :meth:`PITEligibilityLookup.evaluate` (§1.3).
+
+    For repeated queries across many dates, construct one
+    :class:`PITEligibilityLookup` and reuse it.
+    """
+    lookup = PITEligibilityLookup(engine, universe_id)
+    return lookup.evaluate(as_of_date, filters, tickers=tickers)
+
+
+@dataclass(frozen=True)
+class CombinedEligibleUniverse:
+    """Membership AND eligibility, evaluated together (§1.3): "no caller can
+    apply one check without the other."""
+
+    membership: HistoricalUniverse
+    eligibility: EligibilityResult
+
+    @property
+    def eligible_tickers(self) -> tuple[str, ...]:
+        """Tickers that are BOTH PIT members AND pass every eligibility
+        filter -- the single set any scoring/backtest caller should trade."""
+        return tuple(t for t in self.membership.eligible_tickers if t in self.eligibility)
+
+
+def load_historical_universe_as_of(
+    universe_id: str,
+    as_of_date: date,
+    filters: dict[str, FilterSpec],
+    observation_cutoff: Optional[datetime] = None,
+    *,
+    engine: Union[Engine, str],
+    min_eligible: Optional[int] = None,
+) -> CombinedEligibleUniverse:
+    """Combined membership + eligibility call site (§1.3).
+
+    The one call every score-generation, IC-validation, and backtesting site
+    should use going forward, so no caller can apply the membership check
+    without the eligibility check or vice versa. ``filters`` may be empty
+    (e.g. a strategy that declares no eligibility filters) -- eligibility
+    then passes vacuously for every PIT member, and membership alone governs
+    the result, exactly like calling :func:`load_universe_as_of` directly.
+
+    Membership is evaluated first (fewer, cheaper rows); eligibility is then
+    evaluated only over the membership-eligible tickers so a huge
+    non-member universe never needs an eligibility lookup at all.
+    """
+    membership = load_universe_as_of(
+        universe_id,
+        as_of_date,
+        observation_cutoff=observation_cutoff,
+        engine=engine,
+        min_eligible=None,  # min_eligible is enforced below, post-eligibility
+    )
+
+    if filters:
+        eligibility = load_eligibility_as_of(
+            universe_id,
+            as_of_date,
+            filters,
+            engine=engine,
+            tickers=list(membership.eligible_tickers),
+        )
+    else:
+        eligibility = EligibilityResult(
+            universe_id=universe_id,
+            as_of_date=membership.as_of_date,
+            filters={},
+            passing_tickers=membership.eligible_tickers,
+            exclusions=(),
+        )
+
+    combined = CombinedEligibleUniverse(membership=membership, eligibility=eligibility)
+
+    if min_eligible is not None and len(combined.eligible_tickers) < min_eligible:
+        raise InsufficientCrossSectionError(
+            f"Only {len(combined.eligible_tickers)} tickers eligible (membership "
+            f"AND eligibility filters) for universe {universe_id!r} as of "
+            f"{as_of_date}; caller requires at least {min_eligible}. Failing "
+            "closed instead of emitting research from a silently shrunken "
+            "universe (03A-4a, mirrors BUG-008's min_eligible contract)."
+        )
+
+    return combined
