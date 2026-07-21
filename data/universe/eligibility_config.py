@@ -226,7 +226,14 @@ def parse_universe_eligibility_filters(
                 "pass every ticker (03A-4a, §1.3)."
             )
             return
-        specs[key] = _build_filter_spec(key, raw_spec)
+        try:
+            specs[key] = _build_filter_spec(key, raw_spec)
+        except _FilterBuildError as exc:
+            # A recognized (PIT-supported) key with a malformed value must
+            # still fail-closed through this module's "collect every
+            # violation before raising" contract, not crash with a raw
+            # ValueError/TypeError that bypasses it (P2-1/P2-2).
+            violations.append(str(exc))
 
     # 3. Flat legacy keys directly under `universe`.
     for key, value in universe_cfg.items():
@@ -269,16 +276,27 @@ def parse_universe_eligibility_filters(
                 )
                 continue
             threshold = raw_spec["threshold"]
-            if op is EligibilityFilterOp.IN and not isinstance(threshold, (list, tuple)):
-                violations.append(
-                    f"universe.eligibility.{attribute_name}: 'in' filters require "
-                    "a list/tuple threshold."
-                )
-                continue
+            if op is EligibilityFilterOp.IN:
+                if not isinstance(threshold, (list, tuple)):
+                    violations.append(
+                        f"universe.eligibility.{attribute_name}: 'in' filters require "
+                        "a list/tuple threshold."
+                    )
+                    continue
+                coerced_threshold: Any = tuple(threshold)
+            else:
+                try:
+                    coerced_threshold = float(threshold)
+                except (TypeError, ValueError):
+                    violations.append(
+                        f"universe.eligibility.{attribute_name}.threshold="
+                        f"{threshold!r} is not numeric for a {op.value} filter."
+                    )
+                    continue
             specs[f"eligibility.{attribute_name}"] = FilterSpec(
                 attribute_name=attribute_name,
                 op=op,
-                threshold=tuple(threshold) if op is EligibilityFilterOp.IN else float(threshold),
+                threshold=coerced_threshold,
                 max_staleness_days=raw_spec.get("max_staleness_days"),
             )
 
@@ -294,13 +312,45 @@ def parse_universe_eligibility_filters(
     return specs
 
 
+class _FilterBuildError(Exception):
+    """Internal: a recognized (PIT-supported) legacy filter key carried a
+    malformed value. Caught in ``parse_universe_eligibility_filters`` and
+    folded into the collected ``violations`` list so it surfaces as an
+    ``UnsupportedEligibilityFilterError`` alongside every other problem,
+    never as a raw ValueError/TypeError that bypasses the fail-closed
+    contract (P2-1/P2-2)."""
+
+
 def _build_filter_spec(key: str, raw_value: Any) -> FilterSpec:
     """Build a ``FilterSpec`` for a legacy filter key (flat or nested), whose
     shorthand value is just a threshold (numeric or a list of strings), not
-    a structured ``{op, threshold}`` mapping."""
+    a structured ``{op, threshold}`` mapping.
+
+    Raises :class:`_FilterBuildError` (never a raw ValueError/TypeError) when
+    the value's shape does not match the operator: a non-numeric threshold on
+    a numeric filter (P2-1), or a non-list/tuple/str on an ``IN`` filter
+    (P2-2 -- e.g. a dict, which would otherwise parse into a filter that can
+    never match anything and silently exclude EVERY ticker, masking a YAML
+    typo as an illiquid universe)."""
     attribute_name, op = _LEGACY_FILTER_TO_ATTRIBUTE[key]
     if op is EligibilityFilterOp.IN:
-        threshold: Any = tuple(raw_value) if isinstance(raw_value, (list, tuple)) else (raw_value,)
+        if isinstance(raw_value, (list, tuple)):
+            threshold: Any = tuple(raw_value)
+        elif isinstance(raw_value, str):
+            threshold = (raw_value,)
+        else:
+            raise _FilterBuildError(
+                f"universe filter '{key}' expects a list/tuple/str of allowed "
+                f"values for an 'in' filter, got {type(raw_value).__name__} "
+                f"({raw_value!r}). A non-collection value here would silently "
+                "match no ticker and exclude the entire universe."
+            )
     else:
-        threshold = float(raw_value)
+        try:
+            threshold = float(raw_value)
+        except (TypeError, ValueError):
+            raise _FilterBuildError(
+                f"universe filter '{key}' expects a numeric threshold, got "
+                f"{type(raw_value).__name__} ({raw_value!r})."
+            )
     return FilterSpec(attribute_name=attribute_name, op=op, threshold=threshold)

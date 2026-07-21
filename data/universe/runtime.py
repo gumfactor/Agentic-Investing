@@ -599,7 +599,14 @@ class PITEligibilityLookup:
         ]
         if not candidates:
             return None
-        return max(candidates, key=lambda pair: pair[1])
+        # "Latest batch wins" (§1.2). Break computed_at ties deterministically
+        # on computation_batch_id (higher id = later-created batch): two
+        # batches can share an identical computed_at (second-precision
+        # wall-clock, or a corrective script reusing a fixed timestamp), and
+        # max()'s first-maximal-element behavior would otherwise silently
+        # degrade the invariant to "DB insert order" and let a stale/bad row
+        # outrank its correction.
+        return max(candidates, key=lambda pair: (pair[1], pair[0].computation_batch_id))
 
     def evaluate(
         self,

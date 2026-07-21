@@ -160,26 +160,43 @@ class TestSingleFilterEvaluation:
     def test_source_data_asof_newer_than_effective_start_rejected_at_ingestion(
         self, engine
     ) -> None:
-        """§1.5 acceptance test 4 (future-leak guard). Enforced by the
-        model/migration CHECK constraint at the ORM flush -- IntegrityError
-        on a real Postgres backend enforcing the CHECK; here we assert the
-        application-level guard the batch-writer must apply mirrors it by
-        constructing the same invalid row and confirming Python-level
-        validation in the future Phase B writer will need to reject it
-        (schema-level enforcement is exercised via the migration itself,
-        not representable as a portable SQLAlchemy CheckConstraint per
-        UniverseMembership's documented cross-dialect divergence)."""
-        # source_data_asof (2024-02-01) is AFTER effective_start (2024-01-01):
-        # this is exactly the invalid shape the CHECK constraint forbids.
-        bad_row = _adv_row(
-            "FUTURELEAK", 1.0, date(2024, 1, 1), source_asof=date(2024, 2, 1)
-        )
-        assert bad_row["source_data_asof"] > bad_row["effective_start"]
-        # The migration's ck_universe_eligibility_attributes_source_not_future
-        # CHECK constraint is what actually enforces this on Postgres; this
-        # test documents/pins the invariant the constraint encodes so a
-        # future refactor of the row-construction helpers cannot silently
-        # drop the check without a test noticing the shape changed.
+        """§1.5 acceptance test 4 (future-leak guard): a row whose
+        source_data_asof is AFTER the interval it describes is rejected at
+        ingestion, not merely documented. The
+        ck_universe_eligibility_attributes_source_not_future CHECK constraint
+        is portable (unlike the Postgres-only EXCLUDE), so it fires on the
+        mirrored ORM model against SQLite -- we actually attempt the insert
+        and assert IntegrityError, rather than asserting a fact about the
+        fixture."""
+        from sqlalchemy.exc import IntegrityError
+
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            batch = UniverseEligibilityBatch(
+                universe_id=_UNIVERSE_ID,
+                code_version="test",
+                computed_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                created_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            )
+            session.add(batch)
+            session.flush()
+            # source_data_asof (2024-02-01) is AFTER effective_start
+            # (2024-01-01): exactly the invalid shape the CHECK forbids.
+            session.add(
+                UniverseEligibilityAttribute(
+                    universe_id=_UNIVERSE_ID,
+                    ticker="FUTURELEAK",
+                    attribute_name="adv_usd_20d",
+                    attribute_value_numeric=1.0,
+                    effective_start=date(2024, 1, 1),
+                    computed_from="daily_prices.volume*close 20-session mean",
+                    source_data_asof=date(2024, 2, 1),
+                    computation_batch_id=batch.id,
+                    created_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                )
+            )
+            with pytest.raises(IntegrityError):
+                session.flush()
 
 
 class TestSecurityTypeInFilter:
@@ -293,6 +310,71 @@ class TestBatchCorrection:
         )
         # If the bad batch's row won, this would fail (100.0 < threshold).
         assert "CORR" in result
+
+    def test_identical_computed_at_breaks_tie_on_batch_id(self, tmp_path: Path) -> None:
+        """P1-1: two batches sharing an IDENTICAL computed_at must resolve
+        deterministically -- the higher computation_batch_id (later-created
+        batch = the correction) wins, NOT the first-inserted row. max()'s
+        first-maximal-element behavior would otherwise silently degrade
+        "latest batch wins" to "DB insert order"."""
+        eng = create_engine(f"sqlite:///{tmp_path / 'tie.db'}", future=True)
+        Base.metadata.create_all(eng)
+        shared_ts = datetime(2024, 1, 2, 9, 30, 0, tzinfo=timezone.utc)
+        with Session(eng) as session:
+            # Bad batch inserted FIRST, identical computed_at.
+            bad_batch = UniverseEligibilityBatch(
+                universe_id=_UNIVERSE_ID,
+                code_version="bad_commit",
+                computed_at=shared_ts,
+                created_at=shared_ts,
+            )
+            session.add(bad_batch)
+            session.flush()
+            session.add(
+                UniverseEligibilityAttribute(
+                    universe_id=_UNIVERSE_ID,
+                    ticker="TIE",
+                    attribute_name="adv_usd_20d",
+                    attribute_value_numeric=100.0,  # below threshold
+                    effective_start=date(2024, 1, 1),
+                    computed_from="bad",
+                    source_data_asof=date(2024, 1, 1),
+                    computation_batch_id=bad_batch.id,
+                    created_at=shared_ts,
+                )
+            )
+            # Correction batch inserted SECOND, SAME computed_at -> higher id.
+            good_batch = UniverseEligibilityBatch(
+                universe_id=_UNIVERSE_ID,
+                code_version="fixed_commit",
+                computed_at=shared_ts,
+                created_at=shared_ts,
+            )
+            session.add(good_batch)
+            session.flush()
+            assert good_batch.id > bad_batch.id
+            session.add(
+                UniverseEligibilityAttribute(
+                    universe_id=_UNIVERSE_ID,
+                    ticker="TIE",
+                    attribute_name="adv_usd_20d",
+                    attribute_value_numeric=5_000_000.0,  # above threshold
+                    effective_start=date(2024, 1, 1),
+                    computed_from="fixed",
+                    source_data_asof=date(2024, 1, 1),
+                    computation_batch_id=good_batch.id,
+                    created_at=shared_ts,
+                )
+            )
+            session.commit()
+
+        filters = {"min_adv": FilterSpec("adv_usd_20d", EligibilityFilterOp.GTE, 1_000_000.0)}
+        result = load_eligibility_as_of(
+            _UNIVERSE_ID, date(2024, 2, 1), filters, engine=eng, tickers=["TIE"]
+        )
+        # The higher-batch_id correction (5M) must win the tie, not the
+        # first-inserted stale row (100).
+        assert "TIE" in result
 
 
 class TestCombinedMembershipAndEligibility:

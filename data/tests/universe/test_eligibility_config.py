@@ -180,6 +180,46 @@ def test_eligibility_block_unsupported_attribute_rejected() -> None:
     assert "market_cap_usd" in str(exc_info.value)
 
 
+def test_non_numeric_threshold_on_recognized_key_fails_closed() -> None:
+    """P2-1: a non-numeric threshold on a PIT-supported numeric key raises
+    UnsupportedEligibilityFilterError (through the collect-violations
+    contract), never a raw ValueError."""
+    config = {"universe": {"filters": {"min_adv_usd": "not_a_number"}}}
+    with pytest.raises(UnsupportedEligibilityFilterError) as exc_info:
+        parse_universe_eligibility_filters(config)
+    assert "min_adv_usd" in str(exc_info.value)
+
+
+def test_malformed_security_types_value_fails_closed_not_silent_exclude() -> None:
+    """P2-2: a non-list/tuple/str allowed_security_types value (e.g. a dict)
+    must raise a named violation, not silently parse into a filter that
+    excludes every ticker."""
+    config = {"universe": {"filters": {"allowed_security_types": {"nested": "oops"}}}}
+    with pytest.raises(UnsupportedEligibilityFilterError) as exc_info:
+        parse_universe_eligibility_filters(config)
+    assert "allowed_security_types" in str(exc_info.value)
+
+
+def test_eligibility_block_non_numeric_threshold_fails_closed() -> None:
+    config = {
+        "universe": {
+            "eligibility": {"adv_usd_20d": {"op": "gte", "threshold": "nope"}}
+        }
+    }
+    with pytest.raises(UnsupportedEligibilityFilterError) as exc_info:
+        parse_universe_eligibility_filters(config)
+    assert "adv_usd_20d" in str(exc_info.value)
+
+
+def test_single_string_security_type_still_accepted() -> None:
+    """A bare string (not a list) for an IN filter is a legitimate
+    shorthand and must still parse -- the P2-2 guard rejects only
+    non-collection, non-string values."""
+    config = {"universe": {"filters": {"allowed_security_types": "common_stock"}}}
+    specs = parse_universe_eligibility_filters(config)
+    assert specs["allowed_security_types"].threshold == ("common_stock",)
+
+
 def test_all_violations_reported_together() -> None:
     """Mirrors config_contract.py's 'collect every violation before raising'
     behavior -- a caller sees the full offending set in one error, not just
