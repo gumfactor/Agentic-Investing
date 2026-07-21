@@ -481,3 +481,125 @@ def test_repinning_with_one_changed_row_writes_new_objects_and_keeps_old_ones() 
     # Old objects remain byte-identical and present (nothing overwritten).
     for key, value in objects_after_first.items():
         assert client.objects[key] == value
+
+
+# ─── 03A-5: manifest/methodology linkage populated from real batch rows ──────
+
+
+def _engine_with_bundle_data_and_universe_batches(
+    *, import_status: str = "published", with_eligibility_batch: bool = True
+):
+    """Bundle-data engine (as `_engine_with_bundle_data`) plus a real
+    UniverseImportBatch/UniverseEligibilityBatch row for universe_id="sp500"
+    so pin_bundle's lookups (03A-5) resolve to actual ids instead of None."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm import Session
+
+    from data.universe.models import UniverseEligibilityBatch, UniverseImportBatch
+
+    engine = _engine_with_bundle_data()
+    with Session(engine) as session:
+        import_batch = UniverseImportBatch(
+            universe_id="sp500",
+            provider="test",
+            source_version="v1",
+            raw_artifact_path="raw/x",
+            raw_checksum_sha256="a" * 64,
+            retrieved_at=datetime.now(timezone.utc),
+            status=import_status,
+            published_at=datetime.now(timezone.utc) if import_status == "published" else None,
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(import_batch)
+        if with_eligibility_batch:
+            session.add(
+                UniverseEligibilityBatch(
+                    universe_id="sp500",
+                    code_version="v1",
+                    computed_at=datetime.now(timezone.utc),
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+        session.commit()
+        import_batch_id = import_batch.id
+    return engine, import_batch_id
+
+
+def test_pin_bundle_populates_membership_and_eligibility_batch_ids_from_real_rows():
+    """03A-5, requirement 5c: pin_bundle looks up the real published
+    UniverseImportBatch/UniverseEligibilityBatch rows for --universe-id and
+    the resulting manifest carries both ids -- verified end to end through
+    the real ParquetSnapshots + DatasetManifest content-addressing path (not
+    a MagicMock stand-in for the manifest), so the ids are also proven to
+    participate in manifest_content_sha256."""
+    engine, import_batch_id = _engine_with_bundle_data_and_universe_batches()
+
+    client = _InMemoryMinio()
+    snapshots = _real_snapshots(client)
+
+    manifest_path = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
+        universe_id="sp500",
+    )
+
+    from backtesting.dataset_manifest import load_manifest
+
+    data_version = manifest_path.split("/")[-2]
+    manifest = load_manifest(data_version, client, "rqis-snapshots")
+    assert manifest.membership_import_batch_id == import_batch_id
+    assert manifest.eligibility_batch_id is not None
+
+    # The linked ids survive into the content hash: pinning the identical
+    # bundle for a universe_id with no batches at all yields a different
+    # manifest_content_sha256 (proves the ids are hashed, not decorative).
+    bare_engine = _engine_with_bundle_data()
+    bare_path = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=bare_engine, snapshots=snapshots, market_client=_benchmark_client(),
+        universe_id="sp500",
+    )
+    assert bare_path != manifest_path
+
+
+def test_pin_bundle_leaves_membership_batch_id_none_when_no_published_import_exists():
+    """Best-effort lookup, not a hard block: a universe_id with only an
+    unpublished (staged) import batch must not fail the pin -- it just
+    leaves membership_import_batch_id unset."""
+    engine, _ = _engine_with_bundle_data_and_universe_batches(
+        import_status="staged", with_eligibility_batch=False
+    )
+    snapshots = MagicMock()
+    snapshots.save_snapshot.side_effect = (
+        lambda _df, data_type, snapshot_date, bytes_sha256_out=None: (
+            f"rqis-snapshots/snapshots/{data_type}/{snapshot_date}/data.parquet"
+        )
+    )
+    snapshots.save_dataset_manifest.return_value = (
+        "rqis-snapshots/manifests/2022-01-05/manifest.json"
+    )
+
+    pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
+        universe_id="sp500",
+    )
+    manifest = snapshots.save_dataset_manifest.call_args.args[0]
+    assert manifest.membership_import_batch_id is None
+    assert manifest.eligibility_batch_id is None
+
+
+def test_pin_bundle_rejects_nonexistent_research_methodology_id():
+    """A caller-supplied --research-methodology-id that does not exist must
+    fail the pin closed (build_manifest's ManifestBatchLinkageError), not
+    silently link to garbage."""
+    from backtesting.dataset_manifest import ManifestBatchLinkageError
+
+    engine = _engine_with_bundle_data()
+    with pytest.raises(ManifestBatchLinkageError):
+        pin_bundle(
+            "v1", "SPY", date(2022, 1, 5),
+            engine=engine, snapshots=MagicMock(), market_client=_benchmark_client(),
+            research_methodology_id=999,
+        )

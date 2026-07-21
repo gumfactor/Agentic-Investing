@@ -80,6 +80,91 @@ def test_log_run_raises_when_only_config_empty():
 
 
 # ------------------------------------------------------------------
+# 03A-5: require_manifest_data_version transition flag (design plan §2.5's
+# last acceptance test) -- opt-in, so it must not affect any of the tests
+# above/below that pass legacy-shaped placeholder data_version strings
+# without setting the flag.
+# ------------------------------------------------------------------
+
+_VALID_MANIFEST_HASH = "a" * 64
+
+
+def test_log_run_rejects_non_hash_shaped_data_version_when_required():
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    result = _make_result("2026-06-14")  # legacy date-string, not hash-shaped
+    config = _make_config("2026-06-14")
+    with pytest.raises(ValueError, match="not a manifest-hash-shaped"):
+        logger.log_run(
+            config,
+            result,
+            experiment_name="test/exp",
+            require_manifest_data_version=True,
+        )
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_log_run_accepts_hash_shaped_data_version_when_required(mock_mlflow):
+    run_mock = MagicMock()
+    run_mock.info.run_id = "run-hash-ok"
+    mock_mlflow.start_run.return_value.__enter__ = lambda s: run_mock
+    mock_mlflow.start_run.return_value.__exit__ = lambda *a: False
+
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    result = _make_result(_VALID_MANIFEST_HASH)
+    config = _make_config(_VALID_MANIFEST_HASH)
+
+    run_id = logger.log_run(
+        config,
+        result,
+        experiment_name="test/exp",
+        require_manifest_data_version=True,
+    )
+    assert run_id == "run-hash-ok"
+
+
+def test_log_run_does_not_enforce_hash_shape_by_default():
+    """The transition flag defaults to False: legacy placeholder
+    data_version strings used throughout this test module (and, until
+    production callers migrate, real callers) must not be rejected unless
+    the caller opts in."""
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    result = _make_result("snapshot-v1")
+    config = _make_config("snapshot-v1")
+    with patch("backtesting.experiment_tracking.mlflow_logger.mlflow"):
+        logger.log_run(config, result, experiment_name="test/exp")
+
+
+def test_log_walk_forward_run_rejects_non_hash_shaped_data_version_when_required():
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    wf = _make_wf_result("2026-06-14")
+    with pytest.raises(ValueError, match="not a manifest-hash-shaped"):
+        logger.log_walk_forward_run(
+            config=wf.config,
+            wf_result=wf,
+            experiment_name="test/wf",
+            require_manifest_data_version=True,
+        )
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_log_walk_forward_run_accepts_hash_shaped_data_version_when_required(mock_mlflow):
+    run_mock = MagicMock()
+    run_mock.info.run_id = "wf-run-hash-ok"
+    mock_mlflow.start_run.return_value.__enter__ = lambda s: run_mock
+    mock_mlflow.start_run.return_value.__exit__ = lambda *a: False
+
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    wf = _make_wf_result(_VALID_MANIFEST_HASH)
+    run_id = logger.log_walk_forward_run(
+        config=wf.config,
+        wf_result=wf,
+        experiment_name="exp",
+        require_manifest_data_version=True,
+    )
+    assert run_id == "wf-run-hash-ok"
+
+
+# ------------------------------------------------------------------
 # Successful log (fully mocked MLflow)
 # ------------------------------------------------------------------
 
