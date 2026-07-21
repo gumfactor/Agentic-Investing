@@ -1,0 +1,689 @@
+"""Tests for the PIT eligibility-attribute batch job (03A-4b, Phase B of
+BUG-078): adv_usd_20d/price_usd computation+write, security_type
+hand-curated backfill, and the coverage report.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+from data.universe.eligibility_batch import (
+    EmptyBatchError,
+    SecurityTypeCurationEntry,
+    SecurityTypeCurationError,
+    _is_curated_security_type_row,
+    build_security_type_rows,
+    compute_price_eligibility_rows,
+    eligibility_coverage_report,
+    load_membership_intervals,
+    write_price_eligibility_batch,
+    write_security_type_batch,
+)
+from data.universe.import_pipeline import run_import
+from data.universe.models import Base, UniverseEligibilityAttribute, UniverseEligibilityBatch
+from data.universe.providers.fixture_provider import (
+    FIXTURE_COVERAGE_START,
+    FIXTURE_UNIVERSE_ID,
+    FixtureSP500Provider,
+)
+
+
+@pytest.fixture
+def engine(tmp_path: Path):
+    return create_engine(f"sqlite:///{tmp_path / 'eligibility_batch.db'}", future=True)
+
+
+@pytest.fixture
+def published_universe(engine, tmp_path):
+    """Publish the fixture universe import into `engine` and return its id."""
+    run_import(
+        FixtureSP500Provider(),
+        engine=engine,
+        artifact_root=tmp_path / "artifacts",
+        coverage_start=FIXTURE_COVERAGE_START,
+    )
+    return FIXTURE_UNIVERSE_ID
+
+
+def _make_prices(tickers: list[str], dates: list[date], base: float = 100.0) -> pd.DataFrame:
+    rows = []
+    for t_idx, t in enumerate(tickers):
+        level = base + t_idx * 10
+        for d_idx, d in enumerate(dates):
+            level *= 1.001
+            rows.append(
+                {
+                    "ticker": t,
+                    "date": d,
+                    "close": round(level, 4),
+                    "volume": 1_000_000 + d_idx * 1000,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _trading_dates(start: date, n: int) -> list[date]:
+    from data.universe.calendar import is_trading_session
+
+    out: list[date] = []
+    d = start
+    while len(out) < n:
+        if is_trading_session(d):
+            out.append(d)
+        d = date.fromordinal(d.toordinal() + 1)
+    return out
+
+
+# ─── compute_price_eligibility_rows ────────────────────────────────────────────
+
+
+class TestComputePriceEligibilityRows:
+    def test_empty_prices_returns_empty(self):
+        assert compute_price_eligibility_rows(
+            pd.DataFrame(columns=["ticker", "date", "close", "volume"]),
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 31),
+        ) == []
+
+    def test_price_usd_emitted_for_every_session_in_range(self):
+        dates = _trading_dates(date(2024, 1, 2), 25)
+        prices = _make_prices(["AAA"], dates)
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        price_rows = [r for r in rows if r["attribute_name"] == "price_usd"]
+        assert len(price_rows) == 25
+        assert all(r["ticker"] == "AAA" for r in price_rows)
+
+    def test_adv_usd_20d_requires_full_trailing_window(self):
+        dates = _trading_dates(date(2024, 1, 2), 25)
+        prices = _make_prices(["AAA"], dates)
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        adv_rows = [r for r in rows if r["attribute_name"] == "adv_usd_20d"]
+        # First 19 sessions have < 20 trailing observations -> no ADV row.
+        assert len(adv_rows) == 25 - 19
+
+    def test_adv_usd_20d_suppressed_when_trailing_window_has_a_missing_session(self):
+        """Codex P2 fix (PR #42 review, round 5): .rolling(window,
+        min_periods=window).mean() operates on ROW COUNT, not
+        calendar-anchored trading sessions. A row entirely ABSENT from the
+        input (an upstream ingestion gap, not merely a NaN close/volume on
+        an existing row) must suppress adv_usd_20d for every window that
+        would otherwise bridge past it by reaching back to an older
+        pre-gap observation -- the same "never silently bridge a gap"
+        contract as _chain_intervals, this time in the rolling computation
+        itself."""
+        dates = _trading_dates(date(2024, 1, 2), 50)
+        prices = _make_prices(["AAA"], dates)
+        gap_date = dates[10]  # inside the window that would otherwise complete
+        prices = prices[prices["date"] != gap_date].reset_index(drop=True)
+
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        adv_dates = {r["effective_start"] for r in rows if r["attribute_name"] == "adv_usd_20d"}
+
+        # Absent entirely -- the gap date itself was never a candidate row.
+        assert gap_date not in adv_dates
+
+        # Every date whose trailing 20-session window would span the gap
+        # (i.e. any of the 19 sessions immediately after the gap, since the
+        # window needs 20 CONSECUTIVE sessions with none absent) must not
+        # get an adv_usd_20d row either, even though 20 ROWS exist if you
+        # reach back past the gap to older pre-gap observations.
+        remaining_dates = [d for d in dates if d != gap_date]
+        gap_idx = remaining_dates.index(dates[11])  # first date after the gap
+        for d in remaining_dates[gap_idx : gap_idx + 19]:
+            assert d not in adv_dates, f"{d} should be suppressed (window spans the gap)"
+
+        # Sanity: far enough past the gap, a genuine 20-consecutive-session
+        # window exists again and IS emitted.
+        assert remaining_dates[-1] in adv_dates
+
+    def test_adv_value_is_trailing_dollar_volume_mean(self):
+        dates = _trading_dates(date(2024, 1, 2), 25)
+        prices = _make_prices(["AAA"], dates)
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        adv_rows = sorted(
+            (r for r in rows if r["attribute_name"] == "adv_usd_20d"),
+            key=lambda r: r["effective_start"],
+        )
+        first_adv_row = adv_rows[0]
+        window = prices.iloc[0:20]
+        expected = (window["close"] * window["volume"]).mean()
+        assert first_adv_row["attribute_value_numeric"] == pytest.approx(expected)
+
+    def test_grain_is_pit_by_construction_not_backward_projected(self):
+        """A later day's close must never appear as an earlier day's
+        price_usd/adv_usd_20d value (design doc §1.4's core requirement)."""
+        dates = _trading_dates(date(2024, 1, 2), 25)
+        prices = _make_prices(["AAA"], dates)
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        price_rows = {r["effective_start"]: r["attribute_value_numeric"] for r in rows if r["attribute_name"] == "price_usd"}
+        for _, row in prices.iterrows():
+            assert price_rows[row["date"]] == pytest.approx(float(row["close"]))
+
+    def test_intervals_chain_to_next_session_every_row_closed(self):
+        """Codex P1 fix, round 2 (PR #42 second review): the last row of a
+        batch's chain must NOT be left open-ended -- an open tail on a
+        finite/corrective batch would outrank a full-history batch's later
+        rows under the latest-computed_at-wins rule, silently corrupting
+        eligibility beyond what the corrective batch actually covered. Every
+        row, including the last, closes at the next trading session."""
+        from data.universe.calendar import next_trading_session
+
+        dates = _trading_dates(date(2024, 1, 2), 5)
+        prices = _make_prices(["AAA"], dates)
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        price_rows = sorted(
+            (r for r in rows if r["attribute_name"] == "price_usd"),
+            key=lambda r: r["effective_start"],
+        )
+        for i in range(len(price_rows) - 1):
+            assert price_rows[i]["effective_end"] == price_rows[i + 1]["effective_start"]
+        assert price_rows[-1]["effective_end"] == next_trading_session(price_rows[-1]["effective_start"])
+        assert price_rows[-1]["effective_end"] is not None
+
+    def test_corrective_finite_batch_tail_does_not_override_later_full_history_batch(
+        self, engine
+    ):
+        """Codex P1 fix, round 2, end-to-end proof: an older full-history
+        batch covers a long range; a NEWER, small corrective batch re-runs
+        only a short subrange. The corrective batch's later computed_at must
+        not make its (now-closed) tail outrank the full-history batch's rows
+        for dates the corrective batch never touched."""
+        from data.universe.runtime import (
+            EligibilityFilterOp,
+            FilterSpec,
+            PITEligibilityLookup,
+        )
+
+        dates = _trading_dates(date(2024, 1, 2), 30)
+        full_history_prices = _make_prices(["AAA"], dates)
+        write_price_eligibility_batch(
+            engine,
+            "sp500_corrective_test",
+            full_history_prices,
+            start=dates[0],
+            end=dates[-1],
+            code_version="full-history",
+            computed_at=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        )
+
+        # Corrective re-run of just the first 5 sessions, with a LATER
+        # computed_at (simulating a same-day or next-day correction).
+        corrective_prices = full_history_prices[
+            full_history_prices["date"].isin(dates[:5])
+        ].reset_index(drop=True)
+        write_price_eligibility_batch(
+            engine,
+            "sp500_corrective_test",
+            corrective_prices,
+            start=dates[0],
+            end=dates[4],
+            code_version="corrective",
+            computed_at=datetime(2024, 2, 2, tzinfo=timezone.utc),
+        )
+
+        lookup = PITEligibilityLookup(engine, "sp500_corrective_test")
+        # A date well beyond the corrective batch's range must still resolve
+        # from the full-history batch, not be silently blanked/overridden by
+        # the corrective batch's (no-longer-open) final row.
+        far_date = dates[20]
+        result = lookup.evaluate(
+            far_date,
+            {"price_usd": FilterSpec(attribute_name="price_usd", op=EligibilityFilterOp.GTE, threshold=0.0)},
+            tickers=["AAA"],
+        )
+        assert "AAA" in result.passing_tickers
+        assert result.exclusions == ()
+
+    def test_source_data_asof_never_exceeds_effective_start(self):
+        dates = _trading_dates(date(2024, 1, 2), 25)
+        prices = _make_prices(["AAA"], dates)
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        for r in rows:
+            assert r["source_data_asof"] <= r["effective_start"]
+
+    def test_missing_close_skips_price_row_not_fabricated(self):
+        dates = _trading_dates(date(2024, 1, 2), 5)
+        prices = _make_prices(["AAA"], dates)
+        prices.loc[2, "close"] = None
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        price_dates = {r["effective_start"] for r in rows if r["attribute_name"] == "price_usd"}
+        assert dates[2] not in price_dates
+
+    def test_gap_date_is_not_silently_covered_by_prior_value(self):
+        """Codex P1 (PR #42 review): a genuine gap -- a trading session with
+        NO row at all in the input, e.g. an ingestion failure -- must leave
+        that specific date uncovered by any interval, not silently fall
+        inside the previous valid observation's [effective_start,
+        effective_end) span. Before the fix, _chain_intervals set
+        effective_end to the date of the next VALID row, which stretched the
+        prior session's stale price across the gap."""
+        dates = _trading_dates(date(2024, 1, 2), 10)
+        prices = _make_prices(["AAA"], dates)
+        gap_date = dates[5]
+        prior_date = dates[4]
+        next_valid_date = dates[6]
+        # Remove the gap date's row entirely (not just its close value) --
+        # the row is genuinely absent from the source, as an ingestion
+        # failure would produce.
+        prices = prices[prices["date"] != gap_date].reset_index(drop=True)
+
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        price_rows_by_date = {
+            r["effective_start"]: r for r in rows if r["attribute_name"] == "price_usd"
+        }
+
+        assert gap_date not in price_rows_by_date
+        prior_row = price_rows_by_date[prior_date]
+        # The prior row's coverage must stop exactly AT the gap date (the
+        # true next trading session), never at next_valid_date.
+        assert prior_row["effective_end"] == gap_date
+        assert prior_row["effective_end"] != next_valid_date
+
+        # No interval of any row covers the gap date.
+        covering = [
+            r
+            for r in rows
+            if r["attribute_name"] == "price_usd"
+            and r["effective_start"] <= gap_date
+            and (r["effective_end"] is None or gap_date < r["effective_end"])
+        ]
+        assert covering == []
+
+    def test_gap_date_reports_missing_attribute_via_eligibility_lookup(self, tmp_path):
+        """End-to-end proof of the P1 fix through the actual runtime API a
+        caller would use: PITEligibilityLookup must report `missing_attribute`
+        for the gap date, not silently pass it using the prior session's
+        stale price."""
+        from sqlalchemy import create_engine
+
+        from data.universe.eligibility_batch import write_price_eligibility_batch
+        from data.universe.import_pipeline import run_import
+        from data.universe.providers.fixture_provider import (
+            FIXTURE_COVERAGE_START,
+            FIXTURE_UNIVERSE_ID,
+            FixtureSP500Provider,
+        )
+        from data.universe.runtime import (
+            EligibilityExclusionReason,
+            EligibilityFilterOp,
+            FilterSpec,
+            PITEligibilityLookup,
+        )
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'gap_lookup.db'}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        dates = _trading_dates(date(2020, 1, 2), 10)
+        prices = _make_prices(["AAA"], dates)
+        gap_date = dates[5]
+        prices = prices[prices["date"] != gap_date].reset_index(drop=True)
+
+        write_price_eligibility_batch(
+            eng, FIXTURE_UNIVERSE_ID, prices, start=dates[0], end=dates[-1], code_version="test"
+        )
+
+        lookup = PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID)
+        result = lookup.evaluate(
+            gap_date,
+            {"price_usd": FilterSpec(attribute_name="price_usd", op=EligibilityFilterOp.GTE, threshold=0.0)},
+            tickers=["AAA"],
+        )
+        assert "AAA" not in result.passing_tickers
+        assert any(
+            e.ticker == "AAA" and e.reason == EligibilityExclusionReason.MISSING_ATTRIBUTE
+            for e in result.exclusions
+        )
+
+    def test_default_security_type_does_not_diverge_from_membership_on_removal_date(self, tmp_path):
+        """Codex P1 fix (PR #42 second review), end-to-end through the real
+        fixture provider's DDD ticker (removed effective 2020-04-01,
+        end_known_at 2020-04-02T21:00Z per the date-only source's
+        conservative next-session rule): on the raw removal date itself,
+        PITUniverseLookup still counts DDD as a member (the removal is not
+        yet knowable), and security_type coverage must agree -- not report
+        `missing_attribute` and silently drop a still-eligible ticker from a
+        strategy's combined membership+eligibility set."""
+        from data.universe.eligibility_batch import write_security_type_batch
+        from data.universe.import_pipeline import run_import
+        from data.universe.providers.fixture_provider import (
+            FIXTURE_COVERAGE_START,
+            FIXTURE_UNIVERSE_ID,
+            FixtureSP500Provider,
+        )
+        from data.universe.runtime import (
+            EligibilityFilterOp,
+            FilterSpec,
+            PITEligibilityLookup,
+            PITUniverseLookup,
+        )
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'removal_lag.db'}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        write_security_type_batch(eng, FIXTURE_UNIVERSE_ID, curation=[], code_version="test")
+
+        raw_removal_date = date(2020, 4, 1)  # DDD's first stint's raw effective_end
+
+        membership_lookup = PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID)
+        assert membership_lookup.is_eligible("DDD", raw_removal_date)
+
+        eligibility_lookup = PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID)
+        result = eligibility_lookup.evaluate(
+            raw_removal_date,
+            {
+                "security_type": FilterSpec(
+                    attribute_name="security_type", op=EligibilityFilterOp.IN, threshold=("CS",)
+                )
+            },
+            tickers=["DDD"],
+        )
+        assert "DDD" in result.passing_tickers
+        assert result.exclusions == ()
+
+
+# ─── write_price_eligibility_batch ─────────────────────────────────────────────
+
+
+class TestWritePriceEligibilityBatch:
+    def test_write_persists_batch_and_rows(self, engine):
+        dates = _trading_dates(date(2024, 1, 2), 25)
+        prices = _make_prices(["AAA", "BBB"], dates)
+        result = write_price_eligibility_batch(
+            engine, "sp500_test", prices, start=dates[0], end=dates[-1], code_version="test-abc"
+        )
+        assert result.n_rows_written > 0
+        assert result.n_tickers == 2
+        assert set(result.attribute_names) == {"adv_usd_20d", "price_usd"}
+
+        with Session(engine) as session:
+            batch = session.execute(select(UniverseEligibilityBatch)).scalars().one()
+            assert batch.universe_id == "sp500_test"
+            assert batch.code_version == "test-abc"
+            assert batch.n_attribute_rows == result.n_rows_written
+
+            rows = session.execute(select(UniverseEligibilityAttribute)).scalars().all()
+            assert len(rows) == result.n_rows_written
+            for r in rows:
+                assert r.computation_batch_id == batch.id
+
+    def test_empty_prices_raises_empty_batch_error(self, engine):
+        with pytest.raises(EmptyBatchError):
+            write_price_eligibility_batch(
+                engine,
+                "sp500_test",
+                pd.DataFrame(columns=["ticker", "date", "close", "volume"]),
+                start=date(2024, 1, 2),
+                end=date(2024, 1, 31),
+                code_version="test-abc",
+            )
+
+    def test_repeated_batches_are_independent_append_only_rows(self, engine):
+        dates = _trading_dates(date(2024, 1, 2), 25)
+        prices = _make_prices(["AAA"], dates)
+        r1 = write_price_eligibility_batch(
+            engine, "sp500_test", prices, start=dates[0], end=dates[-1], code_version="v1"
+        )
+        r2 = write_price_eligibility_batch(
+            engine, "sp500_test", prices, start=dates[0], end=dates[-1], code_version="v2"
+        )
+        assert r1.batch_id != r2.batch_id
+        with Session(engine) as session:
+            batches = session.execute(select(UniverseEligibilityBatch)).scalars().all()
+            assert len(batches) == 2
+            attrs = session.execute(select(UniverseEligibilityAttribute)).scalars().all()
+            # Both batches' rows persist -- nothing was mutated/overwritten.
+            assert len(attrs) == r1.n_rows_written + r2.n_rows_written
+
+
+# ─── security_type curation ─────────────────────────────────────────────────────
+
+
+class TestBuildSecurityTypeRows:
+    def test_default_applied_to_every_uncurated_ticker(self):
+        membership = {
+            "AAA": [(date(2020, 1, 1), None, None)],
+            "BBB": [
+                (
+                    date(2020, 1, 1),
+                    date(2021, 1, 1),
+                    datetime(2021, 1, 4, 21, 0, tzinfo=timezone.utc),
+                )
+            ],
+        }
+        rows = build_security_type_rows(membership, curation=[])
+        assert len(rows) == 2
+        assert {r["ticker"]: r["attribute_value_text"] for r in rows} == {"AAA": "CS", "BBB": "CS"}
+
+    def test_closed_interval_default_extends_through_end_known_at(self):
+        """Codex P1 fix (PR #42 second review): a closed membership interval's
+        default security_type row must extend coverage through
+        end_known_at's calendar date -- the exact boundary
+        PITUniverseLookup uses to keep counting a not-yet-knowably-removed
+        ticker eligible -- not stop at the raw effective_end."""
+        raw_end = date(2021, 1, 1)
+        end_known_at = datetime(2021, 1, 4, 21, 0, tzinfo=timezone.utc)  # next session's close
+        membership = {"AAA": [(date(2020, 1, 1), raw_end, end_known_at)]}
+        rows = build_security_type_rows(membership, curation=[])
+        assert len(rows) == 1
+        assert rows[0]["effective_end"] == end_known_at.date()
+        assert rows[0]["effective_end"] != raw_end
+
+    def test_after_close_removal_announcement_advances_boundary_one_more_day(self):
+        """Codex P2 fix (PR #42 second review, round 2): an end_known_at
+        landing AFTER its own date's session-close cutoff (22:00 UTC, past
+        the 21:00 UTC cutoff hour) must push the default row's effective_end
+        one day later -- PITUniverseLookup still counts the ticker eligible
+        on end_known_at's own calendar date in that case, since the removal
+        was not knowable by THAT date's cutoff either."""
+        raw_end = date(2021, 1, 1)
+        after_close_announcement = datetime(2021, 1, 4, 22, 0, tzinfo=timezone.utc)
+        membership = {"AAA": [(date(2020, 1, 1), raw_end, after_close_announcement)]}
+        rows = build_security_type_rows(membership, curation=[])
+        assert rows[0]["effective_end"] == date(2021, 1, 5)  # one day past 2021-01-04
+
+    def test_open_interval_default_stays_open(self):
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
+        rows = build_security_type_rows(membership, curation=[])
+        assert rows[0]["effective_end"] is None
+
+    def test_curated_ticker_uses_only_curated_entries(self):
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="REIT", effective_start=date(2020, 1, 1), note="test"
+            )
+        ]
+        rows = build_security_type_rows(membership, curation)
+        assert len(rows) == 1
+        assert rows[0]["attribute_value_text"] == "REIT"
+        assert _is_curated_security_type_row(rows[0]["computed_from"])
+
+    def test_multiple_non_overlapping_curated_entries_allowed(self):
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="CS", effective_start=date(2020, 1, 1), effective_end=date(2022, 1, 1)
+            ),
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="REIT", effective_start=date(2022, 1, 1)
+            ),
+        ]
+        rows = build_security_type_rows(membership, curation)
+        assert len(rows) == 2
+
+    def test_overlapping_curated_entries_rejected(self):
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="CS", effective_start=date(2020, 1, 1), effective_end=date(2022, 1, 1)
+            ),
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="REIT", effective_start=date(2021, 1, 1)
+            ),
+        ]
+        with pytest.raises(SecurityTypeCurationError):
+            build_security_type_rows(membership, curation)
+
+    def test_curation_entry_with_invalid_range_rejected(self):
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="CS", effective_start=date(2022, 1, 1), effective_end=date(2020, 1, 1)
+            ),
+        ]
+        with pytest.raises(SecurityTypeCurationError):
+            build_security_type_rows(membership, curation)
+
+    def test_curation_referencing_unknown_ticker_rejected(self):
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="ZZZ", security_type="CS", effective_start=date(2020, 1, 1)
+            ),
+        ]
+        with pytest.raises(SecurityTypeCurationError):
+            build_security_type_rows(membership, curation)
+
+
+class TestWriteSecurityTypeBatch:
+    def test_write_uses_published_membership(self, engine, published_universe):
+        result = write_security_type_batch(engine, published_universe, curation=[], code_version="test-abc")
+        assert result.n_rows_written > 0
+        assert result.attribute_names == ("security_type",)
+        with Session(engine) as session:
+            rows = session.execute(select(UniverseEligibilityAttribute)).scalars().all()
+            assert all(r.attribute_value_text == "CS" for r in rows)
+
+    def test_no_published_membership_raises_empty_batch_error(self, engine):
+        with pytest.raises(EmptyBatchError):
+            write_security_type_batch(engine, "never_imported", curation=[], code_version="test-abc")
+
+    def test_curated_ticker_overrides_default(self, engine, published_universe):
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="ADR", effective_start=date(2020, 1, 1), note="test override"
+            )
+        ]
+        result = write_security_type_batch(
+            engine, published_universe, curation=curation, code_version="test-abc"
+        )
+        with Session(engine) as session:
+            rows = session.execute(
+                select(UniverseEligibilityAttribute).where(UniverseEligibilityAttribute.ticker == "AAA")
+            ).scalars().all()
+            assert len(rows) == 1
+            assert rows[0].attribute_value_text == "ADR"
+
+
+# ─── load_membership_intervals ─────────────────────────────────────────────────
+
+
+def test_load_membership_intervals_from_published_batch(engine, published_universe):
+    intervals = load_membership_intervals(engine, published_universe)
+    assert "AAA" in intervals
+    assert intervals["AAA"][0][0] == FIXTURE_COVERAGE_START
+
+
+def test_load_membership_intervals_no_published_batch_returns_empty(engine):
+    assert load_membership_intervals(engine, "never_imported") == {}
+
+
+# ─── eligibility_coverage_report ───────────────────────────────────────────────
+
+
+class TestEligibilityCoverageReport:
+    def test_reports_gap_when_no_attribute_rows_exist(self, engine, published_universe):
+        report = eligibility_coverage_report(
+            engine, published_universe, [date(2020, 1, 2), date(2020, 1, 3)]
+        )
+        assert not report.by_date.empty
+        assert (report.by_date["n_missing"] == report.by_date["n_members"]).all()
+
+    def test_reports_zero_gap_once_price_attributes_populated(self, engine, published_universe):
+        dates = [date(2020, 1, 2), date(2020, 1, 3), date(2020, 1, 6)]
+        # Every ticker eligible on these dates in the fixture universe:
+        # AAA, DDD (first stint), EEE (pre-rename), GGG, HHH, III, JJJ.
+        prices = _make_prices(["AAA", "DDD", "EEE", "GGG", "HHH", "III", "JJJ"], dates)
+        write_price_eligibility_batch(
+            engine, published_universe, prices, start=dates[0], end=dates[-1], code_version="t1"
+        )
+        report = eligibility_coverage_report(
+            engine, published_universe, dates, attribute_names=("price_usd",)
+        )
+        assert (report.by_date["n_missing"] == 0).all()
+
+    def test_security_type_curated_vs_default_counts(self, engine, published_universe):
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="ADR", effective_start=date(2020, 1, 1)
+            )
+        ]
+        write_security_type_batch(
+            engine, published_universe, curation=curation, code_version="t1"
+        )
+        report = eligibility_coverage_report(
+            engine, published_universe, [date(2020, 1, 2)]
+        )
+        assert report.n_security_type_curated_tickers == 1
+        assert report.n_security_type_default_tickers >= 1
+
+    def test_curated_ticker_gap_before_curation_start_is_visible(self, engine, published_universe):
+        """Adversarial-review P2: build_security_type_rows's docstring claims
+        a gap left inside a curated ticker's membership span is "visible via
+        eligibility_coverage_report" -- assert that explicitly, not just
+        curated-vs-default counts. AAA is a PIT member from
+        FIXTURE_COVERAGE_START (2020-01-01), but this curation entry only
+        covers it starting 2020-06-01; a date in between must show a real
+        security_type gap, not a silently patched default."""
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="ADR", effective_start=date(2020, 6, 1)
+            )
+        ]
+        write_security_type_batch(
+            engine, published_universe, curation=curation, code_version="t1"
+        )
+        gap_date = date(2020, 3, 1)  # between membership start and curation start
+        report = eligibility_coverage_report(
+            engine, published_universe, [gap_date], attribute_names=("security_type",)
+        )
+        row = report.by_date.iloc[0]
+        assert row["in_coverage"]
+        assert row["n_missing"] == 1
+
+        # Sanity check the gap closes once the curated window is reached.
+        covered_date = date(2020, 6, 2)
+        report_covered = eligibility_coverage_report(
+            engine, published_universe, [covered_date], attribute_names=("security_type",)
+        )
+        assert report_covered.by_date.iloc[0]["n_missing"] == 0
+
+    def test_out_of_scope_market_cap_named_explicitly_not_silently_absent(self, engine, published_universe):
+        report = eligibility_coverage_report(engine, published_universe, [date(2020, 1, 2)])
+        assert "market_cap_usd" in report.excluded_attributes
+
+    def test_out_of_coverage_date_reports_none_not_a_crash(self, engine, published_universe):
+        report = eligibility_coverage_report(
+            engine, published_universe, [date(1999, 1, 1)]
+        )
+        row = report.by_date.iloc[0]
+        assert not row["in_coverage"]
+        assert row["n_missing"] is None
+
+    def test_no_published_import_reports_all_out_of_coverage(self, engine):
+        report = eligibility_coverage_report(engine, "never_imported", [date(2020, 1, 2)])
+        assert (report.by_date["in_coverage"] == False).all()  # noqa: E712

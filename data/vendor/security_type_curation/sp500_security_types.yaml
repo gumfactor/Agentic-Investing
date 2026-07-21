@@ -1,0 +1,37 @@
+# Hand-curated historical security_type facts for the "sp500" universe
+# (Roadmap 03A-4b, design doc §5.1/§6 item 3: "hand-curated historical
+# changes approved, with universe_import_batches-style provenance").
+#
+# HONESTY NOTE (builder judgment call, recorded for review): this seed file
+# intentionally ships with ZERO curated entries. Fabricating specific
+# historical security_type-change dates (e.g. a REIT conversion) for real,
+# named public companies without a verified source would be a data-integrity
+# violation in a system that will eventually trade real capital -- exactly
+# the kind of silent-substitution defect 01B §1.3 and this design doc exist
+# to prevent. Every ticker currently tracked by the "sp500" universe gets the
+# `default_security_type` below for its full known membership span instead
+# (data/universe/eligibility_batch.py::build_security_type_rows), which is
+# correct for the overwhelming majority of S&P 500 constituents (ordinary
+# common stock).
+#
+# To add a VERIFIED historical change, append an entry below with a real,
+# checkable source (e.g. an 8-K, a REIT-conversion press release, a
+# prospectus). Do not guess or infer a date. Each entry becomes its own
+# universe_eligibility_attributes row(s) via
+# scripts/import_security_type_curation.py; a ticker with any entry here
+# uses ONLY the entries listed for it (no automatic default fill for that
+# ticker), so an incomplete entry set for a curated ticker will show up as a
+# gap in scripts/eligibility_coverage_report.py rather than being silently
+# patched with the default.
+#
+# Schema per entry:
+#   ticker: str (required)
+#   security_type: str (required) -- must match an allowed_security_types
+#     value used by strategy configs, e.g. CS (common stock), ADR, REIT.
+#   effective_start: YYYY-MM-DD (required)
+#   effective_end: YYYY-MM-DD (optional; omit/null = still current)
+#   note: str (optional but strongly recommended) -- cite the source.
+
+default_security_type: CS
+
+entries: []
