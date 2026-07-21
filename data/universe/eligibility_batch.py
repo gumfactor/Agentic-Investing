@@ -86,6 +86,33 @@ class EmptyBatchError(EligibilityBatchError):
 # ─── §1: adv_usd_20d / price_usd daily batch job ──────────────────────────────
 
 
+def _consecutive_run_length(dates: pd.Series) -> pd.Series:
+    """For one ticker's rows sorted ascending by ``date``, the length of the
+    maximal trailing run of calendar-CONSECUTIVE trading sessions ending at
+    each row (``data/universe/calendar.py::next_trading_session``, not
+    merely "the row directly above it in the frame").
+
+    A row's run length resets to 1 whenever the immediately preceding row's
+    date is not literally the prior trading session -- i.e. whenever a
+    trading session's row is entirely absent from the input, not just
+    NaN-valued. Used to gate ``adv_usd_20d`` on a genuine
+    ``adv_window``-consecutive-session window (Codex P2, PR #42 round 5),
+    since transitivity of "each adjacent pair is consecutive" implies the
+    whole window is gap-free.
+    """
+    run_lengths: list[int] = []
+    prev_date: Optional[date] = None
+    run = 0
+    for d in dates:
+        if prev_date is not None and d == next_trading_session(prev_date):
+            run += 1
+        else:
+            run = 1
+        run_lengths.append(run)
+        prev_date = d
+    return pd.Series(run_lengths, index=dates.index)
+
+
 def compute_price_eligibility_rows(
     prices: pd.DataFrame,
     *,
@@ -138,6 +165,22 @@ def compute_price_eligibility_rows(
     df["adv_usd_20d"] = df.groupby("ticker")["dollar_volume"].transform(
         lambda s: s.rolling(adv_window, min_periods=adv_window).mean()
     )
+    # Codex P2 fix (03A-4b PR #42 review, round 5): .rolling(...).mean()
+    # operates on ROW COUNT, not calendar-anchored trading sessions. If a
+    # ticker is missing a trading session's row ENTIRELY (not just a NaN
+    # close/volume on an existing row -- an upstream ingestion gap), the
+    # rolling window still fires once 20 rows accumulate by reaching further
+    # back past the gap to an older pre-gap observation, silently bridging
+    # the gap instead of suppressing adv_usd_20d until a genuine complete
+    # 20-CONSECUTIVE-SESSION window exists -- the same class of defect as
+    # the round-1/round-3 interval-chaining fixes, this time in the ADV
+    # computation itself. `_consecutive_run_length` tracks, per ticker, the
+    # length of the maximal trailing run of calendar-consecutive trading
+    # sessions ending at each row; a window is only trusted once that run
+    # length reaches `adv_window`.
+    df["_consecutive_run_length"] = df.groupby("ticker")["date"].transform(
+        _consecutive_run_length
+    )
 
     in_range = df[(df["date"] >= start) & (df["date"] <= end)]
 
@@ -155,7 +198,10 @@ def compute_price_eligibility_rows(
             )
         )
 
-        adv_rows = group.loc[group["adv_usd_20d"].notna(), ["date", "adv_usd_20d"]]
+        adv_rows = group.loc[
+            group["adv_usd_20d"].notna() & (group["_consecutive_run_length"] >= adv_window),
+            ["date", "adv_usd_20d"],
+        ]
         rows.extend(
             _chain_intervals(
                 ticker=ticker,

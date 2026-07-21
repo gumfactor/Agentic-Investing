@@ -107,6 +107,41 @@ class TestComputePriceEligibilityRows:
         # First 19 sessions have < 20 trailing observations -> no ADV row.
         assert len(adv_rows) == 25 - 19
 
+    def test_adv_usd_20d_suppressed_when_trailing_window_has_a_missing_session(self):
+        """Codex P2 fix (PR #42 review, round 5): .rolling(window,
+        min_periods=window).mean() operates on ROW COUNT, not
+        calendar-anchored trading sessions. A row entirely ABSENT from the
+        input (an upstream ingestion gap, not merely a NaN close/volume on
+        an existing row) must suppress adv_usd_20d for every window that
+        would otherwise bridge past it by reaching back to an older
+        pre-gap observation -- the same "never silently bridge a gap"
+        contract as _chain_intervals, this time in the rolling computation
+        itself."""
+        dates = _trading_dates(date(2024, 1, 2), 50)
+        prices = _make_prices(["AAA"], dates)
+        gap_date = dates[10]  # inside the window that would otherwise complete
+        prices = prices[prices["date"] != gap_date].reset_index(drop=True)
+
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        adv_dates = {r["effective_start"] for r in rows if r["attribute_name"] == "adv_usd_20d"}
+
+        # Absent entirely -- the gap date itself was never a candidate row.
+        assert gap_date not in adv_dates
+
+        # Every date whose trailing 20-session window would span the gap
+        # (i.e. any of the 19 sessions immediately after the gap, since the
+        # window needs 20 CONSECUTIVE sessions with none absent) must not
+        # get an adv_usd_20d row either, even though 20 ROWS exist if you
+        # reach back past the gap to older pre-gap observations.
+        remaining_dates = [d for d in dates if d != gap_date]
+        gap_idx = remaining_dates.index(dates[11])  # first date after the gap
+        for d in remaining_dates[gap_idx : gap_idx + 19]:
+            assert d not in adv_dates, f"{d} should be suppressed (window spans the gap)"
+
+        # Sanity: far enough past the gap, a genuine 20-consecutive-session
+        # window exists again and IS emitted.
+        assert remaining_dates[-1] in adv_dates
+
     def test_adv_value_is_trailing_dollar_volume_mean(self):
         dates = _trading_dates(date(2024, 1, 2), 25)
         prices = _make_prices(["AAA"], dates)
