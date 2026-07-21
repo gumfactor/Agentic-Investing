@@ -362,6 +362,37 @@ class TestEligibilityCoverageReport:
         assert report.n_security_type_curated_tickers == 1
         assert report.n_security_type_default_tickers >= 1
 
+    def test_curated_ticker_gap_before_curation_start_is_visible(self, engine, published_universe):
+        """Adversarial-review P2: build_security_type_rows's docstring claims
+        a gap left inside a curated ticker's membership span is "visible via
+        eligibility_coverage_report" -- assert that explicitly, not just
+        curated-vs-default counts. AAA is a PIT member from
+        FIXTURE_COVERAGE_START (2020-01-01), but this curation entry only
+        covers it starting 2020-06-01; a date in between must show a real
+        security_type gap, not a silently patched default."""
+        curation = [
+            SecurityTypeCurationEntry(
+                ticker="AAA", security_type="ADR", effective_start=date(2020, 6, 1)
+            )
+        ]
+        write_security_type_batch(
+            engine, published_universe, curation=curation, code_version="t1"
+        )
+        gap_date = date(2020, 3, 1)  # between membership start and curation start
+        report = eligibility_coverage_report(
+            engine, published_universe, [gap_date], attribute_names=("security_type",)
+        )
+        row = report.by_date.iloc[0]
+        assert row["in_coverage"]
+        assert row["n_missing"] == 1
+
+        # Sanity check the gap closes once the curated window is reached.
+        covered_date = date(2020, 6, 2)
+        report_covered = eligibility_coverage_report(
+            engine, published_universe, [covered_date], attribute_names=("security_type",)
+        )
+        assert report_covered.by_date.iloc[0]["n_missing"] == 0
+
     def test_out_of_scope_market_cap_named_explicitly_not_silently_absent(self, engine, published_universe):
         report = eligibility_coverage_report(engine, published_universe, [date(2020, 1, 2)])
         assert "market_cap_usd" in report.excluded_attributes
