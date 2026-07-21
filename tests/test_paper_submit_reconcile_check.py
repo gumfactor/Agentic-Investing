@@ -20,7 +20,13 @@ def _write_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def _write_blotter(tmp_path: Path, *, mutate: Any = None, generated_at_utc: str | None = None) -> Path:
+def _write_blotter(
+    tmp_path: Path,
+    *,
+    mutate: Any = None,
+    generated_at_utc: str | None = None,
+    now: datetime | None = None,
+) -> Path:
     config_path = tmp_path / "strategy.yaml"
     portfolio_path = tmp_path / "portfolio.json"
     blotter_path = tmp_path / "paper_stage_blotter.json"
@@ -52,8 +58,12 @@ def _write_blotter(tmp_path: Path, *, mutate: Any = None, generated_at_utc: str 
             "estimated_notional": 450.0,
         },
     ]
-    # Default to now so freshness checks pass without an explicit override
-    ts = generated_at_utc or datetime.now(UTC).isoformat()
+    # Default to "now" so freshness checks pass without an explicit override.
+    # Prefer an explicitly injected `now` (e.g. the shared `frozen_now_utc`
+    # fixture, BUG-081) over the real wall clock so tests that both build a
+    # blotter here AND pass `now_fn=` to `check.run()` cannot drift across a
+    # real UTC-midnight boundary between the two calls.
+    ts = generated_at_utc or (now or datetime.now(UTC)).isoformat()
     artifact = {
         "schema_version": "paper_stage_blotter.v1",
         "artifact_type": "paper_stage_only_order_blotter",
@@ -297,8 +307,14 @@ def test_rejects_checksum_mismatch(tmp_path, capsys):
     assert "candidate_rows_sha256 mismatch" in out
 
 
-def test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation(tmp_path, capsys):
-    blotter_path = _write_blotter(tmp_path)
+def test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation(
+    tmp_path, capsys, frozen_now_utc, frozen_now_fn
+):
+    # BUG-081: derive the blotter's `generated_at_utc` from the same frozen
+    # instant passed as `now_fn=` below, so the freshness gate this exercises
+    # cannot flip depending on real wall-clock time (it previously called
+    # `datetime.now(UTC)` directly, ignoring `now_fn`).
+    blotter_path = _write_blotter(tmp_path, now=frozen_now_utc)
     output_path = tmp_path / "paper_reconciliation.json"
     fake = FakeBroker()
 
@@ -315,7 +331,7 @@ def test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation(tmp_path
         ],
         env=_env(),
         broker_factory=lambda: fake,
-        now_fn=lambda: datetime(2026, 6, 20, 15, 0, tzinfo=UTC),
+        now_fn=frozen_now_fn,
         run_id_factory=lambda: "step-7-run",
     )
 
@@ -470,8 +486,11 @@ def test_confirm_yes_rejects_sub_cent_limit_prices_before_broker_connection(tmp_
     assert not output_path.exists()
 
 
-def test_partial_submission_failure_writes_attempt_artifact(tmp_path, capsys):
-    blotter_path = _write_blotter(tmp_path)
+def test_partial_submission_failure_writes_attempt_artifact(
+    tmp_path, capsys, frozen_now_utc, frozen_now_fn
+):
+    # BUG-081: same frozen-clock alignment as the confirm-YES happy path above.
+    blotter_path = _write_blotter(tmp_path, now=frozen_now_utc)
     output_path = tmp_path / "paper_reconciliation.json"
     fake = FailsOnSecondOrderBroker()
 
@@ -488,7 +507,7 @@ def test_partial_submission_failure_writes_attempt_artifact(tmp_path, capsys):
         ],
         env=_env(),
         broker_factory=lambda: fake,
-        now_fn=lambda: datetime(2026, 6, 20, 15, 0, tzinfo=UTC),
+        now_fn=frozen_now_fn,
         run_id_factory=lambda: "step-7-partial",
     )
 
@@ -590,14 +609,27 @@ def test_rejects_adapter_with_live_port_metadata(tmp_path, capsys):
 
 
 # ── Freshness checks (BUG-051) ────────────────────────────────────────────────
+#
+# BUG-081: every test below pins "now" via the shared `frozen_now_utc` fixture
+# and passes the matching `frozen_now_fn` as `now_fn=` to `check.run()`, so
+# both the blotter's `generated_at_utc` and the freshness gate's notion of
+# "today" are derived from the exact same instant. Before this fix,
+# `_validate_blotter_freshness` always called `datetime.now(UTC)` directly
+# (ignoring any `now_fn` override), and these tests computed relative
+# offsets ("N days ago") from a fresh `datetime.now(UTC)` call of their own --
+# two independent wall-clock reads that could disagree if a real UTC-midnight
+# boundary fell between them during a slow/parallel run, which is exactly
+# what produced the one-off flake in
+# `test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation`.
 
-def test_freshness_check_rejects_stale_blotter(tmp_path, capsys):
+def test_freshness_check_rejects_stale_blotter(tmp_path, capsys, frozen_now_fn):
     """Stale blotter must be rejected AND orders still displayed for operator inspection."""
     blotter_path = _write_blotter(tmp_path, generated_at_utc="2020-01-01T12:00:00+00:00")
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
         broker_factory=lambda: FakeBroker(),
+        now_fn=frozen_now_fn,
     )
     out = capsys.readouterr().out
     assert result == 1
@@ -606,54 +638,58 @@ def test_freshness_check_rejects_stale_blotter(tmp_path, capsys):
     assert "AAPL" in out
 
 
-def test_freshness_check_accepts_fresh_blotter(tmp_path, capsys):
-    """Blotter generated today must pass the freshness check."""
-    blotter_path = _write_blotter(tmp_path)  # defaults to datetime.now(UTC)
+def test_freshness_check_accepts_fresh_blotter(tmp_path, capsys, frozen_now_utc, frozen_now_fn):
+    """Blotter generated "today" (the frozen instant) must pass the freshness check."""
+    blotter_path = _write_blotter(tmp_path, now=frozen_now_utc)
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
         broker_factory=lambda: FakeBroker(),
+        now_fn=frozen_now_fn,
     )
     out = capsys.readouterr().out
     assert result == 0
     assert "DRY-RUN OK" in out
 
 
-def test_freshness_check_custom_max_age(tmp_path, capsys):
+def test_freshness_check_custom_max_age(tmp_path, capsys, frozen_now_utc, frozen_now_fn):
     """--max-blotter-age-days=7 should accept a blotter generated 3 days ago."""
     from datetime import timedelta
-    three_days_ago = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    three_days_ago = (frozen_now_utc - timedelta(days=3)).isoformat()
     blotter_path = _write_blotter(tmp_path, generated_at_utc=three_days_ago)
     result = check.run(
         ["--blotter", str(blotter_path), "--max-blotter-age-days", "7"],
         env=_env(),
         broker_factory=lambda: FakeBroker(),
+        now_fn=frozen_now_fn,
     )
     assert result == 0
 
 
-def test_freshness_check_boundary_exactly_one_day_old(tmp_path, capsys):
+def test_freshness_check_boundary_exactly_one_day_old(tmp_path, capsys, frozen_now_utc, frozen_now_fn):
     """Blotter aged exactly 1 calendar day passes the default max-age-days=1 (strictly greater than rejects)."""
     from datetime import timedelta
-    one_day_ago = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    one_day_ago = (frozen_now_utc - timedelta(days=1)).isoformat()
     blotter_path = _write_blotter(tmp_path, generated_at_utc=one_day_ago)
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
         broker_factory=lambda: FakeBroker(),
+        now_fn=frozen_now_fn,
     )
     assert result == 0
 
 
-def test_freshness_check_boundary_two_days_old_fails(tmp_path, capsys):
+def test_freshness_check_boundary_two_days_old_fails(tmp_path, capsys, frozen_now_utc, frozen_now_fn):
     """Blotter aged 2 calendar days fails the default max-age-days=1."""
     from datetime import timedelta
-    two_days_ago = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    two_days_ago = (frozen_now_utc - timedelta(days=2)).isoformat()
     blotter_path = _write_blotter(tmp_path, generated_at_utc=two_days_ago)
     result = check.run(
         ["--blotter", str(blotter_path)],
         env=_env(),
         broker_factory=lambda: FakeBroker(),
+        now_fn=frozen_now_fn,
     )
     out = capsys.readouterr().out
     assert result == 1

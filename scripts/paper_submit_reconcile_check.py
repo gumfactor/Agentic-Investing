@@ -278,7 +278,11 @@ def validate_blotter(path: Path) -> dict[str, Any]:
     return artifact
 
 
-def _validate_blotter_freshness(artifact: Mapping[str, Any], max_age_days: int) -> None:
+def _validate_blotter_freshness(
+    artifact: Mapping[str, Any],
+    max_age_days: int,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
     """Reject blotters more than max_age_days calendar days old (BUG-051).
 
     A blotter aged exactly max_age_days is allowed (strictly greater than is rejected).
@@ -287,6 +291,13 @@ def _validate_blotter_freshness(artifact: Mapping[str, Any], max_age_days: int) 
     A stale blotter has valid checksums but references outdated prices, positions,
     and target weights. This check prevents accidentally re-submitting a prior session's
     blotter via the CLI.
+
+    ``now_fn`` must be the same injected clock used elsewhere in ``run()`` (BUG-081):
+    previously this function always called ``datetime.now(UTC)`` directly even though
+    ``run()`` already accepted a ``now_fn`` override for every other timestamp it
+    produces, so a test (or an operator) that froze "now" via ``now_fn`` could still
+    have this check silently read the real wall clock, producing a result that could
+    flip across a real UTC-midnight boundary mid-run.
     """
     generated_str = artifact.get("generated_at_utc")
     if not isinstance(generated_str, str):
@@ -295,7 +306,7 @@ def _validate_blotter_freshness(artifact: Mapping[str, Any], max_age_days: int) 
         generated_dt = datetime.fromisoformat(generated_str.replace("Z", "+00:00"))
     except ValueError as exc:
         raise RuntimeError(f"Blotter generated_at_utc is not a valid ISO timestamp: {generated_str!r}") from exc
-    today_utc = datetime.now(UTC).date()
+    today_utc = now_fn().astimezone(UTC).date()
     generated_date = generated_dt.astimezone(UTC).date()
     age_days = (today_utc - generated_date).days
     if age_days > max_age_days:
@@ -538,7 +549,7 @@ def run(
         # Freshness check runs after display so the order list is always shown.
         # A stale blotter exits nonzero on both dry-run and submission, but
         # the operator has already seen the orders for inspection purposes.
-        _validate_blotter_freshness(blotter, args.max_blotter_age_days)
+        _validate_blotter_freshness(blotter, args.max_blotter_age_days, now_fn=now_fn)
         if args.confirm != "YES":
             if args.confirm is not None:
                 recorder.fail('Submission confirmation must be the literal string "YES"')

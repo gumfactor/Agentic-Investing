@@ -22,7 +22,9 @@ with other tests' legitimate env/cwd manipulation elsewhere in the repo.
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -32,6 +34,24 @@ import pytest
 # `.env` as a side effect) and/or resolve paths relative to the current
 # working directory.
 _PAPER_PATH_TEST_PREFIX = "test_paper_"
+
+# A single frozen instant shared by paper-path tests that need "now" for
+# both constructing fixture data (e.g. a blotter's `generated_at_utc`) and
+# for injecting into a script's `now_fn=`/`today_fn=` parameter. Deriving
+# both from one frozen constant means the two computations can never drift
+# across a real wall-clock boundary (e.g. a UTC midnight rollover) during a
+# slow or parallel test run -- which is exactly what caused the BUG-081
+# `test_confirm_yes_submits_with_fake_broker_and_writes_reconciliation`
+# flake (calendar rolled over mid-run).
+#
+# This repo's existing convention for deterministic clocks is dependency
+# injection (`today_fn: Callable[[], date] = date.today`, `now_fn: ... =
+# lambda: datetime.now(UTC)` -- see scripts/paper_*.py) rather than
+# monkeypatching the datetime module itself (e.g. freezegun, even though it
+# is present in requirements-dev.txt for other uses). These fixtures follow
+# that same injected-clock convention instead of introducing a new mocking
+# style for this one bug class.
+FROZEN_NOW_UTC = datetime(2026, 6, 20, 15, 0, tzinfo=UTC)
 
 
 def _is_paper_path_test(fspath: Path) -> bool:
@@ -64,3 +84,21 @@ def _paper_path_isolate_global_state(request: pytest.FixtureRequest):
             # The saved directory may no longer exist (e.g. a removed
             # tmp_path); there is nothing sane to restore to in that case.
             pass
+
+
+@pytest.fixture
+def frozen_now_utc() -> datetime:
+    """A fixed, timezone-aware UTC ``datetime`` for paper-path date-guard tests.
+
+    Use together with ``frozen_now_fn`` (or ``lambda: frozen_now_utc``) so
+    that any "now" used to build test fixture data and any "now" injected
+    into the script under test via ``now_fn=`` are the exact same instant,
+    eliminating wall-clock/date-boundary dependence entirely (BUG-081).
+    """
+    return FROZEN_NOW_UTC
+
+
+@pytest.fixture
+def frozen_now_fn(frozen_now_utc: datetime) -> Callable[[], datetime]:
+    """A zero-arg callable returning ``frozen_now_utc``, for ``now_fn=`` injection."""
+    return lambda: frozen_now_utc
