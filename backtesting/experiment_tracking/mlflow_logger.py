@@ -31,6 +31,7 @@ from backtesting.config_contract import (
     ConfigProvenanceMismatchError,
     validate_backtest_config,
 )
+from backtesting.dataset_manifest import require_manifest_hash_data_version
 from backtesting.engine.event_loop import BacktestResult
 
 if TYPE_CHECKING:
@@ -62,6 +63,7 @@ class BacktestLogger:
         run_name: Optional[str] = None,
         tags: Optional[dict[str, str]] = None,
         funnel_result: Optional["SurvivalFunnelResult"] = None,
+        require_manifest_data_version: bool = False,
     ) -> str:
         """Log a backtest result to MLflow.
 
@@ -76,6 +78,19 @@ class BacktestLogger:
             funnel_result: Optional SurvivalFunnelResult; when supplied, each
                 gate's pass/fail is logged as an MLflow tag so the validation
                 outcome is queryable alongside the run metrics.
+            require_manifest_data_version: 03A-5 transition flag. When
+                ``True``, additionally rejects a ``data_version`` that is not
+                manifest-hash-shaped (64 lowercase hex chars) -- e.g. a
+                legacy date string like ``"2026-06-14"`` or a test
+                placeholder -- guarding against a caller silently reverting
+                to the pre-03A-1 convention. Defaults to ``False`` because no
+                production caller of ``log_run`` exists yet outside tests and
+                many test fixtures across this codebase still use short
+                placeholder ``data_version`` strings (design plan §2.5's
+                acceptance test is exercised directly in
+                ``test_mlflow_logger.py`` with this flag set); new call
+                sites wired up against ``scripts.pin_snapshot`` output should
+                pass ``True``.
 
         Returns:
             MLflow run_id string.
@@ -125,6 +140,8 @@ class BacktestLogger:
                 "data_version is required before logging a backtest run (C7). "
                 "Set config['data_version'] to the DVC version or MinIO snapshot ID."
             )
+        if require_manifest_data_version:
+            require_manifest_hash_data_version(data_version)
 
         mlflow.set_experiment(experiment_name)
 
@@ -208,6 +225,7 @@ class BacktestLogger:
         tags: Optional[dict[str, str]] = None,
         funnel_result: Optional["SurvivalFunnelResult"] = None,
         stress_result: Optional["BootstrapStressResult"] = None,
+        require_manifest_data_version: bool = False,
     ) -> str:
         """Log a walk-forward validation result to MLflow.
 
@@ -225,6 +243,9 @@ class BacktestLogger:
                 as MLflow tags when supplied.
             stress_result: Optional BootstrapStressResult; drawdown percentiles
                 logged as MLflow metrics when supplied.
+            require_manifest_data_version: 03A-5 transition flag -- see
+                ``log_run``'s docstring. Defaults to ``False`` for the same
+                reason (no production caller yet, many legacy test fixtures).
 
         Returns:
             MLflow run_id string.
@@ -273,6 +294,8 @@ class BacktestLogger:
                 "data_version is required before logging a walk-forward run (C7). "
                 "Set config['data_version'] to the DVC version or MinIO snapshot ID."
             )
+        if require_manifest_data_version:
+            require_manifest_hash_data_version(data_version)
 
         config_hash = _hash_config(wf_result.config)
         mlflow.set_experiment(experiment_name)
