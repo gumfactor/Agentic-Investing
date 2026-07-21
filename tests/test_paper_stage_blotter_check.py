@@ -3,45 +3,19 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
-import pytest
 from sqlalchemy import create_engine
 
 from scripts import paper_stage_blotter_check as check
 
-
-@pytest.fixture(autouse=True)
-def _isolate_global_state():
-    """Snapshot and restore process-global state around every test in this
-    module (BUG-080 defensive isolation).
-
-    ``paper_stage_blotter_check.run`` calls ``load_dotenv()``, which mutates
-    ``os.environ`` from the repository ``.env`` as a side effect, and other
-    suites elsewhere in the full run may change ``os.environ`` or the current
-    working directory without cleaning up. These tests inject ``env=_env()``
-    explicitly, but any code path they exercise that falls back to
-    ``os.environ`` / cwd-relative resolution (e.g. ``load_dotenv`` itself)
-    can be perturbed by leaked global state from an earlier test, producing
-    an order-dependent failure. Saving and restoring both globals here makes
-    every test in this module robust to whatever ran before it, regardless of
-    the exact upstream polluter (collection order shifted enough by the
-    03B backtester-series-split tests to surface this pre-existing leak).
-    """
-    saved_environ = dict(os.environ)
-    saved_cwd = os.getcwd()
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(saved_environ)
-        try:
-            os.chdir(saved_cwd)
-        except OSError:
-            pass
+# NOTE (BUG-081): the env/cwd isolation fixture that used to live here
+# (added under BUG-080) has been superseded by the shared, autouse
+# `_paper_path_isolate_global_state` fixture in `tests/conftest.py`, which
+# applies the same snapshot/restore behavior to every `tests/test_paper_*.py`
+# module rather than just this one. See conftest.py for the full rationale.
 
 
 def _write_config(
