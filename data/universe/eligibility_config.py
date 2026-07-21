@@ -293,6 +293,26 @@ def parse_universe_eligibility_filters(
                         f"{threshold!r} is not numeric for a {op.value} filter."
                     )
                     continue
+            # max_staleness_days must be validated at parse time, not passed
+            # through: an un-validated string/float here loads fine but
+            # crashes with a raw TypeError at EVALUATION time in
+            # PITEligibilityLookup.evaluate ((as_of_date - source_data_asof).days
+            # > spec.max_staleness_days). Reject non-int (incl. bool/float)
+            # and negatives with a named violation instead (fail-closed
+            # honesty, same class as the threshold guard). bool is excluded
+            # explicitly because it is an int subclass.
+            max_staleness_days = raw_spec.get("max_staleness_days")
+            if max_staleness_days is not None and (
+                isinstance(max_staleness_days, bool)
+                or not isinstance(max_staleness_days, int)
+                or max_staleness_days < 0
+            ):
+                violations.append(
+                    f"universe.eligibility.{attribute_name}.max_staleness_days="
+                    f"{max_staleness_days!r} must be a non-negative integer or "
+                    "omitted."
+                )
+                continue
             specs[f"eligibility.{attribute_name}"] = FilterSpec(
                 attribute_name=attribute_name,
                 op=op,

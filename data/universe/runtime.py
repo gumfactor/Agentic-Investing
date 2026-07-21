@@ -748,6 +748,9 @@ def _evaluate_filter_value(
     elif spec.op is EligibilityFilterOp.LTE:
         passed = value <= threshold
     elif spec.op is EligibilityFilterOp.EQ:
+        # Exact float equality is fragile, but EQ is only reachable via the
+        # explicit universe.eligibility block and is intended for
+        # discrete/integer-valued attributes, not continuous ones.
         passed = value == threshold
     else:  # pragma: no cover - exhaustive over EligibilityFilterOp
         raise AssertionError(f"unhandled EligibilityFilterOp {spec.op!r}")

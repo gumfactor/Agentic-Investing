@@ -220,6 +220,39 @@ def test_single_string_security_type_still_accepted() -> None:
     assert specs["allowed_security_types"].threshold == ("common_stock",)
 
 
+@pytest.mark.parametrize("bad_value", ["30", 30.0, -5, True])
+def test_eligibility_block_bad_max_staleness_days_fails_closed(bad_value) -> None:
+    """P2: an un-validated max_staleness_days (string/float/negative/bool)
+    must fail config load with a named violation, not pass parse and crash
+    with a raw TypeError later in PITEligibilityLookup.evaluate."""
+    config = {
+        "universe": {
+            "eligibility": {
+                "adv_usd_20d": {
+                    "op": "gte",
+                    "threshold": 1_000_000,
+                    "max_staleness_days": bad_value,
+                }
+            }
+        }
+    }
+    with pytest.raises(UnsupportedEligibilityFilterError) as exc_info:
+        parse_universe_eligibility_filters(config)
+    assert "max_staleness_days" in str(exc_info.value)
+
+
+def test_eligibility_block_valid_max_staleness_days_parses() -> None:
+    config = {
+        "universe": {
+            "eligibility": {
+                "adv_usd_20d": {"op": "gte", "threshold": 1_000_000, "max_staleness_days": 30}
+            }
+        }
+    }
+    specs = parse_universe_eligibility_filters(config)
+    assert specs["eligibility.adv_usd_20d"].max_staleness_days == 30
+
+
 def test_all_violations_reported_together() -> None:
     """Mirrors config_contract.py's 'collect every violation before raising'
     behavior -- a caller sees the full offending set in one error, not just
