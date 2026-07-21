@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from datetime import date as date_
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import (
@@ -28,6 +29,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     Text,
     UniqueConstraint,
 )
@@ -171,3 +173,116 @@ class SymbolHistory(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper
         return f"<SymbolHistory {self.old_ticker}->{self.new_ticker} @{self.effective_date}>"
+
+
+class UniverseEligibilityBatch(Base):
+    """One row per nightly/backfill eligibility-attribute computation run.
+
+    Mirrors ``infra/db/migrations/versions/013_universe_eligibility_attributes.py``
+    (Roadmap 03A-4a, design plan §1.2 ``computation_batch_id`` provenance).
+    Append-only: a correction publishes a new batch rather than mutating
+    existing rows (C3-style discipline).
+    """
+
+    __tablename__ = "universe_eligibility_batches"
+    __table_args__ = (
+        CheckConstraint(
+            "length(universe_id) > 0 AND length(code_version) > 0",
+            name="ck_universe_eligibility_batches_nonempty_ids",
+        ),
+        Index(
+            "ix_universe_eligibility_batches_universe_computed",
+            "universe_id",
+            "computed_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    universe_id: Mapped[str] = mapped_column(Text, nullable=False)
+    code_version: Mapped[str] = mapped_column(Text, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    n_attribute_rows: Mapped[Optional[int]] = mapped_column(Integer)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return (
+            f"<UniverseEligibilityBatch id={self.id} universe_id={self.universe_id!r} "
+            f"code_version={self.code_version!r}>"
+        )
+
+
+class UniverseEligibilityAttribute(Base):
+    """Append-only, effective-dated PIT eligibility fact (§1.2).
+
+    One row per ``(universe_id, ticker, attribute_name, effective_start)``.
+    Half-open interval, same shape as :class:`UniverseMembership`. Exactly
+    one of ``attribute_value_numeric``/``attribute_value_text`` is populated
+    depending on ``attribute_name``'s declared type (numeric attributes:
+    ``adv_usd_20d``, ``price_usd``; text attributes: ``security_type``).
+
+    The Postgres-only ``EXCLUDE USING gist`` no-overlap constraint (scoped by
+    ``computation_batch_id``, mirroring migration 009) is not representable
+    in SQLAlchemy Core cross-dialect and is not declared here -- same
+    deliberate divergence documented on :class:`UniverseMembership` above.
+    """
+
+    __tablename__ = "universe_eligibility_attributes"
+    __table_args__ = (
+        CheckConstraint(
+            "length(universe_id) > 0 AND length(ticker) > 0 AND length(attribute_name) > 0",
+            name="ck_universe_eligibility_attributes_nonempty_ids",
+        ),
+        CheckConstraint(
+            "effective_end IS NULL OR effective_end > effective_start",
+            name="ck_universe_eligibility_attributes_valid_range",
+        ),
+        CheckConstraint(
+            "(attribute_value_numeric IS NOT NULL AND attribute_value_text IS NULL) "
+            "OR (attribute_value_numeric IS NULL AND attribute_value_text IS NOT NULL)",
+            name="ck_universe_eligibility_attributes_exactly_one_value",
+        ),
+        CheckConstraint(
+            "source_data_asof <= effective_start",
+            name="ck_universe_eligibility_attributes_source_not_future",
+        ),
+        Index(
+            "ix_universe_eligibility_attributes_universe_ticker_attr",
+            "universe_id",
+            "ticker",
+            "attribute_name",
+        ),
+        Index(
+            "ix_universe_eligibility_attributes_universe_attr_start",
+            "universe_id",
+            "attribute_name",
+            "effective_start",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    universe_id: Mapped[str] = mapped_column(Text, nullable=False)
+    ticker: Mapped[str] = mapped_column(Text, nullable=False)
+    attribute_name: Mapped[str] = mapped_column(Text, nullable=False)
+    attribute_value_numeric: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    attribute_value_text: Mapped[Optional[str]] = mapped_column(Text)
+    effective_start: Mapped[date_] = mapped_column(Date, nullable=False)
+    effective_end: Mapped[Optional[date_]] = mapped_column(Date)
+    computed_from: Mapped[str] = mapped_column(Text, nullable=False)
+    source_data_asof: Mapped[date_] = mapped_column(Date, nullable=False)
+    computation_batch_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("universe_eligibility_batches.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return (
+            f"<UniverseEligibilityAttribute {self.universe_id}:{self.ticker} "
+            f"{self.attribute_name}=[{self.effective_start},{self.effective_end})>"
+        )
