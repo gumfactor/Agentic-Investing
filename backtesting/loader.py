@@ -1,12 +1,35 @@
 """Backtest data loader: assembles a DataHandler from versioned MinIO snapshots.
 
-Price adjustment pipeline
--------------------------
-Prices stored in daily_prices are unadjusted (per the Phase 1 design decision).
-This loader applies corporate-action adjustment factors before constructing
-DataHandler so the backtest engine always operates on split- and
-dividend-adjusted closes.  Using unadjusted prices in a backtest produces
-fictitious P&L wherever a split occurs (Codex finding #3).
+Raw execution series vs. cutoff-aware analytic series (BUG-070)
+-----------------------------------------------------------------
+Prices stored in daily_prices are unadjusted (per the Phase 1 design
+decision). This loader passes that RAW series to ``DataHandler`` unmodified
+as the execution series -- the only series used for order fills, cash, and
+share accounting (design plan §2.2). Corporate actions on a held position
+are instead accounted for explicitly on the portfolio side (split ->
+share-count change, dividend -> cash), via ``DataHandler.
+get_corporate_actions_on`` and ``BacktestEngine``'s ``_PortfolioState.
+apply_corporate_actions``. Using the unadjusted price for fills while also
+silently trading against it without split/dividend accounting produces
+fictitious P&L wherever a split or dividend occurs (Codex finding #3;
+BUG-070 fixes the accounting gap left by the earlier full-history-adjustment
+approach, which mixed execution and signal/valuation semantics into one
+series).
+
+This loader additionally builds a cutoff-aware ANALYTIC series via
+``data.normalization.corporate_actions.build_realized_total_return_as_of``
+(§2.3-2.4) for total-return valuation/reporting only -- e.g. comparing the
+portfolio's raw-price-plus-explicit-corporate-action NAV against a
+documented total-return-adjusted series. It is exposed on the returned
+DataHandler as ``get_analytic_close`` and is NEVER used for fills. The
+analytic series' cutoff is the run-boundary session close (the same
+run-boundary-cutoff convention already accepted for
+``scripts/backfill_momentum_scores.py``/``scripts/validate_signal_ic.py`` in
+01B-3; see BUG-071 for the documented residual limitation of a single
+run-boundary cutoff rather than a literal per-date cutoff -- this loader
+inherits that same accepted limitation and does not attempt to reproduce a
+finer-grained cutoff here because no per-date score computation happens in
+the backtester itself: alpha_scores arrive pre-computed from the snapshot).
 
 Snapshot convention (03A-1, content-addressed)
 ----------------------------------------------
@@ -36,6 +59,7 @@ treated as "no data" (design plan section 4.2).
 
 from __future__ import annotations
 
+from datetime import date as _date
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -43,11 +67,9 @@ import structlog
 
 from backtesting.config_contract import validate_backtest_config
 from backtesting.engine.data_handler import DataHandler
-from data.normalization.corporate_actions import (
-    apply_adjustment_factors,
-    compute_adjustment_factors,
-)
+from data.normalization.corporate_actions import build_realized_total_return_as_of
 from data.storage.errors import SnapshotNotFoundError
+from data.universe.calendar import session_close_cutoff
 
 if TYPE_CHECKING:
     from data.storage.parquet_snapshots import ParquetSnapshots
@@ -203,35 +225,89 @@ def load_from_snapshot(
             "stored score rows, or re-pin/backfill the snapshot."
         )
 
-    # ── Apply price adjustment ────────────────────────────────────────────────
-    prices_adj = _adjust_prices(prices_raw, corp_actions)
+    # ── Build the cutoff-aware ANALYTIC series (BUG-070, §2.3-2.4) ────────────
+    # Total-return valuation/reporting only -- never for fills. The raw
+    # `prices_raw` series above is passed to DataHandler unmodified as the
+    # execution series; corporate actions on held positions are accounted
+    # for explicitly in BacktestEngine's portfolio path, not by adjusting
+    # this price series.
+    analytic_prices = _build_analytic_prices(prices_raw, corp_actions, config)
 
     logger.info(
         "loader_complete",
-        prices_rows=len(prices_adj),
+        prices_rows=len(prices_raw),
         alpha_rows=len(alpha_scores),
         benchmark_rows=len(benchmark),
-        tickers=prices_adj["ticker"].nunique() if not prices_adj.empty else 0,
+        tickers=prices_raw["ticker"].nunique() if not prices_raw.empty else 0,
     )
 
-    return DataHandler(prices_adj, alpha_scores, benchmark)
+    return DataHandler(
+        prices_raw,
+        alpha_scores,
+        benchmark,
+        corporate_actions=corp_actions,
+        analytic_prices=analytic_prices,
+    )
 
 
-def _adjust_prices(
-    prices: pd.DataFrame,
+def _build_analytic_prices(
+    prices_raw: pd.DataFrame,
     corp_actions: pd.DataFrame,
+    config: dict,
 ) -> pd.DataFrame:
-    """Compute and apply adjustment factors; replace close with adj_close.
+    """Build the cutoff-aware total-return-adjusted analytic price series.
 
-    Returns prices DataFrame with the ``close`` column replaced by the
-    split- and dividend-adjusted close price (float dtype).
+    Uses ``build_realized_total_return_as_of`` with a single run-boundary
+    cutoff (the session close of ``min(backtest.end_date, latest loaded
+    price date)``) -- the same accepted convention already used by
+    ``scripts/backfill_momentum_scores.py``/``scripts/validate_signal_ic.py``
+    (01B-3; residual limitation tracked as BUG-071). This never touches the
+    raw execution series returned to the caller; it only feeds
+    ``DataHandler.get_analytic_close`` (valuation/reporting).
+
+    Fails closed: any error from ``build_realized_total_return_as_of``
+    (e.g. corporate_actions missing the required ``known_at``/``ex_date``
+    columns) propagates uncaught -- an analytic series must never silently
+    degrade to an unadjusted/mislabeled one.
     """
-    factors = compute_adjustment_factors(corp_actions, prices)
-    adjusted = apply_adjustment_factors(prices, factors)
+    if prices_raw.empty:
+        return prices_raw.copy()
 
-    result = adjusted.copy()
+    latest_price_date = prices_raw["date"].max()
+    if not isinstance(latest_price_date, _date):
+        latest_price_date = pd.Timestamp(latest_price_date).date()
+    earliest_price_date = prices_raw["date"].min()
+    if not isinstance(earliest_price_date, _date):
+        earliest_price_date = pd.Timestamp(earliest_price_date).date()
+
+    # backtest.start_date/end_date are the normal source of the run window;
+    # fall back to the loaded price range when a caller-supplied config
+    # omits the backtest section entirely (e.g. a unit test exercising only
+    # the strategy_id/corporate-actions path). validate_backtest_config
+    # (called above) does not itself require the section, so this loader
+    # must not assume it is present.
+    bt_cfg = config.get("backtest", {})
+    start = _parse_date(bt_cfg["start_date"]) if "start_date" in bt_cfg else earliest_price_date
+    end = _parse_date(bt_cfg["end_date"]) if "end_date" in bt_cfg else latest_price_date
+    boundary_date = min(end, latest_price_date)
+    exit_cutoff = session_close_cutoff(boundary_date)
+
+    analytic_prices, _metadata = build_realized_total_return_as_of(
+        prices_raw,
+        corp_actions,
+        entry_date=start,
+        exit_cutoff=exit_cutoff,
+    )
+
+    result = analytic_prices.copy()
     # adj_close may contain Decimal objects; cast to float for DataHandler.
     result["close"] = result["adj_close"].apply(
         lambda v: float(v) if v is not None else float("nan")
     )
     return result
+
+
+def _parse_date(value: str | _date) -> _date:
+    if isinstance(value, _date):
+        return value
+    return _date.fromisoformat(str(value))

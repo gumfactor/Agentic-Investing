@@ -460,22 +460,37 @@ def _make_loader_prices(tickers=("AAPL",)) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_loader_adjust_prices_no_actions():
-    """With no corporate actions all adj_factors = 1.0; close unchanged."""
-    from backtesting.loader import _adjust_prices
+def test_loader_analytic_prices_no_actions():
+    """With no corporate actions the analytic series equals the raw series
+    (BUG-070: no-actions is a degenerate case of the cutoff-aware builder,
+    not the removed full-history routine)."""
+    from datetime import datetime, timezone
+
+    from backtesting.loader import _build_analytic_prices
     prices = _make_loader_prices()
-    corp = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value"])
-    result = _adjust_prices(prices, corp)
+    corp = pd.DataFrame(columns=["ticker", "ex_date", "action_type", "value", "known_at"])
+    config = {
+        "backtest": {
+            "start_date": "2023-01-02",
+            "end_date": str(prices["date"].max()),
+        }
+    }
+    result = _build_analytic_prices(prices, corp, config)
     assert "close" in result.columns
     assert all(abs(result["close"] - 150.0) < 1e-6)
 
 
-def test_loader_adjust_prices_split():
-    """A 2-for-1 split: pre-split unadjusted=300, post-split unadjusted=150.
-    Adjustment should bring pre-split adj_close down to 150 (300 * 0.5).
-    Post-split prices remain at 150 (adj_factor=1).
-    """
-    from backtesting.loader import _adjust_prices
+def test_loader_analytic_prices_split():
+    """A 2-for-1 split known well before the backtest boundary cutoff:
+    pre-split unadjusted=300, post-split unadjusted=150. The analytic
+    series brings pre-split adj_close down to 150 (300 * 0.5); post-split
+    prices remain at 150 (adj_factor=1). This is the ANALYTIC series only
+    (valuation/reporting) -- it must never be confused with the raw
+    execution series `load_from_snapshot` now passes unmodified to
+    DataHandler.get_close."""
+    from datetime import datetime, timezone
+
+    from backtesting.loader import _build_analytic_prices
     split_date = date(2023, 1, 10)
 
     # Use different prices before and after the split so the boundary is testable.
@@ -493,8 +508,15 @@ def test_loader_adjust_prices_split():
         "ex_date": split_date,
         "action_type": "split",
         "value": 2.0,
+        "known_at": datetime(2023, 1, 1, tzinfo=timezone.utc),
     }])
-    result = _adjust_prices(prices, corp)
+    config = {
+        "backtest": {
+            "start_date": "2023-01-02",
+            "end_date": str(prices["date"].max()),
+        }
+    }
+    result = _build_analytic_prices(prices, corp, config)
     before_split = result[result["date"] < split_date]
     after_split = result[result["date"] >= split_date]
     # Pre-split unadjusted=300, factor=0.5 → adj_close=150
