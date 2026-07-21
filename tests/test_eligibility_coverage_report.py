@@ -39,6 +39,17 @@ class TestDatesInRange:
     def test_single_day_range(self):
         assert _dates_in_range(date(2024, 1, 1), date(2024, 1, 1), 1) == [date(2024, 1, 1)]
 
+    def test_zero_step_rejected_not_infinite_loop(self):
+        """Codex P2 fix (PR #42 review, round 4): step_days<=0 never
+        advances toward `end`, hanging the command before it can print or
+        write anything. Must fail closed immediately instead."""
+        with pytest.raises(ValueError, match="positive"):
+            _dates_in_range(date(2024, 1, 1), date(2024, 1, 10), 0)
+
+    def test_negative_step_rejected(self):
+        with pytest.raises(ValueError, match="positive"):
+            _dates_in_range(date(2024, 1, 1), date(2024, 1, 10), -1)
+
 
 @pytest.fixture
 def published_universe_engine(tmp_path):
@@ -87,6 +98,31 @@ class TestRunReportFormatting:
         assert all(not r["in_coverage"] for r in summary["by_date"])
         out = capsys.readouterr().out
         assert "0 (date, attribute) rows" in out
+
+    def test_out_of_coverage_counts_serialize_as_json_null_not_nan(
+        self, published_universe_engine, tmp_path
+    ):
+        """Codex P2 fix (PR #42 review, round 4): report.by_date's out-of-
+        coverage rows carry Python None for n_members/n_with_attribute/
+        n_missing, but DataFrame.to_dict() upcasts that column to float64
+        NaN when mixed with real int counts elsewhere in the range.
+        json.dump writes a bare `NaN` token for those -- not valid JSON for
+        many parsers -- unless explicitly restored to None first."""
+        output_path = tmp_path / "report.json"
+        run(
+            universe_id=FIXTURE_UNIVERSE_ID,
+            start=date(1999, 1, 1),  # out of coverage
+            end=date(2020, 1, 2),  # in coverage
+            sample_every_n_days=1,
+            output=str(output_path),
+            engine=published_universe_engine,
+        )
+        raw_text = output_path.read_text(encoding="utf-8")
+        assert "NaN" not in raw_text
+        written = json.loads(raw_text)  # strict parse -- would reject bare NaN
+        out_of_coverage_rows = [r for r in written["by_date"] if not r["in_coverage"]]
+        assert out_of_coverage_rows
+        assert all(r["n_missing"] is None for r in out_of_coverage_rows)
 
     def test_gap_count_correct_with_mixed_in_and_out_of_coverage_dates(
         self, published_universe_engine

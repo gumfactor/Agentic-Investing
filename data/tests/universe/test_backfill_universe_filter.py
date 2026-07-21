@@ -961,4 +961,50 @@ class TestStrategyConfigEligibilityWiring:
                 strategy_config_path=strategy_config_path,
             )
 
+    def test_requested_attribute_never_computed_fails_closed(self, tmp_path):
+        """Codex P2 fix (PR #42 review, round 4): NoEligibilityDataError only
+        catches "the batch job never ran at all for this universe_id" -- a
+        universe_id with ONLY a security_type batch (no price_usd/
+        adv_usd_20d rows at all) passes that check, but a strategy filtering
+        on price_usd would previously have every ticker/date silently
+        resolve to missing_attribute (indistinguishable from "everyone is
+        illiquid") instead of failing closed with a clear "attribute was
+        never computed" error."""
+        from data.universe.eligibility_batch import write_security_type_batch
+        from data.universe.runtime import PITEligibilityLookup, PITUniverseLookup
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'security_type_only.db'}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        # Only security_type has ever been computed for this universe_id.
+        write_security_type_batch(eng, FIXTURE_UNIVERSE_ID, curation=[], code_version="test")
+
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        mock_snaps = _mock_snapshots(prices)
+        strategy_config_path = self._write_strategy_config(
+            tmp_path, {"price_usd": {"op": "gte", "threshold": 1.0}}
+        )
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+
+        with pytest.raises(ValueError, match="price_usd"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=True,
+                snapshots=mock_snaps,
+                universe_id=FIXTURE_UNIVERSE_ID,
+                universe_lookup=PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID),
+                eligibility_lookup=PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID),
+                strategy_config_path=strategy_config_path,
+            )
+
 

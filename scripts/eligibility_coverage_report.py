@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from datetime import date, timedelta
 from typing import Optional
 
@@ -40,13 +41,20 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Check every Nth calendar day in [start, end] rather than every day "
         "(default 1 = every day; use a larger value for a fast summary over a "
-        "long range).",
+        "long range). Must be a positive integer.",
     )
     p.add_argument("--output", default=None, help="Optional path to write the JSON report.")
     return p.parse_args()
 
 
 def _dates_in_range(start: date, end: date, step_days: int) -> list[date]:
+    # Codex P2 fix (03A-4b PR #42 review, round 4): step_days<=0 never
+    # advances `d` toward `end`, hanging the command in an infinite loop
+    # before it can print or write anything -- fail closed instead.
+    if step_days <= 0:
+        raise ValueError(
+            f"--sample-every-n-days must be a positive integer, got {step_days}."
+        )
     dates = []
     d = start
     while d <= end:
@@ -76,6 +84,16 @@ def run(
     by_date_records = report.by_date.to_dict(orient="records") if not report.by_date.empty else []
     for rec in by_date_records:
         rec["date"] = str(rec["date"])
+        # Codex P2 fix (03A-4b PR #42 review, round 4): DataFrame.to_dict()
+        # upcasts a column mixing Python None with ints to float64 NaN
+        # (same root cause as the n_gap_rows fix above). json.dump would
+        # then write a bare `NaN` token, which is not valid JSON for many
+        # downstream parsers even though this command advertises a JSON
+        # report -- restore the intended None sentinel before serializing.
+        for key in ("n_members", "n_with_attribute", "n_missing"):
+            value = rec.get(key)
+            if isinstance(value, float) and math.isnan(value):
+                rec[key] = None
 
     # Codex P2 fix (03A-4b PR #42 review): gate on `in_coverage` directly
     # rather than re-deriving "was this row in scope" from `n_missing`.

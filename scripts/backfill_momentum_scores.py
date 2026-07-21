@@ -282,6 +282,34 @@ def run(
                 os.environ["DATABASE_URL"], universe_id
             )
 
+        # Codex P2 fix (03A-4b PR #42 review): NoEligibilityDataError only
+        # catches "the batch job has NEVER run at all for this universe_id".
+        # A batch job having run for a DIFFERENT attribute (e.g. only the
+        # security_type curation batch ran, but the strategy filters on
+        # price_usd/adv_usd_20d) passes that construction-time check yet
+        # every date/ticker then silently resolves to missing_attribute --
+        # indistinguishable from "every ticker happens to be illiquid" and
+        # reaching the shared momentum-scoring path's known empty-result
+        # crash (BUG-082) instead of a clear, named error. Preflight the
+        # declared filters' attribute_names against what has actually been
+        # computed before running the per-date loop.
+        if eligibility_filters:
+            requested_attributes = {spec.attribute_name for spec in eligibility_filters.values()}
+            missing_attributes = requested_attributes - eligibility_lookup.available_attribute_names
+            if missing_attributes:
+                raise ValueError(
+                    f"--strategy-config declares eligibility filter(s) on "
+                    f"attribute(s) {sorted(missing_attributes)!r}, but "
+                    f"universe_id={universe_id!r} has no "
+                    "universe_eligibility_attributes rows for those attribute(s) "
+                    "at all (only "
+                    f"{sorted(eligibility_lookup.available_attribute_names)!r} have "
+                    "been computed). Run scripts/backfill_eligibility_attributes.py "
+                    "and/or scripts/import_security_type_curation.py for the missing "
+                    "attribute(s) first; proceeding would silently resolve every "
+                    "ticker/date to missing_attribute rather than fail closed."
+                )
+
         candidate_dates = sorted(
             d for d in prices["date"].unique() if start <= d <= end
         )

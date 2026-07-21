@@ -581,10 +581,27 @@ class PITEligibilityLookup:
                     (row, computed_at)
                 )
             self._all_tickers = sorted({r.ticker for r, _ in rows})
+            self._available_attribute_names = frozenset(attr for _, attr in self._rows)
 
     @property
     def universe_id(self) -> str:
         return self._universe_id
+
+    @property
+    def available_attribute_names(self) -> frozenset[str]:
+        """Attribute names with at least one row for this ``universe_id``
+        (across all computation batches) -- distinct from "no eligibility
+        data at all" (:class:`NoEligibilityDataError`, raised at
+        construction). A caller declaring a filter on an attribute NOT in
+        this set would otherwise get every ticker/date silently resolved to
+        ``missing_attribute`` (Codex PR #42 P2: a strategy filtering on
+        ``price_usd``/``adv_usd_20d`` when only a ``security_type``
+        curation batch has ever run for this ``universe_id`` should fail
+        closed with a clear "that attribute was never computed" error, not
+        an empty cross-section indistinguishable from "every ticker
+        happens to be illiquid").
+        """
+        return self._available_attribute_names
 
     def _resolve_attribute(
         self, ticker: str, attribute_name: str, as_of_date: date
