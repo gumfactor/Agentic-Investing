@@ -98,7 +98,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-067 | Data/Universe | P1 | F1 | Fixed (dev/R2-01B2-pit-universe) | `config/universe_loader.py` returned an empty universe on Wikipedia fetch failure (fail-open). |
 | BUG-068 | Data/Universe | P2 | F2 | Open | Wikipedia constituent history has bounded count drift (left-censored inflation ~3% recent era; sparse pre-2000 changes; 3 ticker-collision exclusions). |
 | BUG-069 | Data/Universe | P2 | F2 | Deferred (operator-accepted 2026-07-18) | daily_signal_pipeline degrades to unfiltered provisional scores when the PIT universe import is missing/stale; no alert beyond a log warning. |
-| BUG-070 | Backtesting | P1 | F2 | Open (scheduled — Roadmap row 03B, 2026-07-19) | Backtester loads a single full-history (non-cutoff-aware) adjusted price series, shared for both scoring and execution. |
+| BUG-070 | Backtesting | P1 | F2 | Implemented-pending-review (dev/R2-03B-backtester-series-split, 2026-07-20) | Backtester loads a single full-history (non-cutoff-aware) adjusted price series, shared for both scoring and execution. |
 | BUG-071 | Research/Signals | P2 | F2 | Open | IC-validation cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff (documented residual). |
 | BUG-072 | Dashboard/API | P2 | F2 | Fixed | All alpha/factor-score readers (dashboards, `scripts/indicator_diagnostic.py`) now filter to the active research run by default; `--all-runs`/`--research-run-id` are the only documented explicit opt-ins for cross-run reads. |
 | BUG-073 | Packaging/CI | P1 | F1 | Fixed | `pyproject.toml`'s pytest `testpaths` silently excluded ~412 tests (all of `tests/reporting/dashboards/`, `tests/infra/`) from every "full suite" run whenever a subdirectory (`tests/strategy_registry`) was also listed as its own testpath entry. |
@@ -1725,6 +1725,48 @@ portfolio path) and a cutoff-aware analytic series
 Reject a requested backtest run when the required corporate-action data
 cannot be constructed for either series, rather than silently falling back
 to `adj_factor=1.0`.
+
+**Resolution (Implemented-pending-review, branch
+`dev/R2-03B-backtester-series-split`, 2026-07-20):** `backtesting/loader.py`
+now passes the RAW (unadjusted) `daily_prices` series to `DataHandler`
+unmodified -- the only series `BacktestEngine` uses for fills/NAV/share
+accounting (`DataHandler.get_close`). Corporate actions on a held position
+are applied explicitly in `_PortfolioState.apply_corporate_actions`
+(`backtesting/engine/event_loop.py`): a split multiplies the held share
+count by the net split ratio; a dividend credits cash by
+`shares_held * value` (post-split, matching the module's declared
+POST_SPLIT convention); spinoffs are logged and ignored, matching the
+legacy routine. `DataHandler.get_corporate_actions_on(sim_date)` surfaces
+same-date action rows; `BacktestEngine.run` applies them before any
+NAV/weight computation for that date.
+
+A cutoff-aware ANALYTIC series is built via
+`build_realized_total_return_as_of` (a single run-boundary cutoff --
+`session_close_cutoff(min(backtest.end_date, latest loaded price date))` --
+the same accepted convention 01B-3 already uses for
+`scripts/backfill_momentum_scores.py`/`scripts/validate_signal_ic.py`; see
+BUG-071 for the documented residual limitation, which this loader
+inherits) and exposed via `DataHandler.get_analytic_close` for total-return
+valuation/reporting only -- it is never used for fills. No live signal
+computation from prices happens inside the backtester itself (alpha_scores
+arrive pre-computed from the snapshot, already fixed upstream by 01B-3), so
+`build_score_price_history_as_of` was not needed inside `loader.py`.
+
+Fails closed per 03A-2's existing taxonomy: `allow_missing_corporate_actions`
+still governs whether a genuinely absent `corporate_actions` snapshot may be
+treated as "no actions" (empty frame, both raw execution and analytic
+series unaffected); any other snapshot error, or a `corporate_actions`
+frame structurally missing `known_at`/`ex_date` when non-empty, propagates
+uncaught from `build_realized_total_return_as_of` and aborts backtest
+construction -- never a silent `adj_factor=1.0` degrade.
+
+Tests added in `backtesting/tests/test_engine.py` /
+`backtesting/tests/test_loader_series_split.py` (see branch): a future
+corporate action cannot change a historical raw close via `get_close`; a
+split is applied as a share-count change (not a price adjustment) and a
+dividend as a cash credit, both verified against hand-computed NAV; and a
+fail-closed test proving a missing corporate_actions snapshot aborts by
+default and only proceeds with explicit `allow_missing_corporate_actions=True`.
 
 ### BUG-071: Score-series cutoff-aware adjustment uses one run-boundary cutoff, not a literal per-score-date cutoff
 
