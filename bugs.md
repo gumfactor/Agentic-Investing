@@ -63,6 +63,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-043 | Packaging/CI | P1 | F1 | Open | Test collection can fail through MLflow/pkg_resources drift. |
 | BUG-044 | Packaging/CI | P1 | F1 | Open | Package discovery excludes operational modules. |
 | BUG-045 | Packaging/CI | P1 | F1 | Open | Local Airflow stubs shadow real Airflow imports. |
+| BUG-078 | Research/Signals | P1 | F1 | Implemented — pending operator verification (03A-4a, branch `dev/R2-03A4a-pit-eligibility-schema`) | Strategy-config eligibility filters (market cap, ADV, price, security type) had no PIT source and were silently unenforced/substitutable with current values, violating 01B §1.3. Phase A (this): PIT eligibility schema (`universe_eligibility_attributes`/`universe_eligibility_batches`, migration 013) + runtime read API (`load_eligibility_as_of`, `load_historical_universe_as_of`) + fail-closed config contract (`data/universe/eligibility_config.py`) rejecting `min_market_cap_usd` (no known_at shares-outstanding source) by name. Phase B (03A-4b, not in this slice): the batch job populating `adv_usd_20d`/`price_usd` from `daily_prices` and the `security_type` curation backfill. |
 
 #### Medium-term / planned hardening
 
@@ -2093,3 +2094,104 @@ distinct, larger future roadmap item; until then, `v2_mvo_momentum.yaml`
 (or any future MVO/risk-parity strategy config) cannot be backtested at
 all -- it can only be run through the live/paper execution path, which
 already implements these methods.
+
+### BUG-078: Strategy-config eligibility filters have no PIT source and were unenforced
+
+**Severity:** P1 / research validity (same defect class as BUG-008/BUG-009,
+on the eligibility axis instead of membership/timing)
+
+**Status:** Implemented — pending operator verification (Phase A only,
+03A-4a, branch `dev/R2-03A4a-pit-eligibility-schema`)
+
+**Context:** `docs/plans/03a-immutable-research-data-design.md` §1, itself
+carved out of `docs/plans/01b-research-validity-design.md` §1.3: "If a
+historical version of a configured filter is not available, exclude it from
+the baseline contract... do not substitute today's market cap, ADV, halted,
+or bankruptcy state." Before this fix, `data/universe/runtime.py` answered
+membership only (`load_universe_as_of`, BUG-008); every strategy-config
+eligibility filter (`config/strategy/v1_base_momentum.yaml`'s
+`universe.min_market_cap_usd`/`universe.min_adv_usd`,
+`v2_mvo_momentum.yaml`'s `universe.filters.{min_market_cap_usd,
+min_adv_usd, min_price_usd, allowed_security_types}`) had no runtime
+enforcement path at all -- any future caller that read these keys naively
+would have had to substitute a current value, which is precisely the
+lookahead-shaped defect 01B §1.3 forbids.
+
+**Phase A fix (this branch, schema + read API + fail-closed config
+contract only):**
+
+* **Schema** (`infra/db/migrations/versions/013_universe_eligibility_attributes.py`,
+  revision `013`, down_revision `012`): `universe_eligibility_batches`
+  (append-only computation-run provenance, mirrors
+  `universe_import_batches`) and `universe_eligibility_attributes`
+  (append-only, effective-dated fact table -- one row per `(universe_id,
+  ticker, attribute_name, effective_start)`, half-open interval, a CHECK
+  constraint enforcing exactly one of `attribute_value_numeric`/
+  `attribute_value_text` is populated, a CHECK constraint enforcing
+  `source_data_asof <= effective_start` (future-leak guard), and a
+  `computation_batch_id`-scoped `EXCLUDE USING gist` no-overlap constraint
+  mirroring migration 009's pattern). Mirrored ORM models added to
+  `data/universe/models.py` (`UniverseEligibilityBatch`,
+  `UniverseEligibilityAttribute`), same cross-dialect divergence already
+  documented for `UniverseMembership` (the gist EXCLUDE constraint is
+  Postgres-only and not declared at the ORM level).
+* **Runtime read API** (`data/universe/runtime.py`): `FilterSpec`,
+  `EligibilityResult`, `EligibilityExclusionReason`
+  (`missing_attribute`/`stale_attribute`/`below_threshold`/`wrong_type`),
+  `PITEligibilityLookup`/`load_eligibility_as_of` (evaluate declared filters
+  as of a date; fails closed with `NoEligibilityDataError` when zero rows
+  exist for a `universe_id` at all, distinct from a per-ticker
+  `missing_attribute` exclusion), and `load_historical_universe_as_of`
+  combining membership (BUG-008) and eligibility into one call site
+  (`CombinedEligibleUniverse`) so no future caller can apply one check
+  without the other.
+* **Fail-closed config contract** (`data/universe/eligibility_config.py`,
+  new module): classifies every eligibility-shaped strategy-config filter
+  key as `PIT_SUPPORTED` (`min_adv_usd`/`min_price_usd`/
+  `allowed_security_types` -> `adv_usd_20d`/`price_usd`/`security_type`) or
+  `FAIL_CLOSED_UNSUPPORTED` (`min_market_cap_usd`, `max_market_cap_usd`,
+  `halted_flag`, `bankruptcy_flag` -- all named explicitly per the binding
+  operator decision that yfinance has no filing-dated shares-outstanding
+  source for market cap, and 01B §1.3's explicit halted/bankruptcy
+  carve-out). `parse_universe_eligibility_filters` raises
+  `UnsupportedEligibilityFilterError` (collecting every violation, not just
+  the first) for any key not `PIT_SUPPORTED` -- including a brand-new,
+  never-reviewed key, which classifies `UNCLASSIFIED` and is rejected
+  identically to a named-unsupported one so nothing can silently pass by
+  omission. A conformance test
+  (`data/tests/universe/test_eligibility_config.py`,
+  `test_every_universe_filter_key_is_explicitly_classified`) enumerates
+  every `universe.*` filter key actually present in every
+  `config/strategy/*.yaml` file (bottom-up, not invented from the design
+  doc) and asserts none resolve to `UNCLASSIFIED`; both shipped configs are
+  confirmed to fail closed on `min_market_cap_usd` by name.
+
+**Explicitly deferred to Phase B (03A-4b, separate slice, tracked as the
+open remainder of this bug):**
+
+1. The daily batch job that populates `adv_usd_20d`/`price_usd` rows in
+   `universe_eligibility_attributes` from `daily_prices`.
+2. The hand-curated `security_type` historical-changes import (provenance
+   pattern mirrors `universe_import_batches`, per operator decision).
+3. Wiring `load_historical_universe_as_of` into the live scoring DAG or the
+   backtester -- Phase A ships the schema, read API, and config contract
+   with synthetic/fixture eligibility rows only; no real backfill exists
+   yet for either callers or operators to depend on.
+4. `market_cap_usd` remains permanently excluded from the certified filter
+   set until a dated (`known_at`-comparable) fundamentals source exists
+   (design doc §1.4) -- not merely deferred to Phase B, but out of scope
+   until a new binding operator decision changes the data source.
+
+**Tests:** `data/tests/universe/test_eligibility_runtime.py` (11 tests,
+fixture-backed: below-threshold-on-d-despite-current-value-passing,
+missing-attribute exclusion, staleness exclusion, security_type IN filter,
+latest-batch-wins correction semantics, combined membership+eligibility
+distinguishable exclusion reasons, `min_eligible` fail-closed on the
+combined set), `data/tests/universe/test_eligibility_config.py` (22 tests:
+classification conformance sweep over both shipped YAMLs, fail-closed
+parsing, the new explicit `universe.eligibility` block shape),
+`data/tests/universe/test_eligibility_migration.py` (4 tests: revision
+chain, no duplicate revision id, ORM-mirrored create/drop shape check for
+both new tables plus the `computation_batch_id` FK). All existing
+`data/tests/universe/*` tests (194 total in that directory) continue to
+pass unchanged.
