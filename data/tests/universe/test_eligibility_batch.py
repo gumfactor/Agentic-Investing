@@ -39,12 +39,12 @@ def engine(tmp_path: Path):
 
 
 @pytest.fixture
-def published_universe(engine):
+def published_universe(engine, tmp_path):
     """Publish the fixture universe import into `engine` and return its id."""
     run_import(
         FixtureSP500Provider(),
         engine=engine,
-        artifact_root=Path.cwd() / "_unused_artifacts_test",
+        artifact_root=tmp_path / "artifacts",
         coverage_start=FIXTURE_COVERAGE_START,
     )
     return FIXTURE_UNIVERSE_ID

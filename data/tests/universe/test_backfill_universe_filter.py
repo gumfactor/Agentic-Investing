@@ -738,3 +738,227 @@ class TestProvisionalNoUniverseFailsClosedOnLiveWrite:
         )
 
 
+class TestStrategyConfigEligibilityWiring:
+    """03A-4b: --strategy-config wires data.universe.runtime's combined
+    membership+eligibility check into the scoring path (design doc §1.3:
+    "no caller can apply one check without the other")."""
+
+    @pytest.fixture
+    def eligibility_engine(self, tmp_path):
+        from data.universe.eligibility_batch import write_price_eligibility_batch
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'eligibility_wiring.db'}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        prices["date"] = prices["date"].dt.date
+        prices["volume"] = 1_000_000
+        write_price_eligibility_batch(
+            eng,
+            FIXTURE_UNIVERSE_ID,
+            prices,
+            start=prices["date"].min(),
+            end=prices["date"].max(),
+            code_version="test",
+        )
+        return eng, prices
+
+    def _write_strategy_config(self, tmp_path, eligibility_block: dict) -> str:
+        import yaml
+
+        path = tmp_path / "strategy.yaml"
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump({"universe": {"eligibility": eligibility_block}}, f)
+        return str(path)
+
+    def test_eligibility_filter_actually_excludes_a_ticker(self, tmp_path, capsys):
+        """Deterministic partial-exclusion proof: two tickers are given a
+        far larger trading volume than the rest so adv_usd_20d cleanly
+        separates them regardless of the random-walk price noise, then a
+        threshold between the two groups is asserted to exclude exactly the
+        low-volume tickers from the scoring output (not just "doesn't
+        crash", the failure mode a membership-only regression would have)."""
+        from data.universe.eligibility_batch import write_price_eligibility_batch
+        from data.universe.runtime import PITEligibilityLookup, PITUniverseLookup
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'partial_exclusion.db'}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        low_volume = ["AAA", "GGG"]
+        high_volume = ["HHH", "III", "JJJ"]
+        prices = _make_prices(low_volume + high_volume, date(2021, 1, 4), 273 + 40)
+        prices["date"] = prices["date"].dt.date
+        prices["volume"] = prices["ticker"].map(
+            {"AAA": 100_000, "GGG": 300_000, "HHH": 3_000_000, "III": 4_000_000, "JJJ": 5_000_000}
+        )
+        write_price_eligibility_batch(
+            eng,
+            FIXTURE_UNIVERSE_ID,
+            prices,
+            start=prices["date"].min(),
+            end=prices["date"].max(),
+            code_version="test",
+        )
+        # Prices random-walk within roughly [70, 200] over the window; even
+        # at the extremes, low-volume ADV (<= 300k * 200 = 60M) never
+        # approaches high-volume ADV (>= 3M * 70 = 210M), so a threshold of
+        # 100M cleanly separates the two groups on every date.
+        strategy_config_path = self._write_strategy_config(
+            tmp_path, {"adv_usd_20d": {"op": "gte", "threshold": 100_000_000.0}}
+        )
+        start = sorted(prices["date"].unique())[273]
+        end = prices["date"].max()
+        prices_for_snapshot = prices.assign(date=pd.to_datetime(prices["date"]))
+        mock_snaps = _mock_snapshots(prices_for_snapshot)
+
+        run(
+            snapshot_date=date(2024, 1, 2),
+            start=start,
+            end=end,
+            strategy_id="vtest",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+            universe_id=FIXTURE_UNIVERSE_ID,
+            universe_lookup=PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID),
+            eligibility_lookup=PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID),
+            strategy_config_path=strategy_config_path,
+        )
+        out = capsys.readouterr().out
+        assert "AAA" not in out and "GGG" not in out
+        assert "HHH" in out and "III" in out and "JJJ" in out
+
+    def test_permissive_threshold_keeps_members(self, eligibility_engine, tmp_path, capsys):
+        from data.universe.runtime import PITEligibilityLookup, PITUniverseLookup
+
+        eng, prices = eligibility_engine
+        strategy_config_path = self._write_strategy_config(
+            tmp_path, {"price_usd": {"op": "gte", "threshold": 0.01}}
+        )
+        start = sorted(prices["date"].unique())[273]
+        end = prices["date"].max()
+        mock_snaps = _mock_snapshots(prices)
+
+        run(
+            snapshot_date=date(2024, 1, 2),
+            start=start,
+            end=end,
+            strategy_id="vtest",
+            batch_size=20,
+            dry_run=True,
+            snapshots=mock_snaps,
+            universe_id=FIXTURE_UNIVERSE_ID,
+            universe_lookup=PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID),
+            eligibility_lookup=PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID),
+            strategy_config_path=strategy_config_path,
+        )
+        out = capsys.readouterr().out
+        assert "Would write" in out and "Would write 0 factor_score rows" not in out
+
+    def test_unsupported_filter_fails_closed(self, eligibility_engine, tmp_path):
+        """A strategy config declaring min_market_cap_usd (no PIT source,
+        03A-4a's existing fail-closed contract) must still fail closed when
+        reached through the scoring path, not just in a unit test of
+        eligibility_config.py directly."""
+        from data.universe.eligibility_config import UnsupportedEligibilityFilterError
+        from data.universe.runtime import PITEligibilityLookup, PITUniverseLookup
+
+        eng, prices = eligibility_engine
+        path = tmp_path / "strategy.yaml"
+        import yaml
+
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump({"universe": {"min_market_cap_usd": 500_000_000}}, f)
+
+        start = sorted(prices["date"].unique())[273]
+        end = prices["date"].max()
+        mock_snaps = _mock_snapshots(prices)
+
+        with pytest.raises(UnsupportedEligibilityFilterError):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=True,
+                snapshots=mock_snaps,
+                universe_id=FIXTURE_UNIVERSE_ID,
+                universe_lookup=PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID),
+                eligibility_lookup=PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID),
+                strategy_config_path=str(path),
+            )
+
+    def test_strategy_config_incompatible_with_provisional_no_universe(self, tmp_path):
+        path = tmp_path / "strategy.yaml"
+        import yaml
+
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump({"universe": {"eligibility": {"price_usd": {"op": "gte", "threshold": 1.0}}}}, f)
+
+        with pytest.raises(ValueError, match="incompatible"):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=date(2021, 1, 4),
+                end=date(2021, 6, 1),
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=True,
+                provisional_no_universe=True,
+                strategy_config_path=str(path),
+            )
+
+    def test_no_eligibility_batch_data_fails_closed(self, tmp_path, monkeypatch):
+        """Filters declared but the Phase B batch job never ran for this
+        universe_id -- NoEligibilityDataError, not a silent all-pass.
+
+        Exercises run()'s own DATABASE_URL-backed construction path (the
+        eligibility_lookup=None default) rather than an injected lookup, so
+        DATABASE_URL is monkeypatched to the local fixture DB for this test
+        only -- never a real Postgres connection.
+        """
+        from data.universe.runtime import NoEligibilityDataError, PITUniverseLookup
+
+        db_path = tmp_path / "no_eligibility_data.db"
+        eng = create_engine(f"sqlite:///{db_path}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+        members = ["AAA", "GGG", "HHH", "III", "JJJ"]
+        prices = _make_prices(members, date(2021, 1, 4), 273 + 40)
+        mock_snaps = _mock_snapshots(prices)
+        strategy_config_path = self._write_strategy_config(
+            tmp_path, {"price_usd": {"op": "gte", "threshold": 1.0}}
+        )
+        start = sorted(prices["date"].dt.date.unique())[273]
+        end = prices["date"].dt.date.max()
+
+        with pytest.raises(NoEligibilityDataError):
+            run(
+                snapshot_date=date(2024, 1, 2),
+                start=start,
+                end=end,
+                strategy_id="vtest",
+                batch_size=20,
+                dry_run=True,
+                snapshots=mock_snaps,
+                universe_id=FIXTURE_UNIVERSE_ID,
+                universe_lookup=PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID),
+                strategy_config_path=strategy_config_path,
+            )
+
+

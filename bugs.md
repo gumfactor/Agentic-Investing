@@ -63,7 +63,8 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-043 | Packaging/CI | P1 | F1 | Open | Test collection can fail through MLflow/pkg_resources drift. |
 | BUG-044 | Packaging/CI | P1 | F1 | Open | Package discovery excludes operational modules. |
 | BUG-045 | Packaging/CI | P1 | F1 | Open | Local Airflow stubs shadow real Airflow imports. |
-| BUG-078 | Research/Signals | P1 | F1 | Phase A merged (PR #41, 2026-07-21) — pending operator DB migration + Phase B (03A-4b) data population | Strategy-config eligibility filters (market cap, ADV, price, security type) had no PIT source and were silently unenforced/substitutable with current values, violating 01B §1.3. Phase A (this): PIT eligibility schema (`universe_eligibility_attributes`/`universe_eligibility_batches`, migration 013) + runtime read API (`load_eligibility_as_of`, `load_historical_universe_as_of`) + fail-closed config contract (`data/universe/eligibility_config.py`) rejecting `min_market_cap_usd` (no known_at shares-outstanding source) by name. Phase B (03A-4b, not in this slice): the batch job populating `adv_usd_20d`/`price_usd` from `daily_prices` and the `security_type` curation backfill. |
+| BUG-078 | Research/Signals | P1 | F1 | Phase A merged (PR #41, 2026-07-21); Phase B implemented, pending review (`dev/R2-03A4b-eligibility-population`) | Strategy-config eligibility filters (market cap, ADV, price, security type) had no PIT source and were silently unenforced/substitutable with current values, violating 01B §1.3. Phase A: PIT eligibility schema + runtime read API + fail-closed config contract rejecting `min_market_cap_usd` by name. Phase B (this): daily batch job populating `adv_usd_20d`/`price_usd` from `daily_prices`, hand-curated `security_type` backfill, `--strategy-config` wiring of the combined membership+eligibility check into `scripts/backfill_momentum_scores.py`, and a coverage report. See full entry below. |
+| BUG-082 | Signals/Backtesting | P2 | F2 | Open | `scripts/backfill_momentum_scores.py` raises an unhandled `KeyError: 'date'` instead of a clean "0 rows" dry-run/write outcome when the PIT eligibility/membership cross-section excludes every candidate ticker for every score date in the requested range (discovered while testing 03A-4b's `--strategy-config` wiring with a deliberately impossible threshold). Root cause is in the shared momentum-scoring path: `signals.composites.momentum_score.compute_momentum_scores` appears to return a DataFrame without a `date` column when its input eligibility mask empties the whole cross-section, and `run()` unconditionally indexes `momentum_df["date"]` afterward with no empty-input guard. Not a 03A-4b-introduced defect (a membership-only over-restrictive universe could already have triggered it pre-03A-4b) and not fixed in this slice to avoid scope creep into the shared signals module; an operator hitting an all-excluded run should get a clear "0 eligible tickers for the requested range" error instead of a raw KeyError. |
 
 #### Medium-term / planned hardening
 
@@ -2100,8 +2101,8 @@ already implements these methods.
 **Severity:** P1 / research validity (same defect class as BUG-008/BUG-009,
 on the eligibility axis instead of membership/timing)
 
-**Status:** Implemented — pending operator verification (Phase A only,
-03A-4a, branch `dev/R2-03A4a-pit-eligibility-schema`)
+**Status:** Phase A merged (PR #41). Phase B implemented — pending
+operator/PR review (03A-4b, branch `dev/R2-03A4b-eligibility-population`).
 
 **Context:** `docs/plans/03a-immutable-research-data-design.md` §1, itself
 carved out of `docs/plans/01b-research-validity-design.md` §1.3: "If a
@@ -2166,32 +2167,104 @@ contract only):**
   doc) and asserts none resolve to `UNCLASSIFIED`; both shipped configs are
   confirmed to fail closed on `min_market_cap_usd` by name.
 
-**Explicitly deferred to Phase B (03A-4b, separate slice, tracked as the
-open remainder of this bug):**
+**Phase B fix (this branch, 03A-4b -- data population + scoring-path
+wiring):**
 
-1. The daily batch job that populates `adv_usd_20d`/`price_usd` rows in
-   `universe_eligibility_attributes` from `daily_prices`.
-2. The hand-curated `security_type` historical-changes import (provenance
-   pattern mirrors `universe_import_batches`, per operator decision).
-3. Wiring `load_historical_universe_as_of` into the live scoring DAG or the
-   backtester -- Phase A ships the schema, read API, and config contract
-   with synthetic/fixture eligibility rows only; no real backfill exists
-   yet for either callers or operators to depend on.
-4. `market_cap_usd` remains permanently excluded from the certified filter
-   set until a dated (`known_at`-comparable) fundamentals source exists
-   (design doc §1.4) -- not merely deferred to Phase B, but out of scope
-   until a new binding operator decision changes the data source.
+* **Daily batch job** (`data/universe/eligibility_batch.py`,
+  `compute_price_eligibility_rows`/`write_price_eligibility_batch`,
+  CLI: `scripts/backfill_eligibility_attributes.py`): populates
+  `adv_usd_20d` (20-session trailing dollar-volume mean) and `price_usd`
+  (raw close) from `daily_prices`, one row per (ticker, attribute, trading
+  session), chained into half-open intervals with the latest date left
+  open -- PIT-by-construction per design doc §1.4, never a
+  current-value-projected-backward substitution. ADV rows require a full
+  trailing window (fail-closed: no partial-window average is emitted).
+  `market_cap_usd` remains permanently out of scope (module docstring +
+  `EXCLUDED_ATTRIBUTES`), matching Phase A's `eligibility_config.py`
+  rejection and migration 013's comment -- unchanged, per the binding
+  operator decision (no dated yfinance shares-outstanding source).
+* **`security_type` hand-curated backfill**
+  (`SecurityTypeCurationEntry`/`build_security_type_rows`/
+  `write_security_type_batch` in the same module, CLI:
+  `scripts/import_security_type_curation.py`,
+  seed source `data/vendor/security_type_curation/sp500_security_types.yaml`):
+  `universe_import_batches`-style provenance per §5.1/§6 item 3. A ticker
+  with explicit curated entries uses ONLY those entries (overlapping/
+  invalid ranges rejected at build time); every other tracked member gets a
+  default classification (`CS`) for its full known membership span, derived
+  from the latest published `universe_membership` batch. The seed curation
+  file intentionally ships with zero entries: fabricating unverified
+  historical security-type-change dates for real public companies would
+  itself be a data-integrity violation in a system that will eventually
+  trade real capital. Every member is `CS`-classified by default until a
+  researcher adds a verified, sourced entry.
+* **Scoring-path wiring** (`scripts/backfill_momentum_scores.py`): new
+  optional `--strategy-config` flag parses `universe.eligibility` filters
+  via `data.universe.eligibility_config.parse_universe_eligibility_filters`
+  (fail-closed, unchanged from Phase A) and, when filters are declared,
+  constructs one `PITEligibilityLookup` alongside the existing
+  `PITUniverseLookup` and combines them per score date into a
+  `CombinedEligibleUniverse` (same object
+  `data.universe.runtime.load_historical_universe_as_of` returns) so
+  membership and eligibility are evaluated together for every scored
+  ticker/date -- "no caller can apply one check without the other" is now
+  true at the actual score-generation call site, not just at the unused
+  API layer. Omitting `--strategy-config` preserves pre-03A-4b behavior
+  (membership-only filtering) for backward compatibility.
+  `--strategy-config` is rejected together with `--provisional-no-universe`
+  (eligibility filters are evaluated against the same PIT membership that
+  flag skips). `NoEligibilityDataError` propagates uncaught when filters
+  are declared but the batch job has never populated the universe.
+* **Coverage report** (`eligibility_coverage_report` in the same module,
+  CLI: `scripts/eligibility_coverage_report.py`): mirrors
+  `data/universe/import_pipeline.py::coverage_report`'s 01B-2 precedent --
+  per-date/per-attribute row counts against real PIT membership, plus
+  `security_type` curated-vs-default ticker counts and an explicit
+  `excluded_attributes` listing (`market_cap_usd`) so the permanently
+  out-of-scope attribute is a named exclusion, never a silent gap.
 
-**Tests:** `data/tests/universe/test_eligibility_runtime.py` (11 tests,
-fixture-backed: below-threshold-on-d-despite-current-value-passing,
-missing-attribute exclusion, staleness exclusion, security_type IN filter,
-latest-batch-wins correction semantics, combined membership+eligibility
-distinguishable exclusion reasons, `min_eligible` fail-closed on the
-combined set), `data/tests/universe/test_eligibility_config.py` (22 tests:
-classification conformance sweep over both shipped YAMLs, fail-closed
-parsing, the new explicit `universe.eligibility` block shape),
-`data/tests/universe/test_eligibility_migration.py` (4 tests: revision
-chain, no duplicate revision id, ORM-mirrored create/drop shape check for
-both new tables plus the `computation_batch_id` FK). All existing
-`data/tests/universe/*` tests (194 total in that directory) continue to
-pass unchanged.
+**Judgment calls / scope notes for reviewers:**
+
+* The two shipped strategy configs (`config/strategy/v1_base_momentum.yaml`,
+  `v2_mvo_momentum.yaml`) both declare `min_market_cap_usd` and were
+  deliberately NOT modified (C6: neither has been used in a live session,
+  but both have been used in the Phase 4 paper dry-run/probe, so a
+  precautionary new-version-file discipline was applied rather than editing
+  in place). Running `--strategy-config` against either YAML today still
+  fails closed with `UnsupportedEligibilityFilterError` by design -- this is
+  Phase A's existing, already-tested behavior reachable one layer further
+  down the stack, not a regression. Migrating either config to the
+  `universe.eligibility` block (dropping `min_market_cap_usd`) is a
+  separate, config-owning decision left to the operator/PM, not made here.
+* `--strategy-config` was added as an opt-in flag (default `None`,
+  preserving legacy membership-only behavior) rather than a hard
+  requirement, so existing callers/tests/DAG invocations of
+  `scripts/backfill_momentum_scores.py` are unaffected until an operator
+  explicitly opts a strategy into eligibility enforcement.
+* `scripts/validate_signal_ic.py` (a sibling 01B-3 historical caller) was
+  NOT wired to the combined check in this slice -- only the score-generation
+  backfill script named in the 03A-4b task brief. Extending IC validation to
+  the same combined check is a reasonable, low-risk follow-up if the
+  operator wants eligibility enforced there too.
+
+**New defect discovered while testing (recorded here, not fixed in this
+slice -- outside 03A-4b's scope, lives in the shared momentum-scoring
+pipeline rather than the universe/eligibility code this slice owns):** see
+BUG-082.
+
+**Tests:** Phase A (unchanged): `data/tests/universe/test_eligibility_runtime.py`
+(11 tests), `test_eligibility_config.py` (22 tests), `test_eligibility_migration.py`
+(4 tests). Phase B (new, this branch): `data/tests/universe/test_eligibility_batch.py`
+(28 tests: `compute_price_eligibility_rows` grain/PIT-safety/chaining,
+`write_price_eligibility_batch` persistence/append-only-ness,
+`build_security_type_rows`/`write_security_type_batch` curated-vs-default
+semantics and overlap rejection, `eligibility_coverage_report` gap detection
+and out-of-scope-attribute reporting) and 5 new tests appended to
+`data/tests/universe/test_backfill_universe_filter.py` (18 -> 23)
+(`TestStrategyConfigEligibilityWiring`: deterministic partial-exclusion
+proof via volume-differentiated ADV, permissive-threshold pass-through,
+fail-closed on an unsupported filter reached through the scoring path,
+`--provisional-no-universe` incompatibility guard, `NoEligibilityDataError`
+propagation). Full `data/tests/universe/` suite: 237 passed (up from 194 at
+03A-4a Phase A; 232 with just the Phase B core-module tests, 237 with the
+scoring-path wiring tests too).

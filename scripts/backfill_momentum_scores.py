@@ -129,6 +129,21 @@ def _parse_args() -> argparse.Namespace:
         "permissive (preview only, never persists) and does not need this "
         "flag.",
     )
+    p.add_argument(
+        "--strategy-config",
+        default=None,
+        help="Path to a strategy config YAML (config/strategy/*.yaml) whose "
+        "universe.eligibility filters (ADV, price, security type -- 03A-4b, "
+        "design doc §1.3) are enforced alongside PIT membership via "
+        "data.universe.runtime.PITEligibilityLookup/CombinedEligibleUniverse. "
+        "Optional: omitting this flag preserves the pre-03A-4b behavior "
+        "(membership-only PIT filtering). Parsing fails closed "
+        "(UnsupportedEligibilityFilterError) if the config declares a filter "
+        "with no PIT source (e.g. min_market_cap_usd) -- see "
+        "data/universe/eligibility_config.py. Mutually exclusive with "
+        "--provisional-no-universe, since eligibility filters are evaluated "
+        "against the same PIT membership that flag skips.",
+    )
     return p.parse_args()
 
 
@@ -145,10 +160,40 @@ def run(
     provisional_no_universe: bool = False,
     universe_lookup=None,  # injectable for testing; None → construct from DATABASE_URL
     allow_raw_prices_on_missing_actions: bool = False,
+    strategy_config_path: Optional[str] = None,
+    eligibility_lookup=None,  # injectable for testing; None → construct from DATABASE_URL
 ) -> None:
     from data.storage.timescale_writer import TimescaleWriter
     from signals.composites.momentum_score import compute_momentum_scores
     from signals.scoring.scorer import combine_factor_scores
+
+    # ── PIT eligibility filters (03A-4b, design doc §1.3) ─────────────────────
+    # Parsed BEFORE any snapshot/DB work so a fail-closed config error (e.g. an
+    # unsupported filter like min_market_cap_usd) surfaces immediately rather
+    # than after an expensive snapshot load. Empty dict when no
+    # --strategy-config is given -- membership-only PIT filtering, unchanged
+    # from pre-03A-4b behavior.
+    eligibility_filters: dict = {}
+    if strategy_config_path is not None:
+        if provisional_no_universe:
+            raise ValueError(
+                "--strategy-config is incompatible with --provisional-no-universe: "
+                "eligibility filters (03A-4b) are evaluated against the same PIT "
+                "membership that --provisional-no-universe skips, so combining "
+                "them is contradictory. Drop one or the other."
+            )
+        import yaml
+
+        from data.universe.eligibility_config import parse_universe_eligibility_filters
+
+        with open(strategy_config_path, encoding="utf-8") as f:
+            strategy_config = yaml.safe_load(f)
+        eligibility_filters = parse_universe_eligibility_filters(strategy_config)
+        logger.info(
+            "eligibility_filters_parsed",
+            strategy_config_path=strategy_config_path,
+            n_filters=len(eligibility_filters),
+        )
 
     if snapshots is None:
         from data.storage.parquet_snapshots import ParquetSnapshots
@@ -215,16 +260,44 @@ def run(
     else:
         import os
 
-        from data.universe.runtime import PITUniverseLookup
+        from data.universe.runtime import CombinedEligibleUniverse, PITEligibilityLookup, PITUniverseLookup
 
         if universe_lookup is None:
             universe_lookup = PITUniverseLookup(os.environ["DATABASE_URL"], universe_id)
+
+        # ── Combined membership + eligibility (03A-4b, design doc §1.3) ───────
+        # "No caller can apply one check without the other": when the caller
+        # declared eligibility filters (--strategy-config), construct ONE
+        # PITEligibilityLookup up front (mirrors the single PITUniverseLookup
+        # above) and combine it with membership per date via
+        # CombinedEligibleUniverse -- the same object
+        # data.universe.runtime.load_historical_universe_as_of returns,
+        # without that convenience function's per-call lookup
+        # reconstruction, which would otherwise re-query the DB once per
+        # score date in this loop. Fails closed
+        # (NoEligibilityDataError) if filters are declared but the Phase B
+        # batch job has never populated this universe_id.
+        if eligibility_filters and eligibility_lookup is None:
+            eligibility_lookup = PITEligibilityLookup(
+                os.environ["DATABASE_URL"], universe_id
+            )
+
         candidate_dates = sorted(
             d for d in prices["date"].unique() if start <= d <= end
         )
         eligibility_rows: list[dict] = []
         for d in candidate_dates:
-            eligible = set(universe_lookup.load_universe_as_of(d).eligible_tickers)
+            membership = universe_lookup.load_universe_as_of(d)
+            if eligibility_filters:
+                eligibility_result = eligibility_lookup.evaluate(
+                    d, eligibility_filters, tickers=list(membership.eligible_tickers)
+                )
+                combined = CombinedEligibleUniverse(
+                    membership=membership, eligibility=eligibility_result
+                )
+                eligible = set(combined.eligible_tickers)
+            else:
+                eligible = set(membership.eligible_tickers)
             eligible_by_date[d] = eligible
             eligibility_rows.extend({"ticker": t, "date": d} for t in eligible)
         eligibility_df = pd.DataFrame(eligibility_rows, columns=["ticker", "date"])
@@ -233,6 +306,7 @@ def run(
             universe_id=universe_lookup.universe_id,
             import_batch_id=universe_lookup.import_batch_id,
             n_score_dates=len(candidate_dates),
+            n_eligibility_filters=len(eligibility_filters),
         )
 
     # ── Corporate-action cutoff-aware adjustment (BUG-009 section 2.3) ───────
@@ -522,6 +596,7 @@ def main() -> None:
         universe_id=args.universe_id,
         provisional_no_universe=args.provisional_no_universe,
         allow_raw_prices_on_missing_actions=args.allow_raw_prices_on_missing_actions,
+        strategy_config_path=args.strategy_config,
     )
 
 
