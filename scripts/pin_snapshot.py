@@ -30,7 +30,8 @@ from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import Session
 
 from backtesting.dataset_manifest import build_manifest
 
@@ -59,6 +60,27 @@ def _parse_args() -> argparse.Namespace:
         "rejects the unsafe case instead of silently pinning a mix. Pass this to "
         "disambiguate, or to pin a specific run's rows only.",
     )
+    parser.add_argument(
+        "--universe-id",
+        default="sp500",
+        help="Universe id used to look up the latest published "
+        "UniverseImportBatch (membership_import_batch_id) and the latest "
+        "UniverseEligibilityBatch (eligibility_batch_id, if any) to link on "
+        "the manifest (03A-5). Best-effort: if no published import batch "
+        "exists yet for this universe_id, membership_import_batch_id is left "
+        "unset rather than blocking the pin (default: 'sp500', matching "
+        "scripts/backfill_momentum_scores.py's default).",
+    )
+    parser.add_argument(
+        "--research-methodology-id",
+        type=int,
+        default=None,
+        help="Optional FK to research_methodologies.id (03A-5) to record on "
+        "the manifest. Nullable -- not every pinned bundle is tied to a "
+        "single research methodology. Must reference an existing row or "
+        "pin_bundle fails closed (backtesting.dataset_manifest."
+        "ManifestBatchLinkageError).",
+    )
     return parser.parse_args()
 
 
@@ -68,11 +90,22 @@ def pin_bundle(
     snapshot_date: date,
     *,
     research_run_id: int | None = None,
+    universe_id: str = "sp500",
+    research_methodology_id: int | None = None,
     engine=None,
     snapshots=None,
     market_client=None,
 ) -> str:
-    """Build and save a complete backtest bundle, returning its manifest path."""
+    """Build and save a complete backtest bundle, returning its manifest path.
+
+    03A-5: also looks up the latest published ``UniverseImportBatch`` and the
+    latest ``UniverseEligibilityBatch`` for ``universe_id`` (best-effort --
+    ``None`` if neither exists yet for this universe_id, rather than blocking
+    the pin) and passes them, plus the optional caller-supplied
+    ``research_methodology_id``, through to ``build_manifest`` so the
+    resulting manifest links to the exact PIT membership/eligibility batches
+    and research methodology used.
+    """
     engine = engine or create_engine(os.environ["DATABASE_URL"])
     if snapshots is None:
         from data.storage.parquet_snapshots import ParquetSnapshots  # lazy: pulls in minio
@@ -205,6 +238,8 @@ def pin_bundle(
         for data_type, df in dataframes.items()
     }
     snapshot_dates = {data_type: snapshot_date for data_type in dataframes}
+    membership_import_batch_id = _latest_published_import_batch_id(engine, universe_id)
+    eligibility_batch_id = _latest_eligibility_batch_id(engine, universe_id)
     manifest = build_manifest(
         version=str(snapshot_date),
         strategy_id=strategy_id,
@@ -212,8 +247,51 @@ def pin_bundle(
         object_paths=object_paths,
         snapshot_dates=snapshot_dates,
         bytes_sha256=bytes_hashes,
+        eligibility_batch_id=eligibility_batch_id,
+        membership_import_batch_id=membership_import_batch_id,
+        research_methodology_id=research_methodology_id,
+        engine=engine,
     )
     return snapshots.save_dataset_manifest(manifest)
+
+
+def _latest_published_import_batch_id(engine, universe_id: str) -> int | None:
+    """Best-effort lookup of the latest ``published`` ``UniverseImportBatch``
+    for ``universe_id`` (03A-5). Returns ``None`` -- rather than raising --
+    when no published import exists yet: unlike ``PITUniverseLookup`` (which
+    fails closed because historical research cannot proceed at all without
+    one), pin_snapshot's core job of pinning prices/scores/actions/benchmark
+    predates and is independent of the universe-import system, so an absent
+    universe import is a legitimate "not linked yet" case, not a reason to
+    block the whole pin. A batch id that IS found is still passed through
+    build_manifest's own fail-closed re-validation."""
+    from data.universe.models import UniverseImportBatch
+
+    with Session(engine) as session:
+        batch = session.execute(
+            select(UniverseImportBatch)
+            .where(
+                UniverseImportBatch.universe_id == universe_id,
+                UniverseImportBatch.status == "published",
+            )
+            .order_by(UniverseImportBatch.published_at.desc())
+        ).scalars().first()
+        return batch.id if batch is not None else None
+
+
+def _latest_eligibility_batch_id(engine, universe_id: str) -> int | None:
+    """Best-effort lookup of the latest ``UniverseEligibilityBatch`` for
+    ``universe_id`` (03A-5). Returns ``None`` when none exists -- eligibility
+    filtering is genuinely optional, not every pinned bundle uses it."""
+    from data.universe.models import UniverseEligibilityBatch
+
+    with Session(engine) as session:
+        batch = session.execute(
+            select(UniverseEligibilityBatch)
+            .where(UniverseEligibilityBatch.universe_id == universe_id)
+            .order_by(UniverseEligibilityBatch.computed_at.desc())
+        ).scalars().first()
+        return batch.id if batch is not None else None
 
 
 def main() -> None:
@@ -230,6 +308,8 @@ def main() -> None:
         benchmark_ticker=args.benchmark,
         snapshot_date=date.fromisoformat(args.snapshot_date),
         research_run_id=args.research_run_id,
+        universe_id=args.universe_id,
+        research_methodology_id=args.research_methodology_id,
     )
     print(f"Backtest dataset bundle pinned: {manifest_path}")
 

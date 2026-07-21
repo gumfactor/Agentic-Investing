@@ -8,11 +8,26 @@ from minio.error import S3Error
 from sqlalchemy import create_engine
 
 from data.storage.parquet_snapshots import ParquetSnapshots
+from data.universe.models import Base as UniverseBase
+from data.research.models import Base as ResearchBase
 from scripts.pin_snapshot import pin_bundle
+
+
+def _create_universe_and_research_tables(engine) -> None:
+    """Empty universe_import_batches/universe_eligibility_batches/
+    research_methodologies tables so pin_bundle's best-effort batch lookups
+    (03A-5) can query them without an OperationalError -- real deployments
+    always have these tables via Alembic migrations; these sqlite fixtures
+    build the DB manually with plain to_sql, so the ORM tables must be
+    created explicitly. No rows are inserted unless a specific test needs
+    to exercise a real batch id."""
+    UniverseBase.metadata.create_all(engine)
+    ResearchBase.metadata.create_all(engine)
 
 
 def _engine_with_bundle_data():
     engine = create_engine("sqlite://")
+    _create_universe_and_research_tables(engine)
     prices = pd.DataFrame(
         {
             "ticker": ["AAPL", "AAPL"],
@@ -116,6 +131,7 @@ def _engine_with_colliding_runs():
     """Two research runs both scored AAPL on the same score_date -- pinning
     both would silently duplicate that (ticker, score_date) cross-section."""
     engine = create_engine("sqlite://")
+    _create_universe_and_research_tables(engine)
     prices = pd.DataFrame(
         {
             "ticker": ["AAPL", "AAPL"],
@@ -188,6 +204,7 @@ def _engine_with_disjoint_date_multi_run_history():
     methodologically distinct series spliced into one bundle if pinned
     together unscoped."""
     engine = create_engine("sqlite://")
+    _create_universe_and_research_tables(engine)
     prices = pd.DataFrame(
         {
             "ticker": ["AAPL", "AAPL"],
@@ -257,6 +274,7 @@ def test_pin_bundle_single_run_history_is_allowed_without_explicit_selection():
     research_run_id for its whole history) must NOT require
     --research-run-id -- only genuinely multi-run history needs it."""
     engine = create_engine("sqlite://")
+    _create_universe_and_research_tables(engine)
     prices = pd.DataFrame(
         {
             "ticker": ["AAPL", "AAPL"],
@@ -433,6 +451,7 @@ def test_repinning_with_one_changed_row_writes_new_objects_and_keeps_old_ones() 
     objects_after_first = dict(client.objects)
 
     engine2 = create_engine("sqlite://")
+    _create_universe_and_research_tables(engine2)
     prices = pd.DataFrame(
         {
             "ticker": ["AAPL", "AAPL"],
