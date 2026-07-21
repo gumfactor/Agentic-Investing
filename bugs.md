@@ -2268,3 +2268,16 @@ fail-closed on an unsupported filter reached through the scoring path,
 propagation). Full `data/tests/universe/` suite: 237 passed (up from 194 at
 03A-4a Phase A; 232 with just the Phase B core-module tests, 237 with the
 scoring-path wiring tests too).
+
+**03A-5 follow-up (2026-07-21, branch `dev/R2-03A5-manifest-linkage`,
+downstream of BUG-078 but not itself part of it):** the manifest/methodology
+linkage roadmap row (`docs/plans/03a-immutable-research-data-design.md`
+§2.2/§2.4, §5.2's "03A-5" row) that ties a pinned `DatasetManifest` to the
+exact `UniverseImportBatch`/`UniverseEligibilityBatch` this Phase B's data
+feeds is now wired: `backtesting/dataset_manifest.py::build_manifest` accepts
+and fail-closed-validates `eligibility_batch_id`/`membership_import_batch_id`/
+`research_methodology_id`; `scripts/pin_snapshot.py` looks these up from the
+real DB; `BacktestLogger.log_run`/`log_walk_forward_run` gained an opt-in
+`require_manifest_data_version` check rejecting non-hash-shaped
+`data_version` values. This was scoped in the roadmap as its own phased row
+(03A-5), not as a standalone bug, so no new BUG-XXX was opened for it.
