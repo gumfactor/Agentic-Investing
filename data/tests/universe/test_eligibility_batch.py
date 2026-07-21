@@ -246,6 +246,56 @@ class TestComputePriceEligibilityRows:
             for e in result.exclusions
         )
 
+    def test_default_security_type_does_not_diverge_from_membership_on_removal_date(self, tmp_path):
+        """Codex P1 fix (PR #42 second review), end-to-end through the real
+        fixture provider's DDD ticker (removed effective 2020-04-01,
+        end_known_at 2020-04-02T21:00Z per the date-only source's
+        conservative next-session rule): on the raw removal date itself,
+        PITUniverseLookup still counts DDD as a member (the removal is not
+        yet knowable), and security_type coverage must agree -- not report
+        `missing_attribute` and silently drop a still-eligible ticker from a
+        strategy's combined membership+eligibility set."""
+        from data.universe.eligibility_batch import write_security_type_batch
+        from data.universe.import_pipeline import run_import
+        from data.universe.providers.fixture_provider import (
+            FIXTURE_COVERAGE_START,
+            FIXTURE_UNIVERSE_ID,
+            FixtureSP500Provider,
+        )
+        from data.universe.runtime import (
+            EligibilityFilterOp,
+            FilterSpec,
+            PITEligibilityLookup,
+            PITUniverseLookup,
+        )
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'removal_lag.db'}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        write_security_type_batch(eng, FIXTURE_UNIVERSE_ID, curation=[], code_version="test")
+
+        raw_removal_date = date(2020, 4, 1)  # DDD's first stint's raw effective_end
+
+        membership_lookup = PITUniverseLookup(eng, FIXTURE_UNIVERSE_ID)
+        assert membership_lookup.is_eligible("DDD", raw_removal_date)
+
+        eligibility_lookup = PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID)
+        result = eligibility_lookup.evaluate(
+            raw_removal_date,
+            {
+                "security_type": FilterSpec(
+                    attribute_name="security_type", op=EligibilityFilterOp.IN, threshold=("CS",)
+                )
+            },
+            tickers=["DDD"],
+        )
+        assert "DDD" in result.passing_tickers
+        assert result.exclusions == ()
+
 
 # ─── write_price_eligibility_batch ─────────────────────────────────────────────
 
@@ -306,13 +356,41 @@ class TestWritePriceEligibilityBatch:
 
 class TestBuildSecurityTypeRows:
     def test_default_applied_to_every_uncurated_ticker(self):
-        membership = {"AAA": [(date(2020, 1, 1), None)], "BBB": [(date(2020, 1, 1), date(2021, 1, 1))]}
+        membership = {
+            "AAA": [(date(2020, 1, 1), None, None)],
+            "BBB": [
+                (
+                    date(2020, 1, 1),
+                    date(2021, 1, 1),
+                    datetime(2021, 1, 4, 21, 0, tzinfo=timezone.utc),
+                )
+            ],
+        }
         rows = build_security_type_rows(membership, curation=[])
         assert len(rows) == 2
         assert {r["ticker"]: r["attribute_value_text"] for r in rows} == {"AAA": "CS", "BBB": "CS"}
 
+    def test_closed_interval_default_extends_through_end_known_at(self):
+        """Codex P1 fix (PR #42 second review): a closed membership interval's
+        default security_type row must extend coverage through
+        end_known_at's calendar date -- the exact boundary
+        PITUniverseLookup uses to keep counting a not-yet-knowably-removed
+        ticker eligible -- not stop at the raw effective_end."""
+        raw_end = date(2021, 1, 1)
+        end_known_at = datetime(2021, 1, 4, 21, 0, tzinfo=timezone.utc)  # next session's close
+        membership = {"AAA": [(date(2020, 1, 1), raw_end, end_known_at)]}
+        rows = build_security_type_rows(membership, curation=[])
+        assert len(rows) == 1
+        assert rows[0]["effective_end"] == end_known_at.date()
+        assert rows[0]["effective_end"] != raw_end
+
+    def test_open_interval_default_stays_open(self):
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
+        rows = build_security_type_rows(membership, curation=[])
+        assert rows[0]["effective_end"] is None
+
     def test_curated_ticker_uses_only_curated_entries(self):
-        membership = {"AAA": [(date(2020, 1, 1), None)]}
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
         curation = [
             SecurityTypeCurationEntry(
                 ticker="AAA", security_type="REIT", effective_start=date(2020, 1, 1), note="test"
@@ -324,7 +402,7 @@ class TestBuildSecurityTypeRows:
         assert _is_curated_security_type_row(rows[0]["computed_from"])
 
     def test_multiple_non_overlapping_curated_entries_allowed(self):
-        membership = {"AAA": [(date(2020, 1, 1), None)]}
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
         curation = [
             SecurityTypeCurationEntry(
                 ticker="AAA", security_type="CS", effective_start=date(2020, 1, 1), effective_end=date(2022, 1, 1)
@@ -337,7 +415,7 @@ class TestBuildSecurityTypeRows:
         assert len(rows) == 2
 
     def test_overlapping_curated_entries_rejected(self):
-        membership = {"AAA": [(date(2020, 1, 1), None)]}
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
         curation = [
             SecurityTypeCurationEntry(
                 ticker="AAA", security_type="CS", effective_start=date(2020, 1, 1), effective_end=date(2022, 1, 1)
@@ -350,7 +428,7 @@ class TestBuildSecurityTypeRows:
             build_security_type_rows(membership, curation)
 
     def test_curation_entry_with_invalid_range_rejected(self):
-        membership = {"AAA": [(date(2020, 1, 1), None)]}
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
         curation = [
             SecurityTypeCurationEntry(
                 ticker="AAA", security_type="CS", effective_start=date(2022, 1, 1), effective_end=date(2020, 1, 1)
@@ -360,7 +438,7 @@ class TestBuildSecurityTypeRows:
             build_security_type_rows(membership, curation)
 
     def test_curation_referencing_unknown_ticker_rejected(self):
-        membership = {"AAA": [(date(2020, 1, 1), None)]}
+        membership = {"AAA": [(date(2020, 1, 1), None, None)]}
         curation = [
             SecurityTypeCurationEntry(
                 ticker="ZZZ", security_type="CS", effective_start=date(2020, 1, 1)

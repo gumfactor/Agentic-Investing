@@ -338,11 +338,22 @@ class SecurityTypeCurationError(EligibilityBatchError):
 
 def load_membership_intervals(
     engine: Engine, universe_id: str
-) -> dict[str, list[tuple[date, Optional[date]]]]:
+) -> dict[str, list[tuple[date, Optional[date], Optional[datetime]]]]:
     """Ticker -> membership intervals from the latest PUBLISHED import batch
     (same batch :class:`~data.universe.runtime.PITUniverseLookup` serves),
     so the default security_type coverage matches the actual PIT membership
-    contract rather than every ever-imported row."""
+    contract rather than every ever-imported row.
+
+    Each interval is ``(effective_start, effective_end, end_known_at)``.
+    ``end_known_at`` is carried through (not dropped) so
+    :func:`build_security_type_rows` can extend a default row's coverage
+    through the same knowledge-lag window
+    :class:`~data.universe.runtime.PITUniverseLookup` honors for a removal
+    that is effective but not yet knowable (Codex P1, PR #42 second review) --
+    the migration's ``ck_universe_membership_end_known_consistency`` CHECK
+    constraint guarantees ``end_known_at`` is populated whenever
+    ``effective_end`` is.
+    """
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         latest_published = session.execute(
@@ -361,14 +372,16 @@ def load_membership_intervals(
                 UniverseMembership.import_batch_id == latest_published.id,
             )
         ).scalars().all()
-    intervals: dict[str, list[tuple[date, Optional[date]]]] = {}
+    intervals: dict[str, list[tuple[date, Optional[date], Optional[datetime]]]] = {}
     for r in rows:
-        intervals.setdefault(r.ticker, []).append((r.effective_start, r.effective_end))
+        intervals.setdefault(r.ticker, []).append(
+            (r.effective_start, r.effective_end, r.end_known_at)
+        )
     return intervals
 
 
 def build_security_type_rows(
-    membership_intervals: dict[str, list[tuple[date, Optional[date]]]],
+    membership_intervals: dict[str, list[tuple[date, Optional[date], Optional[datetime]]]],
     curation: list[SecurityTypeCurationEntry],
     *,
     default_security_type: str = DEFAULT_SECURITY_TYPE,
@@ -386,6 +399,26 @@ def build_security_type_rows(
     curation entries at all gets the ``default_security_type`` for its full
     known membership span(s) -- this is the "largely static, hand-curate the
     rare exceptions" design (§5.1).
+
+    Codex P1 fix (PR #42 second review): a closed membership interval's
+    ``effective_end`` is the RAW removal date, but
+    :class:`~data.universe.runtime.PITUniverseLookup` still counts the
+    ticker as eligible past that raw date until ``end_known_at``'s cutoff --
+    a date-only source's removal is only knowable at the next trading
+    session's close (the same knowledge-lag rule as membership entries,
+    ``data/universe/calendar.py::conservative_known_at_for_date_only_source``).
+    Copying the raw ``effective_end`` into the default security_type row
+    made eligibility (missing_attribute) diverge from membership on exactly
+    those knowledge-lag day(s): a strategy filtering on ``security_type``/
+    ``allowed_security_types`` would drop a still-membership-eligible ticker
+    before its removal was actually knowable -- using not-yet-knowable
+    information to end coverage early is itself a look-ahead-shaped defect,
+    the same class this repo already fixed for membership (BUG-008). The
+    default row's ``effective_end`` is now ``end_known_at``'s calendar date
+    (the exact half-open boundary at which
+    :class:`~data.universe.runtime.PITUniverseLookup`'s per-date,
+    per-cutoff check stops counting the ticker eligible -- see the
+    docstring derivation in the PR), not the raw membership ``effective_end``.
     """
     curated_by_ticker: dict[str, list[SecurityTypeCurationEntry]] = {}
     for entry in curation:
@@ -427,7 +460,20 @@ def build_security_type_rows(
                     )
                 )
         else:
-            for start, end in intervals:
+            for start, end, end_known_at in intervals:
+                if end is None:
+                    default_effective_end = None  # open interval, unchanged
+                elif end_known_at is not None:
+                    # Extend through the knowledge-lag window: end_known_at's
+                    # calendar date is the exact date PITUniverseLookup stops
+                    # counting the ticker eligible (see docstring derivation).
+                    default_effective_end = end_known_at.date()
+                else:
+                    # Defensive fallback only -- the schema CHECK constraint
+                    # guarantees end_known_at is populated whenever
+                    # effective_end is, so this branch should be unreachable
+                    # against real data.
+                    default_effective_end = end
                 rows.append(
                     dict(
                         ticker=ticker,
@@ -435,7 +481,7 @@ def build_security_type_rows(
                         attribute_value_numeric=None,
                         attribute_value_text=default_security_type,
                         effective_start=start,
-                        effective_end=end,
+                        effective_end=default_effective_end,
                         computed_from=_security_type_computed_from(
                             _DEFAULT_SOURCE_TAG,
                             f"default classification ({default_security_type})",
