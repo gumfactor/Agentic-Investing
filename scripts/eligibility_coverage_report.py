@@ -77,8 +77,16 @@ def run(
     for rec in by_date_records:
         rec["date"] = str(rec["date"])
 
+    # Codex P2 fix (03A-4b PR #42 review): gate on `in_coverage` directly
+    # rather than re-deriving "was this row in scope" from `n_missing`.
+    # `DataFrame.to_dict()` upcasts a column mixing Python `None` (the
+    # out-of-coverage sentinel) with ints to float64, turning `None` into
+    # `NaN` -- and `NaN not in (None, 0)` is True, so the old check counted
+    # every out-of-coverage row as a gap instead of excluding it as designed.
     n_gap_rows = sum(
-        1 for r in by_date_records if r.get("n_missing") not in (None, 0)
+        1
+        for r in by_date_records
+        if r.get("in_coverage") and r.get("n_missing") not in (None, 0)
     )
     summary = {
         "universe_id": universe_id,

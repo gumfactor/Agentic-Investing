@@ -104,6 +104,7 @@ def run(
     engine: Optional[Engine] = None,  # injectable for testing
 ) -> None:
     from data.universe.eligibility_batch import (
+        EmptyBatchError,
         load_membership_intervals,
         build_security_type_rows,
         write_security_type_batch,
@@ -117,10 +118,26 @@ def run(
     default_security_type, entries = load_curation_file(curation_file)
 
     if dry_run:
+        # Codex-review-adjacent P2 fix (03A-4b PR #42 review): mirror
+        # write_security_type_batch's fail-closed EmptyBatchError checks here
+        # too, so a preview cannot report "0 rows, success" for an input
+        # (e.g. no published universe_membership import yet) that a live run
+        # would refuse to write.
         membership_intervals = load_membership_intervals(engine, universe_id)
+        if not membership_intervals:
+            raise EmptyBatchError(
+                f"[DRY RUN] No published universe_membership rows found for "
+                f"universe_id={universe_id!r}; a live run would raise the same "
+                "error. Run scripts/import_universe_membership.py first."
+            )
         rows = build_security_type_rows(
             membership_intervals, entries, default_security_type=default_security_type
         )
+        if not rows:
+            raise EmptyBatchError(
+                f"[DRY RUN] build_security_type_rows produced zero rows for "
+                f"universe_id={universe_id!r}. A live run would raise the same error."
+            )
         n_curated_tickers = len({e.ticker for e in entries})
         n_default_tickers = len({r["ticker"] for r in rows}) - n_curated_tickers
         print(

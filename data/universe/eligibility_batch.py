@@ -28,6 +28,7 @@ gaps").
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Optional, Union
@@ -38,6 +39,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from data.universe.calendar import next_trading_session
 from data.universe.models import (
     Base,
     UniverseEligibilityAttribute,
@@ -170,11 +172,27 @@ def _chain_intervals(
     *, ticker: str, attribute_name: str, dated_values: list[tuple[date, float]], computed_from: str
 ) -> list[dict]:
     """Turn a ticker's sorted (date, value) series into chained one-session
-    half-open intervals, the last one left open (``effective_end=None``)."""
+    half-open intervals, the last one left open (``effective_end=None``).
+
+    Codex P1 fix (03A-4b PR #42 review): a non-final row's ``effective_end``
+    is the actual NEXT TRADING SESSION after its date
+    (``data/universe/calendar.py``'s NYSE-approximate calendar), NOT the date
+    of the next entry in ``dated_values``. The two coincide when the input is
+    contiguous, but if a session's raw observation is missing (an ingestion
+    gap -- e.g. close/volume absent for one trading day), the previous
+    entry's row must stop exactly at that missing session rather than
+    silently stretching forward to whichever later date happens to have the
+    next valid value. Silently extending a stale value across an unobserved
+    session is exactly the substitution defect this repo already fixed for
+    membership (BUG-008) and object-store errors (BUG-039); leaving the gap
+    session uncovered means :class:`~data.universe.runtime.PITEligibilityLookup`
+    correctly reports ``missing_attribute`` for it instead of inheriting the
+    prior session's value.
+    """
     rows: list[dict] = []
     n = len(dated_values)
     for i, (d, value) in enumerate(dated_values):
-        effective_end = dated_values[i + 1][0] if i + 1 < n else None
+        effective_end = next_trading_session(d) if i + 1 < n else None
         rows.append(
             dict(
                 ticker=ticker,
@@ -273,6 +291,25 @@ def write_price_eligibility_batch(
 
 
 # ─── §2: security_type hand-curated backfill ──────────────────────────────────
+#
+# Codex P2 fix (03A-4b PR #42 review): curated-vs-default provenance is
+# discriminated by a fixed, code-owned tag prefix on `computed_from` --
+# "curated:"/"default:" -- rather than by prefix-matching human-readable
+# prose. There is no dedicated schema column for this (adding one is a new
+# Alembic migration, out of proportion for this fix); the tag is the first
+# ":"-delimited token and is never influenced by an operator-supplied curation
+# note, which is appended only after the tag.
+
+_CURATED_SOURCE_TAG = "curated"
+_DEFAULT_SOURCE_TAG = "default"
+
+
+def _security_type_computed_from(source_tag: str, detail: str) -> str:
+    return f"{source_tag}:{detail}"
+
+
+def _is_curated_security_type_row(computed_from: str) -> bool:
+    return computed_from.split(":", 1)[0] == _CURATED_SOURCE_TAG
 
 
 @dataclass(frozen=True)
@@ -382,8 +419,9 @@ def build_security_type_rows(
                         attribute_value_text=entry.security_type,
                         effective_start=entry.effective_start,
                         effective_end=entry.effective_end,
-                        computed_from=(
-                            f"hand-curated ({entry.note})" if entry.note else "hand-curated"
+                        computed_from=_security_type_computed_from(
+                            _CURATED_SOURCE_TAG,
+                            f"hand-curated ({entry.note})" if entry.note else "hand-curated",
                         ),
                         source_data_asof=entry.effective_start,
                     )
@@ -398,7 +436,10 @@ def build_security_type_rows(
                         attribute_value_text=default_security_type,
                         effective_start=start,
                         effective_end=end,
-                        computed_from=f"default classification ({default_security_type})",
+                        computed_from=_security_type_computed_from(
+                            _DEFAULT_SOURCE_TAG,
+                            f"default classification ({default_security_type})",
+                        ),
                         source_data_asof=start,
                     )
                 )
@@ -477,7 +518,7 @@ def write_security_type_batch(
         universe_id=universe_id,
         batch_id=batch_id,
         n_rows=len(rows),
-        n_curated=len({r["ticker"] for r in rows if not r["computed_from"].startswith("default")}),
+        n_curated=len({r["ticker"] for r in rows if _is_curated_security_type_row(r["computed_from"])}),
     )
     return EligibilityBatchWriteResult(
         batch_id=batch_id,
@@ -535,26 +576,54 @@ def eligibility_coverage_report(
     except NoPublishedImportError:
         membership_lookup = None
 
+    # Codex P3 fix (03A-4b PR #42 review): one query covering both the
+    # caller's requested attribute_names AND security_type (needed below for
+    # the curated-vs-default counts regardless of whether the caller
+    # requested security_type in `attribute_names`), instead of two separate
+    # round trips.
+    query_attribute_names = set(attribute_names) | {SECURITY_TYPE_ATTRIBUTE_NAME}
     with Session(engine) as session:
         attr_rows = session.execute(
             select(UniverseEligibilityAttribute).where(
                 UniverseEligibilityAttribute.universe_id == universe_id,
-                UniverseEligibilityAttribute.attribute_name.in_(attribute_names),
+                UniverseEligibilityAttribute.attribute_name.in_(query_attribute_names),
             )
         ).scalars().all()
 
-    # (ticker, attribute_name) -> list of (start, end)
+    # (ticker, attribute_name) -> list of (start, end), restricted to the
+    # caller's requested attribute_names for the by-date coverage loop below
+    # (security_type rows are excluded here unless the caller asked for it,
+    # matching pre-existing behavior).
     by_ticker_attr: dict[tuple[str, str], list[tuple[date, Optional[date]]]] = {}
     for row in attr_rows:
+        if row.attribute_name not in attribute_names:
+            continue
         by_ticker_attr.setdefault((row.ticker, row.attribute_name), []).append(
             (row.effective_start, row.effective_end)
         )
 
+    # Codex P2 fix (03A-4b PR #42 review): pre-merge each (ticker, attribute)
+    # key's intervals into a sorted, non-overlapping list ONCE (append-only
+    # batches can legitimately produce overlapping/duplicate coverage across
+    # re-runs, so a naive per-index bisect would be unsafe -- merging first
+    # makes it safe), then binary-search per query instead of an O(n) linear
+    # scan repeated for every (date, ticker, attribute) triple. This matters
+    # at the full-history scale this module is designed for (potentially one
+    # row per ticker per trading session over years of history).
+    merged_by_ticker_attr: dict[tuple[str, str], list[tuple[date, Optional[date]]]] = {
+        key: _merge_intervals(intervals) for key, intervals in by_ticker_attr.items()
+    }
+
     def _covered(ticker: str, attribute_name: str, d: date) -> bool:
-        for start, end in by_ticker_attr.get((ticker, attribute_name), ()):
-            if start <= d and (end is None or d < end):
-                return True
-        return False
+        intervals = merged_by_ticker_attr.get((ticker, attribute_name))
+        if not intervals:
+            return False
+        starts = [iv[0] for iv in intervals]
+        idx = bisect.bisect_right(starts, d) - 1
+        if idx < 0:
+            return False
+        start, end = intervals[idx]
+        return start <= d and (end is None or d < end)
 
     report_rows = []
     for d in sorted(dates):
@@ -592,26 +661,35 @@ def eligibility_coverage_report(
                 }
             )
 
-    security_type_tickers = {
-        ticker for (ticker, attr) in by_ticker_attr if attr == SECURITY_TYPE_ATTRIBUTE_NAME
-    }
-    n_curated = 0
-    n_default = 0
-    with Session(engine) as session:
-        rows = session.execute(
-            select(UniverseEligibilityAttribute).where(
-                UniverseEligibilityAttribute.universe_id == universe_id,
-                UniverseEligibilityAttribute.attribute_name == SECURITY_TYPE_ATTRIBUTE_NAME,
-            )
-        ).scalars().all()
-    curated_tickers = {r.ticker for r in rows if not r.computed_from.startswith("default")}
-    default_tickers = {r.ticker for r in rows if r.computed_from.startswith("default")} - curated_tickers
-    n_curated = len(curated_tickers)
-    n_default = len(default_tickers)
+    security_type_rows = [r for r in attr_rows if r.attribute_name == SECURITY_TYPE_ATTRIBUTE_NAME]
+    curated_tickers = {r.ticker for r in security_type_rows if _is_curated_security_type_row(r.computed_from)}
+    default_tickers = {r.ticker for r in security_type_rows} - curated_tickers
 
     return EligibilityCoverageReport(
         by_date=pd.DataFrame(report_rows),
         excluded_attributes=dict(EXCLUDED_ATTRIBUTES),
-        n_security_type_curated_tickers=n_curated,
-        n_security_type_default_tickers=n_default,
+        n_security_type_curated_tickers=len(curated_tickers),
+        n_security_type_default_tickers=len(default_tickers),
     )
+
+
+def _merge_intervals(
+    intervals: list[tuple[date, Optional[date]]]
+) -> list[tuple[date, Optional[date]]]:
+    """Merge possibly-overlapping half-open ``[start, end)`` intervals
+    (``end=None`` meaning open/unbounded) into a sorted, non-overlapping
+    list, so a query only ever needs to inspect one candidate interval."""
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda iv: iv[0])
+    merged: list[list[Optional[date]]] = [list(ordered[0])]
+    for start, end in ordered[1:]:
+        last = merged[-1]
+        last_start, last_end = last[0], last[1]
+        if last_end is None:
+            continue  # already open-ended; nothing later can extend it
+        if start <= last_end:
+            last[1] = None if end is None else max(last_end, end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]

@@ -17,6 +17,7 @@ from data.universe.eligibility_batch import (
     EmptyBatchError,
     SecurityTypeCurationEntry,
     SecurityTypeCurationError,
+    _is_curated_security_type_row,
     build_security_type_rows,
     compute_price_eligibility_rows,
     eligibility_coverage_report,
@@ -156,6 +157,95 @@ class TestComputePriceEligibilityRows:
         price_dates = {r["effective_start"] for r in rows if r["attribute_name"] == "price_usd"}
         assert dates[2] not in price_dates
 
+    def test_gap_date_is_not_silently_covered_by_prior_value(self):
+        """Codex P1 (PR #42 review): a genuine gap -- a trading session with
+        NO row at all in the input, e.g. an ingestion failure -- must leave
+        that specific date uncovered by any interval, not silently fall
+        inside the previous valid observation's [effective_start,
+        effective_end) span. Before the fix, _chain_intervals set
+        effective_end to the date of the next VALID row, which stretched the
+        prior session's stale price across the gap."""
+        dates = _trading_dates(date(2024, 1, 2), 10)
+        prices = _make_prices(["AAA"], dates)
+        gap_date = dates[5]
+        prior_date = dates[4]
+        next_valid_date = dates[6]
+        # Remove the gap date's row entirely (not just its close value) --
+        # the row is genuinely absent from the source, as an ingestion
+        # failure would produce.
+        prices = prices[prices["date"] != gap_date].reset_index(drop=True)
+
+        rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
+        price_rows_by_date = {
+            r["effective_start"]: r for r in rows if r["attribute_name"] == "price_usd"
+        }
+
+        assert gap_date not in price_rows_by_date
+        prior_row = price_rows_by_date[prior_date]
+        # The prior row's coverage must stop exactly AT the gap date (the
+        # true next trading session), never at next_valid_date.
+        assert prior_row["effective_end"] == gap_date
+        assert prior_row["effective_end"] != next_valid_date
+
+        # No interval of any row covers the gap date.
+        covering = [
+            r
+            for r in rows
+            if r["attribute_name"] == "price_usd"
+            and r["effective_start"] <= gap_date
+            and (r["effective_end"] is None or gap_date < r["effective_end"])
+        ]
+        assert covering == []
+
+    def test_gap_date_reports_missing_attribute_via_eligibility_lookup(self, tmp_path):
+        """End-to-end proof of the P1 fix through the actual runtime API a
+        caller would use: PITEligibilityLookup must report `missing_attribute`
+        for the gap date, not silently pass it using the prior session's
+        stale price."""
+        from sqlalchemy import create_engine
+
+        from data.universe.eligibility_batch import write_price_eligibility_batch
+        from data.universe.import_pipeline import run_import
+        from data.universe.providers.fixture_provider import (
+            FIXTURE_COVERAGE_START,
+            FIXTURE_UNIVERSE_ID,
+            FixtureSP500Provider,
+        )
+        from data.universe.runtime import (
+            EligibilityExclusionReason,
+            EligibilityFilterOp,
+            FilterSpec,
+            PITEligibilityLookup,
+        )
+
+        eng = create_engine(f"sqlite:///{tmp_path / 'gap_lookup.db'}", future=True)
+        run_import(
+            FixtureSP500Provider(),
+            engine=eng,
+            artifact_root=tmp_path / "artifacts",
+            coverage_start=FIXTURE_COVERAGE_START,
+        )
+        dates = _trading_dates(date(2020, 1, 2), 10)
+        prices = _make_prices(["AAA"], dates)
+        gap_date = dates[5]
+        prices = prices[prices["date"] != gap_date].reset_index(drop=True)
+
+        write_price_eligibility_batch(
+            eng, FIXTURE_UNIVERSE_ID, prices, start=dates[0], end=dates[-1], code_version="test"
+        )
+
+        lookup = PITEligibilityLookup(eng, FIXTURE_UNIVERSE_ID)
+        result = lookup.evaluate(
+            gap_date,
+            {"price_usd": FilterSpec(attribute_name="price_usd", op=EligibilityFilterOp.GTE, threshold=0.0)},
+            tickers=["AAA"],
+        )
+        assert "AAA" not in result.passing_tickers
+        assert any(
+            e.ticker == "AAA" and e.reason == EligibilityExclusionReason.MISSING_ATTRIBUTE
+            for e in result.exclusions
+        )
+
 
 # ─── write_price_eligibility_batch ─────────────────────────────────────────────
 
@@ -231,7 +321,7 @@ class TestBuildSecurityTypeRows:
         rows = build_security_type_rows(membership, curation)
         assert len(rows) == 1
         assert rows[0]["attribute_value_text"] == "REIT"
-        assert not rows[0]["computed_from"].startswith("default")
+        assert _is_curated_security_type_row(rows[0]["computed_from"])
 
     def test_multiple_non_overlapping_curated_entries_allowed(self):
         membership = {"AAA": [(date(2020, 1, 1), None)]}

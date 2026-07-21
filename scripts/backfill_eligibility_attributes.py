@@ -89,10 +89,20 @@ def _load_prices_for_range(
     )["date"].tolist()
     all_dates = sorted(pd.to_datetime(d).date() for d in all_dates)
     prior_dates = [d for d in all_dates if d < start]
-    lookback_start = (
-        prior_dates[-(adv_window - 1)] if len(prior_dates) >= adv_window - 1 and adv_window > 1
-        else (prior_dates[0] if prior_dates else start)
-    )
+    # Codex-adjacent P3 fix (03A-4b PR #42 review): the previous condition's
+    # `adv_window > 1` guard routed adv_window<=1 into the "else" branch,
+    # which -- rather than the intended "no lookback needed at all" -- fell
+    # through to `prior_dates[0]`, fetching the ENTIRE prior history instead
+    # of starting exactly at `start`. Handle adv_window<=1 explicitly (a
+    # window of 1 needs zero trailing sessions).
+    if adv_window <= 1:
+        lookback_start = start
+    elif len(prior_dates) >= adv_window - 1:
+        lookback_start = prior_dates[-(adv_window - 1)]
+    elif prior_dates:
+        lookback_start = prior_dates[0]
+    else:
+        lookback_start = start
     query = text(
         "SELECT ticker, date, close, volume FROM daily_prices "
         "WHERE date >= :lookback_start AND date <= :end ORDER BY ticker, date"
@@ -112,6 +122,7 @@ def run(
     prices: Optional[pd.DataFrame] = None,  # injectable for testing
 ) -> None:
     from data.universe.eligibility_batch import (
+        EmptyBatchError,
         compute_price_eligibility_rows,
         write_price_eligibility_batch,
     )
@@ -125,7 +136,21 @@ def run(
         prices = _load_prices_for_range(engine, start, end, adv_window)
 
     if dry_run:
+        # Codex-review-adjacent P2 fix (03A-4b PR #42 review): a dry-run
+        # used to report "[DRY RUN] Would write 0 rows" as if that were a
+        # normal preview outcome, even though the equivalent live run would
+        # raise EmptyBatchError for the exact same input. A preview must
+        # surface the same fail-closed condition a live run would hit, not a
+        # falsely reassuring "0 rows, nothing to worry about."
         rows = compute_price_eligibility_rows(prices, start=start, end=end, adv_window=adv_window)
+        if not rows:
+            raise EmptyBatchError(
+                f"[DRY RUN] compute_price_eligibility_rows produced zero rows for "
+                f"universe_id={universe_id!r}, start={start}, end={end}. A live run "
+                "with this input would raise the same error rather than write an "
+                "empty batch. Check that `prices` actually covers this range and "
+                f"includes at least {adv_window - 1} trailing sessions before `start`."
+            )
         n_price = sum(1 for r in rows if r["attribute_name"] == "price_usd")
         n_adv = sum(1 for r in rows if r["attribute_name"] == "adv_usd_20d")
         n_tickers = len({r["ticker"] for r in rows})
