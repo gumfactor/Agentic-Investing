@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Union
 
 import pandas as pd
@@ -39,7 +39,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from data.universe.calendar import next_trading_session
+from data.universe.calendar import next_trading_session, session_close_cutoff
 from data.universe.models import (
     Base,
     UniverseEligibilityAttribute,
@@ -120,9 +120,11 @@ def compute_price_eligibility_rows(
     session) -- "current value projected backward" is exactly what this
     function does NOT do. Each ticker's own qualifying dates are chained
     into consecutive one-session ``[effective_start, effective_end)``
-    intervals; the last qualifying date for that ticker in this batch gets
-    ``effective_end=None`` (open, "still current as of this computation
-    batch" per §1.2).
+    intervals, EVERY one closing at the next trading session (see
+    :func:`_chain_intervals`'s docstring for why the originally-open last
+    row was itself a defect, Codex P1 round 2, PR #42) -- a date with no
+    covering row from any batch reports ``missing_attribute`` rather than
+    silently inheriting an indefinitely "current" stale value.
     """
     if prices.empty:
         return []
@@ -172,9 +174,10 @@ def _chain_intervals(
     *, ticker: str, attribute_name: str, dated_values: list[tuple[date, float]], computed_from: str
 ) -> list[dict]:
     """Turn a ticker's sorted (date, value) series into chained one-session
-    half-open intervals, the last one left open (``effective_end=None``).
+    half-open intervals -- EVERY row closes at the next trading session,
+    never left open-ended.
 
-    Codex P1 fix (03A-4b PR #42 review): a non-final row's ``effective_end``
+    Codex P1 fix, round 1 (03A-4b PR #42 review): a row's ``effective_end``
     is the actual NEXT TRADING SESSION after its date
     (``data/universe/calendar.py``'s NYSE-approximate calendar), NOT the date
     of the next entry in ``dated_values``. The two coincide when the input is
@@ -188,11 +191,27 @@ def _chain_intervals(
     session uncovered means :class:`~data.universe.runtime.PITEligibilityLookup`
     correctly reports ``missing_attribute`` for it instead of inheriting the
     prior session's value.
+
+    Codex P1 fix, round 2 (PR #42 second review): the ORIGINAL design left
+    the LAST row of a batch's chain open-ended (``effective_end=None``,
+    "still current as of this computation batch"). That interacted badly
+    with :class:`PITEligibilityLookup`'s latest-``computed_at``-wins
+    correction rule: a small corrective/backfill batch covering only a
+    finite subrange (e.g. re-running Jan 2-Jan 5 to fix one bad value) would
+    leave Jan 5's row open, so its later ``computed_at`` would make it
+    outrank an OLDER full-history batch's rows for every date after Jan 5
+    too -- silently overriding the entire subsequent history with one stale
+    corrective value, even though the corrective batch never computed
+    anything past Jan 5. Every row now always closes at
+    ``next_trading_session(d)`` regardless of position in the batch; a date
+    that genuinely has no covering row from ANY batch (e.g. tomorrow,
+    before tomorrow's daily job has run) correctly reports
+    ``missing_attribute`` rather than silently inheriting an indefinitely
+    "current" stale value -- consistent with this module's fail-closed
+    design throughout.
     """
     rows: list[dict] = []
-    n = len(dated_values)
-    for i, (d, value) in enumerate(dated_values):
-        effective_end = next_trading_session(d) if i + 1 < n else None
+    for d, value in dated_values:
         rows.append(
             dict(
                 ticker=ticker,
@@ -200,7 +219,7 @@ def _chain_intervals(
                 attribute_value_numeric=float(value),
                 attribute_value_text=None,
                 effective_start=d,
-                effective_end=effective_end,
+                effective_end=next_trading_session(d),
                 computed_from=computed_from,
                 source_data_asof=d,
             )
@@ -312,6 +331,36 @@ def _is_curated_security_type_row(computed_from: str) -> bool:
     return computed_from.split(":", 1)[0] == _CURATED_SOURCE_TAG
 
 
+def _removal_lag_boundary_date(end_known_at: datetime) -> date:
+    """The first calendar date ``D`` such that
+    ``session_close_cutoff(D) >= end_known_at`` -- the exact half-open
+    ``effective_end`` boundary matching
+    :class:`~data.universe.runtime.PITUniverseLookup`'s per-date,
+    per-cutoff eligibility check (``end_known_at > session_close_cutoff(as_of_date)``
+    keeps a not-yet-knowably-removed ticker eligible).
+
+    Codex P2 fix (PR #42 second review, round 2): using ``end_known_at.date()``
+    directly is only correct when ``end_known_at``'s time-of-day is at or
+    before the session-close cutoff hour on its own date -- true for this
+    repo's only current source of ``end_known_at``
+    (``conservative_known_at_for_date_only_source``, which sets it to
+    exactly ``session_close_cutoff(next_trading_session(...))``). A
+    provider-supplied removal announcement landing AFTER that date's own
+    cutoff (e.g. an intra-day timestamp past 21:00 UTC) would otherwise
+    still leave the ticker knowably-member on ``end_known_at.date()``
+    itself per ``PITUniverseLookup``, while the naive boundary already
+    stopped covering that date -- reintroducing the same divergence one day
+    later. ``session_close_cutoff`` is defined for any calendar date (not
+    only trading sessions), and a fixed cutoff HOUR each day means at most
+    one day's advance is ever needed: any timestamp on date ``D`` is
+    strictly earlier than ``session_close_cutoff(D + 1 day)``.
+    """
+    boundary_date = end_known_at.date()
+    if session_close_cutoff(boundary_date) < end_known_at:
+        boundary_date = boundary_date + timedelta(days=1)
+    return boundary_date
+
+
 @dataclass(frozen=True)
 class SecurityTypeCurationEntry:
     """One hand-curated, verified historical ``security_type`` fact for a
@@ -374,8 +423,16 @@ def load_membership_intervals(
         ).scalars().all()
     intervals: dict[str, list[tuple[date, Optional[date], Optional[datetime]]]] = {}
     for r in rows:
+        end_known_at = r.end_known_at
+        if end_known_at is not None and end_known_at.tzinfo is None:
+            # SQLite loses tz awareness on read; stored values are UTC (same
+            # normalization PITUniverseLookup applies to known_at/
+            # end_known_at -- required here too so _removal_lag_boundary_date's
+            # comparison against session_close_cutoff's tz-aware UTC
+            # datetimes doesn't raise TypeError).
+            end_known_at = end_known_at.replace(tzinfo=timezone.utc)
         intervals.setdefault(r.ticker, []).append(
-            (r.effective_start, r.effective_end, r.end_known_at)
+            (r.effective_start, r.effective_end, end_known_at)
         )
     return intervals
 
@@ -414,11 +471,13 @@ def build_security_type_rows(
     before its removal was actually knowable -- using not-yet-knowable
     information to end coverage early is itself a look-ahead-shaped defect,
     the same class this repo already fixed for membership (BUG-008). The
-    default row's ``effective_end`` is now ``end_known_at``'s calendar date
-    (the exact half-open boundary at which
+    default row's ``effective_end`` is now :func:`_removal_lag_boundary_date`
+    of ``end_known_at`` -- the exact half-open boundary at which
     :class:`~data.universe.runtime.PITUniverseLookup`'s per-date,
-    per-cutoff check stops counting the ticker eligible -- see the
-    docstring derivation in the PR), not the raw membership ``effective_end``.
+    per-cutoff check stops counting the ticker eligible, cutoff-hour-aware
+    (Codex P2 fix, round 2: not simply ``end_known_at.date()``, which
+    under-covers when a removal announcement lands after its own date's
+    session-close cutoff) -- not the raw membership ``effective_end``.
     """
     curated_by_ticker: dict[str, list[SecurityTypeCurationEntry]] = {}
     for entry in curation:
@@ -464,10 +523,12 @@ def build_security_type_rows(
                 if end is None:
                     default_effective_end = None  # open interval, unchanged
                 elif end_known_at is not None:
-                    # Extend through the knowledge-lag window: end_known_at's
-                    # calendar date is the exact date PITUniverseLookup stops
-                    # counting the ticker eligible (see docstring derivation).
-                    default_effective_end = end_known_at.date()
+                    # Extend through the knowledge-lag window using the
+                    # exact cutoff-aware boundary (Codex P2 fix, PR #42
+                    # second review, round 2) -- not merely
+                    # end_known_at.date(), which is only correct when
+                    # end_known_at falls at-or-before its own date's cutoff.
+                    default_effective_end = _removal_lag_boundary_date(end_known_at)
                 else:
                     # Defensive fallback only -- the schema CHECK constraint
                     # guarantees end_known_at is populated whenever

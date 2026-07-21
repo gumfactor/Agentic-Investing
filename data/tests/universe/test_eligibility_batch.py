@@ -130,7 +130,15 @@ class TestComputePriceEligibilityRows:
         for _, row in prices.iterrows():
             assert price_rows[row["date"]] == pytest.approx(float(row["close"]))
 
-    def test_intervals_chain_to_next_session_last_is_open(self):
+    def test_intervals_chain_to_next_session_every_row_closed(self):
+        """Codex P1 fix, round 2 (PR #42 second review): the last row of a
+        batch's chain must NOT be left open-ended -- an open tail on a
+        finite/corrective batch would outrank a full-history batch's later
+        rows under the latest-computed_at-wins rule, silently corrupting
+        eligibility beyond what the corrective batch actually covered. Every
+        row, including the last, closes at the next trading session."""
+        from data.universe.calendar import next_trading_session
+
         dates = _trading_dates(date(2024, 1, 2), 5)
         prices = _make_prices(["AAA"], dates)
         rows = compute_price_eligibility_rows(prices, start=dates[0], end=dates[-1])
@@ -140,7 +148,62 @@ class TestComputePriceEligibilityRows:
         )
         for i in range(len(price_rows) - 1):
             assert price_rows[i]["effective_end"] == price_rows[i + 1]["effective_start"]
-        assert price_rows[-1]["effective_end"] is None
+        assert price_rows[-1]["effective_end"] == next_trading_session(price_rows[-1]["effective_start"])
+        assert price_rows[-1]["effective_end"] is not None
+
+    def test_corrective_finite_batch_tail_does_not_override_later_full_history_batch(
+        self, engine
+    ):
+        """Codex P1 fix, round 2, end-to-end proof: an older full-history
+        batch covers a long range; a NEWER, small corrective batch re-runs
+        only a short subrange. The corrective batch's later computed_at must
+        not make its (now-closed) tail outrank the full-history batch's rows
+        for dates the corrective batch never touched."""
+        from data.universe.runtime import (
+            EligibilityFilterOp,
+            FilterSpec,
+            PITEligibilityLookup,
+        )
+
+        dates = _trading_dates(date(2024, 1, 2), 30)
+        full_history_prices = _make_prices(["AAA"], dates)
+        write_price_eligibility_batch(
+            engine,
+            "sp500_corrective_test",
+            full_history_prices,
+            start=dates[0],
+            end=dates[-1],
+            code_version="full-history",
+            computed_at=datetime(2024, 2, 1, tzinfo=timezone.utc),
+        )
+
+        # Corrective re-run of just the first 5 sessions, with a LATER
+        # computed_at (simulating a same-day or next-day correction).
+        corrective_prices = full_history_prices[
+            full_history_prices["date"].isin(dates[:5])
+        ].reset_index(drop=True)
+        write_price_eligibility_batch(
+            engine,
+            "sp500_corrective_test",
+            corrective_prices,
+            start=dates[0],
+            end=dates[4],
+            code_version="corrective",
+            computed_at=datetime(2024, 2, 2, tzinfo=timezone.utc),
+        )
+
+        lookup = PITEligibilityLookup(engine, "sp500_corrective_test")
+        # A date well beyond the corrective batch's range must still resolve
+        # from the full-history batch, not be silently blanked/overridden by
+        # the corrective batch's (no-longer-open) final row.
+        far_date = dates[20]
+        result = lookup.evaluate(
+            far_date,
+            {"price_usd": FilterSpec(attribute_name="price_usd", op=EligibilityFilterOp.GTE, threshold=0.0)},
+            tickers=["AAA"],
+        )
+        assert "AAA" in result.passing_tickers
+        assert result.exclusions == ()
 
     def test_source_data_asof_never_exceeds_effective_start(self):
         dates = _trading_dates(date(2024, 1, 2), 25)
@@ -383,6 +446,19 @@ class TestBuildSecurityTypeRows:
         assert len(rows) == 1
         assert rows[0]["effective_end"] == end_known_at.date()
         assert rows[0]["effective_end"] != raw_end
+
+    def test_after_close_removal_announcement_advances_boundary_one_more_day(self):
+        """Codex P2 fix (PR #42 second review, round 2): an end_known_at
+        landing AFTER its own date's session-close cutoff (22:00 UTC, past
+        the 21:00 UTC cutoff hour) must push the default row's effective_end
+        one day later -- PITUniverseLookup still counts the ticker eligible
+        on end_known_at's own calendar date in that case, since the removal
+        was not knowable by THAT date's cutoff either."""
+        raw_end = date(2021, 1, 1)
+        after_close_announcement = datetime(2021, 1, 4, 22, 0, tzinfo=timezone.utc)
+        membership = {"AAA": [(date(2020, 1, 1), raw_end, after_close_announcement)]}
+        rows = build_security_type_rows(membership, curation=[])
+        assert rows[0]["effective_end"] == date(2021, 1, 5)  # one day past 2021-01-04
 
     def test_open_interval_default_stays_open(self):
         membership = {"AAA": [(date(2020, 1, 1), None, None)]}

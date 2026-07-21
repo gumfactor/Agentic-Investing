@@ -73,6 +73,23 @@ def _default_code_version() -> str:
         return "unknown"
 
 
+def _parse_yaml_date(value) -> date:
+    """Accept both a quoted YAML string (parsed by PyYAML as ``str``) and an
+    unquoted ``YYYY-MM-DD`` scalar (PyYAML's default SafeLoader resolves
+    that natively to ``datetime.date``, per YAML 1.1 timestamp resolution).
+
+    Codex P2 fix (03A-4b PR #42 second review): the seed curation file's own
+    documented schema (``effective_start: YYYY-MM-DD``) reads as a natural,
+    unquoted date to an operator, but ``date.fromisoformat()`` raises
+    ``TypeError`` when given an already-parsed ``date`` object instead of a
+    string -- the un-quoted, most natural way to write the field would have
+    made every curation import fail before writing anything.
+    """
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(value)
+
+
 def load_curation_file(path: str) -> tuple[str, list]:
     from data.universe.eligibility_batch import SecurityTypeCurationEntry
 
@@ -85,9 +102,9 @@ def load_curation_file(path: str) -> tuple[str, list]:
             SecurityTypeCurationEntry(
                 ticker=e["ticker"],
                 security_type=e["security_type"],
-                effective_start=date.fromisoformat(e["effective_start"]),
+                effective_start=_parse_yaml_date(e["effective_start"]),
                 effective_end=(
-                    date.fromisoformat(e["effective_end"]) if e.get("effective_end") else None
+                    _parse_yaml_date(e["effective_end"]) if e.get("effective_end") else None
                 ),
                 note=e.get("note", ""),
             )

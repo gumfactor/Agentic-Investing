@@ -55,6 +55,28 @@ class TestLoadCurationFile:
         assert entry.effective_end == date(2021, 1, 1)
         assert entry.note == "test source"
 
+    def test_accepts_unquoted_yaml_date_scalars(self, tmp_path):
+        """Codex P2 fix (PR #42 second review, round 2): PyYAML's default
+        SafeLoader resolves an UNQUOTED YYYY-MM-DD scalar natively to
+        datetime.date (YAML 1.1 timestamp resolution) -- the seed file's own
+        documented schema shows this exact unquoted form, so it must be
+        accepted, not raise TypeError before any curation can be imported."""
+        path = tmp_path / "curation.yaml"
+        path.write_text(
+            "entries:\n"
+            "  - ticker: AAA\n"
+            "    security_type: REIT\n"
+            "    effective_start: 2020-06-01\n"  # unquoted -- parses as date
+            "    effective_end: 2021-01-01\n"  # unquoted -- parses as date
+            "    note: test source\n",
+            encoding="utf-8",
+        )
+        default_security_type, entries = load_curation_file(str(path))
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry.effective_start == date(2020, 6, 1)
+        assert entry.effective_end == date(2021, 1, 1)
+
     def test_parses_entry_with_no_effective_end_as_open_ended(self, tmp_path):
         path = tmp_path / "curation.yaml"
         path.write_text(
