@@ -1759,7 +1759,7 @@ inherits) and exposed via `DataHandler.get_analytic_close`. It is scaffolding
 for FUTURE total-return reporting/attribution consumers -- it is never used
 for fills, and no tearsheet/attribution/report reads it today. The tested
 accessor is retained deliberately as the stable contract that future
-reporting will consume; wiring it into a consumer is tracked as BUG-078. No
+reporting will consume; wiring it into a consumer is tracked as BUG-079. No
 live signal computation from prices happens inside the backtester itself
 (alpha_scores arrive pre-computed from the snapshot, already fixed upstream
 by 01B-3), so `build_score_price_history_as_of` was not needed inside
