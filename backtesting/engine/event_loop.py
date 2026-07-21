@@ -95,6 +95,58 @@ class _PortfolioState:
                 self.positions.pop(f.ticker, None)
                 self.entry_dates.pop(f.ticker, None)
 
+    def apply_corporate_actions(self, actions: pd.DataFrame) -> None:
+        """Apply explicit split/dividend accounting for held positions
+        (BUG-070, design plan §2.2/§2.4).
+
+        The portfolio holds RAW share counts against a RAW (unadjusted)
+        price series (``DataHandler.get_close``); a split or dividend on a
+        held ticker must therefore be accounted for explicitly here rather
+        than by silently trading against an adjusted price:
+
+        - split: share count is multiplied by the net split ratio (the
+          product of all same-date split ``value`` entries for the ticker)
+          so notional is unchanged at the moment of the split.
+        - dividend: cash is credited ``shares_held * value`` (per-share
+          dividend), using the POST-split share count when a same-date
+          split is also present (matching this project's declared
+          POST_SPLIT quoting convention -- see
+          ``data.normalization.corporate_actions`` module docstring).
+        - spinoff: not implemented (matches the legacy adjustment routine);
+          logged and ignored.
+
+        ``actions`` is expected to already be filtered to one ``ex_date``
+        (typically via ``DataHandler.get_corporate_actions_on``). Rows for
+        tickers with no current position are no-ops.
+        """
+        if actions.empty:
+            return
+
+        for ticker, ticker_actions in actions.groupby("ticker"):
+            shares_held = self.positions.get(ticker, 0.0)
+            if shares_held <= 0:
+                continue
+
+            splits = ticker_actions[ticker_actions["action_type"] == "split"]
+            dividends = ticker_actions[ticker_actions["action_type"] == "dividend"]
+            spinoffs = ticker_actions[ticker_actions["action_type"] == "spinoff"]
+
+            if not spinoffs.empty:
+                logger.warning("spinoff_not_implemented_portfolio_accounting", ticker=ticker)
+
+            net_split_ratio = 1.0
+            for value in splits["value"]:
+                if value:
+                    net_split_ratio *= float(value)
+            if net_split_ratio != 1.0:
+                shares_held = shares_held * net_split_ratio
+                self.positions[ticker] = shares_held
+
+            if not dividends.empty:
+                div_per_share = sum(float(v) for v in dividends["value"] if v)
+                if div_per_share:
+                    self.cash += shares_held * div_per_share
+
 
 class BacktestEngine:
     """Event-driven backtest engine.
@@ -177,6 +229,15 @@ class BacktestEngine:
             close_prices = data_handler.get_close(sim_date)
             if not close_prices:
                 continue
+
+            # Explicit corporate-action accounting (BUG-070): the portfolio
+            # holds raw share counts against the raw price series above, so
+            # a split/dividend on a held ticker must be applied here before
+            # any NAV/weight computation uses today's (already ex-date) raw
+            # close -- never by adjusting the price series itself.
+            actions_today = data_handler.get_corporate_actions_on(sim_date)
+            if not actions_today.empty:
+                portfolio.apply_corporate_actions(actions_today)
 
             if sim_date in rebal_dates:
                 signals = data_handler.get_latest_signals(sim_date)
