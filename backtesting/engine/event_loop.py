@@ -226,18 +226,23 @@ class BacktestEngine:
         )
 
         for sim_date in trading_dates:
-            close_prices = data_handler.get_close(sim_date)
-            if not close_prices:
-                continue
-
             # Explicit corporate-action accounting (BUG-070): the portfolio
-            # holds raw share counts against the raw price series above, so
-            # a split/dividend on a held ticker must be applied here before
+            # holds raw share counts against the raw price series, so a
+            # split/dividend on a held ticker must be applied here before
             # any NAV/weight computation uses today's (already ex-date) raw
-            # close -- never by adjusting the price series itself.
+            # close -- never by adjusting the price series itself. This runs
+            # BEFORE the price-presence guard below so corp-action accounting
+            # is never gated on ticker-blind price presence; DataHandler's
+            # calendar-alignment gate (BUG-070 P1) has already guaranteed
+            # every within-window ex_date aligns to a trading session in the
+            # price calendar, so an action can never be silently dropped.
             actions_today = data_handler.get_corporate_actions_on(sim_date)
             if not actions_today.empty:
                 portfolio.apply_corporate_actions(actions_today)
+
+            close_prices = data_handler.get_close(sim_date)
+            if not close_prices:
+                continue
 
             if sim_date in rebal_dates:
                 signals = data_handler.get_latest_signals(sim_date)

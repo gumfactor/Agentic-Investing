@@ -256,6 +256,91 @@ def test_empty_opted_in_corporate_actions_proceeds_unadjusted():
 
 
 # ------------------------------------------------------------------
+# 4b. Fail-closed: a within-window ex_date on a price-gap day aborts.
+# ------------------------------------------------------------------
+
+def test_within_window_action_on_price_gap_day_aborts():
+    """A corporate action whose ex_date falls within the loaded price window
+    but on a day MISSING from the price calendar would be silently dropped
+    by the event loop (which only visits price-calendar dates), permanently
+    corrupting share counts. DataHandler must fail closed at construction
+    (BUG-070 P1) rather than let the split vanish."""
+    tickers = ["AAPL"]
+    prices = _daily_prices(tickers, n_days=20, start=date(2023, 1, 2))
+    # Remove one interior trading day entirely (all tickers) -> a gap day.
+    gap_date = sorted(prices["date"].unique())[10]
+    prices_with_gap = prices[prices["date"] != gap_date].reset_index(drop=True)
+
+    corp_actions = pd.DataFrame([{
+        "ticker": "AAPL",
+        "ex_date": gap_date,  # within [min,max] window but not in the calendar
+        "action_type": "split",
+        "value": 2.0,
+        "known_at": datetime(2023, 1, 1, tzinfo=timezone.utc),
+    }])
+    alpha_scores = pd.DataFrame(
+        {"ticker": ["AAPL"], "score_date": [date(2023, 1, 3)], "alpha_score": [1.0]}
+    )
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 3)], "close": [400.0]})
+
+    with pytest.raises(ValueError, match="no aligned trading date"):
+        DataHandler(
+            prices_with_gap, alpha_scores, benchmark, corporate_actions=corp_actions
+        )
+
+
+def test_outside_window_action_does_not_abort():
+    """An action whose ex_date is OUTSIDE the loaded price window is never
+    applied (no in-window position it could affect) and must NOT trip the
+    calendar-alignment gate."""
+    tickers = ["AAPL"]
+    prices = _daily_prices(tickers, n_days=20, start=date(2023, 1, 2))
+    corp_actions = pd.DataFrame([{
+        "ticker": "AAPL",
+        "ex_date": date(2022, 12, 1),  # before the window
+        "action_type": "split",
+        "value": 2.0,
+        "known_at": datetime(2022, 11, 1, tzinfo=timezone.utc),
+    }])
+    alpha_scores = pd.DataFrame(
+        {"ticker": ["AAPL"], "score_date": [date(2023, 1, 3)], "alpha_score": [1.0]}
+    )
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 3)], "close": [400.0]})
+
+    # Must construct without raising.
+    handler = DataHandler(
+        prices, alpha_scores, benchmark, corporate_actions=corp_actions
+    )
+    assert handler is not None
+
+
+def test_normal_aligned_action_still_applies():
+    """Control: an action on a real, present trading day constructs fine and
+    is applied by the engine (the gate must not over-reject)."""
+    tickers = ["AAPL"]
+    prices = _daily_prices(tickers, n_days=20, start=date(2023, 1, 2))
+    aligned_date = sorted(prices["date"].unique())[10]
+    corp_actions = pd.DataFrame([{
+        "ticker": "AAPL",
+        "ex_date": aligned_date,
+        "action_type": "split",
+        "value": 2.0,
+        "known_at": datetime(2023, 1, 1, tzinfo=timezone.utc),
+    }])
+    alpha_scores = pd.DataFrame(
+        {"ticker": ["AAPL"], "score_date": [date(2023, 1, 3)], "alpha_score": [1.0]}
+    )
+    benchmark = pd.DataFrame({"date": [date(2023, 1, 3)], "close": [400.0]})
+
+    handler = DataHandler(
+        prices, alpha_scores, benchmark, corporate_actions=corp_actions
+    )
+    on_day = handler.get_corporate_actions_on(aligned_date)
+    assert len(on_day) == 1
+    assert on_day.iloc[0]["action_type"] == "split"
+
+
+# ------------------------------------------------------------------
 # 5. End-to-end engine test: buy-and-hold NAV continuity across a split.
 # ------------------------------------------------------------------
 

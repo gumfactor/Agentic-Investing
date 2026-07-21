@@ -106,6 +106,7 @@ This file consolidates an adversarial, multi-theme review of the project. It is 
 | BUG-075 | Backtesting | P0 | F0 | Fixed (PR #36, merged 2026-07-20) | Backtest path silently ignored strategy-config fields it does not implement (`portfolio.method: mvo`/`risk_parity`, `optimizer_mode`, `constraints`, `risk_model`, live-only `execution` fields) instead of rejecting them — a backtest labeled "mvo with sector caps" was actually an uncapped equal-weight backtest. |
 | BUG-076 | Data/Storage | P2 | F2 | Open | Residual of BUG-037: same-date ordinary split+dividend boundary untested against a real row; Yahoo spinoffs modeled as same-date split+dividend rows are normalized as ordinary split+dividend. Includes P2 sub-notes on silently-ignored NaN dividend/zero split ratio and the §2.3×§3.1 cutoff/convention interaction. |
 | BUG-077 | Data/Storage | P3 | F3 | Fixed (03A-2, branch `dev/R2-03A2-failclosed-objectstore`) | `load_manifest`'s content-addressed predicate is `^[0-9a-f]{64}$`, so an uppercase-hex or 64-char-non-hex `data_version` silently drops to the legacy unverified path. Not exploitable (pipeline emits only lowercase hexdigest; MinIO keys are case-sensitive so an uppercase key cannot alias the genuine object). Fixed by `_is_malformed_hash_version()`: a `version` exactly 64 characters long that fails the canonical lowercase-hex regex now raises `ValueError` before any network call, rather than silently falling to the unverified `legacy_mutable` path; genuine legacy date-string versions (10 characters) are unaffected. Tests: `backtesting/tests/test_dataset_manifest.py::test_uppercase_hex_version_is_rejected_not_treated_as_legacy`, `::test_64_char_non_hex_version_is_rejected_not_treated_as_legacy`, `::test_genuine_legacy_date_version_is_unaffected_by_bug_077_guard`. Found by 03A-1 hostile re-verification (PR #38). |
+| BUG-078 | Backtesting/Reporting | P2 | F2 | Open (follow-up to BUG-070, 2026-07-20) | The cutoff-aware total-return ANALYTIC price series added by BUG-070 (`DataHandler.get_analytic_close`, built in `backtesting/loader._build_analytic_prices` via `build_realized_total_return_as_of`) is available and tested but consumed by NOTHING — no tearsheet/attribution/report reads it. Backtester NAV is already total-return-correct via raw-price + explicit dividend-cash/split-share accounting, so this is scaffolding for future reporting, not a NAV-correctness gap. Wire the analytic/total-return series into a reporting/attribution consumer (e.g. a tearsheet total-return overlay or an attribution series that must use the adjusted, not raw, price) so the contract is exercised end-to-end. Scoped deliberately OUT of the BUG-070 slice to avoid ballooning it. |
 
 #### Long-term / lower-risk backlog
 
@@ -1740,17 +1741,37 @@ legacy routine. `DataHandler.get_corporate_actions_on(sim_date)` surfaces
 same-date action rows; `BacktestEngine.run` applies them before any
 NAV/weight computation for that date.
 
-A cutoff-aware ANALYTIC series is built via
-`build_realized_total_return_as_of` (a single run-boundary cutoff --
+Backtester NAV is already total-return-correct via this raw-price +
+explicit dividend-cash / split-share accounting: a dividend on a held
+position credits cash and a split adjusts the share count, so the NAV path
+captures total return without ever adjusting a traded price. **That is the
+part of BUG-070 delivered and wired end-to-end.**
+
+A separate cutoff-aware ANALYTIC price series is additionally BUILT (but,
+in this slice, NOT YET CONSUMED by any reporting/attribution code path)
+via `build_realized_total_return_as_of` (a single run-boundary cutoff --
 `session_close_cutoff(min(backtest.end_date, latest loaded price date))` --
 the same accepted convention 01B-3 already uses for
 `scripts/backfill_momentum_scores.py`/`scripts/validate_signal_ic.py`; see
 BUG-071 for the documented residual limitation, which this loader
-inherits) and exposed via `DataHandler.get_analytic_close` for total-return
-valuation/reporting only -- it is never used for fills. No live signal
-computation from prices happens inside the backtester itself (alpha_scores
-arrive pre-computed from the snapshot, already fixed upstream by 01B-3), so
-`build_score_price_history_as_of` was not needed inside `loader.py`.
+inherits) and exposed via `DataHandler.get_analytic_close`. It is scaffolding
+for FUTURE total-return reporting/attribution consumers -- it is never used
+for fills, and no tearsheet/attribution/report reads it today. The tested
+accessor is retained deliberately as the stable contract that future
+reporting will consume; wiring it into a consumer is tracked as BUG-078. No
+live signal computation from prices happens inside the backtester itself
+(alpha_scores arrive pre-computed from the snapshot, already fixed upstream
+by 01B-3), so `build_score_price_history_as_of` was not needed inside
+`loader.py`.
+
+A within-window corporate-action ex_date that has no aligned trading
+session in the loaded price calendar is rejected fail-closed at
+`DataHandler` construction (P1 fix): the event loop only applies actions on
+sim_dates present in the price calendar, so a split/dividend on a
+price-gap day would otherwise be silently dropped and permanently corrupt
+the share count (e.g. a dropped 2:1 split undercounts shares 2x thereafter).
+Actions outside the loaded window are correctly ignored (never applied) and
+do not trip the gate.
 
 Fails closed per 03A-2's existing taxonomy: `allow_missing_corporate_actions`
 still governs whether a genuinely absent `corporate_actions` snapshot may be

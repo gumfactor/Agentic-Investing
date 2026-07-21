@@ -100,6 +100,56 @@ class DataHandler:
 
         self._sorted_dates: list[date] = sorted(self._prices["date"].unique())
 
+        self._validate_corporate_action_calendar_alignment()
+
+    def _validate_corporate_action_calendar_alignment(self) -> None:
+        """Fail closed if any within-window corporate-action ex_date has no
+        aligned trading date in the loaded price calendar (BUG-070, P1).
+
+        The event loop only visits sim_dates present in the price calendar
+        and applies corporate actions via ``get_corporate_actions_on(sim_
+        date)``. An action whose ex_date is a real trading day that is
+        MISSING from the loaded price snapshot would therefore be silently
+        dropped -- permanently corrupting the share count (e.g. a 2:1 split
+        never applied => 2x undercount) for every subsequent day. A silently
+        dropped split is exactly the corruption this gate exists to stop, so
+        it must raise, not warn.
+
+        Scope: only ex_dates that fall WITHIN the loaded price window
+        [min, max] are checked. An action outside the window is correctly
+        never applied (there is no in-window position it could affect) and
+        is not an error. An empty price or corporate_actions frame is a
+        no-op.
+        """
+        if self._corporate_actions.empty or not self._sorted_dates:
+            return
+        window_start = self._sorted_dates[0]
+        window_end = self._sorted_dates[-1]
+        trading_dates = set(self._sorted_dates)
+
+        ex_dates = self._corporate_actions["ex_date"]
+        within_window = (ex_dates >= window_start) & (ex_dates <= window_end)
+        misaligned = sorted(
+            {
+                d
+                for d in self._corporate_actions.loc[within_window, "ex_date"]
+                if d not in trading_dates
+            }
+        )
+        if misaligned:
+            raise ValueError(
+                "corporate_actions contains ex_date(s) within the loaded "
+                f"price window [{window_start}, {window_end}] that have no "
+                f"aligned trading date in the price calendar: {misaligned}. "
+                "The backtest engine only applies a corporate action on a "
+                "sim_date present in the price snapshot, so such an action "
+                "would be silently dropped -- permanently corrupting share "
+                "counts (e.g. a dropped 2:1 split undercounts shares 2x for "
+                "every later day). Failing closed (BUG-070): re-pin the "
+                "snapshot so the ex_date's trading session is present, or "
+                "correct the corporate_actions ex_date."
+            )
+
     # ------------------------------------------------------------------
     # Core accessors
     # ------------------------------------------------------------------
