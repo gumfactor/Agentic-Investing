@@ -410,12 +410,18 @@ def test_second_completed_holdout_confirmation_trial_is_rejected(session: Sessio
         session.commit()
 
 
-def test_second_holdout_confirmation_trial_allowed_if_first_not_completed(session: Session) -> None:
-    """A second holdout_confirmation row IS allowed when the first is not
-    'completed' (e.g. still 'running' or 'errored') -- the partial index
-    only guards completed rows, matching the one-shot-seal semantics
-    ('consumed' means a successful confirmation happened, not merely
-    attempted)."""
+@pytest.mark.parametrize("first_status", ["running", "errored", "completed"])
+def test_second_holdout_confirmation_trial_rejected_regardless_of_first_status(
+    session: Session, first_status: str
+) -> None:
+    """The one-shot seal must trip on ANY prior holdout_confirmation attempt,
+    not only a completed one (§4.2: "no prior holdout_confirmation trial row
+    exists"). Because TrialRecorder inserts the row before dispatch and the
+    run reads the sealed holdout data during dispatch, a first attempt that is
+    still 'running' or that 'errored' has already consumed its single
+    permitted look at the holdout -- so a second attempt of any status must be
+    rejected. Regression guard against the earlier completed-only predicate
+    that left the failure/retry path able to re-read the sealed data."""
     defn = _make_definition(session)
     hyp = _make_hypothesis(session)
     _make_trial(
@@ -424,19 +430,22 @@ def test_second_holdout_confirmation_trial_allowed_if_first_not_completed(sessio
         config_hash=defn.config_hash,
         hypothesis_id=hyp.id,
         run_type="holdout_confirmation",
-        status="errored",
+        status=first_status,
         window="holdout",
     )
-    second = _make_trial(
-        session,
+    second = StrategyTrial(
         strategy_id=defn.strategy_id,
         config_hash=defn.config_hash,
         hypothesis_id=hyp.id,
-        run_type="holdout_confirmation",
-        status="completed",
         window="holdout",
+        run_type="holdout_confirmation",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        started_at=datetime.now(timezone.utc),
     )
-    assert second.id is not None
+    session.add(second)
+    with pytest.raises(IntegrityError):
+        session.commit()
 
 
 def test_multiple_walk_forward_trials_are_unrestricted(session: Session) -> None:
@@ -492,6 +501,65 @@ def test_holdout_seal_is_scoped_per_strategy_id_not_global(session: Session) -> 
     assert trial_a.id is not None
     assert trial_b.id is not None
     assert trial_a.strategy_id != trial_b.strategy_id
+
+
+def test_trial_rejects_hypothesis_belonging_to_a_different_strategy(session: Session) -> None:
+    """The composite FK (hypothesis_id, strategy_id) -> strategy_hypotheses
+    (id, strategy_id) must reject a trial for strategy A that references a
+    hypothesis pre-registered for strategy B -- otherwise the trial counts
+    under A while its preregistration evidence describes B, corrupting the
+    audit trail this schema exists to protect."""
+    defn_a = _make_definition(session, strategy_id="v1_alpha_strategy")
+    _make_definition(session, strategy_id="v1_beta_strategy")
+    hyp_b = _make_hypothesis(session, strategy_id="v1_beta_strategy")
+
+    mismatched = StrategyTrial(
+        strategy_id=defn_a.strategy_id,          # strategy A ...
+        config_hash=defn_a.config_hash,
+        hypothesis_id=hyp_b.id,                  # ... citing strategy B's hypothesis
+        window="train_oos",
+        run_type="walk_forward",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        started_at=datetime.now(timezone.utc),
+    )
+    session.add(mismatched)
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_trial_accepts_hypothesis_of_the_same_strategy(session: Session) -> None:
+    """The composite hypothesis FK still accepts the normal case: a trial whose
+    strategy_id matches its referenced hypothesis's strategy_id."""
+    defn = _make_definition(session, strategy_id="v1_alpha_strategy")
+    hyp = _make_hypothesis(session, strategy_id="v1_alpha_strategy")
+    trial = _make_trial(
+        session,
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+    )
+    assert trial.id is not None
+
+
+def test_trial_allows_null_hypothesis_id_legacy_backfill_path(session: Session) -> None:
+    """A NULL hypothesis_id must skip composite-FK enforcement (MATCH SIMPLE),
+    preserving the documented legacy-backfill path for pre-protocol trials that
+    were never linked to a pre-registered hypothesis."""
+    defn = _make_definition(session)
+    trial = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=None,
+        window="train_oos",
+        run_type="walk_forward",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        started_at=datetime.now(timezone.utc),
+    )
+    session.add(trial)
+    session.commit()
+    assert trial.id is not None
 
 
 # ── promotion_decisions: FK + informational-DSR shape (§8 Q3) ──────────────────

@@ -37,6 +37,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
@@ -57,6 +58,13 @@ class StrategyHypothesis(Base):
             name="ck_strategy_hypotheses_strategy_id_nonempty",
         ),
         Index("ix_strategy_hypotheses_strategy_id", "strategy_id"),
+        # Composite unique on (id, strategy_id) -- id is already the PK so this
+        # is trivially satisfied; it exists solely as the FK target of
+        # StrategyTrial's composite (hypothesis_id, strategy_id) FK, so a trial
+        # can only cite a hypothesis pre-registered for its OWN strategy_id.
+        UniqueConstraint(
+            "id", "strategy_id", name="uq_strategy_hypotheses_id_strategy_id"
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -95,9 +103,14 @@ class StrategyTrial(Base):
             name="fk_strategy_trials_definition",
             ondelete="RESTRICT",
         ),
+        # Composite FK: (hypothesis_id, strategy_id) must match a single
+        # strategy_hypotheses (id, strategy_id) row -- a trial can only cite a
+        # hypothesis pre-registered for its OWN strategy_id. hypothesis_id
+        # stays nullable; under MATCH SIMPLE a NULL hypothesis_id skips FK
+        # enforcement, preserving the legacy-backfill path.
         ForeignKeyConstraint(
-            ["hypothesis_id"],
-            ["strategy_hypotheses.id"],
+            ["hypothesis_id", "strategy_id"],
+            ["strategy_hypotheses.id", "strategy_hypotheses.strategy_id"],
             name="fk_strategy_trials_hypothesis",
             ondelete="RESTRICT",
         ),
@@ -149,23 +162,23 @@ class StrategyTrial(Base):
             sa.text("started_at DESC"),
         ),
         Index("ix_strategy_trials_hypothesis", "hypothesis_id"),
-        # One-shot holdout seal (§4.2): at most one COMPLETED
-        # holdout_confirmation trial per strategy_id, enforced at the DB
-        # level. Dual postgresql_where/sqlite_where so
-        # Base.metadata.create_all() builds a working partial-unique index
-        # under both the real Postgres schema and this repo's SQLite-backed
-        # tests (mirrors strategy_registry/models.py's
-        # uix_strategies_one_paper/uix_strategies_one_live pattern).
+        # One-shot holdout seal (§4.2): at most one holdout_confirmation trial
+        # per strategy_id of ANY status. Keyed on run_type alone, NOT
+        # `AND status='completed'`: TrialRecorder (04-2) inserts the row before
+        # dispatch and the run reads the sealed holdout data during dispatch,
+        # so a run that reads the holdout and then errors has already consumed
+        # its single permitted look -- the seal must trip on the first attempt,
+        # matching §4.2 ("no prior holdout_confirmation trial row exists"). See
+        # the migration's fuller comment on the accepted fail-closed tradeoff.
+        # Dual postgresql_where/sqlite_where so Base.metadata.create_all()
+        # builds a working partial-unique index under both backends (mirrors
+        # strategy_registry/models.py's uix_strategies_one_paper/one_live).
         Index(
             "uix_strategy_trials_one_holdout_confirmation",
             "strategy_id",
             unique=True,
-            postgresql_where=sa.text(
-                "run_type = 'holdout_confirmation' AND status = 'completed'"
-            ),
-            sqlite_where=sa.text(
-                "run_type = 'holdout_confirmation' AND status = 'completed'"
-            ),
+            postgresql_where=sa.text("run_type = 'holdout_confirmation'"),
+            sqlite_where=sa.text("run_type = 'holdout_confirmation'"),
         ),
     )
 

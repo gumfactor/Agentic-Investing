@@ -81,6 +81,15 @@ def upgrade() -> None:
             "length(strategy_id) > 0",
             name="ck_strategy_hypotheses_strategy_id_nonempty",
         ),
+        # Composite unique on (id, strategy_id). `id` is already the PK so this
+        # is trivially satisfied; it exists solely to serve as the target of
+        # strategy_trials' composite (hypothesis_id, strategy_id) FK below, so
+        # a trial can only cite a hypothesis pre-registered for the SAME
+        # strategy_id (audit-trail integrity -- a trial for strategy A must not
+        # count under A while referencing strategy B's pre-registration).
+        sa.UniqueConstraint(
+            "id", "strategy_id", name="uq_strategy_hypotheses_id_strategy_id"
+        ),
     )
     op.create_index(
         "ix_strategy_hypotheses_strategy_id",
@@ -125,9 +134,16 @@ def upgrade() -> None:
             name="fk_strategy_trials_definition",
             ondelete="RESTRICT",
         ),
+        # Composite FK: a trial's (hypothesis_id, strategy_id) must match a
+        # single strategy_hypotheses row's (id, strategy_id) -- so a trial can
+        # only reference a hypothesis pre-registered for its OWN strategy_id.
+        # hypothesis_id remains nullable; under default MATCH SIMPLE semantics
+        # a NULL hypothesis_id skips FK enforcement entirely, preserving the
+        # documented legacy-backfill path (a pre-protocol trial with no
+        # hypothesis).
         sa.ForeignKeyConstraint(
-            ["hypothesis_id"],
-            ["strategy_hypotheses.id"],
+            ["hypothesis_id", "strategy_id"],
+            ["strategy_hypotheses.id", "strategy_hypotheses.strategy_id"],
             name="fk_strategy_trials_hypothesis",
             ondelete="RESTRICT",
         ),
@@ -177,10 +193,23 @@ def upgrade() -> None:
         "strategy_trials",
         ["hypothesis_id"],
     )
-    # One-shot holdout seal (§4.2/§5.1): at most one COMPLETED
-    # holdout_confirmation trial per strategy_id, enforced at the DB level so
-    # a future bypass of TrialRecorder (04-2) still cannot slip a second
-    # holdout run through. Dual postgresql_where/sqlite_where so the
+    # One-shot holdout seal (§4.2/§5.1): at most one holdout_confirmation trial
+    # per strategy_id of ANY status, enforced at the DB level so a future bypass
+    # of TrialRecorder (04-2) still cannot slip a second holdout run through.
+    #
+    # The predicate deliberately keys on run_type alone, NOT
+    # `AND status='completed'`. Because TrialRecorder inserts the trial row
+    # BEFORE dispatch (status='running'), and the run reads the sealed holdout
+    # data during dispatch, a run that reads the holdout and then errors has
+    # ALREADY consumed the one-and-only permitted look at that data -- so the
+    # seal must trip on the first attempt, not only on success. §4.2 states the
+    # seal trips when "no prior holdout_confirmation trial row exists" (any
+    # status); an earlier completed-only predicate diverged from that and left
+    # the failure/retry path able to re-read the sealed data. Accepted tradeoff:
+    # a holdout attempt that errors (even before finishing) permanently consumes
+    # the seal; re-running requires an operator append-only audit correction
+    # (C3), never a silent retry -- intentional fail-closed behavior for
+    # one-shot holdout data. Dual postgresql_where/sqlite_where so the
     # constraint is portably declared for both the real Postgres schema and
     # this repo's SQLite-backed model tests (strategy_registry/models.py
     # precedent).
@@ -189,12 +218,8 @@ def upgrade() -> None:
         "strategy_trials",
         ["strategy_id"],
         unique=True,
-        postgresql_where=sa.text(
-            "run_type = 'holdout_confirmation' AND status = 'completed'"
-        ),
-        sqlite_where=sa.text(
-            "run_type = 'holdout_confirmation' AND status = 'completed'"
-        ),
+        postgresql_where=sa.text("run_type = 'holdout_confirmation'"),
+        sqlite_where=sa.text("run_type = 'holdout_confirmation'"),
     )
 
     # ── research_data_windows ────────────────────────────────────────────────

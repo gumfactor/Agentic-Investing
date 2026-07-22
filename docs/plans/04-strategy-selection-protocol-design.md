@@ -385,12 +385,21 @@ pattern), one row per candidate run attempt.
 
 **Constraint:** `ck_strategy_trials_window`: `window IN ('train_oos',
 'holdout')`. **Constraint:** at most one `run_type='holdout_confirmation'`
-row with `status='completed'` per `strategy_id` — a partial unique index
+row per `strategy_id` **of any status** — a partial unique index
 `uix_strategy_trials_one_holdout_confirmation` on `(strategy_id) WHERE
-run_type = 'holdout_confirmation' AND status = 'completed'`, enforcing the
-one-shot seal at the DB level (not just in `TrialRecorder` application
-code) so a second holdout run cannot slip through a future bypass of the
-recorder.
+run_type = 'holdout_confirmation'`, enforcing the one-shot seal at the DB
+level (not just in `TrialRecorder` application code) so a second holdout
+run cannot slip through a future bypass of the recorder. The predicate keys
+on `run_type` alone, **not** `AND status='completed'`: because
+`TrialRecorder` (§4.4) inserts the trial row *before* dispatch and the run
+reads the sealed holdout data *during* dispatch, a holdout attempt that
+reads the data and then errors has already consumed its single permitted
+look — so the seal must trip on the first attempt, exactly matching §4.2's
+"no prior `holdout_confirmation` trial row exists (any status)". A
+completed-only predicate would leave the failure/retry path able to re-read
+the sealed data. Accepted fail-closed tradeoff: an errored holdout attempt
+permanently consumes the seal; re-running requires an operator append-only
+audit correction (C3), never a silent retry.
 
 **`research_data_windows`** — the train/OOS/holdout partition itself.
 
