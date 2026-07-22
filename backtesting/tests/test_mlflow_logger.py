@@ -122,6 +122,27 @@ def test_log_run_accepts_hash_shaped_data_version_when_required(mock_mlflow):
     assert run_id == "run-hash-ok"
 
 
+def test_log_run_rejects_whitespace_padded_hash_when_required():
+    """Codex review P2 (round 1): validation must run against the RAW
+    data_version (what actually lands in config.json/result.config_hash's
+    provenance), not the post-.strip() display value used only for the
+    MLflow tag -- otherwise a hash-shaped value with a trailing newline
+    (e.g. from a shell $(cat file) capture) would pass the gate on the
+    cleaned-up tag while the artifact still carried the untrimmed,
+    non-conformant string."""
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    padded = _VALID_MANIFEST_HASH + "\n"
+    result = _make_result(padded)
+    config = _make_config(padded)
+    with pytest.raises(ValueError, match="not a manifest-hash-shaped"):
+        logger.log_run(
+            config,
+            result,
+            experiment_name="test/exp",
+            require_manifest_data_version=True,
+        )
+
+
 def test_log_run_does_not_enforce_hash_shape_by_default():
     """The transition flag defaults to False: legacy placeholder
     data_version strings used throughout this test module (and, until
@@ -137,6 +158,20 @@ def test_log_run_does_not_enforce_hash_shape_by_default():
 def test_log_walk_forward_run_rejects_non_hash_shaped_data_version_when_required():
     logger = BacktestLogger(tracking_uri="./test_mlruns")
     wf = _make_wf_result("2026-06-14")
+    with pytest.raises(ValueError, match="not a manifest-hash-shaped"):
+        logger.log_walk_forward_run(
+            config=wf.config,
+            wf_result=wf,
+            experiment_name="test/wf",
+            require_manifest_data_version=True,
+        )
+
+
+def test_log_walk_forward_run_rejects_whitespace_padded_hash_when_required():
+    """Codex review P2 (round 1), walk-forward sibling of the log_run fix
+    above."""
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    wf = _make_wf_result(_VALID_MANIFEST_HASH + "\n")
     with pytest.raises(ValueError, match="not a manifest-hash-shaped"):
         logger.log_walk_forward_run(
             config=wf.config,

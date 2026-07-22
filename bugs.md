@@ -2297,3 +2297,26 @@ exists (none does yet outside tests as of this writing), it should pass
 `require_manifest_data_version=True`. No new BUG-XXX opened for this either,
 per the same roadmap-row reasoning above; revisit as part of whichever slice
 adds the first production `log_run`/`log_walk_forward_run` caller.
+
+**Codex round-1 review fixes (PR #44, same branch):**
+
+- P2: `BacktestLogger.log_run`/`log_walk_forward_run` validated
+  `require_manifest_data_version`'s hash-shape gate against the
+  `.strip()`-cleaned `data_version` used for the MLflow tag, not the raw
+  value actually persisted in `config.json`/`result.config_hash`'s
+  provenance -- a hash-shaped value with a trailing/leading whitespace
+  character would pass the gate on the cleaned-up tag while the artifact
+  still carried the untrimmed, non-conformant string. Fixed by validating
+  the raw (pre-strip) value.
+- P2: `scripts/pin_snapshot.py::pin_bundle` originally always auto-looked-up
+  the "latest published" `UniverseImportBatch`/`UniverseEligibilityBatch`
+  for `--universe-id` and linked whatever it found. `pin_bundle` only reads
+  already-persisted `alpha_scores` -- it has no way to confirm the batch
+  that happens to be "latest" at pin time is actually the one that governed
+  those scores when they were generated (a batch published later, or scores
+  generated without eligibility filtering at all, would be silently
+  stamped on regardless). Fixed by making the lookup an explicit opt-in
+  (`--auto-link-latest-universe-batches`, default off) and adding new
+  `--membership-import-batch-id`/`--eligibility-batch-id` explicit-id flags
+  as the preferred path when the real batch is known; an explicit id always
+  takes precedence over the auto-lookup for that field.

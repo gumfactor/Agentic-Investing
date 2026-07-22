@@ -134,14 +134,27 @@ class BacktestLogger:
                 "config dict the engine ran."
             )
 
-        data_version = (result.data_version or "").strip()
+        raw_data_version = result.data_version or ""
+        data_version = raw_data_version.strip()
         if not data_version:
             raise ValueError(
                 "data_version is required before logging a backtest run (C7). "
                 "Set config['data_version'] to the DVC version or MinIO snapshot ID."
             )
         if require_manifest_data_version:
-            require_manifest_hash_data_version(data_version)
+            # Codex review P2: validate the RAW (pre-strip) value, not the
+            # stripped display value. `result.data_version`/`config[
+            # "data_version"]` -- the value actually persisted into
+            # config.json and, transitively via the provenance check above,
+            # into result.config_hash -- keeps whatever whitespace the
+            # caller supplied; only the local `data_version` variable used
+            # for the MLflow tag is stripped. A hash-shaped value with
+            # trailing/leading whitespace (e.g. from a shell `$(cat file)`
+            # capture) would pass the gate on the cleaned-up tag value while
+            # the artifact/config still carried the untrimmed, non-conformant
+            # string -- silently defeating the strict hash-shape cutover
+            # this flag exists to enforce.
+            require_manifest_hash_data_version(raw_data_version)
 
         mlflow.set_experiment(experiment_name)
 
@@ -288,14 +301,19 @@ class BacktestLogger:
         # BacktestEngine, which reads config["data_version"] and stores it on
         # BacktestResult).  log_run() reads result.data_version instead, but
         # both ultimately come from the same config field.
-        data_version = (wf_result.config.get("data_version") or "").strip()
+        raw_data_version = wf_result.config.get("data_version") or ""
+        data_version = raw_data_version.strip()
         if not data_version:
             raise ValueError(
                 "data_version is required before logging a walk-forward run (C7). "
                 "Set config['data_version'] to the DVC version or MinIO snapshot ID."
             )
         if require_manifest_data_version:
-            require_manifest_hash_data_version(data_version)
+            # Codex review P2 (same fix as log_run): validate the RAW
+            # (pre-strip) value -- the one actually stored in
+            # wf_result.config, not the stripped display value used only for
+            # the MLflow tag.
+            require_manifest_hash_data_version(raw_data_version)
 
         config_hash = _hash_config(wf_result.config)
         mlflow.set_experiment(experiment_name)

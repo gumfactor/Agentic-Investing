@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 from minio.error import S3Error
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 
 from data.storage.parquet_snapshots import ParquetSnapshots
 from data.universe.models import Base as UniverseBase
@@ -526,8 +527,70 @@ def _engine_with_bundle_data_and_universe_batches(
     return engine, import_batch_id
 
 
-def test_pin_bundle_populates_membership_and_eligibility_batch_ids_from_real_rows():
-    """03A-5, requirement 5c: pin_bundle looks up the real published
+def test_pin_bundle_does_not_auto_link_batches_by_default():
+    """03A-5 adversarial review P2 (Codex round 1): auto-linking "whatever is
+    latest for this universe_id right now" defaults OFF. pin_bundle has no
+    way to confirm the currently-latest batch actually governed the
+    already-persisted alpha_scores being pinned, so silently stamping it on
+    the manifest would misrepresent provenance. Real batches exist here, but
+    without auto_link_latest_universe_batches=True (and no explicit id
+    passed), both fields must stay None."""
+    engine, _ = _engine_with_bundle_data_and_universe_batches()
+    snapshots = MagicMock()
+    snapshots.save_snapshot.side_effect = (
+        lambda _df, data_type, snapshot_date, bytes_sha256_out=None: (
+            f"rqis-snapshots/snapshots/{data_type}/{snapshot_date}/data.parquet"
+        )
+    )
+    snapshots.save_dataset_manifest.return_value = (
+        "rqis-snapshots/manifests/2022-01-05/manifest.json"
+    )
+
+    pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
+        universe_id="sp500",
+    )
+    manifest = snapshots.save_dataset_manifest.call_args.args[0]
+    assert manifest.membership_import_batch_id is None
+    assert manifest.eligibility_batch_id is None
+
+
+def test_pin_bundle_explicit_batch_ids_are_used_without_auto_link():
+    """The preferred path: a caller who KNOWS the real batch ids passes them
+    explicitly. No auto-link opt-in required, and they are validated
+    fail-closed by build_manifest exactly as an auto-linked id would be."""
+    engine, import_batch_id = _engine_with_bundle_data_and_universe_batches()
+    with Session(engine) as session:
+        from data.universe.models import UniverseEligibilityBatch
+
+        elig_batch_id = session.execute(
+            select(UniverseEligibilityBatch).where(
+                UniverseEligibilityBatch.universe_id == "sp500"
+            )
+        ).scalars().first().id
+
+    client = _InMemoryMinio()
+    snapshots = _real_snapshots(client)
+
+    manifest_path = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
+        membership_import_batch_id=import_batch_id,
+        eligibility_batch_id=elig_batch_id,
+    )
+
+    from backtesting.dataset_manifest import load_manifest
+
+    data_version = manifest_path.split("/")[-2]
+    manifest = load_manifest(data_version, client, "rqis-snapshots")
+    assert manifest.membership_import_batch_id == import_batch_id
+    assert manifest.eligibility_batch_id == elig_batch_id
+
+
+def test_pin_bundle_populates_membership_and_eligibility_batch_ids_when_auto_link_enabled():
+    """03A-5, requirement 5c: with the auto_link_latest_universe_batches
+    opt-in, pin_bundle looks up the real published
     UniverseImportBatch/UniverseEligibilityBatch rows for --universe-id and
     the resulting manifest carries both ids -- verified end to end through
     the real ParquetSnapshots + DatasetManifest content-addressing path (not
@@ -542,6 +605,7 @@ def test_pin_bundle_populates_membership_and_eligibility_batch_ids_from_real_row
         "v1", "SPY", date(2022, 1, 5),
         engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
         universe_id="sp500",
+        auto_link_latest_universe_batches=True,
     )
 
     from backtesting.dataset_manifest import load_manifest
@@ -559,11 +623,12 @@ def test_pin_bundle_populates_membership_and_eligibility_batch_ids_from_real_row
         "v1", "SPY", date(2022, 1, 5),
         engine=bare_engine, snapshots=snapshots, market_client=_benchmark_client(),
         universe_id="sp500",
+        auto_link_latest_universe_batches=True,
     )
     assert bare_path != manifest_path
 
 
-def test_pin_bundle_leaves_membership_batch_id_none_when_no_published_import_exists():
+def test_pin_bundle_auto_link_leaves_membership_batch_id_none_when_no_published_import_exists():
     """Best-effort lookup, not a hard block: a universe_id with only an
     unpublished (staged) import batch must not fail the pin -- it just
     leaves membership_import_batch_id unset."""
@@ -584,10 +649,62 @@ def test_pin_bundle_leaves_membership_batch_id_none_when_no_published_import_exi
         "v1", "SPY", date(2022, 1, 5),
         engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
         universe_id="sp500",
+        auto_link_latest_universe_batches=True,
     )
     manifest = snapshots.save_dataset_manifest.call_args.args[0]
     assert manifest.membership_import_batch_id is None
     assert manifest.eligibility_batch_id is None
+
+
+def test_pin_bundle_explicit_id_takes_precedence_over_auto_link():
+    """When both an explicit id and auto_link_latest_universe_batches are
+    supplied, the explicit id wins and the auto-lookup is not consulted for
+    that field -- explicit caller knowledge must not be silently overridden
+    by a "latest" guess."""
+    engine, import_batch_id = _engine_with_bundle_data_and_universe_batches()
+    # A second, later-published import batch that would win the "latest"
+    # auto-lookup if it were consulted.
+    with Session(engine) as session:
+        from datetime import datetime, timezone
+
+        from data.universe.models import UniverseImportBatch
+
+        later_batch = UniverseImportBatch(
+            universe_id="sp500",
+            provider="test",
+            source_version="v2",
+            raw_artifact_path="raw/y",
+            raw_checksum_sha256="b" * 64,
+            retrieved_at=datetime.now(timezone.utc),
+            status="published",
+            published_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(later_batch)
+        session.commit()
+        later_batch_id = later_batch.id
+        assert later_batch_id != import_batch_id
+
+    snapshots = MagicMock()
+    snapshots.save_snapshot.side_effect = (
+        lambda _df, data_type, snapshot_date, bytes_sha256_out=None: (
+            f"rqis-snapshots/snapshots/{data_type}/{snapshot_date}/data.parquet"
+        )
+    )
+    snapshots.save_dataset_manifest.return_value = (
+        "rqis-snapshots/manifests/2022-01-05/manifest.json"
+    )
+
+    pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
+        universe_id="sp500",
+        membership_import_batch_id=import_batch_id,  # explicit, older batch
+        auto_link_latest_universe_batches=True,  # would otherwise pick later_batch_id
+    )
+    manifest = snapshots.save_dataset_manifest.call_args.args[0]
+    assert manifest.membership_import_batch_id == import_batch_id
+    assert manifest.membership_import_batch_id != later_batch_id
 
 
 def test_latest_eligibility_batch_id_tiebreaks_on_id_when_computed_at_ties():

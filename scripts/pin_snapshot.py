@@ -63,13 +63,47 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--universe-id",
         default="sp500",
-        help="Universe id used to look up the latest published "
-        "UniverseImportBatch (membership_import_batch_id) and the latest "
-        "UniverseEligibilityBatch (eligibility_batch_id, if any) to link on "
-        "the manifest (03A-5). Best-effort: if no published import batch "
-        "exists yet for this universe_id, membership_import_batch_id is left "
-        "unset rather than blocking the pin (default: 'sp500', matching "
-        "scripts/backfill_momentum_scores.py's default).",
+        help="Universe id used by --auto-link-latest-universe-batches (or "
+        "as documentation context when passing --membership-import-batch-id/"
+        "--eligibility-batch-id explicitly). Default 'sp500', matching "
+        "scripts/backfill_momentum_scores.py's default.",
+    )
+    parser.add_argument(
+        "--membership-import-batch-id",
+        type=int,
+        default=None,
+        help="Explicit FK to universe_import_batches.id (03A-5) to record on "
+        "the manifest -- the batch KNOWN to have governed the pinned "
+        "alpha_scores' PIT membership. Must reference a published row or "
+        "pin_bundle fails closed. Preferred over "
+        "--auto-link-latest-universe-batches whenever the actual batch used "
+        "to score is known.",
+    )
+    parser.add_argument(
+        "--eligibility-batch-id",
+        type=int,
+        default=None,
+        help="Explicit FK to universe_eligibility_batches.id (03A-5) to "
+        "record on the manifest -- the batch KNOWN to have governed the "
+        "pinned alpha_scores' PIT eligibility filtering. Must reference an "
+        "existing row or pin_bundle fails closed.",
+    )
+    parser.add_argument(
+        "--auto-link-latest-universe-batches",
+        action="store_true",
+        help="Best-effort fallback (only used for an id NOT already supplied "
+        "explicitly above): look up the latest published "
+        "UniverseImportBatch/latest UniverseEligibilityBatch for "
+        "--universe-id and link them on the manifest. OFF BY DEFAULT "
+        "(03A-5 adversarial review P2): pin_bundle has no way to confirm the "
+        "'latest' batch at pin time is actually the one that governed the "
+        "already-persisted alpha_scores being pinned -- a batch published "
+        "after those scores were generated (or scores generated without any "
+        "eligibility filtering at all) would be linked anyway, misrepresenting "
+        "the manifest's provenance claim. Pass --membership-import-batch-id/"
+        "--eligibility-batch-id explicitly instead whenever the real batch id "
+        "is known; only use this flag when 'whatever is currently latest' is "
+        "an acceptable approximation.",
     )
     parser.add_argument(
         "--research-methodology-id",
@@ -91,20 +125,40 @@ def pin_bundle(
     *,
     research_run_id: int | None = None,
     universe_id: str = "sp500",
+    membership_import_batch_id: int | None = None,
+    eligibility_batch_id: int | None = None,
     research_methodology_id: int | None = None,
+    auto_link_latest_universe_batches: bool = False,
     engine=None,
     snapshots=None,
     market_client=None,
 ) -> str:
     """Build and save a complete backtest bundle, returning its manifest path.
 
-    03A-5: also looks up the latest published ``UniverseImportBatch`` and the
-    latest ``UniverseEligibilityBatch`` for ``universe_id`` (best-effort --
-    ``None`` if neither exists yet for this universe_id, rather than blocking
-    the pin) and passes them, plus the optional caller-supplied
-    ``research_methodology_id``, through to ``build_manifest`` so the
-    resulting manifest links to the exact PIT membership/eligibility batches
-    and research methodology used.
+    03A-5: optionally links the manifest to the ``UniverseImportBatch``/
+    ``UniverseEligibilityBatch`` that governed the pinned alpha_scores' PIT
+    membership/eligibility, plus an optional ``research_methodology_id``.
+
+    ``membership_import_batch_id``/``eligibility_batch_id`` are the preferred
+    path when the caller actually knows which batch was used (they are
+    passed straight through to ``build_manifest``, which fail-closed
+    validates them against the DB). ``auto_link_latest_universe_batches``
+    (default ``False``) is a best-effort FALLBACK, only consulted for an id
+    not already supplied explicitly: it looks up the latest ``published``
+    ``UniverseImportBatch``/latest ``UniverseEligibilityBatch`` for
+    ``universe_id`` and uses that if found, else leaves the id ``None``.
+
+    This defaults OFF (03A-5 adversarial review P2, Codex round 1):
+    ``pin_bundle`` only reads already-persisted ``alpha_scores`` -- it has no
+    way to confirm the batch that happens to be "latest" at pin time is
+    actually the one that governed those scores when they were generated. A
+    batch published later (or scores generated without eligibility filtering
+    at all) would otherwise be silently stamped onto the manifest as if it
+    were the batch "used to build it," which is a genuine provenance-
+    accuracy problem for a field whose entire purpose (design plan §2.2) is
+    recording the *exact* batch used -- not "whatever happens to be current
+    right now." Opting in is a caller's explicit acknowledgment that "latest
+    at pin time" is an acceptable approximation for their use case.
     """
     engine = engine or create_engine(os.environ["DATABASE_URL"])
     if snapshots is None:
@@ -238,8 +292,10 @@ def pin_bundle(
         for data_type, df in dataframes.items()
     }
     snapshot_dates = {data_type: snapshot_date for data_type in dataframes}
-    membership_import_batch_id = _latest_published_import_batch_id(engine, universe_id)
-    eligibility_batch_id = _latest_eligibility_batch_id(engine, universe_id)
+    if membership_import_batch_id is None and auto_link_latest_universe_batches:
+        membership_import_batch_id = _latest_published_import_batch_id(engine, universe_id)
+    if eligibility_batch_id is None and auto_link_latest_universe_batches:
+        eligibility_batch_id = _latest_eligibility_batch_id(engine, universe_id)
     manifest = build_manifest(
         version=str(snapshot_date),
         strategy_id=strategy_id,
@@ -323,7 +379,10 @@ def main() -> None:
         snapshot_date=date.fromisoformat(args.snapshot_date),
         research_run_id=args.research_run_id,
         universe_id=args.universe_id,
+        membership_import_batch_id=args.membership_import_batch_id,
+        eligibility_batch_id=args.eligibility_batch_id,
         research_methodology_id=args.research_methodology_id,
+        auto_link_latest_universe_batches=args.auto_link_latest_universe_batches,
     )
     print(f"Backtest dataset bundle pinned: {manifest_path}")
 
