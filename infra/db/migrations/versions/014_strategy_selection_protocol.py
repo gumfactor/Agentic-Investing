@@ -78,8 +78,8 @@ def upgrade() -> None:
         sa.Column("frozen_at", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.PrimaryKeyConstraint("id", name="pk_strategy_hypotheses"),
         sa.CheckConstraint(
-            "length(strategy_id) > 0",
-            name="ck_strategy_hypotheses_strategy_id_nonempty",
+            "strategy_id ~ '^[a-z][a-z0-9_]{2,99}$'",
+            name="ck_strategy_hypotheses_strategy_id_format",
         ),
         # Composite unique on (id, strategy_id). `id` is already the PK so this
         # is trivially satisfied; it exists solely to serve as the target of
@@ -261,6 +261,10 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "(strategy_family IS NULL) != (strategy_id IS NULL)",
             name="ck_research_data_windows_scope",
+        ),
+        sa.CheckConstraint(
+            "strategy_id IS NULL OR strategy_id ~ '^[a-z][a-z0-9_]{2,99}$'",
+            name="ck_research_data_windows_strategy_id_format",
         ),
         sa.CheckConstraint(
             "train_start < train_end AND train_end <= oos_start AND "

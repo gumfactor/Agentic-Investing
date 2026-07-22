@@ -53,10 +53,18 @@ class StrategyHypothesis(Base):
 
     __tablename__ = "strategy_hypotheses"
     __table_args__ = (
+        # Mirrors StrategyDefinition.strategy_id's format CHECK (models.py,
+        # ck_strategy_definitions_strategy_id): strategy_hypotheses is NOT
+        # FK-bound to strategy_definitions (a hypothesis can precede a
+        # definition), so without this it would be the only strategy_id
+        # column left unvalidated, allowing pre-registration of an id (e.g.
+        # "bad id", "x") that can never correspond to a valid Strategy
+        # Registry definition. ddl_if(postgresql): `~` is a Postgres-only
+        # regex operator; SQLite's create_all() would raise on it.
         CheckConstraint(
-            "length(strategy_id) > 0",
-            name="ck_strategy_hypotheses_strategy_id_nonempty",
-        ),
+            "strategy_id ~ '^[a-z][a-z0-9_]{2,99}$'",
+            name="ck_strategy_hypotheses_strategy_id_format",
+        ).ddl_if(dialect="postgresql"),
         Index("ix_strategy_hypotheses_strategy_id", "strategy_id"),
         # Composite unique on (id, strategy_id) -- id is already the PK so this
         # is trivially satisfied; it exists solely as the FK target of
@@ -236,6 +244,14 @@ class ResearchDataWindow(Base):
             "(strategy_family IS NULL) != (strategy_id IS NULL)",
             name="ck_research_data_windows_scope",
         ),
+        # Mirrors StrategyDefinition.strategy_id's format CHECK (same
+        # rationale as StrategyHypothesis above); strategy_id here is
+        # nullable (XOR'd with strategy_family) so NULL must still pass.
+        # ddl_if(postgresql): `~` is a Postgres-only regex operator.
+        CheckConstraint(
+            "strategy_id IS NULL OR strategy_id ~ '^[a-z][a-z0-9_]{2,99}$'",
+            name="ck_research_data_windows_strategy_id_format",
+        ).ddl_if(dialect="postgresql"),
         CheckConstraint(
             "train_start < train_end AND train_end <= oos_start AND "
             "oos_start < oos_end AND oos_end <= holdout_start AND "

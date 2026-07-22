@@ -28,8 +28,10 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, event, inspect
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.schema import CreateTable
 
 from strategy_registry.models import Base, StrategyDefinition
 from strategy_registry.selection_models import (
@@ -772,3 +774,34 @@ def test_finite_and_null_numerics_are_accepted(session: Session) -> None:
         window="train_oos",
     )
     assert running.oos_sharpe is None
+
+
+def test_strategy_id_format_check_present_on_postgres_compile() -> None:
+    """Codex round-4 P2: strategy_hypotheses.strategy_id and
+    research_data_windows.strategy_id are the two strategy_id columns not
+    already FK-bound to strategy_definitions, so without an explicit format
+    CHECK a hypothesis or research window could be pre-registered with an id
+    (e.g. "bad id", "x") that can never correspond to a valid Strategy
+    Registry definition (StrategyDefinition.strategy_id enforces
+    ``^[a-z][a-z0-9_]{2,99}$`` via ck_strategy_definitions_strategy_id).
+
+    The mirrored CHECKs here use ``~`` (Postgres-only regex operator) and are
+    declared with ``.ddl_if(dialect="postgresql")``, so SQLite's
+    ``create_all()`` -- used throughout the rest of this module -- silently
+    skips them and cannot exercise rejection. Compile each table against the
+    Postgres dialect directly instead, and assert the format CHECK text is
+    present (and the superseded nonempty CHECK on strategy_hypotheses is
+    gone).
+    """
+    hyp_ddl = str(
+        CreateTable(StrategyHypothesis.__table__).compile(dialect=postgresql.dialect())
+    )
+    assert "~ '^[a-z][a-z0-9_]{2,99}$'" in hyp_ddl
+    assert "ck_strategy_hypotheses_strategy_id_format" in hyp_ddl
+    assert "ck_strategy_hypotheses_strategy_id_nonempty" not in hyp_ddl
+
+    window_ddl = str(
+        CreateTable(ResearchDataWindow.__table__).compile(dialect=postgresql.dialect())
+    )
+    assert "~ '^[a-z][a-z0-9_]{2,99}$'" in window_ddl
+    assert "ck_research_data_windows_strategy_id_format" in window_ddl
