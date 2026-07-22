@@ -160,6 +160,19 @@ def upgrade() -> None:
             "status IN ('running', 'completed', 'errored')",
             name="ck_strategy_trials_status",
         ),
+        # Couple window and run_type so they cannot disagree: a row touches the
+        # holdout window IFF it is a holdout_confirmation run. Without this, a
+        # recorder bug or manual backfill could label a run as window='holdout'
+        # but run_type='walk_forward'/'parameter_sweep_variant', which the
+        # one-shot seal below (keyed on run_type='holdout_confirmation') would
+        # NOT catch -- allowing unlimited looks at the sealed holdout data. With
+        # this biconditional, every holdout-window row is a holdout_confirmation
+        # row, so the run_type-keyed seal provably covers every holdout touch.
+        # Boolean-equality form works identically on Postgres and SQLite.
+        sa.CheckConstraint(
+            "(\"window\" = 'holdout') = (run_type = 'holdout_confirmation')",
+            name="ck_strategy_trials_holdout_window_iff_confirmation",
+        ),
         # NaN backstop (Postgres-only): Postgres `numeric` DOES support NaN
         # (`'NaN'::numeric` inserts and persists), so an unfiltered
         # float('nan')/numpy.nan written by 04-2's TrialRecorder would

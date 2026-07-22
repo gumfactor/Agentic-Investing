@@ -127,6 +127,15 @@ class StrategyTrial(Base):
             "status IN ('running', 'completed', 'errored')",
             name="ck_strategy_trials_status",
         ),
+        # Couple window and run_type: a row touches the holdout window IFF it is
+        # a holdout_confirmation run. Prevents a holdout-window row hiding under
+        # run_type='walk_forward'/'parameter_sweep_variant', which the
+        # run_type-keyed one-shot seal would not catch. `"window"` is quoted
+        # (reserved keyword). Boolean-equality form is portable to SQLite.
+        CheckConstraint(
+            "(\"window\" = 'holdout') = (run_type = 'holdout_confirmation')",
+            name="ck_strategy_trials_holdout_window_iff_confirmation",
+        ),
         # NaN backstop (Postgres-only). Postgres `numeric` DOES support NaN
         # (contrary to a now-corrected claim in design doc §5.1): an
         # unfiltered float('nan')/numpy.nan written by 04-2's TrialRecorder

@@ -467,6 +467,39 @@ def test_multiple_walk_forward_trials_are_unrestricted(session: Session) -> None
     # No exception means unrestricted, as intended.
 
 
+@pytest.mark.parametrize(
+    "window,run_type",
+    [
+        ("holdout", "walk_forward"),            # holdout window, non-confirmation type
+        ("holdout", "parameter_sweep_variant"),
+        ("train_oos", "holdout_confirmation"),  # confirmation type, non-holdout window
+    ],
+)
+def test_window_and_run_type_must_agree_on_holdout(
+    session: Session, window: str, run_type: str
+) -> None:
+    """ck_strategy_trials_holdout_window_iff_confirmation: a row touches the
+    holdout window IFF it is a holdout_confirmation run. This closes the hole
+    where a holdout-window row labeled as a normal run_type would escape the
+    run_type-keyed one-shot seal and allow unlimited looks at the sealed
+    holdout data (Codex round-2 P1)."""
+    defn = _make_definition(session)
+    hyp = _make_hypothesis(session)
+    bad = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        window=window,
+        run_type=run_type,
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        started_at=datetime.now(timezone.utc),
+    )
+    session.add(bad)
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
 def test_holdout_seal_is_scoped_per_strategy_id_not_global(session: Session) -> None:
     """The one-shot seal is per-strategy_id, NOT global: two DISTINCT
     strategies must EACH be able to record their own completed

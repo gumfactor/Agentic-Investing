@@ -384,7 +384,14 @@ pattern), one row per candidate run attempt.
 | `completed_at` | `TIMESTAMPTZ` | |
 
 **Constraint:** `ck_strategy_trials_window`: `window IN ('train_oos',
-'holdout')`. **Constraint:** at most one `run_type='holdout_confirmation'`
+'holdout')`. **Constraint:** `ck_strategy_trials_holdout_window_iff_confirmation`:
+`("window" = 'holdout') = (run_type = 'holdout_confirmation')` — a row touches
+the holdout window **if and only if** it is a `holdout_confirmation` run. This
+couples the two columns so a holdout-window row cannot hide under a normal
+`run_type` (which would otherwise escape the run_type-keyed seal below and
+permit unlimited looks at the sealed holdout data); with the biconditional,
+every holdout-window row is provably a `holdout_confirmation` row that the seal
+covers. **Constraint:** at most one `run_type='holdout_confirmation'`
 row per `strategy_id` **of any status** — a partial unique index
 `uix_strategy_trials_one_holdout_confirmation` on `(strategy_id) WHERE
 run_type = 'holdout_confirmation'`, enforcing the one-shot seal at the DB
