@@ -458,6 +458,42 @@ def test_multiple_walk_forward_trials_are_unrestricted(session: Session) -> None
     # No exception means unrestricted, as intended.
 
 
+def test_holdout_seal_is_scoped_per_strategy_id_not_global(session: Session) -> None:
+    """The one-shot seal is per-strategy_id, NOT global: two DISTINCT
+    strategies must EACH be able to record their own completed
+    holdout_confirmation. Mirrors
+    test_second_completed_holdout_confirmation_trial_is_rejected but across
+    two different (strategy_id, config_hash) definitions -- proving the
+    partial unique index keys on strategy_id and does not accidentally cap
+    the whole table at one holdout confirmation."""
+    defn_a = _make_definition(session, strategy_id="v1_alpha_strategy")
+    defn_b = _make_definition(session, strategy_id="v1_beta_strategy")
+    hyp_a = _make_hypothesis(session, strategy_id="v1_alpha_strategy")
+    hyp_b = _make_hypothesis(session, strategy_id="v1_beta_strategy")
+
+    trial_a = _make_trial(
+        session,
+        strategy_id=defn_a.strategy_id,
+        config_hash=defn_a.config_hash,
+        hypothesis_id=hyp_a.id,
+        run_type="holdout_confirmation",
+        status="completed",
+        window="holdout",
+    )
+    trial_b = _make_trial(
+        session,
+        strategy_id=defn_b.strategy_id,
+        config_hash=defn_b.config_hash,
+        hypothesis_id=hyp_b.id,
+        run_type="holdout_confirmation",
+        status="completed",
+        window="holdout",
+    )
+    assert trial_a.id is not None
+    assert trial_b.id is not None
+    assert trial_a.strategy_id != trial_b.strategy_id
+
+
 # ── promotion_decisions: FK + informational-DSR shape (§8 Q3) ──────────────────
 
 
@@ -513,3 +549,125 @@ def test_promotion_decisions_rejects_invalid_sensitivity_verdict(session: Sessio
     session.add(bad)
     with pytest.raises(IntegrityError):
         session.commit()
+
+
+# ── NaN backstop on numeric columns (Postgres CHECK; SQLite coercion) ──────────
+#
+# Design doc §5.1 originally (and wrongly) claimed Postgres numeric has no NaN.
+# It does: `'NaN'::numeric` inserts and persists on Postgres. Migration 014
+# now carries a Postgres-only CHECK (`col IS NULL OR col <> 'NaN'::numeric`)
+# rejecting NaN while allowing NULL. This is a deliberate dialect divergence:
+# the `::numeric` cast is a SQLite syntax error, so the CHECK is
+# `ddl_if(postgresql)` and is NOT built on SQLite -- but SQLite coerces
+# float('nan') to NULL at storage time (verified), so NaN still cannot persist
+# on the SQLite test path. The tests below assert the correct behavior on
+# whichever dialect the test session is bound to (SQLite in CI; Postgres if a
+# scratch-DB engine is ever wired in), so the same test is a genuine proof on
+# both. The Postgres-side rejection is additionally proven out-of-band against
+# a scratch DB during the migration upgrade/downgrade check.
+
+
+def _assert_nan_is_not_persisted(session: Session, obj, attr: str) -> None:
+    """Dialect-aware NaN backstop assertion.
+
+    Postgres: the CHECK rejects the insert (IntegrityError). SQLite: the
+    engine coerces NaN to NULL, so the insert succeeds but the stored value
+    is None -- either way, a NaN value never survives in the column.
+    """
+    dialect = session.bind.dialect.name
+    session.add(obj)
+    if dialect == "postgresql":
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+    else:
+        session.commit()
+        session.refresh(obj)
+        assert getattr(obj, attr) is None, (
+            f"{attr} should be coerced to NULL on {dialect}, not persist NaN"
+        )
+
+
+def test_nan_oos_sharpe_is_not_persisted(session: Session) -> None:
+    defn = _make_definition(session)
+    hyp = _make_hypothesis(session)
+    trial = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        window="train_oos",
+        run_type="walk_forward",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        oos_sharpe=float("nan"),
+        started_at=datetime.now(timezone.utc),
+    )
+    _assert_nan_is_not_persisted(session, trial, "oos_sharpe")
+
+
+def test_nan_oos_max_drawdown_is_not_persisted(session: Session) -> None:
+    defn = _make_definition(session)
+    hyp = _make_hypothesis(session)
+    trial = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        window="train_oos",
+        run_type="walk_forward",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        oos_max_drawdown=float("nan"),
+        started_at=datetime.now(timezone.utc),
+    )
+    _assert_nan_is_not_persisted(session, trial, "oos_max_drawdown")
+
+
+def test_nan_dsr_value_is_not_persisted(session: Session) -> None:
+    defn = _make_definition(session)
+    decision = PromotionDecision(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        n_trials_used=3,
+        dsr_value=float("nan"),
+        funnel_passed=True,
+        overall_passed=False,
+        evidence_json={},
+        created_at=datetime.now(timezone.utc),
+    )
+    _assert_nan_is_not_persisted(session, decision, "dsr_value")
+
+
+def test_finite_and_null_numerics_are_accepted(session: Session) -> None:
+    """The NaN backstop must NOT reject legitimate finite values (including
+    0.0, which a naive CAST-based NaN test would wrongly trip) or NULL."""
+    defn = _make_definition(session)
+    hyp = _make_hypothesis(session)
+    good = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        window="train_oos",
+        run_type="walk_forward",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        oos_sharpe=0.0,          # boundary value that must survive
+        oos_max_drawdown=-0.2,
+        started_at=datetime.now(timezone.utc),
+    )
+    session.add(good)
+    session.commit()
+    session.refresh(good)
+    assert float(good.oos_sharpe) == 0.0
+    assert float(good.oos_max_drawdown) == -0.2
+
+    # NULL still allowed (the "not computed yet" case).
+    running = _make_trial(
+        session,
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        run_type="walk_forward",
+        status="running",
+        window="train_oos",
+    )
+    assert running.oos_sharpe is None
