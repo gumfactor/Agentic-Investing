@@ -376,7 +376,7 @@ pattern), one row per candidate run attempt.
 | `run_type` | `TEXT NOT NULL` | `walk_forward` \| `parameter_sweep_variant` \| `holdout_confirmation` |
 | `data_version` | `TEXT NOT NULL` | Manifest-hash-shaped C7 `data_version`, same enforcement as `require_manifest_hash_data_version` |
 | `status` | `TEXT NOT NULL` | `running` \| `completed` \| `errored` (mirrors `strategy_runs.status` naming minus `blocked`, which does not apply to an automated trial) |
-| `oos_sharpe` | `NUMERIC` | Nullable while `status='running'`; NaN-safe (stored NULL, not `NaN`, since Postgres numeric has no NaN) |
+| `oos_sharpe` | `NUMERIC` | Nullable while `status='running'`. CORRECTION (2026-07-22 adversarial review): Postgres `numeric` DOES support `NaN` (`'NaN'::numeric` inserts and persists), so this column is NOT implicitly NaN-safe. Migration 014 adds a Postgres-only CHECK (`oos_sharpe IS NULL OR oos_sharpe <> 'NaN'::numeric`) that rejects NaN while allowing NULL; SQLite coerces `float('nan')` to NULL on storage (so the SQLite test path cannot persist NaN) and rejects the `::numeric` cast syntax, hence the CHECK is `ddl_if(postgresql)`. `oos_max_drawdown` and `promotion_decisions.dsr_value` carry the same backstop. Writers must additionally normalize non-finite floats to None before insert. |
 | `oos_max_drawdown` | `NUMERIC` | |
 | `metrics_json` | `JSONB NOT NULL DEFAULT '{}'` | Full metrics bag, mirrors `strategy_runs.metrics` |
 | `mlflow_run_id` | `TEXT` | |

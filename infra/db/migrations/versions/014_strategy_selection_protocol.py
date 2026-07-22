@@ -144,6 +144,28 @@ def upgrade() -> None:
             "status IN ('running', 'completed', 'errored')",
             name="ck_strategy_trials_status",
         ),
+        # NaN backstop (Postgres-only): Postgres `numeric` DOES support NaN
+        # (`'NaN'::numeric` inserts and persists), so an unfiltered
+        # float('nan')/numpy.nan written by 04-2's TrialRecorder would
+        # silently poison downstream DSR/funnel/stress comparisons. Reject
+        # NaN while still allowing NULL (the legitimate "not computed yet"
+        # value while status='running'). The self-comparison idiom `col =
+        # col` does NOT work here: Postgres defines `NaN = NaN` as TRUE for
+        # numeric, so it passes NaN through; `col <> 'NaN'::numeric` is FALSE
+        # for a NaN (so the CHECK fails and NaN is rejected) and TRUE for any
+        # real value. ddl_if(postgresql) because the `::numeric` cast is a
+        # Postgres syntax error on SQLite, and SQLite coerces float('nan') to
+        # NULL on storage anyway (so it cannot poison the SQLite test path) --
+        # see selection_models.py's mirrored constraints and the app-layer
+        # NaN->NULL commitment note there.
+        sa.CheckConstraint(
+            "oos_sharpe IS NULL OR oos_sharpe <> 'NaN'::numeric",
+            name="ck_strategy_trials_oos_sharpe_not_nan",
+        ).ddl_if(dialect="postgresql"),
+        sa.CheckConstraint(
+            "oos_max_drawdown IS NULL OR oos_max_drawdown <> 'NaN'::numeric",
+            name="ck_strategy_trials_oos_max_drawdown_not_nan",
+        ).ddl_if(dialect="postgresql"),
     )
     op.create_index(
         "ix_strategy_trials_strategy_started",
@@ -266,6 +288,18 @@ def upgrade() -> None:
             "stress_verdict IS NULL OR stress_verdict IN ('solid', 'fragile')",
             name="ck_promotion_decisions_stress_verdict",
         ),
+        # NaN backstop (Postgres-only) -- same rationale as strategy_trials'
+        # oos_sharpe/oos_max_drawdown above. 04-4 writes dsr_value from the
+        # Deflated-Sharpe computation, which can produce NaN; dsr_value is
+        # informational per §8 Q3 but must still never persist a NaN that a
+        # reviewer could misread as a real (very negative) figure. NULL stays
+        # allowed for "not computed". ddl_if(postgresql): SQLite coerces
+        # float('nan') to NULL on storage and rejects the `::numeric` cast
+        # syntax.
+        sa.CheckConstraint(
+            "dsr_value IS NULL OR dsr_value <> 'NaN'::numeric",
+            name="ck_promotion_decisions_dsr_value_not_nan",
+        ).ddl_if(dialect="postgresql"),
     )
     op.create_index(
         "ix_promotion_decisions_strategy_created",

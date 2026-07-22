@@ -114,8 +114,39 @@ class StrategyTrial(Base):
             "status IN ('running', 'completed', 'errored')",
             name="ck_strategy_trials_status",
         ),
+        # NaN backstop (Postgres-only). Postgres `numeric` DOES support NaN
+        # (contrary to a now-corrected claim in design doc §5.1): an
+        # unfiltered float('nan')/numpy.nan written by 04-2's TrialRecorder
+        # would persist and poison downstream DSR/funnel/stress comparisons.
+        # `col <> 'NaN'::numeric` is FALSE for a NaN (CHECK fails, NaN
+        # rejected) and TRUE for any real value; NULL stays allowed for the
+        # "not computed yet" case (status='running'). The `col = col`
+        # self-comparison idiom does NOT work: Postgres treats `NaN = NaN` as
+        # TRUE and would pass NaN through.
+        #
+        # ddl_if(postgresql) is a deliberate, documented dialect divergence:
+        # the `::numeric` cast is a syntax error on SQLite, and SQLite coerces
+        # float('nan') to NULL at storage time (verified), so NaN cannot
+        # poison the SQLite test path -- there is nothing for a SQLite CHECK
+        # to reject. App-layer commitment: 04-2/04-4 writers must still
+        # normalize any non-finite float to None before insert, so behavior
+        # is identical (NaN -> NULL/rejected) regardless of backend.
+        CheckConstraint(
+            "oos_sharpe IS NULL OR oos_sharpe <> 'NaN'::numeric",
+            name="ck_strategy_trials_oos_sharpe_not_nan",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "oos_max_drawdown IS NULL OR oos_max_drawdown <> 'NaN'::numeric",
+            name="ck_strategy_trials_oos_max_drawdown_not_nan",
+        ).ddl_if(dialect="postgresql"),
+        # started_at DESC mirrors the migration's
+        # sa.text("started_at DESC") ordering exactly (recent-trials-first
+        # lookups); a bare ascending column would silently diverge from the
+        # canonical Postgres schema.
         Index(
-            "ix_strategy_trials_strategy_started", "strategy_id", "started_at"
+            "ix_strategy_trials_strategy_started",
+            "strategy_id",
+            sa.text("started_at DESC"),
         ),
         Index("ix_strategy_trials_hypothesis", "hypothesis_id"),
         # One-shot holdout seal (§4.2): at most one COMPLETED
@@ -245,8 +276,19 @@ class PromotionDecision(Base):
             "stress_verdict IS NULL OR stress_verdict IN ('solid', 'fragile')",
             name="ck_promotion_decisions_stress_verdict",
         ),
+        # NaN backstop (Postgres-only) -- same rationale and dialect
+        # divergence as StrategyTrial.oos_sharpe/oos_max_drawdown above.
+        # dsr_value is informational per §8 Q3, but a persisted NaN could be
+        # misread as a real (very negative) Deflated Sharpe.
+        CheckConstraint(
+            "dsr_value IS NULL OR dsr_value <> 'NaN'::numeric",
+            name="ck_promotion_decisions_dsr_value_not_nan",
+        ).ddl_if(dialect="postgresql"),
+        # created_at DESC mirrors the migration's sa.text("created_at DESC").
         Index(
-            "ix_promotion_decisions_strategy_created", "strategy_id", "created_at"
+            "ix_promotion_decisions_strategy_created",
+            "strategy_id",
+            sa.text("created_at DESC"),
         ),
     )
 
