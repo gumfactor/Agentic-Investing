@@ -495,6 +495,15 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
 
 # A content-addressed manifest version is exactly a SHA-256 hex digest;
 # anything else (a `YYYY-MM-DD` date string) is a legacy mutable key.
+#
+# Every call site below uses `.fullmatch()`, never `.match()`, against this
+# pattern (03A-5 adversarial review): without `re.MULTILINE`, `$` matches
+# either end-of-string OR immediately before a single trailing newline, so
+# `.match()` would accept a 65-character string that is 64 hex chars plus a
+# trailing "\n" (plausible from a shell `$(cat file)` capture or a YAML block
+# scalar) as if it were byte-identical to a real hash. `.fullmatch()` has no
+# such carve-out -- the entire string, including any trailing newline, must
+# match.
 _MANIFEST_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -512,7 +521,7 @@ def _is_malformed_hash_version(version: str) -> bool:
     short `YYYY-MM-DD` date strings (10 characters) and are unaffected by
     this check.
     """
-    return len(version) == 64 and not _MANIFEST_HASH_RE.match(version)
+    return len(version) == 64 and not _MANIFEST_HASH_RE.fullmatch(version)
 
 
 def is_manifest_hash_shaped(data_version: str) -> bool:
@@ -523,7 +532,7 @@ def is_manifest_hash_shaped(data_version: str) -> bool:
     design plan §2.5's last acceptance test) so both call sites use one
     definition of "hash-shaped" rather than two independently-maintained
     regexes."""
-    return bool(_MANIFEST_HASH_RE.match(data_version))
+    return bool(_MANIFEST_HASH_RE.fullmatch(data_version))
 
 
 def require_manifest_hash_data_version(data_version: str) -> None:
@@ -610,7 +619,7 @@ def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
     known = DatasetManifest.__dataclass_fields__
     manifest = DatasetManifest(**{k: v for k, v in data.items() if k in known})
 
-    is_content_addressed = bool(_MANIFEST_HASH_RE.match(version))
+    is_content_addressed = bool(_MANIFEST_HASH_RE.fullmatch(version))
     if is_content_addressed:
         if manifest.legacy_mutable:
             raise SnapshotIntegrityError(

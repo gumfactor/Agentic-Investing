@@ -282,14 +282,28 @@ def _latest_published_import_batch_id(engine, universe_id: str) -> int | None:
 def _latest_eligibility_batch_id(engine, universe_id: str) -> int | None:
     """Best-effort lookup of the latest ``UniverseEligibilityBatch`` for
     ``universe_id`` (03A-5). Returns ``None`` when none exists -- eligibility
-    filtering is genuinely optional, not every pinned bundle uses it."""
+    filtering is genuinely optional, not every pinned bundle uses it.
+
+    Tie-broken on ``(computed_at, id)`` descending, matching
+    ``PITEligibilityLookup._resolve_attribute``'s established convention
+    (``data/universe/runtime.py``): ``computed_at`` is application-supplied
+    wall-clock time, not DB-guaranteed monotonic, so two batches can share an
+    identical value (clock resolution, a rerun with a fixed ``computed_at``
+    override, concurrent workers). Ordering by ``computed_at`` alone leaves
+    ties to the query planner with no guarantee it agrees with "higher id
+    wins" -- exactly the ambiguity ``PITEligibilityLookup`` already closes by
+    adding ``computation_batch_id`` as the deterministic secondary key.
+    """
     from data.universe.models import UniverseEligibilityBatch
 
     with Session(engine) as session:
         batch = session.execute(
             select(UniverseEligibilityBatch)
             .where(UniverseEligibilityBatch.universe_id == universe_id)
-            .order_by(UniverseEligibilityBatch.computed_at.desc())
+            .order_by(
+                UniverseEligibilityBatch.computed_at.desc(),
+                UniverseEligibilityBatch.id.desc(),
+            )
         ).scalars().first()
         return batch.id if batch is not None else None
 

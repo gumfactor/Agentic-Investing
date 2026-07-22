@@ -590,6 +590,46 @@ def test_pin_bundle_leaves_membership_batch_id_none_when_no_published_import_exi
     assert manifest.eligibility_batch_id is None
 
 
+def test_latest_eligibility_batch_id_tiebreaks_on_id_when_computed_at_ties():
+    """Adversarial review P1: _latest_eligibility_batch_id must break a
+    computed_at tie the same deterministic way
+    PITEligibilityLookup._resolve_attribute already does
+    (data/universe/runtime.py) -- computed_at is application-supplied
+    wall-clock time, not DB-guaranteed monotonic, so two batches can
+    legitimately share an identical value (clock resolution, a rerun with a
+    fixed computed_at override, concurrent workers). Without an explicit
+    secondary sort key, SQL gives no ordering guarantee among ties."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm import Session
+
+    from data.universe.models import UniverseEligibilityBatch
+    from scripts.pin_snapshot import _latest_eligibility_batch_id
+
+    engine = _engine_with_bundle_data()
+    shared_computed_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        older = UniverseEligibilityBatch(
+            universe_id="sp500",
+            code_version="v1",
+            computed_at=shared_computed_at,
+            created_at=shared_computed_at,
+        )
+        newer = UniverseEligibilityBatch(
+            universe_id="sp500",
+            code_version="v1",
+            computed_at=shared_computed_at,  # identical computed_at -- the tie
+            created_at=shared_computed_at,
+        )
+        session.add_all([older, newer])
+        session.commit()
+        newer_id = newer.id
+        assert newer_id > older.id  # sanity: insertion order gives a higher id
+
+    result = _latest_eligibility_batch_id(engine, "sp500")
+    assert result == newer_id
+
+
 def test_pin_bundle_rejects_nonexistent_research_methodology_id():
     """A caller-supplied --research-methodology-id that does not exist must
     fail the pin closed (build_manifest's ManifestBatchLinkageError), not

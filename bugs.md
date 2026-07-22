@@ -2281,3 +2281,19 @@ real DB; `BacktestLogger.log_run`/`log_walk_forward_run` gained an opt-in
 `require_manifest_data_version` check rejecting non-hash-shaped
 `data_version` values. This was scoped in the roadmap as its own phased row
 (03A-5), not as a standalone bug, so no new BUG-XXX was opened for it.
+
+**Residual scope gap (adversarial review, 2026-07-21, same branch):**
+`require_manifest_data_version=True` is not passed by any production caller
+yet -- grepping `scripts/`, `backtesting/`, and `airflow/` outside tests
+finds only test call sites setting it `True`. That means today's real
+backtest runs can still call `BacktestLogger.log_run`/`log_walk_forward_run`
+with a legacy date-string `data_version` and succeed, despite 03A-5's stated
+intent that new runs use a real `manifest_content_sha256`. This is a
+legitimate gap in what got wired, not a defect in the code that exists (the
+flag defaults `False` deliberately, documented as a transition flag in both
+the docstring and this file's earlier note) -- flagging here so it isn't
+silently forgotten. Follow-up: once a real backtest-orchestration call site
+exists (none does yet outside tests as of this writing), it should pass
+`require_manifest_data_version=True`. No new BUG-XXX opened for this either,
+per the same roadmap-row reasoning above; revisit as part of whichever slice
+adds the first production `log_run`/`log_walk_forward_run` caller.
