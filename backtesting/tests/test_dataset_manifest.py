@@ -13,7 +13,9 @@ import pytest
 from backtesting.dataset_manifest import (
     DatasetManifest,
     build_manifest,
+    is_manifest_hash_shaped,
     load_manifest,
+    require_manifest_hash_data_version,
     save_manifest,
 )
 from data.storage.canonical_hash import canonical_content_sha256
@@ -203,6 +205,184 @@ class TestBytesSha256:
         assert m1.bytes_sha256 != m2.bytes_sha256  # genuinely different byte hashes
         assert _manifest_content_sha256(m1) == _manifest_content_sha256(m2)
         assert m1.manifest_content_sha256 == m2.manifest_content_sha256
+
+
+class TestManifestHashShapeValidation:
+    """03A-5 adversarial review P2: `.fullmatch()`, not `.match()`, must gate
+    hash-shape checks -- without `re.MULTILINE`, `$` matches either
+    end-of-string OR immediately before a single trailing newline, so a
+    64-hex-char string plus a trailing "\\n" (plausible from a shell
+    `$(cat file)` capture or a YAML block scalar) must NOT be accepted as
+    byte-identical to a real manifest hash."""
+
+    VALID_HASH = "a" * 64
+
+    def test_valid_hash_is_accepted(self) -> None:
+        assert is_manifest_hash_shaped(self.VALID_HASH) is True
+        require_manifest_hash_data_version(self.VALID_HASH)  # must not raise
+
+    def test_hash_with_trailing_newline_is_rejected(self) -> None:
+        tampered = self.VALID_HASH + "\n"
+        assert len(tampered) == 65
+        assert is_manifest_hash_shaped(tampered) is False
+        with pytest.raises(ValueError, match="not a manifest-hash-shaped"):
+            require_manifest_hash_data_version(tampered)
+
+    def test_hash_with_leading_newline_is_rejected(self) -> None:
+        tampered = "\n" + self.VALID_HASH
+        assert is_manifest_hash_shaped(tampered) is False
+
+    def test_legacy_date_string_is_rejected(self) -> None:
+        assert is_manifest_hash_shaped("2026-06-14") is False
+
+
+class TestBatchLinkage:
+    """03A-5: eligibility_batch_id / membership_import_batch_id /
+    research_methodology_id fail-closed validation."""
+
+    @staticmethod
+    def _engine_with_universe_and_research_tables():
+        from sqlalchemy import create_engine
+
+        from data.research.models import Base as ResearchBase
+        from data.universe.models import Base as UniverseBase
+
+        engine = create_engine("sqlite://")
+        UniverseBase.metadata.create_all(engine)
+        ResearchBase.metadata.create_all(engine)
+        return engine
+
+    def _common_kwargs(self, dataframes) -> dict:
+        return dict(
+            version="2024-01-02",
+            strategy_id="v1",
+            dataframes=dataframes,
+            object_paths=_object_paths(dataframes),
+            snapshot_dates={k: date(2024, 1, 2) for k in dataframes},
+        )
+
+    def test_batch_id_supplied_without_engine_fails_closed(self) -> None:
+        dataframes = _dataframes()
+        with pytest.raises(ValueError, match="engine is required"):
+            build_manifest(
+                **self._common_kwargs(dataframes),
+                membership_import_batch_id=1,
+            )
+
+    def test_nonexistent_membership_import_batch_id_fails_to_build(self) -> None:
+        from backtesting.dataset_manifest import ManifestBatchLinkageError
+
+        dataframes = _dataframes()
+        engine = self._engine_with_universe_and_research_tables()
+        with pytest.raises(ManifestBatchLinkageError, match="does not reference a published"):
+            build_manifest(
+                **self._common_kwargs(dataframes),
+                membership_import_batch_id=999,
+                engine=engine,
+            )
+
+    def test_unpublished_membership_import_batch_id_fails_to_build(self) -> None:
+        from datetime import datetime, timezone
+
+        from sqlalchemy.orm import Session
+
+        from backtesting.dataset_manifest import ManifestBatchLinkageError
+        from data.universe.models import UniverseImportBatch
+
+        dataframes = _dataframes()
+        engine = self._engine_with_universe_and_research_tables()
+        with Session(engine) as session:
+            batch = UniverseImportBatch(
+                universe_id="sp500",
+                provider="test",
+                source_version="v1",
+                raw_artifact_path="raw/x",
+                raw_checksum_sha256="a" * 64,
+                retrieved_at=datetime.now(timezone.utc),
+                status="staged",  # not published
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(batch)
+            session.commit()
+            batch_id = batch.id
+
+        with pytest.raises(ManifestBatchLinkageError, match="does not reference a published"):
+            build_manifest(
+                **self._common_kwargs(dataframes),
+                membership_import_batch_id=batch_id,
+                engine=engine,
+            )
+
+    def test_nonexistent_eligibility_batch_id_fails_to_build(self) -> None:
+        from backtesting.dataset_manifest import ManifestBatchLinkageError
+
+        dataframes = _dataframes()
+        engine = self._engine_with_universe_and_research_tables()
+        with pytest.raises(ManifestBatchLinkageError, match="UniverseEligibilityBatch"):
+            build_manifest(
+                **self._common_kwargs(dataframes),
+                eligibility_batch_id=999,
+                engine=engine,
+            )
+
+    def test_nonexistent_research_methodology_id_fails_to_build(self) -> None:
+        from backtesting.dataset_manifest import ManifestBatchLinkageError
+
+        dataframes = _dataframes()
+        engine = self._engine_with_universe_and_research_tables()
+        with pytest.raises(ManifestBatchLinkageError, match="ResearchMethodology"):
+            build_manifest(
+                **self._common_kwargs(dataframes),
+                research_methodology_id=999,
+                engine=engine,
+            )
+
+    def test_valid_batch_ids_populate_manifest_and_survive_into_hash(self) -> None:
+        from datetime import datetime, timezone
+
+        from sqlalchemy.orm import Session
+
+        from data.universe.models import UniverseEligibilityBatch, UniverseImportBatch
+
+        dataframes = _dataframes()
+        engine = self._engine_with_universe_and_research_tables()
+        with Session(engine) as session:
+            import_batch = UniverseImportBatch(
+                universe_id="sp500",
+                provider="test",
+                source_version="v1",
+                raw_artifact_path="raw/x",
+                raw_checksum_sha256="a" * 64,
+                retrieved_at=datetime.now(timezone.utc),
+                status="published",
+                published_at=datetime.now(timezone.utc),
+                created_at=datetime.now(timezone.utc),
+            )
+            eligibility_batch = UniverseEligibilityBatch(
+                universe_id="sp500",
+                code_version="v1",
+                computed_at=datetime.now(timezone.utc),
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add_all([import_batch, eligibility_batch])
+            session.commit()
+            import_batch_id = import_batch.id
+            eligibility_batch_id = eligibility_batch.id
+
+        manifest = build_manifest(
+            **self._common_kwargs(dataframes),
+            membership_import_batch_id=import_batch_id,
+            eligibility_batch_id=eligibility_batch_id,
+            engine=engine,
+        )
+        assert manifest.membership_import_batch_id == import_batch_id
+        assert manifest.eligibility_batch_id == eligibility_batch_id
+
+        # The linked batch ids must actually participate in the identity
+        # hash: a manifest built identically except for these ids gets a
+        # different manifest_content_sha256.
+        bare_manifest = build_manifest(**self._common_kwargs(_dataframes()))
+        assert manifest.manifest_content_sha256 != bare_manifest.manifest_content_sha256
 
 
 class TestSaveLoadManifestRoundTrip:

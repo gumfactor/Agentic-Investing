@@ -30,9 +30,10 @@ from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import Session
 
-from backtesting.dataset_manifest import build_manifest
+from backtesting.dataset_manifest import ManifestBatchLinkageError, build_manifest
 
 load_dotenv()
 
@@ -59,6 +60,61 @@ def _parse_args() -> argparse.Namespace:
         "rejects the unsafe case instead of silently pinning a mix. Pass this to "
         "disambiguate, or to pin a specific run's rows only.",
     )
+    parser.add_argument(
+        "--universe-id",
+        default="sp500",
+        help="Universe id used by --auto-link-latest-universe-batches (or "
+        "as documentation context when passing --membership-import-batch-id/"
+        "--eligibility-batch-id explicitly). Default 'sp500', matching "
+        "scripts/backfill_momentum_scores.py's default.",
+    )
+    parser.add_argument(
+        "--membership-import-batch-id",
+        type=int,
+        default=None,
+        help="Explicit FK to universe_import_batches.id (03A-5) to record on "
+        "the manifest -- the batch KNOWN to have governed the pinned "
+        "alpha_scores' PIT membership. Must reference a published row or "
+        "pin_bundle fails closed. Preferred over "
+        "--auto-link-latest-universe-batches whenever the actual batch used "
+        "to score is known.",
+    )
+    parser.add_argument(
+        "--eligibility-batch-id",
+        type=int,
+        default=None,
+        help="Explicit FK to universe_eligibility_batches.id (03A-5) to "
+        "record on the manifest -- the batch KNOWN to have governed the "
+        "pinned alpha_scores' PIT eligibility filtering. Must reference an "
+        "existing row or pin_bundle fails closed.",
+    )
+    parser.add_argument(
+        "--auto-link-latest-universe-batches",
+        action="store_true",
+        help="Best-effort fallback (only used for an id NOT already supplied "
+        "explicitly above): look up the latest published "
+        "UniverseImportBatch/latest UniverseEligibilityBatch for "
+        "--universe-id and link them on the manifest. OFF BY DEFAULT "
+        "(03A-5 adversarial review P2): pin_bundle has no way to confirm the "
+        "'latest' batch at pin time is actually the one that governed the "
+        "already-persisted alpha_scores being pinned -- a batch published "
+        "after those scores were generated (or scores generated without any "
+        "eligibility filtering at all) would be linked anyway, misrepresenting "
+        "the manifest's provenance claim. Pass --membership-import-batch-id/"
+        "--eligibility-batch-id explicitly instead whenever the real batch id "
+        "is known; only use this flag when 'whatever is currently latest' is "
+        "an acceptable approximation.",
+    )
+    parser.add_argument(
+        "--research-methodology-id",
+        type=int,
+        default=None,
+        help="Optional FK to research_methodologies.id (03A-5) to record on "
+        "the manifest. Nullable -- not every pinned bundle is tied to a "
+        "single research methodology. Must reference an existing row or "
+        "pin_bundle fails closed (backtesting.dataset_manifest."
+        "ManifestBatchLinkageError).",
+    )
     return parser.parse_args()
 
 
@@ -68,11 +124,42 @@ def pin_bundle(
     snapshot_date: date,
     *,
     research_run_id: int | None = None,
+    universe_id: str = "sp500",
+    membership_import_batch_id: int | None = None,
+    eligibility_batch_id: int | None = None,
+    research_methodology_id: int | None = None,
+    auto_link_latest_universe_batches: bool = False,
     engine=None,
     snapshots=None,
     market_client=None,
 ) -> str:
-    """Build and save a complete backtest bundle, returning its manifest path."""
+    """Build and save a complete backtest bundle, returning its manifest path.
+
+    03A-5: optionally links the manifest to the ``UniverseImportBatch``/
+    ``UniverseEligibilityBatch`` that governed the pinned alpha_scores' PIT
+    membership/eligibility, plus an optional ``research_methodology_id``.
+
+    ``membership_import_batch_id``/``eligibility_batch_id`` are the preferred
+    path when the caller actually knows which batch was used (they are
+    passed straight through to ``build_manifest``, which fail-closed
+    validates them against the DB). ``auto_link_latest_universe_batches``
+    (default ``False``) is a best-effort FALLBACK, only consulted for an id
+    not already supplied explicitly: it looks up the latest ``published``
+    ``UniverseImportBatch``/latest ``UniverseEligibilityBatch`` for
+    ``universe_id`` and uses that if found, else leaves the id ``None``.
+
+    This defaults OFF (03A-5 adversarial review P2, Codex round 1):
+    ``pin_bundle`` only reads already-persisted ``alpha_scores`` -- it has no
+    way to confirm the batch that happens to be "latest" at pin time is
+    actually the one that governed those scores when they were generated. A
+    batch published later (or scores generated without eligibility filtering
+    at all) would otherwise be silently stamped onto the manifest as if it
+    were the batch "used to build it," which is a genuine provenance-
+    accuracy problem for a field whose entire purpose (design plan §2.2) is
+    recording the *exact* batch used -- not "whatever happens to be current
+    right now." Opting in is a caller's explicit acknowledgment that "latest
+    at pin time" is an acceptable approximation for their use case.
+    """
     engine = engine or create_engine(os.environ["DATABASE_URL"])
     if snapshots is None:
         from data.storage.parquet_snapshots import ParquetSnapshots  # lazy: pulls in minio
@@ -138,6 +225,12 @@ def pin_bundle(
     # --research-run-id remains the explicit, single-run opt-in that always
     # bypasses this (there is nothing left to splice once scoped to one
     # run).
+    # Resolved to the single research_run_id that actually produced the
+    # pinned alpha_scores -- either the caller's explicit --research-run-id,
+    # or (once the block below confirms there's exactly one) the sole
+    # distinct value present in the rows. None when alpha_scores has no
+    # research_run_id column at all (pre-012_research_identity legacy data).
+    resolved_run_id: int | None = research_run_id
     if research_run_id is None and "research_run_id" in alpha_scores.columns:
         distinct_runs = sorted(alpha_scores["research_run_id"].dropna().unique().tolist())
         if len(distinct_runs) > 1:
@@ -164,6 +257,21 @@ def pin_bundle(
                 "4, adversarial-review round 11). Pass --research-run-id to "
                 "pin exactly one run's rows."
             )
+        elif len(distinct_runs) == 1:
+            resolved_run_id = distinct_runs[0]
+
+    # Codex round-2 review (03A-5, PR #44): a caller-supplied
+    # research_methodology_id passing build_manifest's own "does this row
+    # exist" check is not enough -- it says nothing about whether that
+    # methodology is the one the PINNED alpha_scores were actually produced
+    # under. Cross-check it against the resolved run's real methodology_id
+    # before doing any writes, so e.g. `--research-run-id 8
+    # --research-methodology-id 1` cannot silently save a manifest claiming
+    # methodology 1 when run 8 actually belongs to methodology 2.
+    if research_methodology_id is not None:
+        _validate_research_methodology_matches_run(
+            engine, research_methodology_id, resolved_run_id, strategy_id
+        )
 
     price_start = pd.to_datetime(prices["date"]).min().date()
     price_end = pd.to_datetime(prices["date"]).max().date()
@@ -205,6 +313,10 @@ def pin_bundle(
         for data_type, df in dataframes.items()
     }
     snapshot_dates = {data_type: snapshot_date for data_type in dataframes}
+    if membership_import_batch_id is None and auto_link_latest_universe_batches:
+        membership_import_batch_id = _latest_published_import_batch_id(engine, universe_id)
+    if eligibility_batch_id is None and auto_link_latest_universe_batches:
+        eligibility_batch_id = _latest_eligibility_batch_id(engine, universe_id)
     manifest = build_manifest(
         version=str(snapshot_date),
         strategy_id=strategy_id,
@@ -212,8 +324,113 @@ def pin_bundle(
         object_paths=object_paths,
         snapshot_dates=snapshot_dates,
         bytes_sha256=bytes_hashes,
+        eligibility_batch_id=eligibility_batch_id,
+        membership_import_batch_id=membership_import_batch_id,
+        research_methodology_id=research_methodology_id,
+        engine=engine,
     )
     return snapshots.save_dataset_manifest(manifest)
+
+
+def _validate_research_methodology_matches_run(
+    engine, research_methodology_id: int, resolved_run_id: int | None, strategy_id: str
+) -> None:
+    """Fail closed if a caller-supplied ``research_methodology_id`` does not
+    match the methodology of the ``research_run_id`` that actually produced
+    the pinned ``alpha_scores`` (Codex round-2 review, 03A-5, PR #44).
+
+    ``build_manifest``'s own validation only checks that the supplied
+    methodology id references an EXISTING ``ResearchMethodology`` row -- it
+    has no idea which run's scores are being pinned, so it cannot catch a
+    real-but-wrong methodology id (e.g. ``--research-run-id 8
+    --research-methodology-id 1`` when run 8 actually belongs to
+    methodology 2). This cross-checks against ``research_runs.methodology_id``
+    for the resolved run before any object is written.
+
+    Deliberately NOT a hard failure when ``resolved_run_id`` is ``None``:
+    ``alpha_scores`` rows written before the ``research_run_id`` backfill
+    (migration ``012_research_identity``) have no run to cross-check
+    against, so a caller-supplied ``research_methodology_id`` in that case
+    is unverifiable, not provably wrong -- there is nothing to fail closed
+    against.
+    """
+    if resolved_run_id is None:
+        return
+    from data.research.models import ResearchRun
+
+    with Session(engine) as session:
+        run = session.get(ResearchRun, resolved_run_id)
+        if run is None:
+            raise ManifestBatchLinkageError(
+                f"research_run_id={resolved_run_id} (resolved from the pinned "
+                f"alpha_scores for strategy_id={strategy_id!r}) does not "
+                "reference an existing ResearchRun row -- cannot cross-check "
+                "the supplied --research-methodology-id against it. Refusing "
+                "to pin against a dangling research_run_id."
+            )
+        if run.methodology_id != research_methodology_id:
+            raise ManifestBatchLinkageError(
+                f"--research-methodology-id {research_methodology_id} does not "
+                f"match the methodology (id={run.methodology_id}) that "
+                f"research_run_id={resolved_run_id} -- the run whose scores are "
+                f"actually being pinned for strategy_id={strategy_id!r} -- used. "
+                "Refusing to save a manifest whose research_methodology_id "
+                "link would misrepresent the methodology that actually "
+                "produced the pinned alpha_scores."
+            )
+
+
+def _latest_published_import_batch_id(engine, universe_id: str) -> int | None:
+    """Best-effort lookup of the latest ``published`` ``UniverseImportBatch``
+    for ``universe_id`` (03A-5). Returns ``None`` -- rather than raising --
+    when no published import exists yet: unlike ``PITUniverseLookup`` (which
+    fails closed because historical research cannot proceed at all without
+    one), pin_snapshot's core job of pinning prices/scores/actions/benchmark
+    predates and is independent of the universe-import system, so an absent
+    universe import is a legitimate "not linked yet" case, not a reason to
+    block the whole pin. A batch id that IS found is still passed through
+    build_manifest's own fail-closed re-validation."""
+    from data.universe.models import UniverseImportBatch
+
+    with Session(engine) as session:
+        batch = session.execute(
+            select(UniverseImportBatch)
+            .where(
+                UniverseImportBatch.universe_id == universe_id,
+                UniverseImportBatch.status == "published",
+            )
+            .order_by(UniverseImportBatch.published_at.desc())
+        ).scalars().first()
+        return batch.id if batch is not None else None
+
+
+def _latest_eligibility_batch_id(engine, universe_id: str) -> int | None:
+    """Best-effort lookup of the latest ``UniverseEligibilityBatch`` for
+    ``universe_id`` (03A-5). Returns ``None`` when none exists -- eligibility
+    filtering is genuinely optional, not every pinned bundle uses it.
+
+    Tie-broken on ``(computed_at, id)`` descending, matching
+    ``PITEligibilityLookup._resolve_attribute``'s established convention
+    (``data/universe/runtime.py``): ``computed_at`` is application-supplied
+    wall-clock time, not DB-guaranteed monotonic, so two batches can share an
+    identical value (clock resolution, a rerun with a fixed ``computed_at``
+    override, concurrent workers). Ordering by ``computed_at`` alone leaves
+    ties to the query planner with no guarantee it agrees with "higher id
+    wins" -- exactly the ambiguity ``PITEligibilityLookup`` already closes by
+    adding ``computation_batch_id`` as the deterministic secondary key.
+    """
+    from data.universe.models import UniverseEligibilityBatch
+
+    with Session(engine) as session:
+        batch = session.execute(
+            select(UniverseEligibilityBatch)
+            .where(UniverseEligibilityBatch.universe_id == universe_id)
+            .order_by(
+                UniverseEligibilityBatch.computed_at.desc(),
+                UniverseEligibilityBatch.id.desc(),
+            )
+        ).scalars().first()
+        return batch.id if batch is not None else None
 
 
 def main() -> None:
@@ -230,6 +447,11 @@ def main() -> None:
         benchmark_ticker=args.benchmark,
         snapshot_date=date.fromisoformat(args.snapshot_date),
         research_run_id=args.research_run_id,
+        universe_id=args.universe_id,
+        membership_import_batch_id=args.membership_import_batch_id,
+        eligibility_batch_id=args.eligibility_batch_id,
+        research_methodology_id=args.research_methodology_id,
+        auto_link_latest_universe_batches=args.auto_link_latest_universe_batches,
     )
     print(f"Backtest dataset bundle pinned: {manifest_path}")
 

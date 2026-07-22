@@ -57,10 +57,13 @@ import re
 import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
 import pandas as pd
 import structlog
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 from data.storage.canonical_hash import canonical_content_sha256
 from data.storage.errors import (
@@ -70,6 +73,16 @@ from data.storage.errors import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+class ManifestBatchLinkageError(ValueError):
+    """A manifest referenced an ``eligibility_batch_id``,
+    ``membership_import_batch_id``, or ``research_methodology_id`` that does
+    not exist (or, for ``membership_import_batch_id``, is not in
+    ``published`` status) -- 03A-5, design plan §2.5: "A manifest referencing
+    ... that does not exist ... fails to build rather than pinning a bundle
+    against an unpublished universe import."
+    """
 
 # Data types that participate in a standard backtest bundle.
 _BUNDLE_TYPES = ("daily_prices", "alpha_scores", "corporate_actions", "benchmark")
@@ -122,9 +135,13 @@ class DatasetManifest:
     # per data type. Never used for keys or load-time gating (section 2.1
     # trade-off) -- recorded only so out-of-band byte churn is observable.
     bytes_sha256: dict[str, str] = field(default_factory=dict)
-    # 03A-5 (not wired in this phase): FKs linking this bundle to the exact
-    # PIT membership/eligibility batches used to build it. Nullable/unused
-    # until 03A-4/03A-5 land.
+    # 03A-5: FKs linking this bundle to the exact PIT membership/eligibility
+    # batches used to build it, plus the optional research methodology that
+    # produced its alpha scores. Nullable: legacy bundles pinned before the
+    # universe import/eligibility/methodology systems existed (or bundles
+    # for which no matching batch was found) leave these unset; build_manifest
+    # only fail-closed-validates a batch id that IS supplied (see
+    # ManifestBatchLinkageError).
     eligibility_batch_id: Optional[int] = None
     membership_import_batch_id: Optional[int] = None
     research_methodology_id: Optional[int] = None
@@ -148,6 +165,10 @@ def build_manifest(
     object_paths: dict[str, str],
     snapshot_dates: dict[str, date],
     bytes_sha256: Optional[dict[str, str]] = None,
+    eligibility_batch_id: Optional[int] = None,
+    membership_import_batch_id: Optional[int] = None,
+    research_methodology_id: Optional[int] = None,
+    engine: Optional[Union[Engine, str]] = None,
 ) -> DatasetManifest:
     """Build a DatasetManifest from already-loaded DataFrames.
 
@@ -163,10 +184,53 @@ def build_manifest(
             Informational only (section 2.1 trade-off): recorded on the
             manifest so out-of-band byte churn is observable, but excluded
             from ``manifest_content_sha256`` because it is nondeterministic.
+        eligibility_batch_id: Optional FK to
+            ``data.universe.models.UniverseEligibilityBatch.id`` (03A-5).
+            When supplied, must reference an existing row or building fails
+            closed with :class:`ManifestBatchLinkageError`.
+        membership_import_batch_id: Optional FK to
+            ``data.universe.models.UniverseImportBatch.id`` (03A-5). When
+            supplied, must reference a row in ``published`` status (the same
+            status ``PITUniverseLookup`` requires) or building fails closed
+            with :class:`ManifestBatchLinkageError`.
+        research_methodology_id: Optional FK to
+            ``data.research.models.ResearchMethodology.id`` (03A-5). When
+            supplied, must reference an existing row or building fails
+            closed with :class:`ManifestBatchLinkageError`.
+        engine: SQLAlchemy engine or connection string used to validate any
+            of the three batch/methodology ids above. Required whenever any
+            of those ids is supplied (fail-closed: a batch id cannot be
+            trusted without checking the DB); ignored if none are supplied.
 
     Returns:
         DatasetManifest ready to save via save_manifest().
+
+    Raises:
+        ManifestBatchLinkageError: an ``eligibility_batch_id`` or
+            ``membership_import_batch_id``/``research_methodology_id`` was
+            supplied but does not resolve to an existing (and, for
+            ``membership_import_batch_id``, published) row.
+        ValueError: a batch/methodology id was supplied without ``engine``.
     """
+    if (
+        eligibility_batch_id is not None
+        or membership_import_batch_id is not None
+        or research_methodology_id is not None
+    ) and engine is None:
+        raise ValueError(
+            "engine is required to validate eligibility_batch_id/"
+            "membership_import_batch_id/research_methodology_id against the "
+            "database before building a manifest that links to them (03A-5, "
+            "fail-closed: an unvalidated batch id cannot be trusted)."
+        )
+
+    if membership_import_batch_id is not None:
+        _validate_membership_import_batch(engine, membership_import_batch_id)
+    if eligibility_batch_id is not None:
+        _validate_eligibility_batch(engine, eligibility_batch_id)
+    if research_methodology_id is not None:
+        _validate_research_methodology(engine, research_methodology_id)
+
     row_counts: dict[str, int] = {}
     date_ranges: dict[str, list[str]] = {}
     schema_hashes: dict[str, str] = {}
@@ -219,9 +283,70 @@ def build_manifest(
         alpha_scores_sha256=scores_hash,
         content_sha256=content_hashes,
         bytes_sha256=dict(bytes_sha256) if bytes_sha256 else {},
+        eligibility_batch_id=eligibility_batch_id,
+        membership_import_batch_id=membership_import_batch_id,
+        research_methodology_id=research_methodology_id,
     )
     manifest.manifest_content_sha256 = _manifest_content_sha256(manifest)
     return manifest
+
+
+def _validate_membership_import_batch(engine: Union[Engine, str], batch_id: int) -> None:
+    """Fail closed unless ``batch_id`` references a ``published``
+    ``UniverseImportBatch`` (03A-5) -- the same status
+    ``PITUniverseLookup`` requires before trusting an import for historical
+    research (``data/universe/runtime.py``)."""
+    from data.universe.models import UniverseImportBatch  # lazy: avoid import cycle
+
+    if isinstance(engine, str):
+        engine = create_engine(engine)
+    with Session(engine) as session:
+        batch = session.get(UniverseImportBatch, batch_id)
+        if batch is None or batch.status != "published":
+            raise ManifestBatchLinkageError(
+                f"membership_import_batch_id={batch_id} does not reference a "
+                "published UniverseImportBatch. Refusing to build a manifest "
+                "that pins a bundle against a nonexistent or unpublished "
+                "universe import (03A-5, design plan §2.5)."
+            )
+
+
+def _validate_eligibility_batch(engine: Union[Engine, str], batch_id: int) -> None:
+    """Fail closed unless ``batch_id`` references an existing
+    ``UniverseEligibilityBatch`` row (03A-5). Unlike ``UniverseImportBatch``,
+    eligibility batches have no draft/published status column -- the table
+    is an append-only log of completed computation runs (§1.2), so mere
+    existence is the correct check."""
+    from data.universe.models import UniverseEligibilityBatch  # lazy: avoid import cycle
+
+    if isinstance(engine, str):
+        engine = create_engine(engine)
+    with Session(engine) as session:
+        batch = session.get(UniverseEligibilityBatch, batch_id)
+        if batch is None:
+            raise ManifestBatchLinkageError(
+                f"eligibility_batch_id={batch_id} does not reference an "
+                "existing UniverseEligibilityBatch row. Refusing to build a "
+                "manifest that pins a bundle against a nonexistent "
+                "eligibility computation batch (03A-5, design plan §2.5)."
+            )
+
+
+def _validate_research_methodology(engine: Union[Engine, str], methodology_id: int) -> None:
+    """Fail closed unless ``methodology_id`` references an existing
+    ``ResearchMethodology`` row (03A-5)."""
+    from data.research.models import ResearchMethodology  # lazy: avoid import cycle
+
+    if isinstance(engine, str):
+        engine = create_engine(engine)
+    with Session(engine) as session:
+        row = session.get(ResearchMethodology, methodology_id)
+        if row is None:
+            raise ManifestBatchLinkageError(
+                f"research_methodology_id={methodology_id} does not reference "
+                "an existing ResearchMethodology row. Refusing to build a "
+                "manifest with a dangling methodology link (03A-5)."
+            )
 
 
 # Fields excluded from manifest_content_sha256 because they are provenance/
@@ -370,6 +495,15 @@ def save_manifest(manifest: DatasetManifest, minio_client, bucket: str) -> str:
 
 # A content-addressed manifest version is exactly a SHA-256 hex digest;
 # anything else (a `YYYY-MM-DD` date string) is a legacy mutable key.
+#
+# Every call site below uses `.fullmatch()`, never `.match()`, against this
+# pattern (03A-5 adversarial review): without `re.MULTILINE`, `$` matches
+# either end-of-string OR immediately before a single trailing newline, so
+# `.match()` would accept a 65-character string that is 64 hex chars plus a
+# trailing "\n" (plausible from a shell `$(cat file)` capture or a YAML block
+# scalar) as if it were byte-identical to a real hash. `.fullmatch()` has no
+# such carve-out -- the entire string, including any trailing newline, must
+# match.
 _MANIFEST_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -387,7 +521,36 @@ def _is_malformed_hash_version(version: str) -> bool:
     short `YYYY-MM-DD` date strings (10 characters) and are unaffected by
     this check.
     """
-    return len(version) == 64 and not _MANIFEST_HASH_RE.match(version)
+    return len(version) == 64 and not _MANIFEST_HASH_RE.fullmatch(version)
+
+
+def is_manifest_hash_shaped(data_version: str) -> bool:
+    """True iff ``data_version`` is exactly 64 lowercase hex characters --
+    the shape of a real ``manifest_content_sha256`` (03A-1). Shared by
+    ``load_manifest`` (via ``_MANIFEST_HASH_RE``/``_is_malformed_hash_version``
+    above) and by ``BacktestLogger.log_run``/``log_walk_forward_run`` (03A-5,
+    design plan §2.5's last acceptance test) so both call sites use one
+    definition of "hash-shaped" rather than two independently-maintained
+    regexes."""
+    return bool(_MANIFEST_HASH_RE.fullmatch(data_version))
+
+
+def require_manifest_hash_data_version(data_version: str) -> None:
+    """Raise ``ValueError`` unless ``data_version`` is manifest-hash-shaped
+    (03A-5). Legacy caller-supplied date strings (e.g. ``"2026-06-14"``) and
+    ad hoc test placeholders (``"snapshot-v1"``, ``"v1"``) fail this check by
+    design -- a manifest's ``manifest_content_sha256`` (from
+    ``build_manifest``/``pin_snapshot.py``) is the only value that should be
+    passed as a new run's C7 ``data_version`` going forward."""
+    if not is_manifest_hash_shaped(data_version):
+        raise ValueError(
+            f"data_version {data_version!r} is not a manifest-hash-shaped "
+            "data_version (64 lowercase hex characters). 03A-5 requires new "
+            "backtest runs to pass a real manifest_content_sha256 -- pin a "
+            "bundle via scripts.pin_snapshot and use the printed hash, or "
+            "manifest.manifest_content_sha256 directly -- rather than a "
+            "legacy date-string or placeholder data_version."
+        )
 
 
 def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
@@ -456,7 +619,7 @@ def load_manifest(version: str, minio_client, bucket: str) -> DatasetManifest:
     known = DatasetManifest.__dataclass_fields__
     manifest = DatasetManifest(**{k: v for k, v in data.items() if k in known})
 
-    is_content_addressed = bool(_MANIFEST_HASH_RE.match(version))
+    is_content_addressed = bool(_MANIFEST_HASH_RE.fullmatch(version))
     if is_content_addressed:
         if manifest.legacy_mutable:
             raise SnapshotIntegrityError(

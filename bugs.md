@@ -2268,3 +2268,73 @@ fail-closed on an unsupported filter reached through the scoring path,
 propagation). Full `data/tests/universe/` suite: 237 passed (up from 194 at
 03A-4a Phase A; 232 with just the Phase B core-module tests, 237 with the
 scoring-path wiring tests too).
+
+**03A-5 follow-up (2026-07-21, branch `dev/R2-03A5-manifest-linkage`,
+downstream of BUG-078 but not itself part of it):** the manifest/methodology
+linkage roadmap row (`docs/plans/03a-immutable-research-data-design.md`
+§2.2/§2.4, §5.2's "03A-5" row) that ties a pinned `DatasetManifest` to the
+exact `UniverseImportBatch`/`UniverseEligibilityBatch` this Phase B's data
+feeds is now wired: `backtesting/dataset_manifest.py::build_manifest` accepts
+and fail-closed-validates `eligibility_batch_id`/`membership_import_batch_id`/
+`research_methodology_id`; `scripts/pin_snapshot.py` looks these up from the
+real DB; `BacktestLogger.log_run`/`log_walk_forward_run` gained an opt-in
+`require_manifest_data_version` check rejecting non-hash-shaped
+`data_version` values. This was scoped in the roadmap as its own phased row
+(03A-5), not as a standalone bug, so no new BUG-XXX was opened for it.
+
+**Residual scope gap (adversarial review, 2026-07-21, same branch):**
+`require_manifest_data_version=True` is not passed by any production caller
+yet -- grepping `scripts/`, `backtesting/`, and `airflow/` outside tests
+finds only test call sites setting it `True`. That means today's real
+backtest runs can still call `BacktestLogger.log_run`/`log_walk_forward_run`
+with a legacy date-string `data_version` and succeed, despite 03A-5's stated
+intent that new runs use a real `manifest_content_sha256`. This is a
+legitimate gap in what got wired, not a defect in the code that exists (the
+flag defaults `False` deliberately, documented as a transition flag in both
+the docstring and this file's earlier note) -- flagging here so it isn't
+silently forgotten. Follow-up: once a real backtest-orchestration call site
+exists (none does yet outside tests as of this writing), it should pass
+`require_manifest_data_version=True`. No new BUG-XXX opened for this either,
+per the same roadmap-row reasoning above; revisit as part of whichever slice
+adds the first production `log_run`/`log_walk_forward_run` caller.
+
+**Codex round-1 review fixes (PR #44, same branch):**
+
+- P2: `BacktestLogger.log_run`/`log_walk_forward_run` validated
+  `require_manifest_data_version`'s hash-shape gate against the
+  `.strip()`-cleaned `data_version` used for the MLflow tag, not the raw
+  value actually persisted in `config.json`/`result.config_hash`'s
+  provenance -- a hash-shaped value with a trailing/leading whitespace
+  character would pass the gate on the cleaned-up tag while the artifact
+  still carried the untrimmed, non-conformant string. Fixed by validating
+  the raw (pre-strip) value.
+- P2: `scripts/pin_snapshot.py::pin_bundle` originally always auto-looked-up
+  the "latest published" `UniverseImportBatch`/`UniverseEligibilityBatch`
+  for `--universe-id` and linked whatever it found. `pin_bundle` only reads
+  already-persisted `alpha_scores` -- it has no way to confirm the batch
+  that happens to be "latest" at pin time is actually the one that governed
+  those scores when they were generated (a batch published later, or scores
+  generated without eligibility filtering at all, would be silently
+  stamped on regardless). Fixed by making the lookup an explicit opt-in
+  (`--auto-link-latest-universe-batches`, default off) and adding new
+  `--membership-import-batch-id`/`--eligibility-batch-id` explicit-id flags
+  as the preferred path when the real batch is known; an explicit id always
+  takes precedence over the auto-lookup for that field.
+
+**Codex round-2 review fix (PR #44, same branch):** P2 --
+`scripts/pin_snapshot.py::pin_bundle` accepted any caller-supplied
+`--research-methodology-id` as long as `build_manifest`'s own check found a
+row with that id -- it never cross-checked the id against the methodology
+the PINNED alpha_scores' resolved `research_run_id` actually used. E.g.
+`--research-run-id 8 --research-methodology-id 1` would silently save a
+manifest claiming methodology 1 even if run 8 actually belonged to
+methodology 2, defeating the provenance link this field exists to provide.
+Fixed by resolving the single `research_run_id` behind the pinned
+`alpha_scores` (either the explicit `--research-run-id`, or the sole
+distinct value already required by the BUG-009-section-4 check) and cross-
+checking its `research_runs.methodology_id` against the supplied
+`--research-methodology-id` before any object is written, failing closed
+(`ManifestBatchLinkageError`) on a mismatch. Deliberately not enforced when
+no `research_run_id` is resolvable (pre-`012_research_identity` legacy
+`alpha_scores` with no run column at all) -- there is nothing to prove the
+supplied id wrong against in that case.
