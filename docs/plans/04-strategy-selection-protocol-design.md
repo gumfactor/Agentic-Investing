@@ -526,6 +526,15 @@ evaluate the lifecycle change and the integration proof independently.
    bounds family-wide multiple-testing), but it constrains how future
    strategy families can be dated relative to each other and needs explicit
    sign-off.
+
+   **RESOLVED (2026-07-22):** PER-STRATEGY is the enforced default. The
+   schema still supports per-family windows via the nullable
+   `strategy_family`/`strategy_id` columns on `research_data_windows` (the
+   scope-XOR CHECK constraint, §5.1), but per-strategy is the norm going
+   forward. This is intentionally mixed with Q6's per-family FDR scope
+   resolution below: window sealing is per-strategy, but the multiple-
+   testing correction that reads those windows' trial outcomes is
+   family-wise.
 2. **Holdout length and exact boundary dates.** This plan defines the
    *mechanism* (a sealed, one-shot window) but not the specific calendar
    dates or duration. Given the currently supported backtest window
@@ -538,6 +547,13 @@ evaluate the lifecycle change and the integration proof independently.
    gap requiring ingestion back to ~2018) may be a prerequisite the operator
    needs to schedule before 04-6 can run against real data rather than a
    synthetic fixture.
+
+   **RESOLVED (2026-07-22):** Build the protocol now against synthetic
+   fixtures. The ~2018+ price-history backfill needed for a real
+   train/OOS/holdout split on real data is a scheduled prerequisite before
+   any REAL strategy is qualified through this protocol, but it does NOT
+   block this schema work (04-1) or the recorder/pipeline slices
+   (04-2..04-6), which are proven against fixtures first.
 3. **Promotion thresholds.** Should `validated` require *all six* survival
    funnel gates plus `robust` sensitivity plus `solid` stress plus a DSR
    above some explicit numeric floor (e.g., DSR > 0.95), or is DSR reported
@@ -546,6 +562,10 @@ evaluate the lifecycle change and the integration proof independently.
    but does not currently gate `overall_passed` on it — confirm whether that
    is the intended strictness or whether a DSR floor should be a seventh
    hard gate.
+
+   **RESOLVED (2026-07-22):** INFORMATIONAL ONLY. `dsr_value` is recorded
+   in `promotion_decisions`/evidence for every promotion, but `overall_passed`
+   is NOT gated on any DSR numeric floor. No seventh hard gate is added.
 4. **Mandatory-blocking or advisory trial recording?** §4.1/§4.2 make
    `TrialRecorder` a hard gate for anything reaching `promotion_decisions`
    — a direct, unwrapped `WalkForwardValidator.run` call is structurally
@@ -559,6 +579,14 @@ evaluate the lifecycle change and the integration proof independently.
    means a builder could explore off-protocol and then have to redo the
    winning run through the recorder to make it promotion-eligible; confirm
    that friction is intentional rather than something to soften further.
+
+   **RESOLVED (2026-07-22):** HYBRID. Unwrapped, direct instrument calls
+   remain permitted for quick exploratory iteration (advisory mode) and are
+   simply excluded from `n_trials`/promotion evidence. `TrialRecorder`
+   becomes a hard block only for anything that will ever be cited in a
+   `promotion_decisions` row -- confirmed, the friction of redoing a winning
+   run through the recorder before it becomes promotion-eligible is
+   intentional.
 5. **Selection automation.** §4.0 step 4 treats the winning-config choice as
    a human decision. Should any part of selection (e.g., auto-selecting the
    single highest-DSR candidate among those that already passed
@@ -566,6 +594,11 @@ evaluate the lifecycle change and the integration proof independently.
    candidate proceeds to promotion? Given C1/C8's precedent of never letting
    automation make an unreviewed consequential decision, human selection is
    assumed as the default in this plan; confirm.
+
+   **RESOLVED (2026-07-22):** HUMAN-ONLY. Automation may rank/recommend
+   candidates (e.g. surfacing the highest-DSR candidate among those that
+   already passed `SurvivalFunnel`), but selection itself must always be an
+   explicit human decision, consistent with the C1/C8 precedent.
 6. **Cross-strategy FDR scope.** `benjamini_hochberg` operates over a
    *set* of p-values. Is the intended family-wise comparison "every trial
    ever run for this one `strategy_id`" (narrow), "every trial run for every
@@ -576,6 +609,13 @@ evaluate the lifecycle change and the integration proof independently.
    new registry from day one)? This materially changes how conservative
    promotion becomes as the strategy library (M5.6, 21 composite signals
    across 8 groups) grows.
+
+   **RESOLVED (2026-07-22):** PER-FAMILY. Benjamini-Hochberg is applied
+   across sibling-strategy trials within the same `strategy_family`, not the
+   narrower single-`strategy_id` scope nor the broader registry-wide scope.
+   Paired with Q1's per-strategy window resolution above: window sealing is
+   per-strategy, the FDR correction that consumes those trials' outcomes is
+   family-wise.
 7. **Promotion-pipeline re-run staleness bound.** §4.4 allows reusing an
    already-recorded walk-forward result "within a configurable staleness
    bound" rather than always re-running. What should that bound be (e.g.,
@@ -584,6 +624,12 @@ evaluate the lifecycle change and the integration proof independently.
    at promotion time regardless of cost, given C7's data-version pinning
    already guarantees byte-identical inputs, making staleness a pure
    compute-cost question rather than a correctness one?
+
+   **RESOLVED (2026-07-22):** Re-run fresh at promotion time, UNLESS the
+   already-recorded run used the identical manifest-hash `data_version` --
+   in that case the recorded result may be reused. This makes staleness a
+   pure compute-cost decision keyed strictly off `data_version` equality,
+   never off elapsed wall-clock time.
 8. **Residual-bug handling (BUG-066/068/071) at promotion time.** Should the
    promotion pipeline actively surface these residuals inline in the
    evidence bundle (e.g., a boolean tag "ran against a strategy config with
@@ -596,6 +642,12 @@ evaluate the lifecycle change and the integration proof independently.
    to 04-4 (reading and stamping bug-status flags into the evidence bundle)
    that the current phased breakdown does not include — confirm whether
    that belongs in 04-4 or is acceptable as a later follow-up slice.
+
+   **RESOLVED (2026-07-22):** Surface BUG-066/068/071 INLINE in every
+   promotion evidence bundle (`promotion_decisions.evidence_json`), not just
+   as a one-time acknowledgment in this document. This belongs in 04-4's
+   scope (reading and stamping the residual-bug flags into the evidence
+   bundle when `PromotionPipeline.run` executes).
 
 ## 9. Acknowledged residual limitations this protocol operates on top of
 
