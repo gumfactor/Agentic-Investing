@@ -213,6 +213,14 @@ def run(argv: list[str] | None = None) -> int:
                     "local_path": str(blotter_path),
                     "sha256": blotter_sha256,
                     "selected_ids": json.dumps(selected_seqs),
+                    # Intentionally real wall-clock time, unlike the injected
+                    # now_fn/today_fn convention used elsewhere in
+                    # scripts/paper_*.py (see BUG-081): this is a human
+                    # operator's C1 approval audit timestamp, which must
+                    # record the actual moment of approval, not a test-
+                    # injectable clock. Not a missed instance of BUG-081 --
+                    # audited during the BUG-081 sweep and deliberately left
+                    # as-is.
                     "approved_at": datetime.now(UTC).isoformat(),
                     "approved_by": operator,
                     "confirmed_sha256": blotter_sha256,
