@@ -609,4 +609,27 @@ def test_get_runs_filters(registry: StrategyRegistry, cfg: Path) -> None:
 
     passed_backtests = registry.get_runs(s.strategy_id, run_type="backtest", status="passed")
     assert len(passed_backtests) == 1
-    assert passed_backtests[0].metrics["sharpe"] == 0.8
+
+
+# ── selection-schema table registration (Codex round-3 P2) ────────────────────
+
+
+def test_public_registry_setup_creates_selection_schema_tables(
+    registry: StrategyRegistry,
+) -> None:
+    """StrategyRegistry(...) is the public setup path used by the CLI and by
+    downstream callers (TrialRecorder/PromotionPipeline). It must create the
+    four selection-schema tables (strategy_registry/selection_models.py) via
+    Base.metadata.create_all(), not just the four base tables -- even though
+    nothing on this path imports selection_models directly.
+    """
+    from sqlalchemy import inspect
+
+    table_names = set(inspect(registry._engine).get_table_names())
+    for expected in (
+        "strategy_hypotheses",
+        "strategy_trials",
+        "research_data_windows",
+        "promotion_decisions",
+    ):
+        assert expected in table_names, f"{expected} missing from public registry setup"

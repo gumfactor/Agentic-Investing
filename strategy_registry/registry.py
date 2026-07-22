@@ -11,6 +11,9 @@ from sqlalchemy.orm import Session, selectinload
 
 from strategy_registry import fingerprint as fp_module
 from strategy_registry.fingerprint import StrategyFingerprint
+from strategy_registry import selection_models  # noqa: F401 -- import for side effect: registers
+# StrategyHypothesis/StrategyTrial/ResearchDataWindow/PromotionDecision on Base.metadata
+# so Base.metadata.create_all() below creates their tables too.
 from strategy_registry.models import (
     Base,
     Strategy,
