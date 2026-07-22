@@ -2320,3 +2320,21 @@ adds the first production `log_run`/`log_walk_forward_run` caller.
   `--membership-import-batch-id`/`--eligibility-batch-id` explicit-id flags
   as the preferred path when the real batch is known; an explicit id always
   takes precedence over the auto-lookup for that field.
+
+**Codex round-2 review fix (PR #44, same branch):** P2 --
+`scripts/pin_snapshot.py::pin_bundle` accepted any caller-supplied
+`--research-methodology-id` as long as `build_manifest`'s own check found a
+row with that id -- it never cross-checked the id against the methodology
+the PINNED alpha_scores' resolved `research_run_id` actually used. E.g.
+`--research-run-id 8 --research-methodology-id 1` would silently save a
+manifest claiming methodology 1 even if run 8 actually belonged to
+methodology 2, defeating the provenance link this field exists to provide.
+Fixed by resolving the single `research_run_id` behind the pinned
+`alpha_scores` (either the explicit `--research-run-id`, or the sole
+distinct value already required by the BUG-009-section-4 check) and cross-
+checking its `research_runs.methodology_id` against the supplied
+`--research-methodology-id` before any object is written, failing closed
+(`ManifestBatchLinkageError`) on a mismatch. Deliberately not enforced when
+no `research_run_id` is resolvable (pre-`012_research_identity` legacy
+`alpha_scores` with no run column at all) -- there is nothing to prove the
+supplied id wrong against in that case.

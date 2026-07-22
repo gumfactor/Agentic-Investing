@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
-from backtesting.dataset_manifest import build_manifest
+from backtesting.dataset_manifest import ManifestBatchLinkageError, build_manifest
 
 load_dotenv()
 
@@ -225,6 +225,12 @@ def pin_bundle(
     # --research-run-id remains the explicit, single-run opt-in that always
     # bypasses this (there is nothing left to splice once scoped to one
     # run).
+    # Resolved to the single research_run_id that actually produced the
+    # pinned alpha_scores -- either the caller's explicit --research-run-id,
+    # or (once the block below confirms there's exactly one) the sole
+    # distinct value present in the rows. None when alpha_scores has no
+    # research_run_id column at all (pre-012_research_identity legacy data).
+    resolved_run_id: int | None = research_run_id
     if research_run_id is None and "research_run_id" in alpha_scores.columns:
         distinct_runs = sorted(alpha_scores["research_run_id"].dropna().unique().tolist())
         if len(distinct_runs) > 1:
@@ -251,6 +257,21 @@ def pin_bundle(
                 "4, adversarial-review round 11). Pass --research-run-id to "
                 "pin exactly one run's rows."
             )
+        elif len(distinct_runs) == 1:
+            resolved_run_id = distinct_runs[0]
+
+    # Codex round-2 review (03A-5, PR #44): a caller-supplied
+    # research_methodology_id passing build_manifest's own "does this row
+    # exist" check is not enough -- it says nothing about whether that
+    # methodology is the one the PINNED alpha_scores were actually produced
+    # under. Cross-check it against the resolved run's real methodology_id
+    # before doing any writes, so e.g. `--research-run-id 8
+    # --research-methodology-id 1` cannot silently save a manifest claiming
+    # methodology 1 when run 8 actually belongs to methodology 2.
+    if research_methodology_id is not None:
+        _validate_research_methodology_matches_run(
+            engine, research_methodology_id, resolved_run_id, strategy_id
+        )
 
     price_start = pd.to_datetime(prices["date"]).min().date()
     price_end = pd.to_datetime(prices["date"]).max().date()
@@ -309,6 +330,54 @@ def pin_bundle(
         engine=engine,
     )
     return snapshots.save_dataset_manifest(manifest)
+
+
+def _validate_research_methodology_matches_run(
+    engine, research_methodology_id: int, resolved_run_id: int | None, strategy_id: str
+) -> None:
+    """Fail closed if a caller-supplied ``research_methodology_id`` does not
+    match the methodology of the ``research_run_id`` that actually produced
+    the pinned ``alpha_scores`` (Codex round-2 review, 03A-5, PR #44).
+
+    ``build_manifest``'s own validation only checks that the supplied
+    methodology id references an EXISTING ``ResearchMethodology`` row -- it
+    has no idea which run's scores are being pinned, so it cannot catch a
+    real-but-wrong methodology id (e.g. ``--research-run-id 8
+    --research-methodology-id 1`` when run 8 actually belongs to
+    methodology 2). This cross-checks against ``research_runs.methodology_id``
+    for the resolved run before any object is written.
+
+    Deliberately NOT a hard failure when ``resolved_run_id`` is ``None``:
+    ``alpha_scores`` rows written before the ``research_run_id`` backfill
+    (migration ``012_research_identity``) have no run to cross-check
+    against, so a caller-supplied ``research_methodology_id`` in that case
+    is unverifiable, not provably wrong -- there is nothing to fail closed
+    against.
+    """
+    if resolved_run_id is None:
+        return
+    from data.research.models import ResearchRun
+
+    with Session(engine) as session:
+        run = session.get(ResearchRun, resolved_run_id)
+        if run is None:
+            raise ManifestBatchLinkageError(
+                f"research_run_id={resolved_run_id} (resolved from the pinned "
+                f"alpha_scores for strategy_id={strategy_id!r}) does not "
+                "reference an existing ResearchRun row -- cannot cross-check "
+                "the supplied --research-methodology-id against it. Refusing "
+                "to pin against a dangling research_run_id."
+            )
+        if run.methodology_id != research_methodology_id:
+            raise ManifestBatchLinkageError(
+                f"--research-methodology-id {research_methodology_id} does not "
+                f"match the methodology (id={run.methodology_id}) that "
+                f"research_run_id={resolved_run_id} -- the run whose scores are "
+                f"actually being pinned for strategy_id={strategy_id!r} -- used. "
+                "Refusing to save a manifest whose research_methodology_id "
+                "link would misrepresent the methodology that actually "
+                "produced the pinned alpha_scores."
+            )
 
 
 def _latest_published_import_batch_id(engine, universe_id: str) -> int | None:

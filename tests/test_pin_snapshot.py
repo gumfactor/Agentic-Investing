@@ -760,3 +760,179 @@ def test_pin_bundle_rejects_nonexistent_research_methodology_id():
             engine=engine, snapshots=MagicMock(), market_client=_benchmark_client(),
             research_methodology_id=999,
         )
+
+
+# ─── Codex round-2 (PR #44): research_methodology_id cross-checked against the ──
+# ─── resolved run's actual methodology, not just "does the row exist" ──────────
+
+
+def _create_research_methodology(session, *, name: str) -> int:
+    from datetime import datetime, timezone
+
+    from data.research.models import ResearchMethodology
+
+    methodology = ResearchMethodology(
+        name=name,
+        universe_import_policy="strict",
+        timing_policy_id="t0",
+        score_action_availability_policy="strict",
+        realized_return_action_availability_policy="strict",
+        action_source_version="v1",
+        return_adjustment_policy="total_return",
+        missing_data_policy="exclude",
+        code_config_hash="deadbeef",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(methodology)
+    session.flush()
+    return methodology.id
+
+
+def _create_research_run(session, *, methodology_id: int, data_version: str) -> int:
+    from datetime import datetime, timezone
+
+    from data.research.models import ResearchRun
+
+    run = ResearchRun(
+        methodology_id=methodology_id,
+        data_version=data_version,
+        status="active",
+        is_active=True,
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(run)
+    session.flush()
+    return run.id
+
+
+def _engine_with_bundle_data_scored_under_one_run():
+    """Bundle-data engine where alpha_scores carries a research_run_id
+    column pointing at a real, single ResearchRun row (with a real
+    ResearchMethodology) -- the shape needed to exercise the
+    research_methodology_id <-> research_run_id cross-check."""
+    from sqlalchemy.orm import Session
+
+    engine = _engine_with_bundle_data()
+    with Session(engine) as session:
+        methodology_id = _create_research_methodology(session, name="m-correct")
+        run_id = _create_research_run(session, methodology_id=methodology_id, data_version="v1")
+        session.commit()
+
+    prices = pd.DataFrame(
+        {
+            "ticker": ["AAPL", "AAPL"],
+            "date": [date(2022, 1, 3), date(2022, 1, 4)],
+            "close": [100.0, 101.0],
+        }
+    )
+    alpha = pd.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "score_date": [date(2022, 1, 4)],
+            "strategy_id": ["v1"],
+            "alpha_score": [1.0],
+            "research_run_id": [run_id],
+        }
+    )
+    # Existing daily_prices/alpha_scores tables were already populated by
+    # _engine_with_bundle_data(); replace alpha_scores with the
+    # research_run_id-bearing version (a different schema -- "append" would
+    # fail against the old column set) and leave daily_prices as-is.
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE alpha_scores")
+    alpha.to_sql("alpha_scores", engine, index=False)
+    return engine, methodology_id, run_id
+
+
+def test_pin_bundle_rejects_research_methodology_id_mismatched_with_resolved_run():
+    """The core Codex round-2 finding: a caller-supplied
+    --research-methodology-id that references a real, EXISTING
+    ResearchMethodology row (so build_manifest's own check alone would
+    accept it) but is NOT the methodology the resolved run actually used
+    must still fail closed."""
+    from sqlalchemy.orm import Session
+
+    from backtesting.dataset_manifest import ManifestBatchLinkageError
+
+    engine, correct_methodology_id, run_id = _engine_with_bundle_data_scored_under_one_run()
+    with Session(engine) as session:
+        wrong_methodology_id = _create_research_methodology(session, name="m-wrong")
+        session.commit()
+    assert wrong_methodology_id != correct_methodology_id
+
+    with pytest.raises(ManifestBatchLinkageError, match="does not match the methodology"):
+        pin_bundle(
+            "v1", "SPY", date(2022, 1, 5),
+            engine=engine, snapshots=MagicMock(), market_client=_benchmark_client(),
+            research_methodology_id=wrong_methodology_id,
+        )
+
+
+def test_pin_bundle_rejects_research_methodology_id_mismatched_with_explicit_run():
+    """Same cross-check, exercised via an explicit --research-run-id rather
+    than auto-resolution from a single-run alpha_scores history."""
+    from sqlalchemy.orm import Session
+
+    from backtesting.dataset_manifest import ManifestBatchLinkageError
+
+    engine, correct_methodology_id, run_id = _engine_with_bundle_data_scored_under_one_run()
+    with Session(engine) as session:
+        wrong_methodology_id = _create_research_methodology(session, name="m-wrong-explicit")
+        session.commit()
+
+    with pytest.raises(ManifestBatchLinkageError, match="does not match the methodology"):
+        pin_bundle(
+            "v1", "SPY", date(2022, 1, 5),
+            engine=engine, snapshots=MagicMock(), market_client=_benchmark_client(),
+            research_run_id=run_id,
+            research_methodology_id=wrong_methodology_id,
+        )
+
+
+def test_pin_bundle_accepts_research_methodology_id_matching_resolved_run():
+    """The positive case: a --research-methodology-id that genuinely matches
+    the resolved run's methodology must succeed and the manifest must carry
+    it."""
+    client = _InMemoryMinio()
+    snapshots = _real_snapshots(client)
+    engine, correct_methodology_id, run_id = _engine_with_bundle_data_scored_under_one_run()
+
+    manifest_path = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
+        research_methodology_id=correct_methodology_id,
+    )
+
+    from backtesting.dataset_manifest import load_manifest
+
+    data_version = manifest_path.split("/")[-2]
+    manifest = load_manifest(data_version, client, "rqis-snapshots")
+    assert manifest.research_methodology_id == correct_methodology_id
+
+
+def test_pin_bundle_skips_methodology_cross_check_when_no_research_run_id_column():
+    """Legacy alpha_scores with no research_run_id column at all (pre-
+    012_research_identity) cannot be cross-checked -- resolved_run_id is
+    None, so a caller-supplied research_methodology_id is accepted as long
+    as it references a real row (build_manifest's own existence check),
+    since there is nothing to prove it wrong against."""
+    from sqlalchemy.orm import Session
+
+    engine = _engine_with_bundle_data()  # no research_run_id column
+    with Session(engine) as session:
+        methodology_id = _create_research_methodology(session, name="m-legacy")
+        session.commit()
+
+    client = _InMemoryMinio()
+    snapshots = _real_snapshots(client)
+    manifest_path = pin_bundle(
+        "v1", "SPY", date(2022, 1, 5),
+        engine=engine, snapshots=snapshots, market_client=_benchmark_client(),
+        research_methodology_id=methodology_id,
+    )
+
+    from backtesting.dataset_manifest import load_manifest
+
+    data_version = manifest_path.split("/")[-2]
+    manifest = load_manifest(data_version, client, "rqis-snapshots")
+    assert manifest.research_methodology_id == methodology_id
