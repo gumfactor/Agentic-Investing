@@ -78,6 +78,35 @@ Task branches are named `dev/R2-<order>-<slug>`. Each phased slice is one
 commit; each roadmap job (or sub-job below) is one PR into `dev/R2-phase1`.
 Token figures are reported as `<agent/effort>: <tokens>`.
 
+**PM decisions (2026-07-22, Gate 04 kickoff):**
+
+- **Gate 04 unblocked and started design-doc-first.** Deps 02B/03A/03B all
+  merged. Phase-0 design plan delivered on branch
+  `dev/R2-04-strategy-selection-protocol`
+  ([docs/plans/04-strategy-selection-protocol-design.md](docs/plans/04-strategy-selection-protocol-design.md));
+  PM-approved. Implementation phased 04-1..04-6 (schema → TrialRecorder →
+  hypothesis registry → PromotionPipeline → `validated` status → e2e proof).
+  The design doc rides with the first implementation PR (04-1), no standalone PR.
+- **Operator answers to the design doc's §8 open questions (locked 2026-07-22):**
+  - **Q2 dataset/holdout:** build the protocol now against synthetic fixtures;
+    schedule the known ~2018+ price-history backfill as a prerequisite before
+    any REAL strategy is qualified (protocol machinery is independent of dataset
+    length). **New roadmap prerequisite implied — price-history ingestion back to
+    ~2018 must precede real Gate-04 qualification / Gate 09.**
+  - **Q1 window scope:** **per-strategy** train/OOS/holdout boundaries (schema
+    still supports per-family; per-strategy is the enforced default).
+  - **Q3 DSR:** **informational only** — record DSR in the evidence bundle, do
+    NOT gate `overall_passed` on a DSR floor.
+  - **Q6 FDR scope:** **per-family** Benjamini-Hochberg across sibling-strategy
+    trials.
+  - PM-adopted defaults (operator may override): Q4 recorder = hybrid
+    (advisory for exploration, hard-block for promotion-cited runs); Q5 =
+    human-only selection (C1/C8); Q7 = fresh re-run unless identical manifest-hash
+    `data_version`; Q8 = surface BUG-066/068/071 inline in every evidence bundle.
+- **02A remains the operator-only critical-path bottleneck** for the entire
+  05→08 control-plane/execution track (migrations 009+013, PIT universe import,
+  live no-submit Compose run). Gate 04 runs in parallel and does not depend on it.
+
 **PM decisions (2026-07-20, wave 2 cont.):**
 
 - **Codex review gate waived under rate limits (operator):** Codex hit its
