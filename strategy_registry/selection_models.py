@@ -102,7 +102,7 @@ class StrategyTrial(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "window IN ('train_oos', 'holdout')",
+            '"window" IN (\'train_oos\', \'holdout\')',
             name="ck_strategy_trials_window",
         ),
         CheckConstraint(

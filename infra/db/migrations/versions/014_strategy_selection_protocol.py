@@ -132,7 +132,7 @@ def upgrade() -> None:
             ondelete="RESTRICT",
         ),
         sa.CheckConstraint(
-            "window IN ('train_oos', 'holdout')",
+            '"window" IN (\'train_oos\', \'holdout\')',
             name="ck_strategy_trials_window",
         ),
         sa.CheckConstraint(
