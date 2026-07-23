@@ -1434,6 +1434,101 @@ def test_parameter_sweep_window_override_checked_before_final_holdout_confirmati
     assert recorder.list_trials("v1_test_strategy") == []
 
 
+# Codex round-5 P1: ParameterSweeper._set_nested applies a param_grid key as a
+# dot-path and REPLACES the whole subtree at that path -- not just a scalar
+# leaf. So rejecting only the exact leaf keys ("backtest.start_date",
+# "backtest.end_date") left a gap: a param_grid key of "backtest" (the whole
+# section) also replaces both dates wholesale, evading the exact-key filter.
+# These tests cover the ancestry-based rejection rule that closes it, and
+# prove the rule is precise (siblings like backtest.initial_capital are still
+# allowed) rather than a blanket ban on every backtest.* key.
+
+
+def test_parameter_sweep_rejects_whole_backtest_section_override_before_dispatch(
+    recorder: TrialRecorder,
+) -> None:
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)  # holdout = 2023-01-01 .. 2023-07-01
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(SweepWindowOverrideError, match="backtest"):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={
+                "backtest": [
+                    {
+                        "start_date": "2023-03-01",
+                        "end_date": "2023-06-01",
+                        "initial_capital": 100000,
+                    }
+                ]
+            },
+            data_handler=MagicMock(),
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_parameter_sweep_rejects_empty_string_key(recorder: TrialRecorder) -> None:
+    """A blank/whitespace-only param_grid key is a degenerate ancestor of the
+    entire config root and must be rejected defensively, not silently
+    forwarded to ParameterSweeper._set_nested."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(SweepWindowOverrideError):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={"": [1, 2]},
+            data_handler=MagicMock(),
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_parameter_sweep_accepts_initial_capital_sibling_key(
+    recorder: TrialRecorder,
+) -> None:
+    """backtest.initial_capital is a sibling of backtest.start_date/end_date,
+    not an ancestor of either -- the ancestry rule must accept it so
+    legitimate non-window sweeps under the backtest section still work
+    (proves the fix is precise, not a blanket ban on all backtest.* keys)."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result(mean_sharpe=0.75))
+
+    result = recorder.run_parameter_sweep(
+        sweeper,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        base_config=base_config,
+        param_grid={"backtest.initial_capital": [50000, 100000]},
+        data_handler=MagicMock(),
+    )
+
+    assert result.mean_oos_sharpe == 0.75
+    sweeper.sweep.assert_called_once()
+    trials = recorder.list_trials("v1_test_strategy")
+    assert len(trials) == 1
+    assert trials[0].status == "completed"
+    assert trials[0].run_type == "parameter_sweep_variant"
+
+
 # ── Walk-forward fold containment (proof the class is closed for folds) ────────
 
 

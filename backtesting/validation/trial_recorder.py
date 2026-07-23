@@ -47,23 +47,29 @@ validate the exact concrete date range whose data is actually READ during
 dispatch, using inclusive-boundary semantics, and must never validate a
 declared/base range that dispatch can silently diverge from.
 ``run_parameter_sweep``'s ``param_grid`` applies dot-path overrides
-per-variant (see ``ParameterSweeper._apply_params``), so a ``param_grid``
-containing ``backtest.start_date``/``backtest.end_date`` (or any other key
-that moves the window of dates whose data is read) could pass the guard on
-the validated BASE range while a dispatched VARIANT actually runs over
-sealed holdout / post-holdout dates -- recorded under the single
-``train_oos`` trial row, with the one-shot holdout seal never consumed. Per
+per-variant (see ``ParameterSweeper._apply_params``/``_set_nested``), and
+``_set_nested`` REPLACES the entire subtree at a param_grid key's dot-path --
+not just a scalar leaf. So a ``param_grid`` key that is either window leaf
+itself (``backtest.start_date``/``backtest.end_date``), OR an ANCESTOR of
+one (e.g. the whole ``backtest`` section, which replaces the mapping
+containing both dates), could pass the guard on the validated BASE range
+while a dispatched VARIANT actually runs over sealed holdout / post-holdout
+dates -- recorded under the single ``train_oos`` trial row, with the
+one-shot holdout seal never consumed. Per
 ``backtesting/config_contract.py``'s CONSUMED-field audit, the *only* two
 config keys anywhere in the backtest path that control which dates' data
 gets read are ``backtest.start_date`` and ``backtest.end_date`` --
 everything else CONSUMED (``portfolio.*``, ``execution.*``,
 ``backtest.initial_capital``, top-level ``name``/``version``/
 ``data_version``/``strategy_id``) governs strategy parameters, the cost
-model, or record labelling, never the window of dates read. ``run_parameter_sweep``
-therefore rejects any ``param_grid`` that touches either window key
+model, or record labelling, never the window of dates read.
+``run_parameter_sweep`` therefore rejects any ``param_grid`` key whose
+dot-path is an ancestor-or-equal of either window key's dot-path
 (:class:`SweepWindowOverrideError`) *before* any recording or dispatch: the
 evaluation window is governed by the registered ``research_data_windows``
-row, not the sweep grid -- a sweep varies STRATEGY parameters only.
+row, not the sweep grid -- a sweep varies STRATEGY parameters only, and a
+sibling key such as ``backtest.initial_capital`` (not an ancestor of either
+date leaf) remains a legitimate sweep target.
 Walk-forward fold subdivision (``WalkForwardValidator._build_fold_dates``)
 needs no analogous check: every fold date is drawn from
 ``data_handler.trading_dates(full_start, full_end)``, which is itself
@@ -116,7 +122,7 @@ from strategy_registry.selection_models import ResearchDataWindow, StrategyTrial
 logger = structlog.get_logger(__name__)
 
 
-# 04-2 round-4 fix: the ONLY config dot-paths anywhere in the backtest path
+# 04-2 round-5 fix: the two dot-paths anywhere in the backtest path
 # (backtesting/engine/event_loop.py, backtesting/validation/walk_forward.py,
 # backtesting/validation/parameter_sensitivity.py) that control which dates'
 # data get read. Derived directly from the CONSUMED-field audit in
@@ -125,35 +131,76 @@ logger = structlog.get_logger(__name__)
 # portfolio.min_holding_days, portfolio.max_position_weight, execution.*,
 # backtest.initial_capital, top-level name/version/data_version/strategy_id)
 # governs strategy construction, cost model, or record labelling within an
-# already-fixed date range -- never the range itself. A `param_grid` entry
-# for either key below must be rejected before any sweep dispatch; see the
-# module docstring's "class invariant" note.
-_WINDOW_OVERRIDE_KEYS = frozenset({
-    "backtest.start_date",
-    "backtest.end_date",
-})
+# already-fixed date range -- never the range itself.
+#
+# The invariant enforced by ``_reject_window_override_keys`` is NOT "the
+# param_grid key is exactly one of these two strings" -- ``ParameterSweeper.
+# _set_nested`` applies a param_grid key as a dot-path and REPLACES the
+# entire subtree at that path (see parameter_sensitivity.py's
+# ``_set_nested``/``_apply_params``). So a param_grid key of ``"backtest"``
+# (the whole section, one segment up from either leaf) also replaces
+# ``backtest.start_date``/``backtest.end_date`` wholesale -- it just does so
+# indirectly, by overwriting their parent mapping. The correct rejection
+# rule is therefore ANCESTRY: reject a key ``k`` iff overriding the subtree
+# rooted at ``k`` could change either window key's value, i.e. iff ``k``'s
+# dot-path segments are a prefix of (or equal to) ``["backtest",
+# "start_date"]`` or ``["backtest", "end_date"]``. A degenerate empty/blank
+# key is rejected defensively as an ancestor of everything (a root-level
+# replace). Sibling keys such as ``backtest.initial_capital`` are NOT
+# ancestors of either date leaf and remain allowed, so legitimate
+# non-window sweeps over that key still work. See the module docstring's
+# "class invariant" note.
+_WINDOW_KEY_PATHS: tuple[tuple[str, ...], ...] = (
+    ("backtest", "start_date"),
+    ("backtest", "end_date"),
+)
+
+
+def _is_window_overriding_key(key: str) -> bool:
+    """True iff replacing the subtree at dot-path ``key`` (as ``ParameterSweeper.
+    _set_nested`` does for a ``param_grid`` entry) could change
+    ``backtest.start_date`` or ``backtest.end_date`` -- i.e. ``key``'s segments
+    are an ancestor-or-equal dot-path of either window key (04-2 round-5 fix).
+    """
+    stripped = key.strip()
+    if not stripped:
+        # A blank/whitespace-only key is a degenerate ancestor of the whole
+        # config root -- reject defensively rather than let it fall through
+        # to whatever _set_nested does with an empty path.
+        return True
+    segments = tuple(stripped.split("."))
+    for window_path in _WINDOW_KEY_PATHS:
+        if segments == window_path[: len(segments)]:
+            return True
+    return False
 
 
 def _reject_window_override_keys(param_grid: dict[str, list]) -> None:
     """Fail closed before any recording/dispatch if ``param_grid`` contains a
-    dot-path key that would let a per-variant override move the window of
-    dates whose data is actually read (04-2 round-4 fix).
+    dot-path key that is an ancestor-or-equal of ``backtest.start_date``/
+    ``backtest.end_date`` -- i.e. a key whose per-variant override could move
+    the window of dates whose data is actually read (04-2 round-5 fix).
     """
-    offending = sorted(key for key in param_grid if key in _WINDOW_OVERRIDE_KEYS)
+    offending = sorted(key for key in param_grid if _is_window_overriding_key(key))
     if offending:
         raise SweepWindowOverrideError(
-            "param_grid contains key(s) that override the evaluation date "
-            f"window: {offending}. A parameter sweep varies STRATEGY "
-            "parameters only -- the evaluation window is governed by the "
-            "registered research_data_windows row (validated against "
-            "base_config's backtest.start_date/end_date), never by the "
-            "sweep grid. Allowing a per-variant date-window override would "
-            "let a variant run over sealed holdout / post-holdout dates "
-            "while the single trial row is recorded as 'train_oos' and the "
-            "one-shot holdout seal is never consumed. Remove these key(s) "
-            "from param_grid; if you need to test a different date range, "
-            "run a separate TrialRecorder call with that range as the base "
-            "config so the guard validates what actually executes."
+            "param_grid contains key(s) whose per-variant override could "
+            f"change the evaluation date window: {offending}. A parameter "
+            "sweep varies STRATEGY parameters only -- the evaluation window "
+            "is governed by the registered research_data_windows row "
+            "(validated against base_config's backtest.start_date/end_date), "
+            "never by the sweep grid. ParameterSweeper._set_nested replaces "
+            "the entire subtree at a param_grid key's dot-path, so a key "
+            "that is an ancestor of backtest.start_date/backtest.end_date "
+            "(e.g. the whole 'backtest' section, not just the leaf date "
+            "keys themselves) can also move the window indirectly. Allowing "
+            "that would let a variant run over sealed holdout / "
+            "post-holdout dates while the single trial row is recorded as "
+            "'train_oos' and the one-shot holdout seal is never consumed. "
+            "Remove these key(s) from param_grid; if you need to test a "
+            "different date range, run a separate TrialRecorder call with "
+            "that range as the base config so the guard validates what "
+            "actually executes."
         )
 
 
@@ -175,13 +222,15 @@ class HoldoutWindowViolationError(TrialRecorderError):
 
 class SweepWindowOverrideError(TrialRecorderError):
     """Raised when a ``run_parameter_sweep`` ``param_grid`` contains a
-    dot-path key that would let a per-variant override move the window of
-    dates whose data is actually read, diverging from the base range the
-    §4.2 holdout guard validated (04-2 round-4 fix).
+    dot-path key that is an ancestor-or-equal of ``backtest.start_date``/
+    ``backtest.end_date`` -- i.e. a key whose per-variant override could move
+    the window of dates whose data is actually read, diverging from the base
+    range the §4.2 holdout guard validated (04-2 round-5 fix).
 
     See the module docstring's "class invariant" note for the full
-    rationale and the audited set of window-controlling keys
-    (``backtest.start_date``, ``backtest.end_date``).
+    rationale: the rejection rule is dot-path ANCESTRY relative to
+    ``backtest.start_date``/``backtest.end_date`` (so the whole ``backtest``
+    section is rejected too), not exact membership in those two leaf keys.
     """
 
 
@@ -352,11 +401,13 @@ class TrialRecorder:
 
         Raises:
             SweepWindowOverrideError: ``param_grid`` contains a dot-path key
-                (``backtest.start_date``/``backtest.end_date``) that would
-                let a per-variant override move the window of dates whose
-                data is actually read, diverging from the base range the
-                §4.2 guard validated (04-2 round-4 fix). Checked first,
-                before any recording or dispatch.
+                that is an ancestor-or-equal of ``backtest.start_date``/
+                ``backtest.end_date`` (e.g. either leaf itself, or the whole
+                ``backtest`` section) that would let a per-variant override
+                move the window of dates whose data is actually read,
+                diverging from the base range the §4.2 guard validated
+                (04-2 round-5 fix). Checked first, before any recording or
+                dispatch.
             HoldoutWindowViolationError: ``final_holdout_confirmation=True``
                 was passed. A parameter sweep evaluates every variant in
                 ``param_grid`` against the wrapped data, so a "final holdout

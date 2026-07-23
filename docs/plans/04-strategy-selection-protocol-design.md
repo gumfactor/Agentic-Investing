@@ -283,14 +283,22 @@ that dispatch can diverge from. Date ranges are inclusive on both ends
 must be strictly before `holdout_start`, not merely `<= oos_end` (a run
 ending exactly on a touching `oos_end == holdout_start` boundary would
 otherwise read the first sealed holdout session). A `ParameterSweeper.sweep`
-`param_grid` may **not** override `backtest.start_date`/`backtest.end_date`
-(or any other config key that controls which dates' data get read — the
-config-contract audit found no others; every other CONSUMED field governs
-strategy parameters, the cost model, or record labelling within an
-already-fixed range): `TrialRecorder.run_parameter_sweep` rejects any such
-`param_grid` before recording or dispatch, because a sweep varies STRATEGY
-parameters only — the evaluation window is governed by the registered
-`research_data_windows` row, never by the sweep grid. Walk-forward fold
+`param_grid` may **not** contain a dot-path key that is an ancestor-or-equal
+of `backtest.start_date`/`backtest.end_date` (04-2 round-5 hardening):
+`ParameterSweeper._set_nested` replaces the whole subtree at a `param_grid`
+key's path, so rejecting only the two exact leaf keys is insufficient — a
+key one level up (the whole `backtest` section) also replaces both dates
+wholesale. `backtest.start_date`/`backtest.end_date` are the only config
+keys anywhere in the backtest path that control which dates' data get read
+— the config-contract audit found no others; every other CONSUMED field
+(including sibling keys like `backtest.initial_capital`, which remain a
+legitimate sweep target) governs strategy parameters, the cost model, or
+record labelling within an already-fixed range. `TrialRecorder.
+run_parameter_sweep` rejects any `param_grid` key whose dot-path is an
+ancestor-or-equal of either window key before recording or dispatch,
+because a sweep varies STRATEGY parameters only — the evaluation window is
+governed by the registered `research_data_windows` row, never by the sweep
+grid. Walk-forward fold
 subdivision needs no separate check: every fold date is drawn from
 `data_handler.trading_dates(full_start, full_end)`, itself bounded to the
 already-validated outer range, so no fold can exceed it.
