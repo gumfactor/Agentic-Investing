@@ -37,7 +37,7 @@ from strategy_registry.models import StrategyDefinition
 from strategy_registry.selection_models import ResearchDataWindow
 from sqlalchemy.orm import Session
 
-DATA_VERSION = "rqis-snapshots/manifests/2026-06-14/manifest.json"
+DATA_VERSION = "a" * 64
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -672,3 +672,107 @@ def test_reversed_date_range_raises_value_error(recorder: TrialRecorder) -> None
 
     validator.run.assert_not_called()
     assert recorder.list_trials("v1_test_strategy") == []
+
+
+# ── FIX 1: a parameter sweep must never run against the sealed holdout ─────────
+
+
+def test_parameter_sweep_final_holdout_confirmation_is_rejected_before_dispatch(
+    recorder: TrialRecorder,
+) -> None:
+    """final_holdout_confirmation=True on run_parameter_sweep must fail
+    closed BEFORE any recording or dispatch -- a sweep evaluates the whole
+    param_grid, so running it against the sealed holdout would spend the
+    one-shot seal on many looks at the holdout data rather than one fixed
+    configuration."""
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(HoldoutWindowViolationError):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash="a" * 64,
+            data_version=DATA_VERSION,
+            base_config=_config("2023-01-01", "2023-07-01"),
+            param_grid={"portfolio.n_long": [10, 20]},
+            data_handler=MagicMock(),
+            final_holdout_confirmation=True,
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+# ── FIX 2: C7 manifest-hash shape enforcement on data_version ──────────────────
+
+
+@pytest.mark.parametrize(
+    "bad_data_version",
+    [
+        "rqis-snapshots/manifests/2026-06-14/manifest.json",
+        "not-a-hash",
+        "2026-06-14",
+        "A" * 64,  # uppercase hex fails the lowercase-only shape
+    ],
+)
+def test_non_hash_data_version_is_rejected_on_walk_forward(
+    recorder: TrialRecorder, bad_data_version: str
+) -> None:
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(ValueError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash="a" * 64,
+            data_version=bad_data_version,
+            config=_config("2022-01-01", "2022-12-31"),
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_non_hash_data_version_is_rejected_on_parameter_sweep(recorder: TrialRecorder) -> None:
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper()
+
+    with pytest.raises(ValueError):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash="a" * 64,
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            base_config=_config("2022-01-01", "2022-12-31"),
+            param_grid={"portfolio.n_long": [10, 20]},
+            data_handler=MagicMock(),
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_valid_hash_shaped_data_version_is_accepted(recorder: TrialRecorder) -> None:
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash="a" * 64,
+        data_version="3fae" + "0" * 60,
+        config=_config("2022-01-01", "2022-12-31"),
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    trials = recorder.list_trials("v1_test_strategy")
+    assert len(trials) == 1
+    assert trials[0].data_version == "3fae" + "0" * 60

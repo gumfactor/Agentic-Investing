@@ -52,6 +52,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backtesting.dataset_manifest import require_manifest_hash_data_version
 from backtesting.engine.data_handler import DataHandler
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
@@ -222,7 +223,31 @@ class TrialRecorder:
         not go hunting for per-variant trial rows; they don't exist by
         design (variant configs aren't registered ``strategy_definitions``
         rows, so they can't satisfy the composite ``config_hash`` FK).
+
+        Raises:
+            HoldoutWindowViolationError: ``final_holdout_confirmation=True``
+                was passed. A parameter sweep evaluates every variant in
+                ``param_grid`` against the wrapped data, so a "final holdout
+                confirmation" sweep would spend the one-shot sealed-holdout
+                look on the *entire grid* rather than a single fixed
+                configuration -- exactly the "many looks under one consumed
+                seal" failure the §4.2 one-shot guarantee exists to prevent.
+                Rejected before any recording or dispatch. A genuine holdout
+                confirmation must be a single fixed-config run via
+                ``run_walk_forward``.
         """
+        if final_holdout_confirmation:
+            raise HoldoutWindowViolationError(
+                "final_holdout_confirmation=True is not permitted on "
+                "run_parameter_sweep(). A parameter sweep evaluates every "
+                "variant in param_grid against the wrapped data -- running "
+                "it against the sealed holdout window would spend the "
+                "one-shot confirmation seal on many looks at the holdout "
+                "data instead of one fixed configuration, defeating the "
+                "§4.2 one-shot holdout guarantee. Run a single fixed-config "
+                "confirmation via TrialRecorder.run_walk_forward() instead."
+            )
+
         effective_start, effective_end = _effective_range(base_config)
 
         def _dispatch() -> ParameterSensitivityResult:
@@ -279,6 +304,15 @@ class TrialRecorder:
                 "data_version is required to record a strategy_trials row (C7 discipline). "
                 "Pass the MLflow manifest-hash-shaped data_version."
             )
+        # C7 (03A-5): a strategy_trials row is promotion evidence, so
+        # data_version must be the immutable manifest_content_sha256 shape
+        # (64 lowercase hex), not a mutable/legacy token such as a
+        # "rqis-snapshots/manifests/{date}/manifest.json" path -- accepting
+        # the latter would let a trial row look reproducible while pointing
+        # at a token whose underlying manifest can still change. Shares the
+        # same helper BacktestLogger uses so both call sites enforce one
+        # definition of "hash-shaped".
+        require_manifest_hash_data_version(data_version)
 
         run_type = "holdout_confirmation" if final_holdout_confirmation else base_run_type
         window = "holdout" if final_holdout_confirmation else "train_oos"
