@@ -49,6 +49,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 import structlog
 from sqlalchemy import create_engine, event, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backtesting.engine.data_handler import DataHandler
@@ -212,6 +213,15 @@ class TrialRecorder:
         row's ``metrics_json``. See ``run_walk_forward`` for the shared
         holdout-guard and hybrid-mode semantics; the same rules and error
         types apply here.
+
+        Note: per-variant ``ParameterSensitivityResult.rows`` detail is
+        intentionally NOT persisted as separate ``strategy_trials`` rows --
+        only summary stats (mean/std/positive_fraction/verdict) plus
+        ``configs_tested`` are kept in the single recorded row's
+        ``metrics_json``. A future 04-4 (``PromotionPipeline``) author should
+        not go hunting for per-variant trial rows; they don't exist by
+        design (variant configs aren't registered ``strategy_definitions``
+        rows, so they can't satisfy the composite ``config_hash`` FK).
         """
         effective_start, effective_end = _effective_range(base_config)
 
@@ -307,7 +317,36 @@ class TrialRecorder:
                 started_at=started_at,
             )
             session.add(trial)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as integrity_exc:
+                session.rollback()
+                # A genuine TOCTOU race: two processes both passed
+                # _enforce_holdout_guard's app-layer check above before either
+                # committed, so the DB's partial unique index
+                # (uix_strategy_trials_one_holdout_confirmation) is the
+                # backstop that actually catches the second insert. Only
+                # relabel this as a clean HoldoutWindowViolationError when it
+                # really is the holdout-seal violation -- re-query for the
+                # now-committed sibling row to confirm before mislabeling an
+                # unrelated IntegrityError (e.g. the FK constraints above).
+                if final_holdout_confirmation:
+                    existing = session.scalar(
+                        select(StrategyTrial).where(
+                            StrategyTrial.strategy_id == strategy_id,
+                            StrategyTrial.run_type == "holdout_confirmation",
+                        )
+                    )
+                    if existing is not None:
+                        raise HoldoutWindowViolationError(
+                            f"strategy_id={strategy_id!r} already has a holdout_confirmation "
+                            f"trial (id={existing.id}, status={existing.status!r}); a "
+                            "concurrent request recorded it first and the one-shot holdout "
+                            "seal has already been consumed. A second confirmation requires "
+                            "an operator append-only audit correction (C3), never a silent "
+                            "retry."
+                        ) from integrity_exc
+                raise
             session.refresh(trial)
             trial_id = trial.id
             logger.info(
@@ -325,7 +364,23 @@ class TrialRecorder:
         try:
             result = dispatch()
         except Exception as exc:
-            self._mark_errored(trial_id, exc)
+            try:
+                self._mark_errored(trial_id, exc)
+            except Exception as mark_exc:
+                # The recording write itself failed (e.g. a DB blip while
+                # handling the original error). Never let the recording
+                # failure mask the original exception's type/message from the
+                # caller -- log a distinct event with both exceptions so a
+                # human can manually reconcile the trial row stuck in
+                # 'running', then re-raise the ORIGINAL exception unchanged.
+                logger.error(
+                    "strategy_trial_error_recording_failed",
+                    trial_id=trial_id,
+                    strategy_id=strategy_id,
+                    original_error=repr(exc),
+                    recording_error=repr(mark_exc),
+                )
+                raise exc
             logger.warning(
                 "strategy_trial_errored",
                 trial_id=trial_id,
@@ -475,7 +530,19 @@ def _effective_range(config: dict) -> tuple[date, date]:
             "config['backtest'] must declare 'start_date' and 'end_date' for the "
             "TrialRecorder holdout guard to compute the effective date range."
         )
-    return _parse_date(bt_cfg["start_date"]), _parse_date(bt_cfg["end_date"])
+    effective_start = _parse_date(bt_cfg["start_date"])
+    effective_end = _parse_date(bt_cfg["end_date"])
+    if effective_start > effective_end:
+        # Fail closed: a reversed range is invalid input to a safety guard
+        # and must never silently pass the overlap/containment arithmetic in
+        # _enforce_holdout_guard (e.g. `effective_start <= window.holdout_end
+        # and effective_end >= window.holdout_start` can spuriously read as
+        # "no overlap" for a reversed pair even when the guard should fire).
+        raise ValueError(
+            f"config['backtest'] date range is reversed: start_date "
+            f"({effective_start}) is after end_date ({effective_end})."
+        )
+    return effective_start, effective_end
 
 
 def _parse_date(value: str | date) -> date:

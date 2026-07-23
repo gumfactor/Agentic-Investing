@@ -310,6 +310,19 @@ single overall verdict and is both:
   the Strategy Registry transition in step 7 can cite it by ID rather than
   by loose MLflow run-name convention.
 
+**`n_trials` sweep-counting policy (04-4 decision, deferred from 04-2).**
+04-2's `TrialRecorder.run_parameter_sweep` records exactly ONE
+`strategy_trials` row per sweep *invocation*, not one row per grid variant,
+because sweep variants aren't registered `strategy_definitions` rows and so
+cannot satisfy `strategy_trials`' composite `config_hash` FK; the variant
+count is preserved as `metrics_json['configs_tested']` on that single row.
+`PromotionPipeline` (this section) must make a conscious choice of whether
+its Deflated Sharpe `n_trials` count treats a recorded sweep as 1 trial or as
+`configs_tested` trials. Given the operator's §8 Q3 resolution that DSR is
+informational-only (not a hard promotion gate), this is not a
+correctness-blocking issue today, but it must be decided deliberately here
+rather than left implicit.
+
 ### 4.5 Strategy Registry integration: the `validated` status
 
 Insert `validated` between `backtesting` and `paper` in the lifecycle:

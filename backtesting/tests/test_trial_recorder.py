@@ -17,10 +17,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
+import structlog.testing
 
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
@@ -568,3 +569,106 @@ def test_parameter_sweep_inside_train_oos_succeeds_and_records_one_row(recorder:
     assert trial.status == "completed"
     assert float(trial.oos_sharpe) == 0.77
     assert trial.metrics_json["verdict"] == "robust"
+
+
+# ── FIX 1: _mark_errored failure must not mask the original exception ──────────
+
+
+def test_mark_errored_failure_does_not_mask_original_exception(recorder: TrialRecorder) -> None:
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    validator = _mock_validator(exc=RuntimeError("boom"))
+
+    with patch.object(TrialRecorder, "_mark_errored", side_effect=RuntimeError("db blip during error handling")):
+        with structlog.testing.capture_logs() as captured_logs:
+            with pytest.raises(RuntimeError, match="boom"):
+                recorder.run_walk_forward(
+                    validator,
+                    strategy_id="v1_test_strategy",
+                    config_hash="a" * 64,
+                    data_version=DATA_VERSION,
+                    config=_config("2022-01-01", "2022-12-31"),
+                    data_handler=MagicMock(),
+                )
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert "strategy_trial_error_recording_failed" in events
+    failure_log = next(
+        entry for entry in captured_logs if entry.get("event") == "strategy_trial_error_recording_failed"
+    )
+    assert "boom" in failure_log["original_error"]
+    assert "db blip during error handling" in failure_log["recording_error"]
+    # The 'errored' recording never happened, but the caller still saw the
+    # ORIGINAL exception type/message, not the recording failure's.
+    assert "strategy_trial_errored" not in events
+
+
+# ── FIX 2: TOCTOU race on the holdout seal must raise HoldoutWindowViolationError,
+# not a raw IntegrityError from uix_strategy_trials_one_holdout_confirmation ─────
+
+
+def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
+    recorder: TrialRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates two processes both passing _enforce_holdout_guard before
+    either commits by bypassing the app-layer guard entirely -- the DB's
+    partial unique index must then be the thing that actually stops the
+    second insert, and _run_and_record must translate that raw IntegrityError
+    into a clean HoldoutWindowViolationError rather than letting it leak.
+    """
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    validator_first = _mock_validator(_wf_result())
+    validator_second = _mock_validator(_wf_result())
+
+    monkeypatch.setattr(recorder, "_enforce_holdout_guard", lambda *args, **kwargs: None)
+
+    recorder.run_walk_forward(
+        validator_first,
+        strategy_id="v1_test_strategy",
+        config_hash="a" * 64,
+        data_version=DATA_VERSION,
+        config=_config("2023-01-01", "2023-07-01"),
+        data_handler=MagicMock(),
+        final_holdout_confirmation=True,
+    )
+    validator_first.run.assert_called_once()
+
+    with pytest.raises(HoldoutWindowViolationError):
+        recorder.run_walk_forward(
+            validator_second,
+            strategy_id="v1_test_strategy",
+            config_hash="a" * 64,
+            data_version=DATA_VERSION,
+            config=_config("2023-01-01", "2023-07-01"),
+            data_handler=MagicMock(),
+            final_holdout_confirmation=True,
+        )
+
+    # The second run never reached dispatch -- the race was caught at the
+    # Step 1 commit, before the wrapped instrument ran.
+    validator_second.run.assert_not_called()
+    trials = recorder.list_trials("v1_test_strategy", run_type="holdout_confirmation")
+    assert len(trials) == 1
+
+
+# ── FIX 3: reversed date range fails closed ─────────────────────────────────────
+
+
+def test_reversed_date_range_raises_value_error(recorder: TrialRecorder) -> None:
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(ValueError, match="reversed"):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash="a" * 64,
+            data_version=DATA_VERSION,
+            config=_config("2023-01-01", "2022-01-01"),
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
