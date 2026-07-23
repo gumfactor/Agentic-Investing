@@ -110,6 +110,26 @@ class WalkForwardValidator:
             all_dates, n_folds, train_years, test_months, window_type
         )
 
+        # 04-2 round-4 class-audit note (TrialRecorder's §4.2 holdout guard
+        # validates config["backtest"]["start_date"]/["end_date"] -- i.e.
+        # full_start/full_end above -- and needs no SEPARATE check on fold
+        # subdivision: every (tr_start, tr_end, te_start, te_end) tuple in
+        # folds_dates is drawn exclusively from all_dates, and all_dates is
+        # itself `data_handler.trading_dates(full_start, full_end)` -- already
+        # bounded to [full_start, full_end]. So folds can never read a date
+        # outside the outer range the guard validated. Assert this
+        # containment explicitly (not just by construction) so a future
+        # change to _build_fold_dates that widened a fold past all_dates'
+        # bounds would fail loudly here instead of silently reintroducing the
+        # 04-2 defect class.
+        for tr_start, tr_end, te_start, te_end in folds_dates:
+            assert full_start <= tr_start <= tr_end <= te_start <= te_end <= full_end, (
+                f"Fold date range ({tr_start}..{tr_end}, {te_start}..{te_end}) "
+                f"escaped the validated outer range ({full_start}..{full_end}); "
+                "this would let a walk-forward fold read data the §4.2 "
+                "holdout guard never validated."
+            )
+
         folds: list[WalkForwardFold] = []
         for fold_num, (tr_start, tr_end, te_start, te_end) in enumerate(folds_dates, 1):
             logger.info(

@@ -275,6 +275,34 @@ same way direct SQL bypasses an ORM constraint, so §4.4/§6 make
 `TrialRecorder` the only sanctioned entry point for anything that will feed
 a promotion decision.
 
+**Invariant (04-2 rounds 2-4 hardening).** The guard must validate every
+concrete date range whose data is actually READ during dispatch, using
+inclusive-boundary semantics — it must never validate a declared/base range
+that dispatch can diverge from. Date ranges are inclusive on both ends
+(`DataHandler.trading_dates` returns `[start, end]`), so `effective_end`
+must be strictly before `holdout_start`, not merely `<= oos_end` (a run
+ending exactly on a touching `oos_end == holdout_start` boundary would
+otherwise read the first sealed holdout session). A `ParameterSweeper.sweep`
+`param_grid` may **not** contain a dot-path key that is an ancestor-or-equal
+of `backtest.start_date`/`backtest.end_date` (04-2 round-5 hardening):
+`ParameterSweeper._set_nested` replaces the whole subtree at a `param_grid`
+key's path, so rejecting only the two exact leaf keys is insufficient — a
+key one level up (the whole `backtest` section) also replaces both dates
+wholesale. `backtest.start_date`/`backtest.end_date` are the only config
+keys anywhere in the backtest path that control which dates' data get read
+— the config-contract audit found no others; every other CONSUMED field
+(including sibling keys like `backtest.initial_capital`, which remain a
+legitimate sweep target) governs strategy parameters, the cost model, or
+record labelling within an already-fixed range. `TrialRecorder.
+run_parameter_sweep` rejects any `param_grid` key whose dot-path is an
+ancestor-or-equal of either window key before recording or dispatch,
+because a sweep varies STRATEGY parameters only — the evaluation window is
+governed by the registered `research_data_windows` row, never by the sweep
+grid. Walk-forward fold
+subdivision needs no separate check: every fold date is drawn from
+`data_handler.trading_dates(full_start, full_end)`, itself bounded to the
+already-validated outer range, so no fold can exceed it.
+
 ### 4.3 Config freeze binding
 
 The promotion pipeline's only valid input is a `(strategy_id, config_hash)`
@@ -309,6 +337,19 @@ single overall verdict and is both:
 - written to `strategy_trials`/a new `promotion_decisions` audit row (§5) so
   the Strategy Registry transition in step 7 can cite it by ID rather than
   by loose MLflow run-name convention.
+
+**`n_trials` sweep-counting policy (04-4 decision, deferred from 04-2).**
+04-2's `TrialRecorder.run_parameter_sweep` records exactly ONE
+`strategy_trials` row per sweep *invocation*, not one row per grid variant,
+because sweep variants aren't registered `strategy_definitions` rows and so
+cannot satisfy `strategy_trials`' composite `config_hash` FK; the variant
+count is preserved as `metrics_json['configs_tested']` on that single row.
+`PromotionPipeline` (this section) must make a conscious choice of whether
+its Deflated Sharpe `n_trials` count treats a recorded sweep as 1 trial or as
+`configs_tested` trials. Given the operator's §8 Q3 resolution that DSR is
+informational-only (not a hard promotion gate), this is not a
+correctness-blocking issue today, but it must be decided deliberately here
+rather than left implicit.
 
 ### 4.5 Strategy Registry integration: the `validated` status
 
