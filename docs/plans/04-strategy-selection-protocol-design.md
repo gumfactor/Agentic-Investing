@@ -275,6 +275,26 @@ same way direct SQL bypasses an ORM constraint, so §4.4/§6 make
 `TrialRecorder` the only sanctioned entry point for anything that will feed
 a promotion decision.
 
+**Invariant (04-2 rounds 2-4 hardening).** The guard must validate every
+concrete date range whose data is actually READ during dispatch, using
+inclusive-boundary semantics — it must never validate a declared/base range
+that dispatch can diverge from. Date ranges are inclusive on both ends
+(`DataHandler.trading_dates` returns `[start, end]`), so `effective_end`
+must be strictly before `holdout_start`, not merely `<= oos_end` (a run
+ending exactly on a touching `oos_end == holdout_start` boundary would
+otherwise read the first sealed holdout session). A `ParameterSweeper.sweep`
+`param_grid` may **not** override `backtest.start_date`/`backtest.end_date`
+(or any other config key that controls which dates' data get read — the
+config-contract audit found no others; every other CONSUMED field governs
+strategy parameters, the cost model, or record labelling within an
+already-fixed range): `TrialRecorder.run_parameter_sweep` rejects any such
+`param_grid` before recording or dispatch, because a sweep varies STRATEGY
+parameters only — the evaluation window is governed by the registered
+`research_data_windows` row, never by the sweep grid. Walk-forward fold
+subdivision needs no separate check: every fold date is drawn from
+`data_handler.trading_dates(full_start, full_end)`, itself bounded to the
+already-validated outer range, so no fold can exceed it.
+
 ### 4.3 Config freeze binding
 
 The promotion pipeline's only valid input is a `(strategy_id, config_hash)`

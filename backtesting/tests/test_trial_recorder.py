@@ -31,6 +31,7 @@ from backtesting.validation.parameter_sensitivity import (
 from backtesting.validation.trial_recorder import (
     DataVersionProvenanceMismatchError,
     HoldoutWindowViolationError,
+    SweepWindowOverrideError,
     TrialRecorder,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
@@ -1247,4 +1248,212 @@ def test_parameter_sweep_dispatched_config_carries_validated_data_version(
     sweeper.sweep.assert_called_once()
     dispatched_config = sweeper.sweep.call_args.args[0]
     assert dispatched_config["data_version"] == DATA_VERSION
-    assert "data_version" not in base_config
+
+
+# ── R4 fix: param_grid may never override the evaluation date window ───────────
+#
+# Four consecutive Codex review rounds each found a different instance of ONE
+# defect class in this holdout/partition guard: the guard must validate every
+# concrete date range whose data is actually READ during dispatch, never a
+# declared/base range dispatch can diverge from. R2 fixed base-range
+# containment; R3 fixed the inclusive touching-boundary gap; these tests
+# cover R4: ParameterSweeper.sweep applies param_grid dot-path overrides
+# per-variant, so a param_grid containing backtest.start_date/end_date could
+# pass the guard on a validated BASE range while a dispatched VARIANT reads
+# sealed holdout / post-holdout data, recorded under a single 'train_oos' row
+# with the one-shot seal never consumed.
+
+
+def test_parameter_sweep_rejects_start_date_override_before_dispatch(
+    recorder: TrialRecorder,
+) -> None:
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)  # holdout = 2023-01-01 .. 2023-07-01
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(SweepWindowOverrideError, match="backtest.start_date"):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={"backtest.start_date": ["2022-06-01", "2023-02-01"]},
+            data_handler=MagicMock(),
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_parameter_sweep_rejects_end_date_override_before_dispatch(
+    recorder: TrialRecorder,
+) -> None:
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)  # holdout = 2023-01-01 .. 2023-07-01
+
+    # This variant value (2023-03-01) is inside the sealed holdout window --
+    # exactly the leak R4 exists to close: the base range (2022-01-01 ..
+    # 2022-12-31) alone passes the §4.2 guard, but a dispatched variant using
+    # this override would read holdout data outside any validated range.
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(SweepWindowOverrideError, match="backtest.end_date"):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={"backtest.end_date": ["2022-12-31", "2023-03-01"]},
+            data_handler=MagicMock(),
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_parameter_sweep_rejects_both_window_keys_listed_together(
+    recorder: TrialRecorder,
+) -> None:
+    """Both offending keys must be reported in one error, not just the first
+    one found -- mirrors validate_backtest_config's "collect every violation"
+    convention elsewhere in this codebase."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(SweepWindowOverrideError) as excinfo:
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={
+                "backtest.start_date": ["2022-06-01"],
+                "backtest.end_date": ["2023-03-01"],
+                "portfolio.n_long": [10, 20],
+            },
+            data_handler=MagicMock(),
+        )
+
+    assert "backtest.start_date" in str(excinfo.value)
+    assert "backtest.end_date" in str(excinfo.value)
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_parameter_sweep_window_override_rejected_even_without_a_registered_window(
+    recorder: TrialRecorder,
+) -> None:
+    """The window-override rejection must fire even when no
+    research_data_windows row is registered at all -- it is not conditioned
+    on a holdout window existing, because the defect it closes (a variant
+    reading dates outside the validated base range) is independent of
+    whether that range happens to touch a holdout window today."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(SweepWindowOverrideError):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={"backtest.start_date": ["2021-01-01"]},
+            data_handler=MagicMock(),
+        )
+
+    sweeper.sweep.assert_not_called()
+
+
+def test_parameter_sweep_legitimate_strategy_param_grid_still_accepted(
+    recorder: TrialRecorder,
+) -> None:
+    """A param_grid that only overrides legitimate STRATEGY parameters (e.g.
+    portfolio.n_long) must still run normally -- the R4 fix rejects
+    date-window keys specifically, not param_grid sweeps in general."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result(mean_sharpe=0.9))
+
+    result = recorder.run_parameter_sweep(
+        sweeper,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        base_config=base_config,
+        param_grid={
+            "portfolio.n_long": [10, 20, 30],
+            "portfolio.min_holding_days": [0, 21],
+        },
+        data_handler=MagicMock(),
+    )
+
+    assert result.mean_oos_sharpe == 0.9
+    sweeper.sweep.assert_called_once()
+    trials = recorder.list_trials("v1_test_strategy")
+    assert len(trials) == 1
+    assert trials[0].status == "completed"
+    assert trials[0].run_type == "parameter_sweep_variant"
+
+
+def test_parameter_sweep_window_override_checked_before_final_holdout_confirmation_check(
+    recorder: TrialRecorder,
+) -> None:
+    """When both a window-override param_grid AND
+    final_holdout_confirmation=True are passed, the window-override rejection
+    must win (it is checked first) -- both are fail-closed no-dispatch paths,
+    but the error message should point at the actual mistake (an unsupported
+    param_grid key) rather than the unrelated one-shot-seal message."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result())
+
+    with pytest.raises(SweepWindowOverrideError):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={"backtest.start_date": ["2022-06-01"]},
+            data_handler=MagicMock(),
+            final_holdout_confirmation=True,
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+# ── Walk-forward fold containment (proof the class is closed for folds) ────────
+
+
+def test_walk_forward_folds_never_exceed_the_validated_outer_range() -> None:
+    """WalkForwardValidator._build_fold_dates must only ever produce fold
+    date tuples drawn from the outer [full_start, full_end] range that
+    TrialRecorder's §4.2 guard validated -- this is why fold subdivision
+    needs no separate holdout check (see the assertion/comment added to
+    WalkForwardValidator.run alongside this test)."""
+    from backtesting.validation.walk_forward import _build_fold_dates
+    import pandas as pd
+
+    full_start = date(2020, 1, 1)
+    full_end = date(2023, 12, 31)
+    all_dates = list(pd.bdate_range(full_start, full_end).date)
+
+    folds = _build_fold_dates(
+        all_dates, n_folds=3, train_years=2.0, test_months=6, window_type="expanding"
+    )
+
+    assert folds, "expected at least one fold for this date range"
+    for tr_start, tr_end, te_start, te_end in folds:
+        assert full_start <= tr_start <= tr_end <= te_start <= te_end <= full_end

@@ -41,6 +41,36 @@ backstop for a bypass of this recorder; this module is the *primary*,
 fail-clean rejection path so a caller sees a clear
 ``HoldoutWindowViolationError`` instead of a raw ``IntegrityError``.
 
+**Class invariant (04-2 round-4 fix):** the guard above only ever inspects
+the BASE config's ``backtest.start_date``/``backtest.end_date`` -- it must
+validate the exact concrete date range whose data is actually READ during
+dispatch, using inclusive-boundary semantics, and must never validate a
+declared/base range that dispatch can silently diverge from.
+``run_parameter_sweep``'s ``param_grid`` applies dot-path overrides
+per-variant (see ``ParameterSweeper._apply_params``), so a ``param_grid``
+containing ``backtest.start_date``/``backtest.end_date`` (or any other key
+that moves the window of dates whose data is read) could pass the guard on
+the validated BASE range while a dispatched VARIANT actually runs over
+sealed holdout / post-holdout dates -- recorded under the single
+``train_oos`` trial row, with the one-shot holdout seal never consumed. Per
+``backtesting/config_contract.py``'s CONSUMED-field audit, the *only* two
+config keys anywhere in the backtest path that control which dates' data
+gets read are ``backtest.start_date`` and ``backtest.end_date`` --
+everything else CONSUMED (``portfolio.*``, ``execution.*``,
+``backtest.initial_capital``, top-level ``name``/``version``/
+``data_version``/``strategy_id``) governs strategy parameters, the cost
+model, or record labelling, never the window of dates read. ``run_parameter_sweep``
+therefore rejects any ``param_grid`` that touches either window key
+(:class:`SweepWindowOverrideError`) *before* any recording or dispatch: the
+evaluation window is governed by the registered ``research_data_windows``
+row, not the sweep grid -- a sweep varies STRATEGY parameters only.
+Walk-forward fold subdivision (``WalkForwardValidator._build_fold_dates``)
+needs no analogous check: every fold date is drawn from
+``data_handler.trading_dates(full_start, full_end)``, which is itself
+bounded to the validated ``[full_start, full_end]`` range, so folds can
+never exceed the outer range the guard already validated (see the assertion
+and comment in ``walk_forward.py``).
+
 Hybrid mode (design doc §8 Q4, resolved HYBRID): calling
 ``WalkForwardValidator.run``/``ParameterSweeper.sweep`` directly (unwrapped)
 remains permitted for quick exploratory iteration and simply produces no
@@ -86,6 +116,47 @@ from strategy_registry.selection_models import ResearchDataWindow, StrategyTrial
 logger = structlog.get_logger(__name__)
 
 
+# 04-2 round-4 fix: the ONLY config dot-paths anywhere in the backtest path
+# (backtesting/engine/event_loop.py, backtesting/validation/walk_forward.py,
+# backtesting/validation/parameter_sensitivity.py) that control which dates'
+# data get read. Derived directly from the CONSUMED-field audit in
+# backtesting/config_contract.py: every other CONSUMED field
+# (portfolio.n_long, portfolio.method, portfolio.rebalance_frequency,
+# portfolio.min_holding_days, portfolio.max_position_weight, execution.*,
+# backtest.initial_capital, top-level name/version/data_version/strategy_id)
+# governs strategy construction, cost model, or record labelling within an
+# already-fixed date range -- never the range itself. A `param_grid` entry
+# for either key below must be rejected before any sweep dispatch; see the
+# module docstring's "class invariant" note.
+_WINDOW_OVERRIDE_KEYS = frozenset({
+    "backtest.start_date",
+    "backtest.end_date",
+})
+
+
+def _reject_window_override_keys(param_grid: dict[str, list]) -> None:
+    """Fail closed before any recording/dispatch if ``param_grid`` contains a
+    dot-path key that would let a per-variant override move the window of
+    dates whose data is actually read (04-2 round-4 fix).
+    """
+    offending = sorted(key for key in param_grid if key in _WINDOW_OVERRIDE_KEYS)
+    if offending:
+        raise SweepWindowOverrideError(
+            "param_grid contains key(s) that override the evaluation date "
+            f"window: {offending}. A parameter sweep varies STRATEGY "
+            "parameters only -- the evaluation window is governed by the "
+            "registered research_data_windows row (validated against "
+            "base_config's backtest.start_date/end_date), never by the "
+            "sweep grid. Allowing a per-variant date-window override would "
+            "let a variant run over sealed holdout / post-holdout dates "
+            "while the single trial row is recorded as 'train_oos' and the "
+            "one-shot holdout seal is never consumed. Remove these key(s) "
+            "from param_grid; if you need to test a different date range, "
+            "run a separate TrialRecorder call with that range as the base "
+            "config so the guard validates what actually executes."
+        )
+
+
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 
@@ -99,6 +170,18 @@ class HoldoutWindowViolationError(TrialRecorderError):
     when a ``final_holdout_confirmation`` request itself is invalid (no
     registered window, range not contained in the holdout window, or the
     one-shot seal has already been consumed for this ``strategy_id``).
+    """
+
+
+class SweepWindowOverrideError(TrialRecorderError):
+    """Raised when a ``run_parameter_sweep`` ``param_grid`` contains a
+    dot-path key that would let a per-variant override move the window of
+    dates whose data is actually read, diverging from the base range the
+    §4.2 holdout guard validated (04-2 round-4 fix).
+
+    See the module docstring's "class invariant" note for the full
+    rationale and the audited set of window-controlling keys
+    (``backtest.start_date``, ``backtest.end_date``).
     """
 
 
@@ -268,6 +351,12 @@ class TrialRecorder:
         rows, so they can't satisfy the composite ``config_hash`` FK).
 
         Raises:
+            SweepWindowOverrideError: ``param_grid`` contains a dot-path key
+                (``backtest.start_date``/``backtest.end_date``) that would
+                let a per-variant override move the window of dates whose
+                data is actually read, diverging from the base range the
+                §4.2 guard validated (04-2 round-4 fix). Checked first,
+                before any recording or dispatch.
             HoldoutWindowViolationError: ``final_holdout_confirmation=True``
                 was passed. A parameter sweep evaluates every variant in
                 ``param_grid`` against the wrapped data, so a "final holdout
@@ -279,6 +368,11 @@ class TrialRecorder:
                 confirmation must be a single fixed-config run via
                 ``run_walk_forward``.
         """
+        # 04-2 round-4 fix: reject before any recording/dispatch -- see
+        # _reject_window_override_keys and the module docstring's "class
+        # invariant" note.
+        _reject_window_override_keys(param_grid)
+
         if final_holdout_confirmation:
             raise HoldoutWindowViolationError(
                 "final_holdout_confirmation=True is not permitted on "
