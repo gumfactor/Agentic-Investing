@@ -23,6 +23,7 @@ import pandas as pd
 import pytest
 import structlog.testing
 
+from backtesting.config_contract import ConfigProvenanceMismatchError
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
     ParameterSweeper,
@@ -32,6 +33,7 @@ from backtesting.validation.trial_recorder import (
     TrialRecorder,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
+from strategy_registry.fingerprint import hash_config
 from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
 from strategy_registry.models import StrategyDefinition
 from strategy_registry.selection_models import ResearchDataWindow
@@ -57,8 +59,22 @@ def _seed_definition(
     recorder: TrialRecorder,
     *,
     strategy_id: str = "v1_test_strategy",
-    config_hash: str = "a" * 64,
-) -> None:
+    config: dict | None = None,
+    config_hash: str | None = None,
+) -> str:
+    """Seed a ``strategy_definitions`` row and return the ``config_hash`` used.
+
+    FIX 1 (config-provenance check): most tests now need the seeded
+    ``config_hash`` to be the REAL canonical hash of whatever config dict
+    they later pass to ``run_walk_forward``/``run_parameter_sweep``, or the
+    new provenance check rejects them. Pass ``config=`` (the exact dict the
+    test will dispatch with) to get a hash that will genuinely match; tests
+    that only exercise a guard which rejects BEFORE the provenance check
+    (e.g. the holdout-overlap tests) can omit it and keep the arbitrary
+    legacy placeholder hash, since it is never compared in that path.
+    """
+    if config_hash is None:
+        config_hash = hash_config(config) if config is not None else "a" * 64
     with Session(recorder._engine) as session:
         session.add(
             StrategyDefinition(
@@ -71,6 +87,7 @@ def _seed_definition(
             )
         )
         session.commit()
+    return config_hash
 
 
 def _seed_window(
@@ -155,16 +172,17 @@ def _mock_sweeper(result=None, exc=None) -> MagicMock:
 
 
 def test_walk_forward_inside_train_oos_succeeds_and_records_one_row(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator = _mock_validator(_wf_result(sharpe=1.5, max_dd=-0.12))
 
     result = recorder.run_walk_forward(
         validator,
         strategy_id="v1_test_strategy",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        config=_config("2022-01-01", "2022-12-31"),
+        config=config,
         data_handler=MagicMock(),
     )
 
@@ -249,7 +267,8 @@ def test_parameter_sweep_overlapping_holdout_window_is_rejected_without_dispatch
 
 
 def test_run_that_raises_leaves_an_errored_row(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator = _mock_validator(exc=RuntimeError("engine blew up mid-fold"))
 
@@ -257,9 +276,9 @@ def test_run_that_raises_leaves_an_errored_row(recorder: TrialRecorder) -> None:
         recorder.run_walk_forward(
             validator,
             strategy_id="v1_test_strategy",
-            config_hash="a" * 64,
+            config_hash=config_hash,
             data_version=DATA_VERSION,
-            config=_config("2022-01-01", "2022-12-31"),
+            config=config,
             data_handler=MagicMock(),
         )
 
@@ -276,7 +295,8 @@ def test_run_that_raises_leaves_an_errored_row(recorder: TrialRecorder) -> None:
 
 
 def test_parameter_sweep_that_raises_leaves_an_errored_row(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
     _seed_window(recorder)
     sweeper = _mock_sweeper(exc=ValueError("param_grid must not be empty."))
 
@@ -284,9 +304,9 @@ def test_parameter_sweep_that_raises_leaves_an_errored_row(recorder: TrialRecord
         recorder.run_parameter_sweep(
             sweeper,
             strategy_id="v1_test_strategy",
-            config_hash="a" * 64,
+            config_hash=config_hash,
             data_version=DATA_VERSION,
-            base_config=_config("2022-01-01", "2022-12-31"),
+            base_config=base_config,
             param_grid={"portfolio.n_long": [10, 20]},
             data_handler=MagicMock(),
         )
@@ -300,16 +320,17 @@ def test_parameter_sweep_that_raises_leaves_an_errored_row(recorder: TrialRecord
 
 
 def test_first_holdout_confirmation_succeeds_and_records_holdout_row(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    config = _config("2023-01-01", "2023-07-01")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)  # holdout = 2023-01-01 .. 2023-07-01
     validator = _mock_validator(_wf_result(sharpe=0.9, max_dd=-0.2))
 
     result = recorder.run_walk_forward(
         validator,
         strategy_id="v1_test_strategy",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        config=_config("2023-01-01", "2023-07-01"),
+        config=config,
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -332,16 +353,17 @@ def test_second_holdout_confirmation_is_rejected_by_app_layer_guard(recorder: Tr
     IntegrityError) and that the wrapped instrument is never dispatched a
     second time.
     """
-    _seed_definition(recorder)
+    config = _config("2023-01-01", "2023-07-01")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator = _mock_validator(_wf_result())
 
     recorder.run_walk_forward(
         validator,
         strategy_id="v1_test_strategy",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        config=_config("2023-01-01", "2023-07-01"),
+        config=config,
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -351,9 +373,9 @@ def test_second_holdout_confirmation_is_rejected_by_app_layer_guard(recorder: Tr
         recorder.run_walk_forward(
             validator,
             strategy_id="v1_test_strategy",
-            config_hash="a" * 64,
+            config_hash=config_hash,
             data_version=DATA_VERSION,
-            config=_config("2023-01-01", "2023-07-01"),
+            config=config,
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -372,7 +394,8 @@ def test_second_holdout_confirmation_is_rejected_even_after_a_failed_first_attem
     """The one-shot seal must trip on ANY prior holdout_confirmation attempt,
     including one that errored -- a run that reads the sealed data and then
     errors has already consumed its single permitted look (§4.2)."""
-    _seed_definition(recorder)
+    config = _config("2023-01-01", "2023-07-01")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     failing_validator = _mock_validator(exc=RuntimeError("holdout engine crash"))
 
@@ -380,9 +403,9 @@ def test_second_holdout_confirmation_is_rejected_even_after_a_failed_first_attem
         recorder.run_walk_forward(
             failing_validator,
             strategy_id="v1_test_strategy",
-            config_hash="a" * 64,
+            config_hash=config_hash,
             data_version=DATA_VERSION,
-            config=_config("2023-01-01", "2023-07-01"),
+            config=config,
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -392,9 +415,9 @@ def test_second_holdout_confirmation_is_rejected_even_after_a_failed_first_attem
         recorder.run_walk_forward(
             second_validator,
             strategy_id="v1_test_strategy",
-            config_hash="a" * 64,
+            config_hash=config_hash,
             data_version=DATA_VERSION,
-            config=_config("2023-01-01", "2023-07-01"),
+            config=config,
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -443,8 +466,10 @@ def test_holdout_confirmation_requires_a_registered_window(recorder: TrialRecord
 def test_holdout_seal_is_scoped_per_strategy_id(recorder: TrialRecorder) -> None:
     """Two distinct strategies must each be able to record their own
     holdout confirmation -- the seal must not be global."""
-    _seed_definition(recorder, strategy_id="v1_alpha", config_hash="a" * 64)
-    _seed_definition(recorder, strategy_id="v1_beta", config_hash="b" * 64)
+    config = _config("2023-01-01", "2023-07-01")
+    config_hash = hash_config(config)
+    _seed_definition(recorder, strategy_id="v1_alpha", config_hash=config_hash)
+    _seed_definition(recorder, strategy_id="v1_beta", config_hash=config_hash)
     _seed_window(recorder, strategy_id="v1_alpha")
     _seed_window(recorder, strategy_id="v1_beta")
 
@@ -454,18 +479,18 @@ def test_holdout_seal_is_scoped_per_strategy_id(recorder: TrialRecorder) -> None
     recorder.run_walk_forward(
         validator_a,
         strategy_id="v1_alpha",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        config=_config("2023-01-01", "2023-07-01"),
+        config=config,
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
     recorder.run_walk_forward(
         validator_b,
         strategy_id="v1_beta",
-        config_hash="b" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        config=_config("2023-01-01", "2023-07-01"),
+        config=config,
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -478,16 +503,17 @@ def test_holdout_seal_is_scoped_per_strategy_id(recorder: TrialRecorder) -> None
 
 
 def test_nan_and_inf_metrics_are_normalized_to_none(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator = _mock_validator(_wf_result(sharpe=float("nan"), max_dd=float("-inf")))
 
     recorder.run_walk_forward(
         validator,
         strategy_id="v1_test_strategy",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        config=_config("2022-01-01", "2022-12-31"),
+        config=config,
         data_handler=MagicMock(),
     )
 
@@ -545,16 +571,17 @@ def test_blank_data_version_is_rejected(recorder: TrialRecorder) -> None:
 
 
 def test_parameter_sweep_inside_train_oos_succeeds_and_records_one_row(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
     _seed_window(recorder)
     sweeper = _mock_sweeper(_sweep_result(mean_sharpe=0.77, verdict="robust"))
 
     result = recorder.run_parameter_sweep(
         sweeper,
         strategy_id="v1_test_strategy",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        base_config=_config("2022-01-01", "2022-12-31"),
+        base_config=base_config,
         param_grid={"portfolio.n_long": [10, 20]},
         data_handler=MagicMock(),
     )
@@ -575,7 +602,8 @@ def test_parameter_sweep_inside_train_oos_succeeds_and_records_one_row(recorder:
 
 
 def test_mark_errored_failure_does_not_mask_original_exception(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator = _mock_validator(exc=RuntimeError("boom"))
 
@@ -585,9 +613,9 @@ def test_mark_errored_failure_does_not_mask_original_exception(recorder: TrialRe
                 recorder.run_walk_forward(
                     validator,
                     strategy_id="v1_test_strategy",
-                    config_hash="a" * 64,
+                    config_hash=config_hash,
                     data_version=DATA_VERSION,
-                    config=_config("2022-01-01", "2022-12-31"),
+                    config=config,
                     data_handler=MagicMock(),
                 )
 
@@ -616,7 +644,8 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
     second insert, and _run_and_record must translate that raw IntegrityError
     into a clean HoldoutWindowViolationError rather than letting it leak.
     """
-    _seed_definition(recorder)
+    config = _config("2023-01-01", "2023-07-01")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator_first = _mock_validator(_wf_result())
     validator_second = _mock_validator(_wf_result())
@@ -626,9 +655,9 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
     recorder.run_walk_forward(
         validator_first,
         strategy_id="v1_test_strategy",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version=DATA_VERSION,
-        config=_config("2023-01-01", "2023-07-01"),
+        config=config,
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -638,9 +667,9 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
         recorder.run_walk_forward(
             validator_second,
             strategy_id="v1_test_strategy",
-            config_hash="a" * 64,
+            config_hash=config_hash,
             data_version=DATA_VERSION,
-            config=_config("2023-01-01", "2023-07-01"),
+            config=config,
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -759,16 +788,17 @@ def test_non_hash_data_version_is_rejected_on_parameter_sweep(recorder: TrialRec
 
 
 def test_valid_hash_shaped_data_version_is_accepted(recorder: TrialRecorder) -> None:
-    _seed_definition(recorder)
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator = _mock_validator(_wf_result())
 
     recorder.run_walk_forward(
         validator,
         strategy_id="v1_test_strategy",
-        config_hash="a" * 64,
+        config_hash=config_hash,
         data_version="3fae" + "0" * 60,
-        config=_config("2022-01-01", "2022-12-31"),
+        config=config,
         data_handler=MagicMock(),
     )
 
@@ -776,3 +806,227 @@ def test_valid_hash_shaped_data_version_is_accepted(recorder: TrialRecorder) -> 
     trials = recorder.list_trials("v1_test_strategy")
     assert len(trials) == 1
     assert trials[0].data_version == "3fae" + "0" * 60
+
+
+# ── FIX 1 (P1): config-provenance check -- passed config must actually hash
+# to the claimed config_hash, not merely have SOME row registered ──────────
+
+
+def test_config_hash_mismatch_is_rejected_before_dispatch(recorder: TrialRecorder) -> None:
+    """A caller that mutates the config (here: a different n_long) while
+    reusing an already-registered config_hash must be rejected -- otherwise
+    metrics would be recorded under a config_hash the passed config never
+    actually produced, corrupting promotion evidence and DSR trial counts."""
+    registered_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=registered_config)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    mutated_config = dict(registered_config)
+    mutated_config["portfolio"] = {"n_long": 999}  # not part of the registered config
+
+    with pytest.raises(ConfigProvenanceMismatchError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=mutated_config,
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_config_hash_match_is_accepted(recorder: TrialRecorder) -> None:
+    """The mirror-image acceptance case: a config whose canonical hash
+    genuinely equals the claimed config_hash proceeds normally."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    assert len(recorder.list_trials("v1_test_strategy")) == 1
+
+
+def test_config_differing_only_in_data_version_is_not_a_mismatch(recorder: TrialRecorder) -> None:
+    """``data_version`` is a runtime key excluded from the canonical hash
+    (strategy_registry.fingerprint._RUNTIME_KEYS), so a config carrying a
+    different data_version than whatever was present (or absent) when the
+    strategy_definitions row was registered must NOT be flagged as a
+    provenance mismatch."""
+    registered_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=registered_config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result())
+
+    config_with_data_version = dict(registered_config)
+    config_with_data_version["data_version"] = "b" * 64  # differs; must be ignored by the hash
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config_with_data_version,
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    assert len(recorder.list_trials("v1_test_strategy")) == 1
+
+
+def test_parameter_sweep_config_hash_mismatch_is_rejected_before_dispatch(recorder: TrialRecorder) -> None:
+    registered_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=registered_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper()
+
+    mutated_base_config = dict(registered_config)
+    mutated_base_config["portfolio"] = {"n_long": 999}
+
+    with pytest.raises(ConfigProvenanceMismatchError):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=mutated_base_config,
+            param_grid={"portfolio.n_long": [10, 20]},
+            data_handler=MagicMock(),
+        )
+
+    sweeper.sweep.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+# ── FIX 2 (P1): non-confirmation runs must be CONTAINED in [train_start,
+# oos_end], not merely avoid intersecting the holdout window ────────────────
+
+
+def test_post_holdout_non_confirmation_run_is_rejected(recorder: TrialRecorder) -> None:
+    """A non-confirmation run entirely AFTER holdout_end does not intersect
+    the holdout window under the old overlap-only check, but it is still a
+    peek at post-holdout data and must be rejected under containment."""
+    config = _config("2023-08-01", "2023-12-31")  # after holdout_end (2023-07-01)
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)  # oos_end=2023-01-01, holdout_end=2023-07-01
+    validator = _mock_validator()
+
+    with pytest.raises(HoldoutWindowViolationError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_pre_train_start_non_confirmation_run_is_rejected(recorder: TrialRecorder) -> None:
+    """A non-confirmation run entirely BEFORE train_start is the same class
+    of leak (data outside the registered train/OOS partition) and must be
+    rejected under containment even though it never touches the holdout."""
+    config = _config("2021-01-01", "2021-06-01")  # before train_start (2022-01-01)
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(HoldoutWindowViolationError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_run_entirely_within_train_oos_partition_is_accepted(recorder: TrialRecorder) -> None:
+    """The positive case: a range fully inside [train_start, oos_end] is
+    accepted -- containment must not be stricter than the old behavior for
+    genuinely in-bounds runs."""
+    config = _config("2022-01-01", "2023-01-01")  # exactly [train_start, oos_end]
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    assert len(recorder.list_trials("v1_test_strategy")) == 1
+
+
+def test_confirmation_mode_still_requires_containment_in_holdout_window_only(
+    recorder: TrialRecorder,
+) -> None:
+    """Confirmation-mode behavior must be unchanged by FIX 2: it still checks
+    containment in [holdout_start, holdout_end] specifically, not
+    [train_start, oos_end] -- a confirmation range that is inside train/OOS
+    but NOT inside the holdout window must still be rejected."""
+    config = _config("2022-06-01", "2022-12-01")  # inside train/OOS, not holdout
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(HoldoutWindowViolationError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+            final_holdout_confirmation=True,
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_no_registered_window_advisory_mode_allows_any_range(recorder: TrialRecorder) -> None:
+    """Hybrid mode (design doc §8 Q4): when no research_data_windows row is
+    registered for the strategy (or its family), the recorder cannot know
+    the train/OOS/holdout partition, so a non-confirmation run is not
+    constrained at all -- this must remain true after FIX 2."""
+    config = _config("2099-01-01", "2099-12-31")  # arbitrary; no window to violate
+    config_hash = _seed_definition(recorder, config=config)
+    # Deliberately no _seed_window call.
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    assert len(recorder.list_trials("v1_test_strategy")) == 1

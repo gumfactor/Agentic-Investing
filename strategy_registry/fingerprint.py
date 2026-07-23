@@ -72,6 +72,25 @@ def fingerprint(
     )
 
 
+def hash_config(config: Mapping[str, Any]) -> str:
+    """Canonical ``config_hash`` for an already-in-memory config dict.
+
+    Same canonicalisation as :func:`fingerprint`/:func:`recompute_hash` (key
+    sorting + ``_RUNTIME_KEYS`` stripping via :func:`_canonical`, then
+    :func:`_hash`) so a hash computed here is directly comparable to a
+    ``StrategyDefinition.config_hash``/``StrategyFingerprint.config_hash``
+    produced from the YAML file that originally registered it. Unlike
+    :func:`fingerprint`, this does no file I/O and does not run
+    :func:`validate_config` -- it exists for provenance-hash comparison of a
+    config dict a caller already holds in memory (e.g.
+    ``backtesting.validation.trial_recorder.TrialRecorder``'s C7 provenance
+    check that the config passed to a wrapped ``validator.run``/
+    ``sweeper.sweep`` call is the one that actually produced the claimed
+    ``config_hash``), not for first-time registration.
+    """
+    return _hash(_canonical(config))
+
+
 def recompute_hash(config_path: str) -> str:
     """Re-fingerprint a YAML on disk; used by verify_config_integrity (C6)."""
     path = Path(config_path)

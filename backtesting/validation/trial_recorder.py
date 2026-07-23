@@ -10,6 +10,24 @@ dispatched (so a crashed/discarded run still counts, closing design doc
 Gap 1's "just don't report the bad ones" hole) and updated afterwards to
 ``completed`` (with observed OOS metrics) or ``errored``.
 
+This module also enforces a config-provenance guard (P1 fix): before
+recording a ``running`` row / dispatching, it recomputes the canonical
+``config_hash`` of the config it was actually passed (via
+``strategy_registry.fingerprint.hash_config``, the same canonicalisation
+``StrategyRegistry``/``BacktestLogger`` already use) and requires it to equal
+the caller-supplied ``config_hash`` argument. Without this, a caller could
+mutate params/dates while reusing an already-registered ``config_hash`` and
+have metrics recorded under the wrong frozen config, corrupting promotion
+evidence and Deflated Sharpe trial counts. A mismatch raises
+:class:`backtesting.config_contract.ConfigProvenanceMismatchError` (reused
+from ``BacktestLogger``'s identical provenance check rather than
+reimplemented here). ``data_version`` is excluded from the canonical hash
+(``strategy_registry.fingerprint._RUNTIME_KEYS``), so a run whose config
+differs from the registered one ONLY in ``data_version`` is still accepted.
+For ``run_parameter_sweep``, the BASE config (not any per-variant grid
+override) is what was registered and hashed, so the base config is what is
+checked against ``config_hash``.
+
 This module also enforces the §4.2 data-split guard: a run whose effective
 date range (``config["backtest"]["start_date"]``/``["end_date"]``) overlaps
 a registered ``research_data_windows`` holdout window is rejected with
@@ -52,6 +70,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backtesting.config_contract import ConfigProvenanceMismatchError
 from backtesting.dataset_manifest import require_manifest_hash_data_version
 from backtesting.engine.data_handler import DataHandler
 from backtesting.validation.parameter_sensitivity import (
@@ -59,6 +78,7 @@ from backtesting.validation.parameter_sensitivity import (
     ParameterSweeper,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
+from strategy_registry.fingerprint import hash_config
 from strategy_registry.models import Base, StrategyDefinition
 from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
 from strategy_registry.selection_models import ResearchDataWindow, StrategyTrial
@@ -165,6 +185,8 @@ class TrialRecorder:
                 invalid).
             DefinitionNotFoundError: No ``strategy_definitions`` row exists
                 for ``(strategy_id, config_hash)``.
+            ConfigProvenanceMismatchError: The canonical hash of ``config``
+                does not equal ``config_hash`` (ignoring ``data_version``).
             MissingDataVersionError: ``data_version`` is empty/blank.
             Exception: Any exception the wrapped ``validator.run`` raises is
                 recorded (trial marked ``errored``) and re-raised unchanged.
@@ -178,6 +200,7 @@ class TrialRecorder:
             _dispatch,
             strategy_id=strategy_id,
             config_hash=config_hash,
+            config=config,
             data_version=data_version,
             effective_start=effective_start,
             effective_end=effective_end,
@@ -253,10 +276,20 @@ class TrialRecorder:
         def _dispatch() -> ParameterSensitivityResult:
             return sweeper.sweep(base_config, param_grid, data_handler, **sweep_kwargs)
 
+        # The config-provenance check hashes base_config, not any per-variant
+        # override ParameterSweeper.sweep applies internally from param_grid:
+        # base_config is what was fingerprinted/registered as this
+        # (strategy_id, config_hash) strategy_definitions row, and
+        # ParameterSweeper.sweep layers param_grid combinations on top of it
+        # per-variant (see parameter_sensitivity.py) -- those per-variant
+        # configs are never themselves registered rows (run_parameter_sweep's
+        # own docstring above notes they can't satisfy the config_hash FK),
+        # so they are not what config_hash could ever validly describe.
         return self._run_and_record(
             _dispatch,
             strategy_id=strategy_id,
             config_hash=config_hash,
+            config=base_config,
             data_version=data_version,
             effective_start=effective_start,
             effective_end=effective_end,
@@ -290,6 +323,7 @@ class TrialRecorder:
         *,
         strategy_id: str,
         config_hash: str,
+        config: dict,
         data_version: str,
         effective_start: date,
         effective_end: date,
@@ -337,6 +371,29 @@ class TrialRecorder:
                 raise DefinitionNotFoundError(
                     f"No definition found for ('{strategy_id}', '{config_hash[:8]}…'). "
                     f"Call StrategyRegistry.add_definition()/register() before recording a trial."
+                )
+
+            # P1 fix: a (strategy_id, config_hash) row existing is not enough
+            # -- verify the config actually PASSED to this call is the one
+            # that produced config_hash, using the same canonical
+            # hashing (key-sorted JSON, data_version stripped) StrategyRegistry
+            # and BacktestLogger already use. Without this, a caller could
+            # mutate params/dates while reusing an already-registered hash and
+            # have metrics recorded under the wrong frozen config_hash,
+            # corrupting promotion evidence and DSR trial counts.
+            computed_hash = hash_config(config)
+            if computed_hash != config_hash:
+                raise ConfigProvenanceMismatchError(
+                    f"The config passed for strategy_id={strategy_id!r} does not "
+                    f"match the claimed config_hash: computed canonical hash of "
+                    f"the passed config is {computed_hash} but the caller claims "
+                    f"config_hash={config_hash}. Recording a trial here would "
+                    "attribute its metrics to a config_hash the passed config "
+                    "did not actually produce, corrupting promotion evidence and "
+                    "Deflated Sharpe trial counts. Pass the exact config dict "
+                    "that was fingerprinted/registered under this config_hash "
+                    "(a difference in data_version alone is fine -- it is "
+                    "excluded from the canonical hash)."
                 )
 
             trial = StrategyTrial(
@@ -482,16 +539,34 @@ class TrialRecorder:
             return window
 
         if window is not None:
-            overlaps_holdout = (
-                effective_start <= window.holdout_end and effective_end >= window.holdout_start
+            # P1 fix: a non-confirmation run must be CONTAINED in the
+            # registered train/OOS partition [train_start, oos_end], not
+            # merely avoid intersecting the holdout window. Rejecting only
+            # overlap left a gap: a run with effective_start > holdout_end
+            # (post-holdout data) doesn't intersect the holdout window at all,
+            # so it would dispatch and be recorded as window='train_oos'
+            # without ever consuming the one-shot confirmation seal -- a peek
+            # at post-holdout data. Data before train_start is the same class
+            # of leak. This containment predicate subsumes the old
+            # holdout-overlap rejection for the non-confirmation path: the
+            # 04-1 ordering CHECK guarantees holdout_start >= oos_end, so any
+            # range overlapping the holdout window already fails
+            # effective_end <= window.oos_end.
+            contained_in_train_oos = (
+                effective_start >= window.train_start and effective_end <= window.oos_end
             )
-            if overlaps_holdout:
+            if not contained_in_train_oos:
                 raise HoldoutWindowViolationError(
                     f"Run date range ({effective_start} .. {effective_end}) for "
-                    f"strategy_id={strategy_id!r} overlaps the registered holdout window "
-                    f"({window.holdout_start} .. {window.holdout_end}). Pass "
-                    "final_holdout_confirmation=True for the one-shot confirmation run, or "
-                    "adjust the config's date range to stay inside train/OOS."
+                    f"strategy_id={strategy_id!r} is not fully contained within the "
+                    f"registered train/OOS partition ({window.train_start} .. "
+                    f"{window.oos_end}). This rejects both overlap with the sealed "
+                    f"holdout window ({window.holdout_start} .. {window.holdout_end}) "
+                    "and any range outside it entirely (before train_start, or after "
+                    "oos_end / holdout_end -- a post-holdout peek). Pass "
+                    "final_holdout_confirmation=True for the one-shot confirmation "
+                    "run within the holdout window, or adjust the config's date "
+                    "range to stay inside train/OOS."
                 )
         return window
 
