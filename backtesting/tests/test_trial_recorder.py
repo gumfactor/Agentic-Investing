@@ -29,6 +29,7 @@ from backtesting.validation.parameter_sensitivity import (
     ParameterSweeper,
 )
 from backtesting.validation.trial_recorder import (
+    DataVersionProvenanceMismatchError,
     HoldoutWindowViolationError,
     TrialRecorder,
 )
@@ -863,16 +864,24 @@ def test_config_hash_match_is_accepted(recorder: TrialRecorder) -> None:
 def test_config_differing_only_in_data_version_is_not_a_mismatch(recorder: TrialRecorder) -> None:
     """``data_version`` is a runtime key excluded from the canonical hash
     (strategy_registry.fingerprint._RUNTIME_KEYS), so a config carrying a
-    different data_version than whatever was present (or absent) when the
-    strategy_definitions row was registered must NOT be flagged as a
-    provenance mismatch."""
+    ``data_version`` that was absent when the strategy_definitions row was
+    registered must NOT be flagged as a config_hash provenance mismatch.
+
+    The carried ``data_version`` here is set to the SAME value as the
+    ``data_version`` argument (``DATA_VERSION``) so this test isolates the
+    config_hash check from the separate data_version-consistency check
+    (FIX 2 / 04-2 round-2 P2) -- see
+    ``test_config_data_version_differing_from_argument_is_rejected`` below
+    for that check's own dedicated coverage.
+    """
     registered_config = _config("2022-01-01", "2022-12-31")
     config_hash = _seed_definition(recorder, config=registered_config)
     _seed_window(recorder)
     validator = _mock_validator(_wf_result())
 
     config_with_data_version = dict(registered_config)
-    config_with_data_version["data_version"] = "b" * 64  # differs; must be ignored by the hash
+    # Absent at registration time; present now. Must be ignored by the hash.
+    config_with_data_version["data_version"] = DATA_VERSION
 
     recorder.run_walk_forward(
         validator,
@@ -962,10 +971,17 @@ def test_pre_train_start_non_confirmation_run_is_rejected(recorder: TrialRecorde
 
 
 def test_run_entirely_within_train_oos_partition_is_accepted(recorder: TrialRecorder) -> None:
-    """The positive case: a range fully inside [train_start, oos_end] is
-    accepted -- containment must not be stricter than the old behavior for
-    genuinely in-bounds runs."""
-    config = _config("2022-01-01", "2023-01-01")  # exactly [train_start, oos_end]
+    """The positive case: a range fully inside [train_start, oos_end] and
+    strictly before holdout_start is accepted -- containment must not be
+    stricter than necessary for genuinely in-bounds runs.
+
+    Ends one day before the default seeded window's oos_end/holdout_start
+    (both 2023-01-01 -- see ``_seed_window``'s touching-partition default)
+    rather than exactly on it, since FIX 2 (04-2 round-2 P1) now rejects a
+    run whose effective_end lands exactly on that shared boundary date --
+    see ``test_run_ending_exactly_on_touching_holdout_boundary_is_rejected``.
+    """
+    config = _config("2022-01-01", "2022-12-31")  # inside partition, before holdout_start
     config_hash = _seed_definition(recorder, config=config)
     _seed_window(recorder)
     validator = _mock_validator(_wf_result())
@@ -1030,3 +1046,205 @@ def test_no_registered_window_advisory_mode_allows_any_range(recorder: TrialReco
 
     validator.run.assert_called_once()
     assert len(recorder.list_trials("v1_test_strategy")) == 1
+
+
+# ── FIX 1 (04-2 round-2 P1): touching oos_end/holdout_start boundary must be
+# excluded from the non-confirmation containment window -- backtest date
+# ranges are inclusive, so a run ending exactly on a shared boundary date
+# would otherwise read the first sealed holdout session ─────────────────────
+
+
+def test_run_ending_exactly_on_touching_holdout_boundary_is_rejected(
+    recorder: TrialRecorder,
+) -> None:
+    """The default seeded window has oos_end == holdout_start == 2023-01-01
+    (touching partitions, permitted by the 04-1 ordering CHECK). A
+    non-confirmation run ending exactly on that shared boundary date reads
+    the first sealed holdout session (dates are inclusive) while still being
+    recorded as window='train_oos' -- a leak that the old
+    `effective_end <= window.oos_end` check alone did not catch."""
+    config = _config("2022-01-01", "2023-01-01")  # ends exactly on oos_end == holdout_start
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)  # oos_end=2023-01-01, holdout_start=2023-01-01 (touching)
+    validator = _mock_validator()
+
+    with pytest.raises(HoldoutWindowViolationError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_run_ending_one_day_before_touching_holdout_boundary_is_accepted(
+    recorder: TrialRecorder,
+) -> None:
+    """The mirror-image positive case: a run ending one day before the same
+    touching oos_end/holdout_start boundary (2022-12-31 vs. 2023-01-01) is
+    accepted -- FIX 1 must not reject runs that genuinely stay inside the
+    train/OOS partition and strictly before the holdout seal."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)  # oos_end=2023-01-01, holdout_start=2023-01-01 (touching)
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    assert len(recorder.list_trials("v1_test_strategy")) == 1
+
+
+def test_gap_window_run_ending_before_holdout_start_is_still_accepted(
+    recorder: TrialRecorder,
+) -> None:
+    """Regression guard for the non-touching (gap) case: when oos_end <
+    holdout_start, a run fully inside [train_start, oos_end] must still be
+    accepted -- FIX 1's added `effective_end < window.holdout_start` clause
+    is implied by (not stricter than) `effective_end <= window.oos_end` when
+    there is a gap, so this must behave exactly as before."""
+    config = _config("2022-01-01", "2022-11-01")  # inside [train_start, oos_end], gap before holdout
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(
+        recorder,
+        oos_end=date(2022, 12, 1),
+        holdout_start=date(2023, 1, 1),  # gap between oos_end and holdout_start
+        holdout_end=date(2023, 7, 1),
+    )
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    assert len(recorder.list_trials("v1_test_strategy")) == 1
+
+
+# ── FIX 2 (04-2 round-2 P2): dispatched config's data_version must match the
+# recorded data_version ──────────────────────────────────────────────────────
+
+
+def test_config_data_version_differing_from_argument_is_rejected(recorder: TrialRecorder) -> None:
+    """A config whose top-level data_version is non-empty and differs from
+    the data_version argument must be rejected before dispatch -- a caller
+    should not silently disagree with itself about which C7 data snapshot a
+    trial ran against."""
+    config = _config("2022-01-01", "2022-12-31")
+    config["data_version"] = "b" * 64
+    config_hash = _seed_definition(
+        recorder,
+        config={k: v for k, v in config.items() if k != "data_version"},
+    )
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(DataVersionProvenanceMismatchError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,  # "a" * 64 -- differs from config["data_version"]
+            config=config,
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_config_without_data_version_gets_the_validated_value_dispatched(
+    recorder: TrialRecorder,
+) -> None:
+    """A config with no top-level data_version is accepted, and the config
+    object actually dispatched to the wrapped instrument carries the
+    validated data_version argument -- proving TrialRecorder injects it
+    rather than dispatching the caller's config unchanged."""
+    config = _config("2022-01-01", "2022-12-31")  # no data_version key
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    validator.run.assert_called_once()
+    dispatched_config = validator.run.call_args.args[0]
+    assert dispatched_config["data_version"] == DATA_VERSION
+    # The caller's original config dict must be left untouched.
+    assert "data_version" not in config
+
+
+def test_recorded_trial_data_version_matches_what_the_instrument_was_dispatched_with(
+    recorder: TrialRecorder,
+) -> None:
+    """The strategy_trials.data_version column must equal the data_version
+    the (mocked) instrument actually received in its dispatched config --
+    the whole point of FIX 2 is that these two can never disagree."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result())
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    dispatched_config = validator.run.call_args.args[0]
+    recorded = recorder.list_trials("v1_test_strategy")[0]
+    assert dispatched_config["data_version"] == recorded.data_version == DATA_VERSION
+
+
+def test_parameter_sweep_dispatched_config_carries_validated_data_version(
+    recorder: TrialRecorder,
+) -> None:
+    """Same FIX 2 propagation, exercised through run_parameter_sweep: the
+    base_config actually dispatched to sweeper.sweep() must carry the
+    validated data_version, not the caller's unmodified base_config."""
+    base_config = _config("2022-01-01", "2022-12-31")  # no data_version key
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result())
+
+    recorder.run_parameter_sweep(
+        sweeper,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        base_config=base_config,
+        param_grid={"portfolio.n_long": [10, 20]},
+        data_handler=MagicMock(),
+    )
+
+    sweeper.sweep.assert_called_once()
+    dispatched_config = sweeper.sweep.call_args.args[0]
+    assert dispatched_config["data_version"] == DATA_VERSION
+    assert "data_version" not in base_config

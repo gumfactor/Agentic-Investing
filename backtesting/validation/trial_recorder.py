@@ -102,6 +102,23 @@ class HoldoutWindowViolationError(TrialRecorderError):
     """
 
 
+class DataVersionProvenanceMismatchError(TrialRecorderError):
+    """Raised when ``config`` already declares a non-empty top-level
+    ``data_version`` that disagrees with the ``data_version`` argument the
+    caller is asking this trial to be recorded under (04-2 round-2 P2 fix).
+
+    ``hash_config`` strips ``data_version`` from the canonical
+    ``config_hash`` (it is a ``_RUNTIME_KEYS`` entry), so the config-hash
+    provenance check above cannot catch this: a caller could pass a
+    ``config['data_version']`` that differs from (or is blank while the
+    dispatched backtest ends up reading) the validated ``data_version``
+    argument, leaving the ``strategy_trials`` row's C7 manifest hash
+    inconsistent with what ``BacktestEngine.run``/``BacktestLogger`` actually
+    recorded for the dispatched backtest. A caller should not silently
+    disagree with itself about which data snapshot a trial ran against.
+    """
+
+
 # ── TrialRecorder ─────────────────────────────────────────────────────────────
 
 
@@ -187,14 +204,17 @@ class TrialRecorder:
                 for ``(strategy_id, config_hash)``.
             ConfigProvenanceMismatchError: The canonical hash of ``config``
                 does not equal ``config_hash`` (ignoring ``data_version``).
+            DataVersionProvenanceMismatchError: ``config`` already declares a
+                non-empty top-level ``data_version`` that disagrees with the
+                ``data_version`` argument.
             MissingDataVersionError: ``data_version`` is empty/blank.
             Exception: Any exception the wrapped ``validator.run`` raises is
                 recorded (trial marked ``errored``) and re-raised unchanged.
         """
         effective_start, effective_end = _effective_range(config)
 
-        def _dispatch() -> WalkForwardResult:
-            return validator.run(config, data_handler, **run_kwargs)
+        def _dispatch(dispatch_config: dict) -> WalkForwardResult:
+            return validator.run(dispatch_config, data_handler, **run_kwargs)
 
         return self._run_and_record(
             _dispatch,
@@ -273,8 +293,8 @@ class TrialRecorder:
 
         effective_start, effective_end = _effective_range(base_config)
 
-        def _dispatch() -> ParameterSensitivityResult:
-            return sweeper.sweep(base_config, param_grid, data_handler, **sweep_kwargs)
+        def _dispatch(dispatch_config: dict) -> ParameterSensitivityResult:
+            return sweeper.sweep(dispatch_config, param_grid, data_handler, **sweep_kwargs)
 
         # The config-provenance check hashes base_config, not any per-variant
         # override ParameterSweeper.sweep applies internally from param_grid:
@@ -319,7 +339,7 @@ class TrialRecorder:
 
     def _run_and_record(
         self,
-        dispatch: Callable[[], Any],
+        dispatch: Callable[[dict], Any],
         *,
         strategy_id: str,
         config_hash: str,
@@ -396,6 +416,46 @@ class TrialRecorder:
                     "excluded from the canonical hash)."
                 )
 
+            # 04-2 round-2 P2 fix: hash_config strips data_version from the
+            # canonical hash, so the check above deliberately lets a config
+            # differ from the registered one ONLY in data_version through --
+            # but that means it cannot catch a caller whose
+            # config['data_version'] disagrees with the data_version argument
+            # this trial row is about to record. Reject that disagreement
+            # explicitly rather than silently recording one C7 version while
+            # dispatching a config that carries (or later gets overwritten
+            # to carry) a different one.
+            existing_config_data_version = config.get("data_version")
+            if (
+                existing_config_data_version
+                and str(existing_config_data_version).strip()
+                and existing_config_data_version != data_version
+            ):
+                raise DataVersionProvenanceMismatchError(
+                    f"config['data_version'] ({existing_config_data_version!r}) for "
+                    f"strategy_id={strategy_id!r} does not match the data_version "
+                    f"argument ({data_version!r}) this trial is being recorded "
+                    "under. Pass the same data_version in both places, or omit "
+                    "config['data_version'] and let TrialRecorder set it from the "
+                    "validated argument."
+                )
+
+            # Dispatch a COPY of config carrying the validated data_version at
+            # the top level -- never mutate the caller's dict in place.
+            # BacktestEngine.run reads config.get("data_version", "") directly
+            # (backtesting/engine/event_loop.py), and both
+            # WalkForwardValidator._config_with_dates and
+            # ParameterSweeper._apply_params deep-copy this same dict
+            # per-fold/per-variant, so setting it here on the copy that is
+            # actually dispatched is what keeps WalkForwardResult.config,
+            # every per-fold/per-variant BacktestResult.data_version, and any
+            # later BacktestLogger.log_run/log_walk_forward_run call
+            # consistent with the data_version this strategy_trials row
+            # records below. Injected after the hash_config provenance check
+            # above (which already ignores data_version) so it cannot change
+            # that comparison's outcome.
+            dispatch_config = _config_with_data_version(config, data_version)
+
             trial = StrategyTrial(
                 strategy_id=strategy_id,
                 config_hash=config_hash,
@@ -453,7 +513,7 @@ class TrialRecorder:
         # Gap 1's "just don't report the bad ones" hole); Step 3/4 below
         # updates it to a terminal status.
         try:
-            result = dispatch()
+            result = dispatch(dispatch_config)
         except Exception as exc:
             try:
                 self._mark_errored(trial_id, exc)
@@ -552,21 +612,50 @@ class TrialRecorder:
             # 04-1 ordering CHECK guarantees holdout_start >= oos_end, so any
             # range overlapping the holdout window already fails
             # effective_end <= window.oos_end.
+            #
+            # 04-2 round-2 P1 fix: the 04-1 window-ordering CHECK permits
+            # oos_end == holdout_start (touching partitions), and backtest
+            # date ranges are INCLUSIVE on both ends (DataHandler.trading_dates
+            # returns dates in [start, end]). So `effective_end <= window.oos_end`
+            # alone still let a run whose effective_end lands exactly on a
+            # touching oos_end/holdout_start boundary dispatch and be recorded
+            # as window='train_oos' -- reading the FIRST sealed holdout session
+            # without ever consuming the one-shot confirmation seal. Add an
+            # explicit `effective_end < window.holdout_start` clause so the
+            # upper edge is always strictly before the holdout window, whether
+            # or not there is a gap. When oos_end < holdout_start (a gap), this
+            # clause is already implied by `effective_end <= window.oos_end`
+            # and is a no-op; when oos_end == holdout_start (touching), this
+            # clause is what actually excludes the shared boundary date. Both
+            # clauses are kept so the intent -- contained in train/OOS AND
+            # strictly before the holdout seal -- is explicit rather than
+            # relying on an accidental implication.
             contained_in_train_oos = (
-                effective_start >= window.train_start and effective_end <= window.oos_end
+                effective_start >= window.train_start
+                and effective_end <= window.oos_end
+                and effective_end < window.holdout_start
             )
             if not contained_in_train_oos:
                 raise HoldoutWindowViolationError(
                     f"Run date range ({effective_start} .. {effective_end}) for "
                     f"strategy_id={strategy_id!r} is not fully contained within the "
                     f"registered train/OOS partition ({window.train_start} .. "
-                    f"{window.oos_end}). This rejects both overlap with the sealed "
-                    f"holdout window ({window.holdout_start} .. {window.holdout_end}) "
-                    "and any range outside it entirely (before train_start, or after "
-                    "oos_end / holdout_end -- a post-holdout peek). Pass "
+                    f"{window.oos_end}), or its end touches/crosses the sealed "
+                    f"holdout window start ({window.holdout_start}). The allowed "
+                    f"partition requires effective_start >= {window.train_start}, "
+                    f"effective_end <= {window.oos_end}, AND effective_end strictly "
+                    f"before {window.holdout_start} (dates are inclusive, so a run "
+                    "ending exactly on a touching oos_end/holdout_start boundary "
+                    "would otherwise read the first sealed holdout session). This "
+                    "rejects overlap with the sealed holdout window "
+                    f"({window.holdout_start} .. {window.holdout_end}), any range "
+                    "outside the partition entirely (before train_start, or after "
+                    "oos_end / holdout_end -- a post-holdout peek), and a run "
+                    "touching the holdout boundary. Pass "
                     "final_holdout_confirmation=True for the one-shot confirmation "
                     "run within the holdout window, or adjust the config's date "
-                    "range to stay inside train/OOS."
+                    "range to stay inside train/OOS and strictly before "
+                    "holdout_start."
                 )
         return window
 
@@ -658,6 +747,25 @@ def _parse_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _config_with_data_version(config: dict, data_version: str) -> dict:
+    """Return a deep copy of ``config`` with its top-level ``data_version``
+    set to the validated ``data_version`` argument (04-2 round-2 P2 fix).
+
+    Never mutates the caller's ``config`` dict. ``BacktestEngine.run`` reads
+    ``config.get("data_version", "")`` directly at the top level (see
+    ``backtesting/config_contract.py``'s note on why a nested
+    ``backtest.data_version`` is rejected rather than accepted as a synonym),
+    so this is the key that must carry the recorded value for the dispatched
+    backtest -- and every downstream ``BacktestResult``/``WalkForwardResult``
+    -- to agree with the ``strategy_trials`` row.
+    """
+    import copy
+
+    cfg = copy.deepcopy(config)
+    cfg["data_version"] = data_version
+    return cfg
 
 
 def _normalize_metric(value: Optional[Any]) -> Optional[float]:
