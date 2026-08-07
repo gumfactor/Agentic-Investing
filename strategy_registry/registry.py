@@ -49,6 +49,26 @@ class DuplicateVersionError(StrategyRegistryError):
     pass
 
 
+class EvaluationWindowConflictError(StrategyRegistryError):
+    """
+    An existing (strategy_id, config_hash) definition is being reused with an
+    incoming config that is IDENTICAL in strategy identity but DIFFERS in
+    evaluation context (the backtest date window, and any other field excluded
+    from the identity hash — see strategy_registry/fingerprint.py).
+
+    Since config_hash excludes the evaluation window, "same strategy, different
+    window" collapses to one hash and hits the definition-reuse path. Silently
+    reusing the stored definition would let its *stored* window govern
+    downstream evaluation (PromotionPipeline dispatches ``defn.config``) instead
+    of the window the caller supplied — the "value that ran diverges from the
+    value supplied" defect class. The evaluation window is a per-measurement
+    input, not part of the stored definition's identity; it must be threaded to
+    the measurement (e.g. PromotionPipeline holdout window), never smuggled in
+    by re-registering the same identity with different dates. Fail closed.
+    """
+    pass
+
+
 class InvalidTransitionError(StrategyRegistryError):
     pass
 
@@ -139,6 +159,35 @@ class StrategyRegistry:
         """Validate and hash a config without touching the DB."""
         return fp_module.fingerprint(config_path, explicit_strategy_id)
 
+    @staticmethod
+    def _assert_reuse_config_matches(
+        existing: StrategyDefinition,
+        fp: "StrategyFingerprint",
+    ) -> None:
+        """
+        Guard the definition-reuse path. A stored definition may only be reused
+        for an incoming fingerprint whose canonical config is IDENTICAL to the
+        stored one. Because both sides share config_hash, every identity field
+        already matches by construction; therefore any difference here lives
+        entirely in the excluded evaluation-context fields (the backtest date
+        window). Reusing the stored row in that case would let its stored window
+        silently govern downstream evaluation instead of the caller's window.
+        Fail closed rather than discard the incoming config.
+        """
+        if existing.config != fp.config:
+            raise EvaluationWindowConflictError(
+                f"strategy_id={fp.strategy_id!r} already has a stored definition "
+                f"for config_hash={fp.config_hash[:12]!r} whose evaluation "
+                f"context differs from the config supplied now (identity is "
+                f"identical — the difference is in fields excluded from the "
+                f"identity hash, i.e. the backtest date window). The evaluation "
+                f"window is a per-measurement input, not part of the stored "
+                f"definition; thread it to the measurement (e.g. "
+                f"PromotionPipeline's holdout window) instead of re-registering "
+                f"the same identity with different dates. Refusing to silently "
+                f"reuse the stored definition."
+            )
+
     def add_definition(
         self,
         config_path: str,
@@ -163,6 +212,7 @@ class StrategyRegistry:
                 .options(selectinload(StrategyDefinition.runs))
             )
             if existing is not None:
+                self._assert_reuse_config_matches(existing, fp)
                 log.debug("definition_already_exists", strategy_id=fp.strategy_id, config_hash=fp.config_hash[:8])
                 return existing
 
@@ -274,6 +324,8 @@ class StrategyRegistry:
             # so the composite FK (strategy_id, canonical_config_hash) is satisfied
             # at INSERT time — required when SQLite FK enforcement is enabled.
             defn = session.get(StrategyDefinition, (fp.strategy_id, fp.config_hash))
+            if defn is not None:
+                self._assert_reuse_config_matches(defn, fp)
             if defn is None:
                 defn = StrategyDefinition(
                     strategy_id=fp.strategy_id,

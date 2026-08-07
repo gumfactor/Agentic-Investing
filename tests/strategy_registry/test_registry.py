@@ -16,6 +16,7 @@ from strategy_registry.registry import (
     ConflictingActiveStrategyError,
     DefinitionNotFoundError,
     DuplicateVersionError,
+    EvaluationWindowConflictError,
     InsufficientPaperQualificationError,
     InvalidTransitionError,
     MissingDataVersionError,
@@ -232,6 +233,44 @@ def test_add_definition_is_idempotent(registry: StrategyRegistry, cfg: Path) -> 
     d1 = registry.add_definition(str(cfg))
     d2 = registry.add_definition(str(cfg))
     assert d1.config_hash == d2.config_hash
+
+
+def test_add_definition_same_identity_different_window_raises(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """Same strategy identity (same hash — window is excluded) but a different
+    backtest window must NOT silently reuse the stored definition, because the
+    stored window would then govern downstream evaluation instead of the
+    caller's. Fail closed (P1, PR #49 identity review)."""
+    p1 = _write_config(
+        tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31"
+    )
+    p2 = _write_config(
+        tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31"
+    )
+    d1 = registry.add_definition(str(p1))
+    d2 = registry.fingerprint(str(p2))
+    # Precondition: these two collide on identity (same hash) by design.
+    assert d1.config_hash == d2.config_hash
+    with pytest.raises(EvaluationWindowConflictError):
+        registry.add_definition(str(p2))
+
+
+def test_register_same_identity_different_window_raises(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """register() reuses an existing definition row; if a prior definition was
+    added with a different window it must not be silently reused and dispatched
+    (P1, PR #49 identity review)."""
+    p1 = _write_config(
+        tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31"
+    )
+    p2 = _write_config(
+        tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31"
+    )
+    registry.add_definition(str(p1))
+    with pytest.raises(EvaluationWindowConflictError):
+        registry.register(str(p2))
 
 
 def test_add_definition_same_version_different_hash_raises(
