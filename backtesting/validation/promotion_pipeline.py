@@ -66,19 +66,33 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
   resolved policy's correctness bar (C7 data-version pinning already
   guarantees byte-identical inputs across re-runs) while deferring the
   actual compute-cost optimization to a later slice if it is ever needed.
-- **holdout_mode is GATED/DEFERRED (not yet supported)**: a promoted
-  strategy's ``config_hash`` INCLUDES its ``backtest.start_date``/
-  ``end_date``, so the frozen winner's config cannot be re-evaluated over
-  the sealed holdout window without changing its hash -- holdout
-  confirmation as previously built either fails the holdout guard or
-  silently confirms a DIFFERENT config than the frozen winner. Pending an
-  identity/evaluation-context design decision (see
-  ``docs/plans/04-identity-evaluation-context-design.md``), ``run(...,
-  holdout_mode=True)`` now fails closed immediately with
-  :class:`HoldoutConfirmationNotSupportedError`, before any instrument or
-  DB work happens. The parameter is kept on the signature for callers/
-  tests that reference it. The train/OOS (``holdout_mode=False``) path
-  described below is unaffected and fully supported.
+- **holdout_mode is SUPPORTED (design doc §4.0 step 8, implemented per
+  docs/plans/04-identity-evaluation-context-design.md, operator decision
+  2026-08-07, Option 1)**: ``config_hash`` now excludes
+  ``backtest.start_date``/``backtest.end_date`` (they are evaluation
+  context, not strategy identity -- see
+  ``strategy_registry.fingerprint._IDENTITY_EXCLUDED_NESTED``), so the
+  SAME frozen winning ``config_hash`` can be evaluated over train/OOS
+  dates and then, once, over the sealed holdout window. ``run(...,
+  holdout_mode=True)`` loads the winning definition's config, looks up its
+  registered ``research_data_windows`` row (fail closed if none is
+  registered -- :class:`MissingHoldoutWindowError`), builds a holdout
+  evaluation config (the winner's config with ``backtest.start_date``/
+  ``end_date`` replaced by the registered ``holdout_start``/
+  ``holdout_end``), and asserts
+  ``hash_config(holdout_config) == config_hash`` before dispatch
+  (:class:`HoldoutIdentityMismatchError` if that ever fails -- it is the
+  crux of the whole design: the date swap must NOT change the identity).
+  It then dispatches via ``TrialRecorder.run_walk_forward(...,
+  final_holdout_confirmation=True)``, which independently re-enforces that
+  the effective date range is contained in the registered holdout window
+  and applies the one-shot seal (``_enforce_holdout_guard`` -- unaffected
+  by this change, still the primary window-safety backstop). No parameter
+  sweep runs in holdout mode (``TrialRecorder.run_parameter_sweep``
+  already hard-rejects ``final_holdout_confirmation=True``); the gate is
+  funnel PASS AND stress ``solid`` only. The ``promotion_decisions`` row's
+  ``evidence_json`` carries an explicit ``evaluation="holdout_confirmation"``
+  marker plus the holdout window.
 - **MLflow logging failure degrades gracefully**: when a ``backtest_logger``
   IS supplied (as opposed to the ``backtest_logger=None`` "skip MLflow
   entirely" path) but raises during ``_log_to_mlflow`` (e.g. a transient
@@ -95,6 +109,7 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -128,10 +143,11 @@ from backtesting.validation.trial_recorder import (
     _sanitize_metrics,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
+from strategy_registry.fingerprint import hash_config
 from strategy_registry.hypothesis import HypothesisRegistry, HypothesisNotFoundError
 from strategy_registry.models import Base
 from strategy_registry.registry import StrategyNotFoundError, StrategyRegistry
-from strategy_registry.selection_models import PromotionDecision
+from strategy_registry.selection_models import PromotionDecision, ResearchDataWindow
 
 logger = structlog.get_logger(__name__)
 
@@ -221,20 +237,35 @@ class MissingParameterGridError(PromotionPipelineError):
     """
 
 
-class HoldoutConfirmationNotSupportedError(PromotionPipelineError):
-    """Raised immediately when ``run(..., holdout_mode=True)`` is called.
+class MissingHoldoutWindowError(PromotionPipelineError):
+    """Raised when ``run(..., holdout_mode=True)`` is called for a
+    ``strategy_id`` (or its ``strategy_family``) with no registered
+    ``research_data_windows`` row.
 
-    Holdout confirmation is DEFERRED: a promoted strategy's
-    ``config_hash`` includes its ``backtest.start_date``/``end_date``, so
-    the frozen winner's config cannot be re-evaluated over the sealed
-    holdout window without changing its hash -- holdout confirmation as
-    previously built either fails the holdout guard or silently confirms
-    a DIFFERENT config than the frozen winner. This is gated fail-closed
-    pending an identity/evaluation-context design decision -- see
-    ``docs/plans/04-identity-evaluation-context-design.md``. The
-    ``holdout_mode`` parameter is kept on ``run()`` so existing callers/
-    tests referencing it still import; it now always raises before any
-    instrument or DB work happens.
+    A holdout confirmation requires a pre-registered, sealed holdout
+    window (§4.2) to evaluate the frozen winner over -- there is no
+    ad hoc/inferred holdout range, mirroring the same "no ad hoc grid"
+    discipline :class:`MissingParameterGridError` enforces for the
+    parameter-sensitivity sweep. Checked before any instrument runs.
+    """
+
+
+class HoldoutIdentityMismatchError(PromotionPipelineError):
+    """Raised if the holdout evaluation config's canonical ``config_hash``
+    does not equal the frozen winner's ``config_hash``.
+
+    This is the crux assertion the whole identity/evaluation-context
+    design (``docs/plans/04-identity-evaluation-context-design.md``,
+    operator decision 2026-08-07, Option 1) exists to make true: swapping
+    only ``backtest.start_date``/``backtest.end_date`` for the registered
+    holdout window must NOT change the identity hash (those two nested
+    keys are excluded from ``config_hash`` -- see
+    ``strategy_registry.fingerprint._IDENTITY_EXCLUDED_NESTED``). If this
+    assertion ever fails, something is architecturally wrong (e.g. the
+    winner's stored config carries some other field that differs from
+    what was fingerprinted) and the holdout run must not proceed -- a
+    holdout confirmation of a DIFFERENT identity than the frozen winner
+    would defeat the entire point of the one-shot seal.
     """
 
 
@@ -405,25 +436,34 @@ class PromotionPipeline:
             hypothesis_id: FK to the ``strategy_hypotheses`` row this
                 promotion's parameter grid is sourced from. Required
                 (never inferred) -- see ``MissingParameterGridError``.
-            holdout_mode: DEFERRED/GATED -- kept on the signature for
-                callers/tests that reference it, but passing ``True``
-                always raises ``HoldoutConfirmationNotSupportedError``
-                immediately (before any instrument or DB work). See the
-                module docstring's "holdout_mode is GATED/DEFERRED" note
-                and ``docs/plans/04-identity-evaluation-context-design.md``.
+            holdout_mode: When ``True``, runs the one-shot final holdout
+                confirmation (§4.0 step 8) instead of a train/OOS
+                evaluation: the frozen winner's config is re-evaluated over
+                its registered ``research_data_windows`` holdout window
+                (same ``config_hash`` -- see the module docstring's
+                "holdout_mode is SUPPORTED" note), no parameter-sensitivity
+                sweep runs, and the gate is funnel PASS AND stress
+                ``solid`` only.
 
         Returns:
             A ``PromotionResult`` with every stage's outcome and the
             persisted ``promotion_decision_id``.
 
         Raises:
-            HoldoutConfirmationNotSupportedError: ``holdout_mode=True`` was
-                passed. Checked first, before any instrument or DB work.
             MissingParameterGridError: ``hypothesis_id`` is None, does not
                 belong to ``strategy_id``, or its ``param_grid_json`` is
                 missing/empty/malformed (a scalar, string, non-sequence, or
                 empty list/tuple for any key). Checked before any
                 instrument runs.
+            MissingHoldoutWindowError: ``holdout_mode=True`` and no
+                ``research_data_windows`` row is registered for
+                ``strategy_id`` (or its ``strategy_family``). Checked
+                before any instrument runs.
+            HoldoutIdentityMismatchError: ``holdout_mode=True`` and the
+                holdout evaluation config's canonical hash does not equal
+                ``config_hash`` -- see the class docstring; this should
+                never happen given the identity/evaluation-context design,
+                and is a fail-closed defensive check.
             DefinitionNotFoundError: No ``strategy_definitions`` row for
                 ``(strategy_id, config_hash)`` (raised by
                 ``TrialRecorder``/``StrategyRegistry``).
@@ -431,22 +471,10 @@ class PromotionPipeline:
                 its source YAML has drifted from the registered canonical
                 hash (§4.3's config-freeze re-check).
             HoldoutWindowViolationError: The walk-forward date range
-                violates the §4.2 train/OOS/holdout partition (propagated
-                unchanged from ``TrialRecorder``).
+                violates the §4.2 train/OOS/holdout partition, or (in
+                holdout mode) the one-shot seal was already consumed
+                (propagated unchanged from ``TrialRecorder``).
         """
-        if holdout_mode:
-            raise HoldoutConfirmationNotSupportedError(
-                "PromotionPipeline.run(holdout_mode=True) is not yet "
-                "supported: a promoted strategy's config_hash includes its "
-                "backtest.start_date/end_date, so the frozen winner's "
-                "config cannot be re-evaluated over the sealed holdout "
-                "window without changing its hash. Holdout confirmation is "
-                "deferred pending an identity/evaluation-context design "
-                "decision -- see "
-                "docs/plans/04-identity-evaluation-context-design.md. Use "
-                "holdout_mode=False (the train/OOS path) for now."
-            )
-
         defn = self._registry.get_definition(strategy_id, config_hash)
         config = dict(defn.config)
 
@@ -468,15 +496,54 @@ class PromotionPipeline:
         self._resolve_frozen_grid(strategy_id, hypothesis_id)
         strategy_family = self._resolve_strategy_family(strategy_id)
 
+        # holdout_mode: build the holdout evaluation config -- the frozen
+        # winner's config with backtest.start_date/end_date replaced by the
+        # registered holdout window -- and assert its canonical hash still
+        # equals config_hash (see HoldoutIdentityMismatchError's docstring:
+        # this is the crux of the whole design, true by construction once
+        # strategy_registry.fingerprint excludes those two nested keys from
+        # the hash). dispatch_config is what actually gets passed to
+        # run_walk_forward below; the non-holdout path leaves it as the
+        # winner's own (train/OOS) config, unchanged from before.
+        dispatch_config = config
+        holdout_window: Optional[ResearchDataWindow] = None
+        if holdout_mode:
+            holdout_window = self._resolve_holdout_window(strategy_id, strategy_family)
+            holdout_config = copy.deepcopy(config)
+            holdout_config.setdefault("backtest", {})
+            holdout_config["backtest"] = dict(holdout_config["backtest"])
+            holdout_config["backtest"]["start_date"] = holdout_window.holdout_start.isoformat()
+            holdout_config["backtest"]["end_date"] = holdout_window.holdout_end.isoformat()
+
+            recomputed_hash = hash_config(holdout_config)
+            if recomputed_hash != config_hash:
+                raise HoldoutIdentityMismatchError(
+                    f"Holdout evaluation config for strategy_id={strategy_id!r} "
+                    f"hashes to {recomputed_hash}, which does not equal the "
+                    f"frozen winning config_hash={config_hash}. Swapping only "
+                    "backtest.start_date/end_date for the registered holdout "
+                    "window must not change strategy identity (those two "
+                    "nested keys are excluded from config_hash -- see "
+                    "strategy_registry.fingerprint._IDENTITY_EXCLUDED_NESTED). "
+                    "Refusing to run a holdout confirmation that would "
+                    "silently confirm a DIFFERENT identity than the frozen "
+                    "winner."
+                )
+            dispatch_config = holdout_config
+
         # Stage 1: walk-forward (fresh; see module docstring's "re-run
         # staleness" note for why this never attempts to reuse a prior
-        # recorded trial).
+        # recorded trial). TrialRecorder._enforce_holdout_guard is the
+        # independent, primary window-safety backstop here: it re-validates
+        # that the effective date range falls within the registered holdout
+        # window and applies the one-shot seal, entirely independent of the
+        # config_hash identity assertion above.
         wf_result = self._trial_recorder.run_walk_forward(
             self._wf_validator,
             strategy_id=strategy_id,
             config_hash=config_hash,
             data_version=self._data_version,
-            config=config,
+            config=dispatch_config,
             data_handler=data_handler,
             hypothesis_id=hypothesis_id,
             final_holdout_confirmation=holdout_mode,
@@ -551,6 +618,7 @@ class PromotionPipeline:
             strategy_id=strategy_id,
             config_hash=config_hash,
             holdout_mode=holdout_mode,
+            holdout_window=holdout_window,
             funnel_result=funnel_result,
             sensitivity_result=sensitivity_result,
             stress_result=stress_result,
@@ -697,6 +765,39 @@ class PromotionPipeline:
         except StrategyNotFoundError:
             return None
         return strategy.strategy_family
+
+    def _resolve_holdout_window(
+        self, strategy_id: str, strategy_family: Optional[str]
+    ) -> ResearchDataWindow:
+        """Fail closed unless a pre-registered ``research_data_windows`` row
+        is available for ``strategy_id`` (or, as a fallback, its
+        ``strategy_family``) -- mirrors
+        ``TrialRecorder._lookup_window``'s per-strategy-first, per-family-
+        fallback scoping (§8 Q1) exactly, so this read-only precondition
+        check agrees with the guard ``TrialRecorder`` re-applies at dispatch
+        time.
+        """
+        with Session(self._engine) as session:
+            window = session.scalar(
+                select(ResearchDataWindow).where(ResearchDataWindow.strategy_id == strategy_id)
+            )
+            if window is None and strategy_family is not None:
+                window = session.scalar(
+                    select(ResearchDataWindow).where(
+                        ResearchDataWindow.strategy_family == strategy_family
+                    )
+                )
+        if window is None:
+            raise MissingHoldoutWindowError(
+                f"holdout_mode=True requires a registered research_data_windows "
+                f"row for strategy_id={strategy_id!r}"
+                + (f" (or strategy_family={strategy_family!r})" if strategy_family else "")
+                + ". No sealed holdout window is registered; a holdout "
+                "confirmation cannot proceed without one. Register a window "
+                "via research_data_windows before calling "
+                "PromotionPipeline.run(holdout_mode=True)."
+            )
+        return window
 
     def _compute_n_trials(self, strategy_id: str) -> int:
         """§4.4's n_trials sweep-counting policy: SUM(configs_tested) over
@@ -860,6 +961,7 @@ class PromotionPipeline:
         strategy_id: str,
         config_hash: str,
         holdout_mode: bool,
+        holdout_window: Optional[ResearchDataWindow],
         funnel_result: SurvivalFunnelResult,
         sensitivity_result: Optional[ParameterSensitivityResult],
         stress_result: BootstrapStressResult,
@@ -875,6 +977,19 @@ class PromotionPipeline:
             "config_hash": config_hash,
             "data_version": self._data_version,
             "holdout_mode": holdout_mode,
+            # Explicit marker (design doc §4.0 step 8) so a reviewer of a
+            # promotion_decisions row can immediately tell a holdout
+            # confirmation apart from a train/OOS evaluation without
+            # cross-referencing strategy_trials.window.
+            "evaluation": "holdout_confirmation" if holdout_mode else "train_oos",
+            "holdout_window": (
+                {
+                    "holdout_start": holdout_window.holdout_start.isoformat(),
+                    "holdout_end": holdout_window.holdout_end.isoformat(),
+                }
+                if holdout_window is not None
+                else None
+            ),
             "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
             "overall_passed": overall_passed,
             "funnel": {

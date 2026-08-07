@@ -35,18 +35,21 @@ from backtesting.validation.parameter_sensitivity import (
     ParameterSweeper,
 )
 from backtesting.validation.promotion_pipeline import (
-    HoldoutConfirmationNotSupportedError,
+    HoldoutIdentityMismatchError,
+    MissingHoldoutWindowError,
     MissingParameterGridError,
     PromotionPipeline,
     RESIDUAL_BUG_ACKNOWLEDGEMENTS,
     _sanitize_metrics,
 )
+from backtesting.validation.trial_recorder import HoldoutWindowViolationError
 from backtesting.validation.walk_forward import WalkForwardFold, WalkForwardResult, WalkForwardValidator
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.hypothesis import HypothesisRegistry
 from strategy_registry.models import Base, Strategy, StrategyDefinition
 from strategy_registry.selection_models import (
     PromotionDecision,
+    ResearchDataWindow,
     StrategyHypothesis,
     StrategyTrial,
 )
@@ -100,6 +103,40 @@ def _seed_definition(db_url: str, strategy_id: str = "v1_test_strategy", config:
         )
         session.commit()
     return config_hash
+
+
+def _seed_window(
+    db_url: str,
+    *,
+    strategy_id: str = "v1_test_strategy",
+    train_start: date = date(2022, 1, 1),
+    train_end: date = date(2022, 7, 1),
+    oos_start: date = date(2022, 7, 1),
+    oos_end: date = date(2022, 12, 31),
+    holdout_start: date = date(2023, 1, 1),
+    holdout_end: date = date(2023, 6, 30),
+) -> ResearchDataWindow:
+    """Seed a ``research_data_windows`` row whose train/OOS bounds contain
+    ``_config()``'s default 2022-01-01..2022-12-31 range, with a holdout
+    window immediately after it. Returns the seeded row (detached values
+    only -- callers read the plain date fields, not a live ORM instance)."""
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        window = ResearchDataWindow(
+            strategy_id=strategy_id,
+            train_start=train_start,
+            train_end=train_end,
+            oos_start=oos_start,
+            oos_end=oos_end,
+            holdout_start=holdout_start,
+            holdout_end=holdout_end,
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(window)
+        session.commit()
+        session.refresh(window)
+        session.expunge(window)
+    return window
 
 
 _UNSET = object()
@@ -675,23 +712,117 @@ def test_residual_bug_flags_present_in_evidence(db_url: str) -> None:
     assert "BUG-066" in fail_result.evidence_json["residual_bug_acknowledgements"]
 
 
-# ── FIX 3: holdout_mode=True is gated/deferred -- fails closed immediately ─────
+# ── Holdout confirmation (design doc §4.0 step 8, implemented per ──────────
+#    docs/plans/04-identity-evaluation-context-design.md, operator decision
+#    2026-08-07, Option 1: config_hash excludes backtest.start_date/end_date,
+#    so the SAME frozen winning identity can be confirmed over the sealed
+#    holdout window.) ──────────────────────────────────────────────────────
 
 
-def test_holdout_mode_fails_closed_before_any_instrument_or_db_work(db_url: str) -> None:
-    """holdout_mode=True must raise HoldoutConfirmationNotSupportedError
-    immediately, before ANY instrument (walk-forward, sweep) runs and
-    before any DB work (no strategy_trials or promotion_decisions rows).
+def _expected_holdout_config(window: ResearchDataWindow) -> dict:
+    """The holdout evaluation config PromotionPipeline._resolve_holdout_window
+    + run() should build: _config()'s base with backtest dates swapped for
+    the registered holdout window."""
+    cfg = _config("v1_test_strategy")
+    cfg["backtest"] = dict(cfg["backtest"])
+    cfg["backtest"]["start_date"] = window.holdout_start.isoformat()
+    cfg["backtest"]["end_date"] = window.holdout_end.isoformat()
+    return cfg
 
-    This replaces the old test_holdout_mode_skips_sensitivity_sweep /
-    test_promotion_result_dsr_none_when_n_trials_is_one_and_fdr_skips
-    tests, which propped up holdout confirmation via a separate
-    holdout-dated StrategyDefinition + a hand-seeded ResearchDataWindow --
-    the exact flawed "confirms a DIFFERENT config than the frozen winner"
-    workaround this fix gates closed. holdout_mode is deferred pending
-    docs/plans/04-identity-evaluation-context-design.md; no test should
-    exercise the old path as if it worked.
-    """
+
+def test_holdout_confirmation_uses_same_frozen_config_hash_as_winner(db_url: str) -> None:
+    """The crux assertion: the holdout evaluation config (winner's config
+    with dates swapped for the registered holdout window) must hash to the
+    SAME config_hash as the frozen train/OOS winner -- proving the holdout
+    run confirms the identical identity, not a different one."""
+    config_hash = _seed_definition(db_url)
+    window = _seed_window(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    holdout_config = _expected_holdout_config(window)
+    assert hash_config(holdout_config) == config_hash  # the crux, independent of the pipeline
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(sharpe=1.0, max_dd=-0.05, is_sharpe=1.0, trade_count=20, n_folds=1),
+        stress_result=_stress_result("solid"),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy",
+        config_hash,
+        data_handler=MagicMock(),
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+
+    # The dispatched config's canonical hash equals config_hash -- the
+    # pipeline actually built and used the holdout config, not the raw
+    # train/OOS one.
+    dispatched_config = pipeline._wf_validator.run.call_args.args[0]
+    assert hash_config(dispatched_config) == config_hash
+    assert dispatched_config["backtest"]["start_date"] == window.holdout_start.isoformat()
+    assert dispatched_config["backtest"]["end_date"] == window.holdout_end.isoformat()
+
+    assert result.config_hash == config_hash
+    assert result.sensitivity_result is None
+    assert result.sensitivity_verdict is None
+    assert result.overall_passed == (result.funnel_passed and result.stress_verdict == "solid")
+    assert result.promotion_decision_id is not None
+
+    pipeline._sweeper.sweep.assert_not_called()
+
+    trials = pipeline._trial_recorder.list_trials("v1_test_strategy")
+    assert len(trials) == 1
+    assert trials[0].window == "holdout"
+    assert trials[0].run_type == "holdout_confirmation"
+
+    assert result.evidence_json["evaluation"] == "holdout_confirmation"
+    assert result.evidence_json["holdout_window"] == {
+        "holdout_start": window.holdout_start.isoformat(),
+        "holdout_end": window.holdout_end.isoformat(),
+    }
+
+
+def test_second_holdout_confirmation_is_rejected_by_one_shot_seal(db_url: str) -> None:
+    """A second holdout_mode=True call for the same strategy_id must be
+    rejected by TrialRecorder's one-shot seal (unchanged guard, independent
+    of the identity/config_hash change)."""
+    config_hash = _seed_definition(db_url)
+    _seed_window(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(n_folds=1),
+        stress_result=_stress_result("solid"),
+    )
+    pipeline.run(
+        "v1_test_strategy",
+        config_hash,
+        data_handler=MagicMock(),
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+
+    with pytest.raises(HoldoutWindowViolationError):
+        pipeline.run(
+            "v1_test_strategy",
+            config_hash,
+            data_handler=MagicMock(),
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
+        )
+
+    trials = pipeline._trial_recorder.list_trials("v1_test_strategy", run_type="holdout_confirmation")
+    assert len(trials) == 1  # the seal held -- only the first confirmation was recorded
+
+
+def test_holdout_mode_fails_closed_with_no_registered_window(db_url: str) -> None:
+    """holdout_mode=True with no registered research_data_windows row must
+    fail closed with MissingHoldoutWindowError before any instrument or DB
+    work -- mirrors MissingParameterGridError's fail-before-instruments
+    discipline."""
     config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
     validator = _mock_validator()
@@ -700,7 +831,7 @@ def test_holdout_mode_fails_closed_before_any_instrument_or_db_work(db_url: str)
     pipeline._wf_validator = validator
     pipeline._sweeper = sweeper
 
-    with pytest.raises(HoldoutConfirmationNotSupportedError):
+    with pytest.raises(MissingHoldoutWindowError):
         pipeline.run(
             "v1_test_strategy",
             config_hash,
@@ -725,6 +856,48 @@ def test_holdout_mode_fails_closed_before_any_instrument_or_db_work(db_url: str)
             )
         )
     assert decisions == []
+
+
+def test_holdout_identity_mismatch_fails_closed(db_url: str) -> None:
+    """Defensive check: if the holdout config's recomputed hash somehow
+    disagreed with config_hash, the pipeline must refuse to dispatch rather
+    than silently confirm a different identity. Simulated here by seeding a
+    config_hash that does NOT match hash_config(_config(...)) (as if the
+    stored StrategyDefinition.config had drifted from what produced its own
+    hash) -- an artificial but direct way to exercise the assertion without
+    relying on the fingerprint algorithm itself being wrong."""
+    strategy_id = "v1_test_strategy"
+    real_config = _config(strategy_id)
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        session.add(
+            StrategyDefinition(
+                strategy_id=strategy_id,
+                config_hash="f" * 64,  # deliberately wrong -- does not match real_config
+                name=strategy_id,
+                version=1,
+                config=real_config,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+    _seed_window(db_url, strategy_id=strategy_id)
+    hyp_id = _seed_hypothesis(db_url, strategy_id=strategy_id)
+
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(HoldoutIdentityMismatchError):
+        pipeline.run(
+            strategy_id,
+            "f" * 64,
+            data_handler=MagicMock(),
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
+        )
+
+    validator.run.assert_not_called()
 
 
 def test_holdout_mode_default_false_train_oos_path_unaffected(db_url: str) -> None:
