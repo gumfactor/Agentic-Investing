@@ -339,6 +339,113 @@ def test_parameter_sweep_that_raises_leaves_an_errored_row(recorder: TrialRecord
     assert trials[0].status == "errored"
 
 
+def test_parameter_sweep_that_raises_still_records_planned_configs_tested(
+    recorder: TrialRecorder,
+) -> None:
+    """FIX 2: the PLANNED variant count (Cartesian product of param_grid) is
+    seeded into metrics_json['configs_tested'] at the INITIAL insert, before
+    dispatch -- so a sweep that crashes partway through still leaves an
+    'errored' row carrying its attempted count, not an empty metrics_json
+    that PromotionPipeline._compute_n_trials would understate as 1."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(exc=RuntimeError("sweep crashed mid-grid"))
+
+    # A 2x3 grid -> planned Cartesian product of 6 variants.
+    param_grid = {"portfolio.n_long": [10, 20], "signals.momentum_window": [3, 6, 12]}
+
+    with pytest.raises(RuntimeError, match="sweep crashed mid-grid"):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid=param_grid,
+            data_handler=MagicMock(),
+        )
+
+    trials = recorder.list_trials("v1_test_strategy", run_type="parameter_sweep_variant")
+    assert len(trials) == 1
+    trial = trials[0]
+    assert trial.status == "errored"
+    assert trial.metrics_json["configs_tested"] == 6
+    assert trial.metrics_json["error_type"] == "RuntimeError"
+    assert "sweep crashed mid-grid" in trial.metrics_json["error_message"]
+
+
+def test_parameter_sweep_success_still_records_actual_configs_tested(
+    recorder: TrialRecorder,
+) -> None:
+    """Happy path unchanged: on a SUCCESSFUL sweep, the recorded row's
+    metrics_json['configs_tested'] reflects the actual
+    ParameterSensitivityResult.configs_tested (which equals the planned
+    product for a full grid), not merely the pre-dispatch planned seed."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    param_grid = {"portfolio.n_long": [10, 20], "signals.momentum_window": [3, 6, 12]}
+    sweeper = _mock_sweeper(result=_sweep_result())
+    sweeper.sweep.return_value = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid=param_grid,
+        configs_tested=6,
+        rows=[],
+        mean_oos_sharpe=0.8,
+        std_oos_sharpe=0.1,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    recorder.run_parameter_sweep(
+        sweeper,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        base_config=base_config,
+        param_grid=param_grid,
+        data_handler=MagicMock(),
+    )
+
+    trials = recorder.list_trials("v1_test_strategy", run_type="parameter_sweep_variant")
+    assert len(trials) == 1
+    trial = trials[0]
+    assert trial.status == "completed"
+    assert trial.metrics_json["configs_tested"] == 6
+
+
+def test_parameter_sweep_malformed_param_grid_does_not_crash_seeding(
+    recorder: TrialRecorder,
+) -> None:
+    """A malformed param_grid value (not a list-like of candidates) must not
+    crash the planned-count seeding step -- it should leave configs_tested
+    unset on the initial row rather than raising, deferring any validation
+    error to the wrapped ParameterSweeper.sweep call itself."""
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(exc=ValueError("bad grid"))
+
+    with pytest.raises(ValueError, match="bad grid"):
+        recorder.run_parameter_sweep(
+            sweeper,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            base_config=base_config,
+            param_grid={"portfolio.n_long": 10},  # not a list -- malformed
+            data_handler=MagicMock(),
+        )
+
+    trials = recorder.list_trials("v1_test_strategy", run_type="parameter_sweep_variant")
+    assert len(trials) == 1
+    trial = trials[0]
+    assert trial.status == "errored"
+    assert "configs_tested" not in trial.metrics_json
+
+
 # ── Holdout confirmation: one-shot seal ─────────────────────────────────────────
 
 

@@ -454,6 +454,20 @@ class TrialRecorder:
 
         effective_start, effective_end = _effective_range(base_config)
 
+        # Planned variant count (Cartesian product of param_grid), computed
+        # BEFORE dispatch from the grid shape alone. Seeded into the initial
+        # 'running' row's metrics_json['configs_tested'] so a crashed/errored
+        # sweep still carries an honest attempted count for
+        # PromotionPipeline._compute_n_trials, instead of falling back to 1.
+        # None (malformed/empty grid) means "leave it unset" -- the existing
+        # _compute_n_trials fallback+warning already covers a missing value.
+        planned_configs_tested = _planned_grid_size(param_grid)
+        initial_metrics_json = (
+            {"configs_tested": planned_configs_tested}
+            if planned_configs_tested is not None
+            else None
+        )
+
         def _dispatch(dispatch_config: dict) -> ParameterSensitivityResult:
             return sweeper.sweep(dispatch_config, param_grid, data_handler, **sweep_kwargs)
 
@@ -479,6 +493,7 @@ class TrialRecorder:
             strategy_family=strategy_family,
             base_run_type="parameter_sweep_variant",
             extract_metrics=_extract_sweep_metrics,
+            initial_metrics_json=initial_metrics_json,
         )
 
     def list_trials(
@@ -513,6 +528,7 @@ class TrialRecorder:
         strategy_family: Optional[str],
         base_run_type: str,
         extract_metrics: Callable[[Any], tuple[Optional[float], Optional[float], dict]],
+        initial_metrics_json: Optional[dict] = None,
     ) -> Any:
         if not data_version or not data_version.strip():
             raise MissingDataVersionError(
@@ -671,7 +687,7 @@ class TrialRecorder:
                 run_type=run_type,
                 data_version=data_version,
                 status="running",
-                metrics_json={},
+                metrics_json=dict(initial_metrics_json) if initial_metrics_json else {},
                 started_at=started_at,
             )
             session.add(trial)
@@ -732,7 +748,7 @@ class TrialRecorder:
             result = dispatch(dispatch_config)
         except Exception as exc:
             try:
-                self._mark_errored(trial_id, exc)
+                self._mark_errored(trial_id, exc, initial_metrics_json=initial_metrics_json)
             except Exception as mark_exc:
                 # The recording write itself failed (e.g. a DB blip while
                 # handling the original error). Never let the recording
@@ -916,7 +932,13 @@ class TrialRecorder:
             trial.completed_at = now
             session.commit()
 
-    def _mark_errored(self, trial_id: int, exc: Exception) -> None:
+    def _mark_errored(
+        self,
+        trial_id: int,
+        exc: Exception,
+        *,
+        initial_metrics_json: Optional[dict] = None,
+    ) -> None:
         now = datetime.now(tz=timezone.utc)
         with Session(self._engine) as session:
             trial = session.get(StrategyTrial, trial_id)
@@ -924,10 +946,18 @@ class TrialRecorder:
                 logger.error("strategy_trial_vanished_on_error", trial_id=trial_id)
                 return
             trial.status = "errored"
-            trial.metrics_json = {
-                "error_type": type(exc).__name__,
-                "error_message": str(exc),
-            }
+            # Preserve the planned-count seed (e.g. configs_tested) recorded
+            # at insert time -- an errored sweep still carries its attempted
+            # variant count alongside the error detail, rather than losing it
+            # to a full metrics_json overwrite.
+            metrics_json = dict(initial_metrics_json) if initial_metrics_json else {}
+            metrics_json.update(
+                {
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+            )
+            trial.metrics_json = metrics_json
             trial.completed_at = now
             session.commit()
 
@@ -935,6 +965,34 @@ class TrialRecorder:
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
+
+def _planned_grid_size(param_grid: dict[str, list]) -> Optional[int]:
+    """Cartesian-product size of ``param_grid`` -- the number of variants a
+    full sweep is PLANNED to execute, computed up front from the grid shape
+    alone (no dispatch required). Used to seed ``metrics_json['configs_tested']``
+    on the initial ``running`` row so a crashed/errored sweep still carries an
+    honest attempted count instead of silently understating ``n_trials`` (see
+    ``PromotionPipeline._compute_n_trials``).
+
+    Returns ``None`` (leave unset) for a malformed or empty grid -- e.g. a
+    non-dict, an empty dict, or any value that isn't a non-empty list-like of
+    candidates -- rather than raising, since a malformed grid is a pre-existing
+    validation concern of ``ParameterSweeper.sweep`` itself, not something this
+    seeding helper should crash on.
+    """
+    if not isinstance(param_grid, dict) or not param_grid:
+        return None
+    size = 1
+    for value in param_grid.values():
+        try:
+            n = len(value)
+        except TypeError:
+            return None
+        if n <= 0:
+            return None
+        size *= n
+    return size
 
 
 def _effective_range(config: dict) -> tuple[date, date]:

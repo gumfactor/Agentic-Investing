@@ -649,13 +649,19 @@ class PromotionPipeline:
                 n_observations=n_observations,
             )
             return None
-        return self._deflated_sharpe_fn(
+        raw_dsr = self._deflated_sharpe_fn(
             observed_sharpe=float(observed_sharpe),
             n_trials=n_trials,
             n_observations=n_observations,
             sharpe_std=self._sharpe_std,
             risk_free_rate=self._risk_free_rate,
         )
+        # Normalize at the SOURCE: a non-finite (NaN/inf) return from
+        # deflated_sharpe_fn must become None here, before this value feeds
+        # _compute_family_fdr, evidence_json, the MLflow log call, and the
+        # returned PromotionResult -- not just at the DB persistence sink.
+        # Every downstream consumer must agree on the same normalized value.
+        return _normalize_metric(raw_dsr)
 
     def _compute_family_fdr(
         self,

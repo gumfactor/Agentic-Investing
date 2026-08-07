@@ -730,6 +730,48 @@ def test_compute_n_trials_no_warning_on_well_formed_sweep_row(db_url: str) -> No
     assert "promotion_n_trials_configs_tested_fallback" not in events
 
 
+def test_compute_n_trials_counts_planned_size_on_errored_sweep_row(db_url: str) -> None:
+    """A crashed/errored parameter_sweep_variant row that still carries the
+    PLANNED configs_tested (seeded by TrialRecorder.run_parameter_sweep at
+    insert time, before dispatch) must contribute its planned count to
+    n_trials, not silently fall back to 1 -- an undercount here inflates the
+    deflated Sharpe by understating the multiple-testing penalty."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+    pipeline = _make_pipeline(db_url)
+
+    engine = _raw_engine(db_url)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            StrategyTrial(
+                strategy_id="v1_test_strategy",
+                config_hash=config_hash,
+                hypothesis_id=hyp_id,
+                window="train_oos",
+                run_type="parameter_sweep_variant",
+                data_version=DATA_VERSION,
+                status="errored",
+                metrics_json={
+                    "configs_tested": 6,  # planned 2x3 grid, seeded pre-dispatch
+                    "error_type": "RuntimeError",
+                    "error_message": "boom",
+                },
+                started_at=now,
+                completed_at=now,
+            )
+        )
+        session.commit()
+
+    with structlog.testing.capture_logs() as captured_logs:
+        n_trials = pipeline._compute_n_trials("v1_test_strategy")
+
+    assert n_trials == 6
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert "promotion_n_trials_configs_tested_fallback" not in events
+
+
 # ── FIX 1: non-finite metrics must not block persistence ────────────────────
 
 
@@ -830,8 +872,11 @@ def test_all_nan_funnel_and_sensitivity_still_persists_decision(db_url: str) -> 
 def test_nan_dsr_from_deflated_sharpe_fn_normalized_to_none(db_url: str) -> None:
     """Even when observed_sharpe/n_trials/n_observations are all finite and
     sufficient (so _compute_dsr actually calls the injected
-    deflated_sharpe_fn), a NaN returned directly from that fn must still be
-    normalized to None at the DB persistence boundary."""
+    deflated_sharpe_fn), a NaN returned directly from that fn must be
+    normalized to None at the SOURCE (_compute_dsr), not merely at the DB
+    persistence boundary -- so every downstream consumer (the returned
+    PromotionResult, the FDR evidence, evidence_json, and the DB row) agrees
+    on the same normalized value."""
     config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
 
@@ -846,13 +891,20 @@ def test_nan_dsr_from_deflated_sharpe_fn_normalized_to_none(db_url: str) -> None
         "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
     )
 
-    assert result.dsr_value is not None and math.isnan(result.dsr_value)
+    # Source-normalized: None everywhere, never a raw NaN surfacing anywhere.
+    assert result.dsr_value is None
+
+    # FDR evidence must treat this run's own DSR as unavailable (skipped),
+    # not clamp a NaN into p=1.0.
+    assert result.evidence_json["overfitting"]["fdr"]["skipped"] is True
+    assert result.evidence_json["overfitting"]["dsr_value"] is None
 
     engine = _raw_engine(db_url)
     with Session(engine) as session:
         row = session.get(PromotionDecision, result.promotion_decision_id)
         assert row is not None
         assert row.dsr_value is None
+        assert row.evidence_json["overfitting"]["dsr_value"] is None
 
 
 # ── FIX 2: FDR must use each sibling's LATEST decision, or omit it ──────────
