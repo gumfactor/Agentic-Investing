@@ -141,6 +141,69 @@ def test_update_param_grid_rejected_after_frozen(
     assert reloaded.param_grid_json == {"momentum_window": [3, 6]}
 
 
+# ── param_grid_json validation (FIX 2) ────────────────────────────────────────
+
+
+def test_register_rejects_non_serializable_param_grid(hyp_registry: HypothesisRegistry) -> None:
+    with pytest.raises(InvalidHypothesisError):
+        hyp_registry.register_hypothesis(
+            strategy_id="v1_base_momentum",
+            hypothesis_text="bad grid",
+            param_grid_json={"w": {1, 2, 3}},  # a set -- not JSON-serializable
+        )
+
+
+def test_register_rejects_list_shaped_param_grid(hyp_registry: HypothesisRegistry) -> None:
+    with pytest.raises(InvalidHypothesisError):
+        hyp_registry.register_hypothesis(
+            strategy_id="v1_base_momentum",
+            hypothesis_text="bad shape",
+            param_grid_json=[1, 2, 3],  # type: ignore[arg-type]
+        )
+
+
+def test_register_accepts_valid_dict_param_grid(hyp_registry: HypothesisRegistry) -> None:
+    hyp = hyp_registry.register_hypothesis(
+        strategy_id="v1_base_momentum",
+        hypothesis_text="good grid",
+        param_grid_json={"momentum_window": [3, 6, 12]},
+    )
+    assert hyp.param_grid_json == {"momentum_window": [3, 6, 12]}
+
+
+def test_update_param_grid_rejects_non_serializable(hyp_registry: HypothesisRegistry) -> None:
+    hyp = hyp_registry.register_hypothesis(
+        strategy_id="v1_base_momentum",
+        hypothesis_text="Momentum window sensitivity",
+        param_grid_json={"momentum_window": [3, 6]},
+    )
+    with pytest.raises(InvalidHypothesisError):
+        hyp_registry.update_param_grid(hyp.id, {"w": {1, 2, 3}})
+    # Grid must remain unchanged after the rejected edit (fails before write).
+    reloaded = hyp_registry.get_hypothesis(hyp.id)
+    assert reloaded.param_grid_json == {"momentum_window": [3, 6]}
+
+
+def test_update_param_grid_rejects_list_shape(hyp_registry: HypothesisRegistry) -> None:
+    hyp = hyp_registry.register_hypothesis(
+        strategy_id="v1_base_momentum",
+        hypothesis_text="Momentum window sensitivity",
+        param_grid_json={"momentum_window": [3, 6]},
+    )
+    with pytest.raises(InvalidHypothesisError):
+        hyp_registry.update_param_grid(hyp.id, [1, 2, 3])  # type: ignore[arg-type]
+
+
+def test_update_param_grid_allows_none(hyp_registry: HypothesisRegistry) -> None:
+    hyp = hyp_registry.register_hypothesis(
+        strategy_id="v1_base_momentum",
+        hypothesis_text="Momentum window sensitivity",
+        param_grid_json={"momentum_window": [3, 6]},
+    )
+    updated = hyp_registry.update_param_grid(hyp.id, None)
+    assert updated.param_grid_json is None
+
+
 # ── CLI smoke test ──────────────────────────────────────────────────────────────
 
 

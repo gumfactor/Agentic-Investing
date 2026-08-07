@@ -1687,6 +1687,75 @@ def test_second_trial_linking_already_frozen_hypothesis_is_a_noop_on_frozen_at(
     assert all(t.hypothesis_id == hypothesis_id for t in trials)
 
 
+def test_freeze_log_not_emitted_when_trial_insert_fails_after_freeze(
+    recorder: TrialRecorder,
+) -> None:
+    """FIX 3: if the in-session freeze is applied but the trial insert then
+    fails (here: the composite (hypothesis_id, strategy_id) FK rejects a
+    hypothesis registered under a DIFFERENT strategy_id than the trial),
+    the whole transaction rolls back -- frozen_at must stay NULL AND the
+    'strategy_hypothesis_frozen' audit log must never have been emitted,
+    since logging before commit would otherwise record a freeze that never
+    took effect."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, strategy_id="v2_other_strategy", config=config)
+    _seed_window(recorder, strategy_id="v2_other_strategy")
+    # Hypothesis registered for a DIFFERENT strategy_id -> composite FK
+    # mismatch when linked to a v2_other_strategy trial.
+    hypothesis_id = _seed_hypothesis(recorder, strategy_id="v1_test_strategy")
+    validator = _mock_validator(_wf_result(sharpe=0.9))
+
+    with structlog.testing.capture_logs() as captured_logs:
+        with pytest.raises(Exception):
+            recorder.run_walk_forward(
+                validator,
+                strategy_id="v2_other_strategy",
+                config_hash=config_hash,
+                data_version=DATA_VERSION,
+                config=config,
+                data_handler=MagicMock(),
+                hypothesis_id=hypothesis_id,
+            )
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert "strategy_hypothesis_frozen" not in events
+
+    with Session(recorder._engine) as session:
+        hyp = session.get(StrategyHypothesis, hypothesis_id)
+        assert hyp.frozen_at is None
+
+
+def test_freeze_log_emitted_exactly_once_after_successful_commit(
+    recorder: TrialRecorder,
+) -> None:
+    """FIX 3: a successful first linked trial DOES emit exactly one
+    'strategy_hypothesis_frozen' log line, and only after the commit that
+    durably applies the freeze."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    hypothesis_id = _seed_hypothesis(recorder)
+    validator = _mock_validator(_wf_result(sharpe=1.5))
+
+    with structlog.testing.capture_logs() as captured_logs:
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+            hypothesis_id=hypothesis_id,
+        )
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert events.count("strategy_hypothesis_frozen") == 1
+
+    with Session(recorder._engine) as session:
+        hyp = session.get(StrategyHypothesis, hypothesis_id)
+        assert hyp.frozen_at is not None
+
+
 def test_param_grid_edit_rejected_after_recorder_freezes_hypothesis(
     recorder: TrialRecorder, db_url: str
 ) -> None:

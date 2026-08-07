@@ -631,16 +631,21 @@ class TrialRecorder:
             # already-frozen hypothesis (frozen_at IS NOT NULL) is a no-op --
             # frozen_at is set exactly once, on the first linked trial, and
             # every subsequent trial linking it proceeds without altering it.
+            # Capture whether THIS call applied the freeze so the audit log
+            # line (04-3 P3 fix) can be emitted only after the commit below
+            # actually succeeds -- logging here, before commit, would record
+            # "frozen" for a freeze that a later IntegrityError rolls back
+            # (e.g. the trial insert failing the composite FK / holdout
+            # seal), leaving an audit event that never took effect. The
+            # freeze assignment itself stays in-session/atomic with the
+            # trial insert; only the LOG EMISSION moves to after commit.
+            freeze_applied = False
             if hypothesis_id is not None:
                 hypothesis = session.get(StrategyHypothesis, hypothesis_id)
                 if hypothesis is not None and hypothesis.frozen_at is None:
                     hypothesis.frozen_at = started_at
                     session.add(hypothesis)
-                    logger.info(
-                        "strategy_hypothesis_frozen",
-                        hypothesis_id=hypothesis_id,
-                        strategy_id=strategy_id,
-                    )
+                    freeze_applied = True
 
             trial = StrategyTrial(
                 strategy_id=strategy_id,
@@ -686,6 +691,15 @@ class TrialRecorder:
                 raise
             session.refresh(trial)
             trial_id = trial.id
+            # Commit succeeded -- if this call applied the freeze, the audit
+            # event now reflects reality (the freeze is durable, not a
+            # since-rolled-back side effect).
+            if freeze_applied:
+                logger.info(
+                    "strategy_hypothesis_frozen",
+                    hypothesis_id=hypothesis_id,
+                    strategy_id=strategy_id,
+                )
             logger.info(
                 "strategy_trial_started",
                 trial_id=trial_id,

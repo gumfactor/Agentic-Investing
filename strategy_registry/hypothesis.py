@@ -20,12 +20,13 @@ per design doc §5.1's explicit note on ``frozen_at``.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import structlog
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.orm import Session
 
 from strategy_registry.models import Base
@@ -41,6 +42,31 @@ logger = structlog.get_logger(__name__)
 # CHECK is not installed, per selection_models.py's ddl_if(postgresql)) and
 # Postgres.
 _STRATEGY_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,99}$")
+
+
+def _validate_param_grid(param_grid_json: Optional[dict[str, Any]]) -> None:
+    """Fast-fail shape/serializability check for ``param_grid_json``.
+
+    Applied in both ``register_hypothesis`` and ``update_param_grid``,
+    BEFORE any DB write, so a malformed grid fails with a clear
+    :class:`InvalidHypothesisError` instead of a raw driver
+    ``StatementError`` at commit time. ``None`` is always allowed (the
+    column is nullable).
+    """
+    if param_grid_json is None:
+        return
+    if not isinstance(param_grid_json, dict):
+        raise InvalidHypothesisError(
+            "param_grid_json must be a dict mapping dot-paths to candidate "
+            f"values (got {type(param_grid_json).__name__}: "
+            f"{param_grid_json!r})."
+        )
+    try:
+        json.dumps(param_grid_json)
+    except (TypeError, ValueError) as exc:
+        raise InvalidHypothesisError(
+            f"param_grid_json must be JSON-serializable: {exc}"
+        ) from exc
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -125,6 +151,7 @@ class HypothesisRegistry:
                 "hypothesis_text must be a non-empty description of the "
                 "research question this hypothesis pre-registers."
             )
+        _validate_param_grid(param_grid_json)
 
         now = datetime.now(tz=timezone.utc)
         with Session(self._engine) as session:
@@ -186,29 +213,53 @@ class HypothesisRegistry:
                 instead of trying to retroactively widen/narrow an
                 already-tested grid (this is exactly the "no tuning after
                 seeing the result" discipline §4.4 requires).
+
+        Note (TOCTOU fix): the frozen-check and the write are ONE atomic
+        conditional UPDATE (``WHERE id = :id AND frozen_at IS NULL``), not a
+        read-then-write. A read-then-write would let a concurrent
+        ``TrialRecorder`` freeze (see ``backtesting.validation.
+        trial_recorder.TrialRecorder``) commit BETWEEN this method's read of
+        ``frozen_at`` and its write of ``param_grid_json``, letting the edit
+        slip through after the grid was frozen. The guard living in the
+        UPDATE's WHERE predicate closes that race on both SQLite and
+        Postgres without needing ``SELECT ... FOR UPDATE``.
         """
+        _validate_param_grid(param_grid_json)
         with Session(self._engine) as session:
+            result = session.execute(
+                update(StrategyHypothesis.__table__)
+                .where(
+                    StrategyHypothesis.__table__.c.id == hypothesis_id,
+                    StrategyHypothesis.__table__.c.frozen_at.is_(None),
+                )
+                .values(param_grid_json=param_grid_json)
+            )
+            if result.rowcount == 1:
+                session.commit()
+                hyp = session.get(StrategyHypothesis, hypothesis_id)
+                logger.info(
+                    "hypothesis_param_grid_updated",
+                    hypothesis_id=hypothesis_id,
+                    strategy_id=hyp.strategy_id,
+                )
+                return hyp
+
+            # rowcount == 0: either the row does not exist, or it exists but
+            # is already frozen. Distinguish with a re-query in the SAME
+            # session (no write occurred, so nothing to roll back beyond
+            # discarding this no-op transaction).
+            session.rollback()
             hyp = session.get(StrategyHypothesis, hypothesis_id)
             if hyp is None:
                 raise HypothesisNotFoundError(
                     f"strategy_hypotheses id={hypothesis_id} not found."
                 )
-            if hyp.frozen_at is not None:
-                raise HypothesisParamGridFrozenError(
-                    f"strategy_hypotheses id={hypothesis_id} (strategy_id="
-                    f"{hyp.strategy_id!r}) param_grid_json is frozen "
-                    f"(frozen_at={hyp.frozen_at.isoformat()}). It was frozen "
-                    "when the first strategy_trials row linking this "
-                    "hypothesis was recorded, and can never be edited again "
-                    "-- register a new hypothesis instead of retroactively "
-                    "changing an already-tested grid."
-                )
-            hyp.param_grid_json = param_grid_json
-            session.commit()
-            session.refresh(hyp)
-            logger.info(
-                "hypothesis_param_grid_updated",
-                hypothesis_id=hypothesis_id,
-                strategy_id=hyp.strategy_id,
+            raise HypothesisParamGridFrozenError(
+                f"strategy_hypotheses id={hypothesis_id} (strategy_id="
+                f"{hyp.strategy_id!r}) param_grid_json is frozen "
+                f"(frozen_at={hyp.frozen_at.isoformat()}). It was frozen "
+                "when the first strategy_trials row linking this "
+                "hypothesis was recorded, and can never be edited again "
+                "-- register a new hypothesis instead of retroactively "
+                "changing an already-tested grid."
             )
-            return hyp
