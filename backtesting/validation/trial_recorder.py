@@ -589,14 +589,19 @@ class TrialRecorder:
                     "did not actually produce, corrupting promotion evidence and "
                     "Deflated Sharpe trial counts. Pass the exact config dict "
                     "that was fingerprinted/registered under this config_hash "
-                    "(a difference in data_version alone is fine -- it is "
-                    "excluded from the canonical hash)."
+                    "(differences confined to the evaluation-context keys "
+                    "excluded from the identity hash are fine: data_version and "
+                    "backtest.start_date/backtest.end_date -- the latter is what "
+                    "lets a holdout confirmation reuse the frozen winner's "
+                    "config_hash while swapping in the holdout window; see "
+                    "docs/plans/04-identity-evaluation-context-design.md)."
                 )
 
-            # 04-2 round-2 P2 fix: hash_config strips data_version from the
-            # canonical hash, so the check above deliberately lets a config
-            # differ from the registered one ONLY in data_version through --
-            # but that means it cannot catch a caller whose
+            # 04-2 round-2 P2 fix: hash_config strips the evaluation-context
+            # keys (data_version + backtest.start_date/end_date) from the
+            # identity hash, so the check above deliberately lets a config
+            # differ from the registered one in those keys through -- but that
+            # means it cannot catch a caller whose
             # config['data_version'] disagrees with the data_version argument
             # this trial row is about to record. Reject that disagreement
             # explicitly rather than silently recording one C7 version while
