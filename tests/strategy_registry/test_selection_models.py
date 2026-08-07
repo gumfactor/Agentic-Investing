@@ -83,6 +83,99 @@ def test_no_other_migration_claims_revision_014() -> None:
     assert claimants == ["014_strategy_selection_protocol.py"], claimants
 
 
+# ── Migration 015 (04-4W W1: eval_start_date/eval_end_date) ─────────────────────
+
+
+def _migration_015_module():
+    return importlib.import_module(
+        "infra.db.migrations.versions.015_strategy_trial_eval_window"
+    )
+
+
+def test_revision_015_chains_after_014() -> None:
+    mod = _migration_015_module()
+    assert mod.revision == "015"
+    assert mod.down_revision == "014"
+
+
+def test_upgrade_and_downgrade_functions_exist_015() -> None:
+    mod = _migration_015_module()
+    assert callable(mod.upgrade)
+    assert callable(mod.downgrade)
+
+
+def test_no_other_migration_claims_revision_015() -> None:
+    """Mirrors test_no_other_migration_claims_revision_014 -- guards against a
+    duplicate revision id."""
+    versions_dir = (
+        Path(__file__).resolve().parents[2] / "infra" / "db" / "migrations" / "versions"
+    )
+    claimants = []
+    for path in sorted(versions_dir.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("revision") and '"015"' in stripped:
+                claimants.append(path.name)
+                break
+    assert claimants == ["015_strategy_trial_eval_window.py"], claimants
+
+
+def test_migration_015_adds_eval_window_columns_via_alembic_ops(monkeypatch) -> None:
+    """Exercises the migration's upgrade()/downgrade() bodies directly
+    (mirrors this repo's established convention noted in this file's module
+    docstring: no Postgres-only DDL here, so op.add_column/op.drop_column
+    calls are captured and asserted rather than run against a live Alembic
+    context) -- proves upgrade() adds exactly eval_start_date/eval_end_date
+    as nullable DATE columns on strategy_trials via op.add_column (never a
+    raw ALTER TABLE, per C2), and downgrade() drops them in reverse order.
+    """
+    import sqlalchemy as sa
+
+    mod = _migration_015_module()
+
+    added: list[tuple[str, str, bool]] = []
+    dropped: list[tuple[str, str]] = []
+
+    def _fake_add_column(table_name, column):
+        added.append((table_name, column.name, column.nullable))
+
+    def _fake_drop_column(table_name, column_name):
+        dropped.append((table_name, column_name))
+
+    monkeypatch.setattr(mod.op, "add_column", _fake_add_column)
+    monkeypatch.setattr(mod.op, "drop_column", _fake_drop_column)
+
+    mod.upgrade()
+    assert added == [
+        ("strategy_trials", "eval_start_date", True),
+        ("strategy_trials", "eval_end_date", True),
+    ]
+
+    mod.downgrade()
+    assert dropped == [
+        ("strategy_trials", "eval_end_date"),
+        ("strategy_trials", "eval_start_date"),
+    ]
+
+
+def test_strategy_trial_model_has_eval_window_columns_matching_migration_015(
+    engine,
+) -> None:
+    """Model-vs-migration parity (mirrors this file's SQLite-standing-in-for-
+    Alembic convention): the ORM model's eval_start_date/eval_end_date
+    columns must exist on the create_all()-built table, be DATE-typed, and
+    nullable -- matching migration 015's op.add_column calls exactly."""
+    from sqlalchemy import inspect
+
+    inspector = inspect(engine)
+    columns = {c["name"]: c for c in inspector.get_columns("strategy_trials")}
+    assert "eval_start_date" in columns
+    assert "eval_end_date" in columns
+    assert columns["eval_start_date"]["nullable"] is True
+    assert columns["eval_end_date"]["nullable"] is True
+
+
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 
@@ -774,6 +867,95 @@ def test_finite_and_null_numerics_are_accepted(session: Session) -> None:
         window="train_oos",
     )
     assert running.oos_sharpe is None
+
+
+# ── 04-4W W1: eval_start_date/eval_end_date persistence at the model layer ──────
+
+
+def test_eval_window_columns_are_nullable_for_legacy_backfill(session: Session) -> None:
+    """Mirrors hypothesis_id's documented nullable-for-legacy-only precedent
+    (StrategyTrial's docstring): the model must allow NULL for both columns
+    at the schema layer -- the writer (TrialRecorder), not the DB, is what
+    enforces non-NULL for every NEW row going forward."""
+    defn = _make_definition(session)
+    hyp = _make_hypothesis(session)
+    legacy = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        window="train_oos",
+        run_type="walk_forward",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        started_at=datetime.now(timezone.utc),
+        # eval_start_date/eval_end_date deliberately omitted -- legacy row.
+    )
+    session.add(legacy)
+    session.commit()
+    session.refresh(legacy)
+    assert legacy.eval_start_date is None
+    assert legacy.eval_end_date is None
+
+
+def test_eval_window_columns_persist_and_differ_between_train_oos_and_holdout(
+    session: Session,
+) -> None:
+    """A train_oos trial and a holdout trial recorded under the SAME
+    (strategy_id, config_hash) must carry DIFFERENT eval_start_date/
+    eval_end_date once persisted -- the property the design doc's identity
+    change needs, now that config_hash no longer covers the window."""
+    defn = _make_definition(session)
+    hyp = _make_hypothesis(session)
+
+    train_oos_trial = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        window="train_oos",
+        run_type="walk_forward",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        started_at=datetime.now(timezone.utc),
+        eval_start_date=date(2022, 1, 1),
+        eval_end_date=date(2022, 12, 31),
+    )
+    holdout_trial = StrategyTrial(
+        strategy_id=defn.strategy_id,
+        config_hash=defn.config_hash,
+        hypothesis_id=hyp.id,
+        window="holdout",
+        run_type="holdout_confirmation",
+        data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        status="completed",
+        started_at=datetime.now(timezone.utc),
+        eval_start_date=date(2023, 1, 1),
+        eval_end_date=date(2023, 6, 30),
+    )
+    session.add_all([train_oos_trial, holdout_trial])
+    session.commit()
+    session.refresh(train_oos_trial)
+    session.refresh(holdout_trial)
+
+    assert train_oos_trial.eval_start_date == date(2022, 1, 1)
+    assert train_oos_trial.eval_end_date == date(2022, 12, 31)
+    assert holdout_trial.eval_start_date == date(2023, 1, 1)
+    assert holdout_trial.eval_end_date == date(2023, 6, 30)
+    assert train_oos_trial.eval_start_date != holdout_trial.eval_start_date
+    assert train_oos_trial.eval_end_date != holdout_trial.eval_end_date
+
+    # Queryable directly off the row, independent of config_hash -- the
+    # property the 04-identity design doc's window exclusion needed restored.
+    fetched = (
+        session.query(StrategyTrial)
+        .filter(
+            StrategyTrial.strategy_id == defn.strategy_id,
+            StrategyTrial.config_hash == defn.config_hash,
+            StrategyTrial.window == "holdout",
+        )
+        .one()
+    )
+    assert fetched.eval_start_date == date(2023, 1, 1)
+    assert fetched.eval_end_date == date(2023, 6, 30)
 
 
 def test_strategy_id_format_check_present_on_postgres_compile() -> None:

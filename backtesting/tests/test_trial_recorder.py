@@ -30,6 +30,7 @@ from backtesting.validation.parameter_sensitivity import (
 )
 from backtesting.validation.trial_recorder import (
     DataVersionProvenanceMismatchError,
+    HoldoutEvaluationPreflightError,
     HoldoutWindowViolationError,
     SweepWindowOverrideError,
     TrialRecorder,
@@ -189,6 +190,21 @@ def _mock_sweeper(result=None, exc=None) -> MagicMock:
     else:
         mock.sweep.return_value = result if result is not None else _sweep_result()
     return mock
+
+
+def _holdout_ok_data_handler(n_sessions: int = 40) -> MagicMock:
+    """A data_handler double that clears the 04-4W W2 bug 2 preflight
+    (``_preflight_holdout_viability`` requires
+    ``trading_dates(...)`` to report at least
+    ``_MIN_HOLDOUT_TRADING_SESSIONS`` sessions). A bare ``MagicMock()`` fails
+    this by default -- ``len(MagicMock())`` is 0 -- so any test that expects
+    a ``final_holdout_confirmation=True`` dispatch to actually reach the
+    wrapped instrument must use this instead of a bare ``MagicMock()``."""
+    handler = MagicMock()
+    handler.trading_dates.return_value = [
+        date(2023, 1, day) for day in range(1, min(n_sessions, 28) + 1)
+    ]
+    return handler
 
 
 # ── Successful walk-forward run inside train/OOS ────────────────────────────────
@@ -461,7 +477,7 @@ def test_first_holdout_confirmation_succeeds_and_records_holdout_row(recorder: T
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         final_holdout_confirmation=True,
     )
 
@@ -494,7 +510,7 @@ def test_second_holdout_confirmation_is_rejected_by_app_layer_guard(recorder: Tr
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         final_holdout_confirmation=True,
     )
     assert validator.run.call_count == 1
@@ -536,7 +552,7 @@ def test_second_holdout_confirmation_is_rejected_even_after_a_failed_first_attem
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
-            data_handler=MagicMock(),
+            data_handler=_holdout_ok_data_handler(),
             final_holdout_confirmation=True,
         )
 
@@ -612,7 +628,7 @@ def test_holdout_seal_is_scoped_per_strategy_id(recorder: TrialRecorder) -> None
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         final_holdout_confirmation=True,
     )
     recorder.run_walk_forward(
@@ -621,7 +637,7 @@ def test_holdout_seal_is_scoped_per_strategy_id(recorder: TrialRecorder) -> None
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         final_holdout_confirmation=True,
     )
 
@@ -788,7 +804,7 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         final_holdout_confirmation=True,
     )
     validator_first.run.assert_called_once()
@@ -800,7 +816,7 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
-            data_handler=MagicMock(),
+            data_handler=_holdout_ok_data_handler(),
             final_holdout_confirmation=True,
         )
 
@@ -1956,3 +1972,217 @@ def test_param_grid_edit_rejected_after_recorder_freezes_hypothesis(
     # Grid is unchanged after the rejected edit.
     unchanged = hyp_registry.get_hypothesis(hyp.id)
     assert unchanged.param_grid_json == {"momentum_window": [3, 6, 12]}
+
+
+# ── 04-4W W1: eval_start_date/eval_end_date persisted on every trial ────────────
+
+
+def test_eval_window_persisted_on_walk_forward_train_oos_trial(recorder: TrialRecorder) -> None:
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result(sharpe=1.1))
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+    )
+
+    trials = recorder.list_trials("v1_test_strategy", run_type="walk_forward")
+    assert len(trials) == 1
+    assert trials[0].eval_start_date == date(2022, 1, 1)
+    assert trials[0].eval_end_date == date(2022, 12, 31)
+
+
+def test_eval_window_persisted_on_parameter_sweep_trial(recorder: TrialRecorder) -> None:
+    base_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=base_config)
+    _seed_window(recorder)
+    sweeper = _mock_sweeper(_sweep_result())
+
+    recorder.run_parameter_sweep(
+        sweeper,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        base_config=base_config,
+        param_grid={"portfolio.n_long": [10, 20]},
+        data_handler=MagicMock(),
+    )
+
+    trials = recorder.list_trials("v1_test_strategy", run_type="parameter_sweep_variant")
+    assert len(trials) == 1
+    assert trials[0].eval_start_date == date(2022, 1, 1)
+    assert trials[0].eval_end_date == date(2022, 12, 31)
+
+
+def test_eval_window_persisted_on_holdout_trial_and_differs_from_train_oos(
+    recorder: TrialRecorder,
+) -> None:
+    """The property W1 exists to restore: a train_oos trial and a holdout
+    trial recorded under the SAME (strategy_id, config_hash) must carry
+    DIFFERENT, independently-queryable eval_start_date/eval_end_date -- now
+    that config_hash no longer covers backtest.start_date/end_date, this is
+    what makes the two measurements distinguishable from the row alone."""
+    train_oos_config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=train_oos_config)
+    _seed_window(recorder)  # holdout = 2023-01-01 .. 2023-07-01
+
+    train_oos_validator = _mock_validator(_wf_result(sharpe=1.1))
+    recorder.run_walk_forward(
+        train_oos_validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=train_oos_config,
+        data_handler=MagicMock(),
+    )
+
+    holdout_config = _config("2023-01-01", "2023-07-01")
+    holdout_validator = _mock_validator(_wf_result(sharpe=0.7))
+    recorder.run_walk_forward(
+        holdout_validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=holdout_config,
+        data_handler=_holdout_ok_data_handler(),
+        final_holdout_confirmation=True,
+    )
+
+    train_oos_trials = recorder.list_trials("v1_test_strategy", run_type="walk_forward")
+    holdout_trials = recorder.list_trials("v1_test_strategy", run_type="holdout_confirmation")
+    assert len(train_oos_trials) == 1
+    assert len(holdout_trials) == 1
+
+    assert train_oos_trials[0].eval_start_date == date(2022, 1, 1)
+    assert train_oos_trials[0].eval_end_date == date(2022, 12, 31)
+    assert holdout_trials[0].eval_start_date == date(2023, 1, 1)
+    assert holdout_trials[0].eval_end_date == date(2023, 7, 1)
+
+    # Both rows share the same config_hash (the crux of the identity change)
+    # yet are distinguishable purely from the persisted window.
+    assert train_oos_trials[0].config_hash == holdout_trials[0].config_hash == config_hash
+    assert train_oos_trials[0].eval_start_date != holdout_trials[0].eval_start_date
+
+
+# ── 04-4W W2: seal-safe holdout preflight (data-sufficiency / config-viability) ──
+
+
+def test_holdout_preflight_rejects_insufficient_trading_sessions_and_leaves_seal_unconsumed(
+    recorder: TrialRecorder,
+) -> None:
+    """A holdout confirmation whose data_handler cannot actually cover the
+    holdout window (fewer than the minimum trading sessions) must raise
+    HoldoutEvaluationPreflightError BEFORE the seal-committing insert -- the
+    wrapped instrument is never dispatched, no strategy_trials row is ever
+    written, and a subsequent CORRECTED attempt (a data_handler that DOES
+    cover the window) still succeeds -- proof the one-shot seal was never
+    touched by the non-viable first attempt."""
+    config = _config("2023-01-01", "2023-07-01")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)  # holdout = 2023-01-01 .. 2023-07-01
+
+    starved_data_handler = MagicMock()
+    starved_data_handler.trading_dates.return_value = [date(2023, 1, 3)]  # only 1 session
+    validator = _mock_validator(_wf_result())
+
+    with pytest.raises(HoldoutEvaluationPreflightError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=starved_data_handler,
+            final_holdout_confirmation=True,
+        )
+
+    # Never dispatched -- the preflight failure is a SETUP failure, not "a
+    # look at holdout returns".
+    validator.run.assert_not_called()
+
+    # No strategy_trials row at all -- the seal-committing insert never ran.
+    assert recorder.list_trials("v1_test_strategy", run_type="holdout_confirmation") == []
+
+    # A corrected retry (data_handler that genuinely covers the holdout
+    # window) still succeeds -- the partial-unique one-shot index was never
+    # touched by the failed preflight attempt.
+    retry_validator = _mock_validator(_wf_result(sharpe=0.8))
+    result = recorder.run_walk_forward(
+        retry_validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=_holdout_ok_data_handler(),
+        final_holdout_confirmation=True,
+    )
+    assert result.oos_metrics["sharpe"] == 0.8
+    retry_validator.run.assert_called_once()
+
+    trials = recorder.list_trials("v1_test_strategy", run_type="holdout_confirmation")
+    assert len(trials) == 1
+    assert trials[0].status == "completed"
+
+
+def test_holdout_preflight_runs_after_the_policy_guard_not_before(
+    recorder: TrialRecorder,
+) -> None:
+    """A range that violates the §4.2 containment guard must still raise
+    HoldoutWindowViolationError (the policy check), even when the
+    data_handler ALSO happens to be preflight-starved -- ordering matters:
+    the guard's policy rejection must win over the viability preflight, not
+    be masked by it. (The preflight is scoped to genuinely-viable-per-policy
+    requests only.)"""
+    _seed_definition(recorder)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(HoldoutWindowViolationError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash="a" * 64,
+            data_version=DATA_VERSION,
+            # Starts before holdout_start -- not fully contained (and this
+            # data_handler is also a bare MagicMock(), i.e. preflight-starved
+            # too -- the guard must fire first regardless).
+            config=_config("2022-11-01", "2023-03-01"),
+            data_handler=MagicMock(),
+            final_holdout_confirmation=True,
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy", run_type="holdout_confirmation") == []
+
+
+def test_holdout_preflight_rejects_config_that_fails_backtest_contract_before_seal(
+    recorder: TrialRecorder,
+) -> None:
+    """A structurally-invalid config (fails validate_backtest_config, e.g. an
+    unsupported portfolio.method) must be rejected by the preflight before
+    the seal-committing insert, exactly like the data-sufficiency case."""
+    config = _config("2023-01-01", "2023-07-01")
+    config["portfolio"] = {"method": "mvo", "n_long": 10}  # unsupported method
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(HoldoutEvaluationPreflightError):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=_holdout_ok_data_handler(),
+            final_holdout_confirmation=True,
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy", run_type="holdout_confirmation") == []

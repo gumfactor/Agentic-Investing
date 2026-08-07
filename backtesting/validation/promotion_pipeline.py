@@ -93,6 +93,25 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
   funnel PASS AND stress ``solid`` only. The ``promotion_decisions`` row's
   ``evidence_json`` carries an explicit ``evaluation="holdout_confirmation"``
   marker plus the holdout window.
+- **holdout_mode is a SINGLE fixed-config evaluation, never a walk-forward
+  (04-4W W2 bug 1 fix)**: the dispatch above is routed through
+  ``self._holdout_evaluator`` (a ``SingleWindowEvaluator``, see
+  ``backtesting.validation.holdout_evaluator``), never
+  ``self._wf_validator`` (the fold-based ``WalkForwardValidator``, which
+  needs ~6 years of data for its default fold shape -- far more than a
+  realistic ~6-month holdout window provides). ``walk_forward_kwargs`` are
+  withheld on this path (fold-shaped knobs have no meaning for a
+  single-window evaluation). ``TrialRecorder.run_walk_forward`` additionally
+  runs a data-sufficiency + config-viability PREFLIGHT
+  (``trial_recorder._preflight_holdout_viability``) BEFORE the seal-
+  committing ``strategy_trials`` insert whenever
+  ``final_holdout_confirmation=True`` -- a setup/insufficient-data failure
+  is caught there and raises ``HoldoutEvaluationPreflightError`` without
+  ever consuming the one-shot seal; only a genuinely viable attempt (one
+  that will actually read holdout returns) reaches the seal-committing
+  insert. A run that clears the preflight and then fails during the actual
+  evaluation still consumes the seal -- that is a real look at the data,
+  which the one-shot guarantee is designed to capture.
 - **MLflow logging failure degrades gracefully**: when a ``backtest_logger``
   IS supplied (as opposed to the ``backtest_logger=None`` "skip MLflow
   entirely" path) but raises during ``_log_to_mlflow`` (e.g. a transient
@@ -123,6 +142,7 @@ from backtesting.validation.bootstrap_stress import (
     BootstrapStressResult,
     bootstrap_stress as _default_bootstrap_stress,
 )
+from backtesting.validation.holdout_evaluator import SingleWindowEvaluator
 from backtesting.validation.overfitting_checks import (
     benjamini_hochberg as _default_benjamini_hochberg,
     deflated_sharpe_ratio as _default_deflated_sharpe_ratio,
@@ -340,7 +360,16 @@ class PromotionPipeline:
             scoped to one data snapshot; construct a new instance for a
             different snapshot.
         walk_forward_validator: Injected for testing; defaults to a real
-            ``WalkForwardValidator()``.
+            ``WalkForwardValidator()``. Used ONLY for the train/OOS
+            (``holdout_mode=False``) path.
+        holdout_evaluator: Injected for testing; defaults to a real
+            ``SingleWindowEvaluator()`` (04-4W W2 bug 1 fix). Used ONLY for
+            the ``holdout_mode=True`` path -- a holdout confirmation is one
+            fixed-config backtest over the sealed holdout window, never the
+            fold-based ``WalkForwardValidator`` (which needs roughly six
+            years of data for its default fold shape, far more than a
+            typical ~6-month holdout window provides). See
+            ``backtesting.validation.holdout_evaluator`` module docstring.
         parameter_sweeper: Injected for testing; defaults to a real
             ``ParameterSweeper()``.
         survival_funnel: Injected for testing/threshold overrides; defaults
@@ -379,6 +408,7 @@ class PromotionPipeline:
         data_version: str,
         *,
         walk_forward_validator: Optional[WalkForwardValidator] = None,
+        holdout_evaluator: Optional[Any] = None,
         parameter_sweeper: Optional[ParameterSweeper] = None,
         survival_funnel: Optional[SurvivalFunnel] = None,
         backtest_logger: Optional[Any] = None,
@@ -418,6 +448,12 @@ class PromotionPipeline:
         self._trial_recorder = TrialRecorder(db_url)
 
         self._wf_validator = walk_forward_validator or WalkForwardValidator()
+        # 04-4W W2 bug 1 fix: holdout_mode dispatches through a SEPARATE
+        # single-window evaluator, never self._wf_validator -- see
+        # backtesting.validation.holdout_evaluator's module docstring for
+        # why the fold-based WalkForwardValidator is the wrong instrument
+        # for a one-shot fixed-config holdout confirmation.
+        self._holdout_evaluator = holdout_evaluator or SingleWindowEvaluator()
         self._sweeper = parameter_sweeper or ParameterSweeper()
         self._funnel = survival_funnel or SurvivalFunnel()
         self._backtest_logger = backtest_logger
@@ -579,15 +615,27 @@ class PromotionPipeline:
                 )
             dispatch_config = holdout_config
 
-        # Stage 1: walk-forward (fresh; see module docstring's "re-run
+        # Stage 1: evaluation (fresh; see module docstring's "re-run
         # staleness" note for why this never attempts to reuse a prior
         # recorded trial). TrialRecorder._enforce_holdout_guard is the
         # independent, primary window-safety backstop here: it re-validates
         # that the effective date range falls within the registered holdout
         # window and applies the one-shot seal, entirely independent of the
         # config_hash identity assertion above.
+        #
+        # 04-4W W2 bug 1 fix: holdout_mode selects the single-window
+        # evaluator (self._holdout_evaluator), never self._wf_validator --
+        # a holdout confirmation is one fixed-config backtest over the
+        # sealed holdout window, not a fold-based walk-forward (see
+        # backtesting.validation.holdout_evaluator). walk_forward_kwargs
+        # (n_folds/window_type/train_years/test_months) are fold-shaped
+        # knobs that only mean something for the real WalkForwardValidator,
+        # so they are withheld entirely on the holdout_mode path rather than
+        # forwarded to (and silently ignored by) SingleWindowEvaluator.run.
+        evaluator = self._holdout_evaluator if holdout_mode else self._wf_validator
+        evaluator_kwargs = {} if holdout_mode else self._walk_forward_kwargs
         wf_result = self._trial_recorder.run_walk_forward(
-            self._wf_validator,
+            evaluator,
             strategy_id=strategy_id,
             config_hash=config_hash,
             data_version=self._data_version,
@@ -596,7 +644,7 @@ class PromotionPipeline:
             hypothesis_id=hypothesis_id,
             final_holdout_confirmation=holdout_mode,
             strategy_family=strategy_family,
-            **self._walk_forward_kwargs,
+            **evaluator_kwargs,
         )
 
         # Stage 2: survival funnel.

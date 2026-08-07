@@ -118,7 +118,7 @@ from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backtesting.config_contract import ConfigProvenanceMismatchError
+from backtesting.config_contract import ConfigProvenanceMismatchError, validate_backtest_config
 from backtesting.dataset_manifest import require_manifest_hash_data_version
 from backtesting.engine.data_handler import DataHandler
 from backtesting.validation.parameter_sensitivity import (
@@ -267,6 +267,26 @@ class DataVersionProvenanceMismatchError(TrialRecorderError):
     """
 
 
+class HoldoutEvaluationPreflightError(TrialRecorderError):
+    """Raised by the pre-seal viability preflight (04-4W W2 bug 2 fix) when a
+    ``final_holdout_confirmation=True`` request cannot actually be evaluated
+    -- e.g. the config fails ``validate_backtest_config`` or the
+    ``data_handler`` reports too few trading sessions in the effective
+    holdout range.
+
+    This is deliberately raised BEFORE the seal-committing ``strategy_trials``
+    insert (see ``_preflight_holdout_viability`` and ``run_walk_forward``'s
+    call site), so a SETUP failure -- a config or data problem discovered
+    before any holdout return was ever read -- never consumes the one-shot
+    holdout seal (``uix_strategy_trials_one_holdout_confirmation``). Compare
+    with ``HoldoutWindowViolationError``, which is raised for genuine policy
+    violations (wrong window, seal already consumed) rather than "this
+    attempt was never going to be able to run." A caller that fixes the
+    underlying config/data problem and retries is not performing a
+    disallowed second look -- the first attempt never got to look at all.
+    """
+
+
 # ── TrialRecorder ─────────────────────────────────────────────────────────────
 
 
@@ -356,6 +376,14 @@ class TrialRecorder:
                 non-empty top-level ``data_version`` that disagrees with the
                 ``data_version`` argument.
             MissingDataVersionError: ``data_version`` is empty/blank.
+            HoldoutEvaluationPreflightError: ``final_holdout_confirmation=True``
+                and the pre-seal viability preflight determines the holdout
+                window cannot actually be evaluated (config fails
+                ``validate_backtest_config``, or ``data_handler`` reports too
+                few trading sessions in the effective range). Raised BEFORE
+                the seal-committing ``strategy_trials`` insert (04-4W W2 bug
+                2 fix), so this SETUP failure never consumes the one-shot
+                holdout seal.
             Exception: Any exception the wrapped ``validator.run`` raises is
                 recorded (trial marked ``errored``) and re-raised unchanged.
         """
@@ -363,6 +391,31 @@ class TrialRecorder:
 
         def _dispatch(dispatch_config: dict) -> WalkForwardResult:
             return validator.run(dispatch_config, data_handler, **run_kwargs)
+
+        # 04-4W W2 bug 2 fix: a data-sufficiency + config-viability preflight
+        # for a final_holdout_confirmation=True request, invoked by
+        # _run_and_record AFTER _enforce_holdout_guard's policy checks
+        # (window registered, range contained, seal not already consumed)
+        # but BEFORE the seal-committing 'running' row insert -- both still
+        # inside the same DB session/transaction as the guard. Ordering
+        # after the guard means a policy violation (e.g. range not
+        # contained in the registered window) still raises
+        # HoldoutWindowViolationError as before, even against a data_handler
+        # that would also fail the viability check; the viability check only
+        # matters once the request has already cleared policy. Without this
+        # hook, a setup/insufficient-data error inside the wrapped
+        # validator.run (dispatched AFTER the insert, in Step 2) would still
+        # have already burned the one-shot seal, permanently blocking even a
+        # corrected retry. See _preflight_holdout_viability's docstring for
+        # the exact "availability/shape only, never a look at returns"
+        # boundary this preflight is not allowed to cross. Scoped to
+        # final_holdout_confirmation only -- a train_oos run consumes no
+        # seal, so there is nothing here for it to prematurely burn.
+        pre_insert_check = (
+            (lambda: _preflight_holdout_viability(config, data_handler))
+            if final_holdout_confirmation
+            else None
+        )
 
         return self._run_and_record(
             _dispatch,
@@ -377,6 +430,7 @@ class TrialRecorder:
             strategy_family=strategy_family,
             base_run_type="walk_forward",
             extract_metrics=_extract_walk_forward_metrics,
+            pre_insert_check=pre_insert_check,
         )
 
     def run_parameter_sweep(
@@ -529,6 +583,7 @@ class TrialRecorder:
         base_run_type: str,
         extract_metrics: Callable[[Any], tuple[Optional[float], Optional[float], dict]],
         initial_metrics_json: Optional[dict] = None,
+        pre_insert_check: Optional[Callable[[], None]] = None,
     ) -> Any:
         if not data_version or not data_version.strip():
             raise MissingDataVersionError(
@@ -563,6 +618,19 @@ class TrialRecorder:
                 final_holdout_confirmation=final_holdout_confirmation,
                 strategy_family=strategy_family,
             )
+
+            # 04-4W W2 bug 2 fix: run the data-sufficiency + config-viability
+            # preflight (when supplied -- only run_walk_forward's
+            # final_holdout_confirmation=True path supplies one) AFTER the
+            # policy guard above but BEFORE anything below that leads to the
+            # seal-committing insert. A policy violation (wrong/unregistered
+            # window, seal already consumed) is raised by the guard first,
+            # unaffected by data availability; only a request that already
+            # clears policy is then checked for whether it can actually be
+            # evaluated. See _preflight_holdout_viability's docstring for the
+            # precise "availability/shape only" boundary it must not cross.
+            if pre_insert_check is not None:
+                pre_insert_check()
 
             if session.get(StrategyDefinition, (strategy_id, config_hash)) is None:
                 raise DefinitionNotFoundError(
@@ -694,6 +762,18 @@ class TrialRecorder:
                 status="running",
                 metrics_json=dict(initial_metrics_json) if initial_metrics_json else {},
                 started_at=started_at,
+                # 04-4W W1 fix: persist the EFFECTIVE evaluation range this
+                # trial was already validated/guarded against above --
+                # previously computed and used by _enforce_holdout_guard,
+                # then discarded rather than recorded on the row it gates.
+                # Once config_hash stopped covering backtest.start_date/
+                # backtest.end_date, this is what makes a train_oos trial
+                # and a holdout trial recorded under the SAME config_hash
+                # distinguishable from the row alone (see
+                # strategy_registry/selection_models.py's StrategyTrial
+                # docstring and migration 015).
+                eval_start_date=effective_start,
+                eval_end_date=effective_end,
             )
             session.add(trial)
             try:
@@ -1026,6 +1106,89 @@ def _parse_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+# 04-4W W2 bug 2 fix: minimum trading sessions the preflight requires in the
+# effective holdout range before it will let a final_holdout_confirmation
+# request proceed to the seal-committing insert. A single-window evaluation
+# (backtesting.validation.holdout_evaluator.SingleWindowEvaluator) computes
+# daily returns via nav_series.pct_change().dropna() -- one trading session
+# produces zero usable return rows (the diff has nothing to compare against),
+# which would insert a 'running' row, consume the one-shot seal, and then
+# hand SurvivalFunnel/bootstrap_stress an all-empty oos_returns series. Two
+# is the minimum that can ever produce a single non-NaN daily return.
+_MIN_HOLDOUT_TRADING_SESSIONS = 2
+
+
+def _preflight_holdout_viability(config: dict, data_handler: "DataHandler") -> None:
+    """Fail-closed data-sufficiency + config-viability check for a
+    ``final_holdout_confirmation=True`` request, run BEFORE the seal-
+    committing ``strategy_trials`` insert (04-4W W2 bug 2 fix).
+
+    **Boundary this function must never cross**: it may only check the
+    AVAILABILITY/SHAPE of the holdout window's data -- that
+    ``config['backtest']`` is a structurally valid backtest config
+    (``validate_backtest_config``) and that ``data_handler`` reports at
+    least ``_MIN_HOLDOUT_TRADING_SESSIONS`` trading dates in the effective
+    range (``DataHandler.trading_dates``, a plain date-index lookup) -- it
+    must NEVER read a price, a return, or any metric that would constitute
+    "a look" at the holdout evaluation itself. The one-shot seal exists
+    precisely because reading holdout RETURNS is the thing that may happen
+    at most once, ever; reading the date INDEX shape is not a look at
+    returns and is safe to do before the seal commits. This mirrors
+    ``WalkForwardValidator.run``'s own pre-dispatch
+    ``data_handler.trading_dates(...)`` emptiness check
+    (``backtesting/validation/walk_forward.py``) -- the same class of setup
+    check, just performed here, before the recorder's insert, so a bad
+    holdout window fails BEFORE the trial row (and therefore the seal)
+    commits, instead of after.
+
+    A run that clears this preflight and then fails DURING evaluation (e.g.
+    inside ``BacktestEngine.run``, after the 'running' row is already
+    inserted and dispatch has started) still consumes the seal -- that is a
+    real look at the data, exactly what the one-shot guarantee is designed
+    to capture, and this function has no say over it (it never runs again
+    after Step 1's insert). This function's only job is to keep genuinely
+    non-viable SETUP failures -- a malformed config, or a data_handler with
+    no coverage of the registered holdout window -- from burning the seal
+    before any evaluation was ever possible.
+
+    Raises:
+        HoldoutEvaluationPreflightError: ``config`` fails
+            ``validate_backtest_config``, or ``data_handler`` reports fewer
+            than ``_MIN_HOLDOUT_TRADING_SESSIONS`` trading dates in the
+            effective ``[start_date, end_date]`` range.
+    """
+    try:
+        validate_backtest_config(config)
+    except Exception as exc:  # noqa: BLE001 -- any validate_backtest_config
+        # failure is a config-viability SETUP problem, not a code bug; wrap
+        # it uniformly as HoldoutEvaluationPreflightError so callers have one
+        # exception type to catch for "this holdout attempt never got to run".
+        raise HoldoutEvaluationPreflightError(
+            "Holdout confirmation preflight failed: config is not a valid "
+            f"backtest config ({type(exc).__name__}: {exc}). This is a SETUP "
+            "failure caught before the one-shot holdout seal is consumed -- "
+            "no holdout data was read. Fix the config and retry; the seal "
+            "remains unconsumed."
+        ) from exc
+
+    bt_cfg = config["backtest"]
+    start = _parse_date(bt_cfg["start_date"])
+    end = _parse_date(bt_cfg["end_date"])
+    sessions = data_handler.trading_dates(start, end)
+    if len(sessions) < _MIN_HOLDOUT_TRADING_SESSIONS:
+        raise HoldoutEvaluationPreflightError(
+            f"Holdout confirmation preflight failed: only {len(sessions)} "
+            f"trading session(s) available in the effective holdout window "
+            f"({start} .. {end}); at least {_MIN_HOLDOUT_TRADING_SESSIONS} "
+            "are required to run a single-window backtest and compute even "
+            "one daily return. This is a SETUP failure -- no holdout "
+            "returns were read -- caught before the one-shot holdout seal "
+            "is consumed. Provide a data_handler that actually covers the "
+            "registered holdout window and retry; the seal remains "
+            "unconsumed."
+        )
 
 
 def _config_with_data_version(config: dict, data_version: str) -> dict:

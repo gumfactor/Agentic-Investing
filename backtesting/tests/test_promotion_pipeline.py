@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from backtesting.experiment_tracking.mlflow_logger import BacktestLogger
 from backtesting.validation.bootstrap_stress import BootstrapStressResult
+from backtesting.validation.holdout_evaluator import SingleWindowEvaluator
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
     ParameterSweeper,
@@ -229,6 +230,33 @@ def _mock_validator(result: WalkForwardResult | None = None) -> MagicMock:
     return mock
 
 
+def _mock_holdout_evaluator(result: WalkForwardResult | None = None) -> MagicMock:
+    """04-4W W2 bug 1 fix: holdout_mode dispatches through a SEPARATE
+    ``SingleWindowEvaluator``-shaped instrument
+    (``PromotionPipeline._holdout_evaluator``), never through
+    ``self._wf_validator``. Mocked independently here so holdout-path tests
+    can assert the RIGHT evaluator was called (and the wrong one was not)."""
+    mock = MagicMock(spec=SingleWindowEvaluator)
+    mock.run.return_value = result if result is not None else _wf_result(n_folds=1)
+    return mock
+
+
+def _holdout_ok_data_handler(n_sessions: int = 40) -> MagicMock:
+    """A data_handler double that clears TrialRecorder's 04-4W W2 bug 2
+    preflight (``_preflight_holdout_viability`` requires
+    ``trading_dates(...)`` to report at least
+    ``_MIN_HOLDOUT_TRADING_SESSIONS`` sessions before a
+    ``final_holdout_confirmation=True`` dispatch may proceed). A bare
+    ``MagicMock()`` fails this by default (``len(MagicMock())`` is 0), so
+    every holdout_mode=True test that expects a successful dispatch must use
+    this instead."""
+    handler = MagicMock()
+    handler.trading_dates.return_value = [
+        date(2023, 1, day) for day in range(1, min(n_sessions, 28) + 1)
+    ]
+    return handler
+
+
 def _mock_sweeper(result: ParameterSensitivityResult | None = None) -> MagicMock:
     mock = MagicMock(spec=ParameterSweeper)
     mock.sweep.return_value = result if result is not None else _sweep_result()
@@ -239,6 +267,7 @@ def _make_pipeline(
     db_url: str,
     *,
     validator_result: WalkForwardResult | None = None,
+    holdout_evaluator_result: WalkForwardResult | None = None,
     sweep_result: ParameterSensitivityResult | None = None,
     stress_result: BootstrapStressResult | None = None,
     backtest_logger=None,
@@ -249,6 +278,7 @@ def _make_pipeline(
         db_url,
         DATA_VERSION,
         walk_forward_validator=_mock_validator(validator_result),
+        holdout_evaluator=_mock_holdout_evaluator(holdout_evaluator_result),
         parameter_sweeper=_mock_sweeper(sweep_result),
         bootstrap_stress_fn=lambda *a, **kw: stress,
         backtest_logger=backtest_logger,
@@ -747,25 +777,29 @@ def test_holdout_confirmation_uses_same_frozen_config_hash_as_winner(db_url: str
 
     pipeline = _make_pipeline(
         db_url,
-        validator_result=_wf_result(sharpe=1.0, max_dd=-0.05, is_sharpe=1.0, trade_count=20, n_folds=1),
+        holdout_evaluator_result=_wf_result(
+            sharpe=1.0, max_dd=-0.05, is_sharpe=1.0, trade_count=20, n_folds=1
+        ),
         stress_result=_stress_result("solid"),
     )
 
     result = pipeline.run(
         "v1_test_strategy",
         config_hash,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         hypothesis_id=hyp_id,
         holdout_mode=True,
     )
 
     # The dispatched config's canonical hash equals config_hash -- the
     # pipeline actually built and used the holdout config, not the raw
-    # train/OOS one.
-    dispatched_config = pipeline._wf_validator.run.call_args.args[0]
+    # train/OOS one. Dispatched via the SINGLE-WINDOW evaluator (04-4W W2
+    # bug 1 fix), never the fold-based self._wf_validator.
+    dispatched_config = pipeline._holdout_evaluator.run.call_args.args[0]
     assert hash_config(dispatched_config) == config_hash
     assert dispatched_config["backtest"]["start_date"] == window.holdout_start.isoformat()
     assert dispatched_config["backtest"]["end_date"] == window.holdout_end.isoformat()
+    pipeline._wf_validator.run.assert_not_called()
 
     assert result.config_hash == config_hash
     assert result.sensitivity_result is None
@@ -797,13 +831,13 @@ def test_second_holdout_confirmation_is_rejected_by_one_shot_seal(db_url: str) -
 
     pipeline = _make_pipeline(
         db_url,
-        validator_result=_wf_result(n_folds=1),
+        holdout_evaluator_result=_wf_result(n_folds=1),
         stress_result=_stress_result("solid"),
     )
     pipeline.run(
         "v1_test_strategy",
         config_hash,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         hypothesis_id=hyp_id,
         holdout_mode=True,
     )
@@ -1078,13 +1112,15 @@ def test_non_canonical_config_hash_rejected_before_dispatch_holdout_mode(
     # succeeds -- proof the seal was untouched by the rejected attempt.
     pipeline_ok = _make_pipeline(
         db_url,
-        validator_result=_wf_result(sharpe=1.0, max_dd=-0.05, is_sharpe=1.0, trade_count=20, n_folds=1),
+        holdout_evaluator_result=_wf_result(
+            sharpe=1.0, max_dd=-0.05, is_sharpe=1.0, trade_count=20, n_folds=1
+        ),
         stress_result=_stress_result("solid"),
     )
     result = pipeline_ok.run(
         strategy_id,
         canonical_hash,
-        data_handler=MagicMock(),
+        data_handler=_holdout_ok_data_handler(),
         hypothesis_id=hyp_id,
         holdout_mode=True,
     )
@@ -1664,3 +1700,245 @@ def test_fdr_includes_sibling_whose_newest_decision_has_finite_dsr_value(db_url:
     assert sibling_id in fdr_evidence["compared_strategy_ids"]
     idx = fdr_evidence["compared_strategy_ids"].index(sibling_id)
     assert fdr_evidence["p_values"][idx] == pytest.approx(1.0 - 0.8)
+
+
+# ── 04-4W W2/W3: real end-to-end single-window holdout evaluator ────────────────
+# (docs/plans/04-4W-evaluation-window-threading-scope.md §2 W2/W3). Unlike the
+# rest of this file, these tests use REAL DataHandler/BacktestEngine/
+# TrialRecorder/SingleWindowEvaluator instances (no mocked wf_validator/
+# holdout_evaluator) -- proof that a realistic ~6-month holdout window
+# genuinely dispatches through ONE BacktestEngine.run() call end to end,
+# rather than the fold-based WalkForwardValidator (which would raise
+# "Insufficient data for N folds" against a window this short).
+
+
+def _business_days(start: date, end: date) -> list[date]:
+    return [d.date() for d in pd.bdate_range(start, end)]
+
+
+def _real_prices(dates: list[date], tickers: list[str]) -> pd.DataFrame:
+    rows = []
+    for d in dates:
+        for t in tickers:
+            rows.append({"ticker": t, "date": d, "close": 100.0})
+    return pd.DataFrame(rows)
+
+
+def _real_signals(dates: list[date], tickers: list[str]) -> pd.DataFrame:
+    rows = []
+    for d in dates[::21]:  # monthly rebalance signal
+        for j, t in enumerate(tickers):
+            rows.append({"ticker": t, "score_date": d, "alpha_score": float(j)})
+    return pd.DataFrame(rows)
+
+
+def _real_benchmark(dates: list[date]) -> pd.DataFrame:
+    return pd.DataFrame({"date": dates, "close": [400.0 + i * 0.05 for i in range(len(dates))]})
+
+
+def _write_holdout_promo_config(path: Path, *, strategy_id: str) -> Path:
+    """A real, fully valid strategy YAML for the end-to-end holdout tests --
+    train/OOS range 2022-01-01..2022-12-31, matching the registered window
+    seeded alongside it below."""
+    config = {
+        "version": 1,
+        "name": strategy_id,
+        "strategy_id": strategy_id,
+        "description": "04-4W end-to-end holdout test strategy",
+        "universe": {"source": "sp500"},
+        "indicators": {"momentum": {"weight": 1.0, "score_col": "momentum_score"}},
+        "portfolio": {"method": "equal_weight", "n_long": 2, "max_position_weight": 0.6},
+        "execution": {"fill_model": "perfect"},
+        "backtest": {
+            "start_date": "2022-01-01",
+            "end_date": "2022-12-31",
+            "initial_capital": 100_000.0,
+            "benchmark": "SPY",
+        },
+    }
+    path.write_text(yaml.dump(config), encoding="utf-8")
+    return path
+
+
+def _seed_real_holdout_fixture(
+    db_url: str, tmp_path: Path, strategy_id: str = "v1_e2e_holdout"
+) -> tuple[str, int, "DataHandler"]:
+    """Shared setup for the real end-to-end holdout tests: registers a real
+    strategy definition, a matching hypothesis, a research_data_windows row
+    whose holdout is a realistic ~6-month window (2023-01-02..2023-06-30),
+    and a real DataHandler covering BOTH the train/OOS range and the holdout
+    range with actual price/signal/benchmark data. Returns
+    (config_hash, hypothesis_id, data_handler)."""
+    from backtesting.engine.data_handler import DataHandler
+
+    cfg_path = _write_holdout_promo_config(tmp_path / "e2e.yaml", strategy_id=strategy_id)
+    registry = StrategyRegistry(db_url)
+    strategy = registry.register(str(cfg_path))
+    config_hash = strategy.canonical_config_hash
+
+    hyp_id = _seed_hypothesis(db_url, strategy_id=strategy_id)
+
+    _seed_window(
+        db_url,
+        strategy_id=strategy_id,
+        train_start=date(2022, 1, 1),
+        train_end=date(2022, 7, 1),
+        oos_start=date(2022, 7, 1),
+        oos_end=date(2022, 12, 31),
+        holdout_start=date(2023, 1, 2),
+        holdout_end=date(2023, 6, 30),
+    )
+
+    all_dates = _business_days(date(2022, 1, 1), date(2023, 6, 30))
+    tickers = ["AAA", "BBB", "CCC"]
+    data_handler = DataHandler(
+        _real_prices(all_dates, tickers),
+        _real_signals(all_dates, tickers),
+        _real_benchmark(all_dates),
+    )
+    return config_hash, hyp_id, data_handler
+
+
+def test_holdout_confirmation_real_single_window_evaluator_succeeds_end_to_end(
+    db_url: str, tmp_path: Path
+) -> None:
+    """The realistic ~6-month holdout confirmation the design doc's worked
+    example describes: a real BacktestEngine.run() call over the sealed
+    holdout window, dispatched via the real SingleWindowEvaluator (not a
+    mock), through the real TrialRecorder -- proving the wrong-evaluator bug
+    (W2 bug 1) is actually fixed, not just mock-asserted, and that the seal
+    is consumed exactly once."""
+    from backtesting.engine.event_loop import BacktestEngine
+    from backtesting.engine.fill_simulator import FillSimulator
+    from backtesting.validation.holdout_evaluator import SingleWindowEvaluator
+
+    config_hash, hyp_id, data_handler = _seed_real_holdout_fixture(db_url, tmp_path)
+
+    pipeline = PromotionPipeline(
+        db_url,
+        DATA_VERSION,
+        holdout_evaluator=SingleWindowEvaluator(
+            engine=BacktestEngine(), fill_simulator=FillSimulator(fill_model="perfect")
+        ),
+        bootstrap_stress_fn=lambda *a, **kw: _stress_result("solid"),
+        n_reshuffles=10,
+    )
+
+    result = pipeline.run(
+        "v1_e2e_holdout",
+        config_hash,
+        data_handler=data_handler,
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+
+    assert result.config_hash == config_hash
+    assert result.evidence_json["evaluation"] == "holdout_confirmation"
+    assert result.sensitivity_result is None  # no sweep in holdout mode
+    assert result.promotion_decision_id is not None
+    # A real single-window evaluation produced a real (non-empty) OOS return
+    # series -- proof BacktestEngine actually ran over the holdout window.
+    assert result.wf_result is not None
+    assert len(result.wf_result.oos_returns) > 0
+    assert len(result.wf_result.folds) == 1  # ONE fixed-config look, no folds
+
+    trials = pipeline._trial_recorder.list_trials("v1_e2e_holdout", run_type="holdout_confirmation")
+    assert len(trials) == 1  # seal consumed exactly once
+    assert trials[0].status == "completed"
+    assert trials[0].eval_start_date == date(2023, 1, 2)
+    assert trials[0].eval_end_date == date(2023, 6, 30)
+
+    # A second attempt is rejected by the one-shot seal.
+    with pytest.raises(HoldoutWindowViolationError):
+        pipeline.run(
+            "v1_e2e_holdout",
+            config_hash,
+            data_handler=data_handler,
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
+        )
+    assert (
+        len(pipeline._trial_recorder.list_trials("v1_e2e_holdout", run_type="holdout_confirmation"))
+        == 1
+    )
+
+
+def test_holdout_confirmation_preflight_failure_does_not_burn_seal_and_retry_succeeds(
+    db_url: str, tmp_path: Path
+) -> None:
+    """W2 bug 2, exercised through the full PromotionPipeline (not just
+    TrialRecorder directly): a data_handler that cannot actually cover the
+    registered holdout window makes the preflight raise BEFORE the
+    seal-committing insert -- no strategy_trials row, no promotion_decisions
+    row -- and a subsequent attempt with a data_handler that DOES cover the
+    window still succeeds afterward."""
+    from backtesting.engine.data_handler import DataHandler
+    from backtesting.engine.event_loop import BacktestEngine
+    from backtesting.engine.fill_simulator import FillSimulator
+    from backtesting.validation.holdout_evaluator import SingleWindowEvaluator
+    from backtesting.validation.trial_recorder import HoldoutEvaluationPreflightError
+
+    config_hash, hyp_id, real_data_handler = _seed_real_holdout_fixture(db_url, tmp_path)
+
+    # A data_handler with NO price coverage of the registered holdout window
+    # at all (only covers the train/OOS range) -- structurally viable config,
+    # but zero trading sessions available in the holdout range.
+    starved_dates = _business_days(date(2022, 1, 1), date(2022, 12, 31))
+    starved_handler = DataHandler(
+        _real_prices(starved_dates, ["AAA", "BBB", "CCC"]),
+        _real_signals(starved_dates, ["AAA", "BBB", "CCC"]),
+        _real_benchmark(starved_dates),
+    )
+
+    def _make_pipeline_for(data_handler_unused=None) -> PromotionPipeline:
+        return PromotionPipeline(
+            db_url,
+            DATA_VERSION,
+            holdout_evaluator=SingleWindowEvaluator(
+                engine=BacktestEngine(), fill_simulator=FillSimulator(fill_model="perfect")
+            ),
+            bootstrap_stress_fn=lambda *a, **kw: _stress_result("solid"),
+            n_reshuffles=10,
+        )
+
+    starved_pipeline = _make_pipeline_for()
+    with pytest.raises(HoldoutEvaluationPreflightError):
+        starved_pipeline.run(
+            "v1_e2e_holdout",
+            config_hash,
+            data_handler=starved_handler,
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
+        )
+
+    assert (
+        starved_pipeline._trial_recorder.list_trials(
+            "v1_e2e_holdout", run_type="holdout_confirmation"
+        )
+        == []
+    )
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        decisions = list(
+            session.scalars(
+                select(PromotionDecision).where(PromotionDecision.strategy_id == "v1_e2e_holdout")
+            )
+        )
+    assert decisions == []
+
+    # A corrected retry, with a data_handler that actually covers the
+    # registered holdout window, still succeeds -- the seal was untouched.
+    retry_pipeline = _make_pipeline_for()
+    result = retry_pipeline.run(
+        "v1_e2e_holdout",
+        config_hash,
+        data_handler=real_data_handler,
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+    assert result.promotion_decision_id is not None
+    trials = retry_pipeline._trial_recorder.list_trials(
+        "v1_e2e_holdout", run_type="holdout_confirmation"
+    )
+    assert len(trials) == 1
+    assert trials[0].status == "completed"
