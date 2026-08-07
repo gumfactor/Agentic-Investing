@@ -21,6 +21,15 @@ def _registry():
     return StrategyRegistry(db_url)
 
 
+def _hypothesis_registry():
+    from strategy_registry.hypothesis import HypothesisRegistry
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print("ERROR: DATABASE_URL environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+    return HypothesisRegistry(db_url)
+
+
 # ── subcommand handlers ───────────────────────────────────────────────────────
 
 
@@ -180,6 +189,71 @@ def cmd_runs(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_hypothesis_register(args: argparse.Namespace) -> None:
+    """Pre-register a research hypothesis + its param_grid_json before any
+    candidate run happens (Gate 04 §4.0 step 1)."""
+    reg = _hypothesis_registry()
+    param_grid = None
+    if args.param_grid_json:
+        with open(args.param_grid_json, encoding="utf-8") as fh:
+            param_grid = json.load(fh)
+        if not isinstance(param_grid, dict):
+            print("ERROR: --param-grid-json must contain a JSON object.", file=sys.stderr)
+            sys.exit(1)
+    hyp = reg.register_hypothesis(
+        strategy_id=args.strategy_id,
+        hypothesis_text=args.text,
+        param_grid_json=param_grid,
+    )
+    print(
+        f"Hypothesis registered (id={hyp.id}) for '{hyp.strategy_id}': "
+        f"{hyp.hypothesis_text!r} (frozen_at={hyp.frozen_at})"
+    )
+
+
+def cmd_hypothesis_update_grid(args: argparse.Namespace) -> None:
+    """Edit param_grid_json for a hypothesis that has not yet been frozen."""
+    reg = _hypothesis_registry()
+    param_grid = None
+    if args.param_grid_json:
+        with open(args.param_grid_json, encoding="utf-8") as fh:
+            param_grid = json.load(fh)
+        if not isinstance(param_grid, dict):
+            print("ERROR: --param-grid-json must contain a JSON object.", file=sys.stderr)
+            sys.exit(1)
+    hyp = reg.update_param_grid(hypothesis_id=args.hypothesis_id, param_grid_json=param_grid)
+    print(f"Hypothesis id={hyp.id} param_grid_json updated.")
+
+
+def cmd_hypothesis_show(args: argparse.Namespace) -> None:
+    """Show a single hypothesis by id."""
+    reg = _hypothesis_registry()
+    hyp = reg.get_hypothesis(args.hypothesis_id)
+    print(json.dumps({
+        "id": hyp.id,
+        "strategy_id": hyp.strategy_id,
+        "hypothesis_text": hyp.hypothesis_text,
+        "param_grid_json": hyp.param_grid_json,
+        "created_at": hyp.created_at.isoformat() if hyp.created_at else None,
+        "frozen_at": hyp.frozen_at.isoformat() if hyp.frozen_at else None,
+    }, indent=2))
+
+
+def cmd_hypothesis_list(args: argparse.Namespace) -> None:
+    """List hypotheses registered for a strategy."""
+    reg = _hypothesis_registry()
+    hyps = reg.list_hypotheses(args.strategy_id)
+    if not hyps:
+        print("No hypotheses found.")
+        return
+    header = f"{'ID':<8} {'FROZEN_AT':<26} {'HYPOTHESIS_TEXT'}"
+    print(header)
+    print("-" * len(header))
+    for h in hyps:
+        frozen = h.frozen_at.isoformat() if h.frozen_at else ""
+        print(f"{h.id:<8} {frozen:<26} {h.hypothesis_text}")
+
+
 # ── argument parser ───────────────────────────────────────────────────────────
 
 
@@ -271,6 +345,43 @@ def main() -> None:
         dest="run_status",
     )
     p.set_defaults(func=cmd_runs)
+
+    # hypothesis-register
+    p = sub.add_parser(
+        "hypothesis-register",
+        help="Pre-register a research hypothesis + param_grid_json before any trial runs",
+    )
+    p.add_argument("--strategy-id", required=True)
+    p.add_argument("--text", required=True, help="Free-text description of the research question")
+    p.add_argument(
+        "--param-grid-json",
+        default=None,
+        help="Path to a JSON file with the pre-declared parameter-sensitivity grid",
+    )
+    p.set_defaults(func=cmd_hypothesis_register)
+
+    # hypothesis-update-grid
+    p = sub.add_parser(
+        "hypothesis-update-grid",
+        help="Edit param_grid_json for a hypothesis not yet frozen",
+    )
+    p.add_argument("--hypothesis-id", required=True, type=int)
+    p.add_argument(
+        "--param-grid-json",
+        default=None,
+        help="Path to a JSON file with the replacement grid (omit to clear it)",
+    )
+    p.set_defaults(func=cmd_hypothesis_update_grid)
+
+    # hypothesis-show
+    p = sub.add_parser("hypothesis-show", help="Show a single hypothesis by id")
+    p.add_argument("--hypothesis-id", required=True, type=int)
+    p.set_defaults(func=cmd_hypothesis_show)
+
+    # hypothesis-list
+    p = sub.add_parser("hypothesis-list", help="List hypotheses registered for a strategy")
+    p.add_argument("--strategy-id", required=True)
+    p.set_defaults(func=cmd_hypothesis_list)
 
     args = parser.parse_args()
     try:
