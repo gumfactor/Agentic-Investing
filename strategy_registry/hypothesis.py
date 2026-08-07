@@ -62,10 +62,15 @@ def _validate_param_grid(param_grid_json: Optional[dict[str, Any]]) -> None:
             f"{param_grid_json!r})."
         )
     try:
-        json.dumps(param_grid_json)
+        # allow_nan=False so NaN/Infinity fail fast here (Codex round-1 P2):
+        # Python's default json.dumps emits non-standard NaN/Infinity tokens
+        # that PostgreSQL JSONB rejects at write time (turning the promised
+        # fast-fail into a raw driver StatementError) while SQLite may accept
+        # a value production cannot store. Reject strictly, up front.
+        json.dumps(param_grid_json, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise InvalidHypothesisError(
-            f"param_grid_json must be JSON-serializable: {exc}"
+            f"param_grid_json must be strictly-JSON-serializable (no NaN/Infinity): {exc}"
         ) from exc
 
 

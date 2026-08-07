@@ -76,6 +76,22 @@ def test_register_allows_none_param_grid(hyp_registry: HypothesisRegistry) -> No
     assert hyp.frozen_at is None
 
 
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_register_rejects_non_finite_param_grid_values(
+    hyp_registry: HypothesisRegistry, bad_value: float
+) -> None:
+    """Codex round-1 P2: NaN/Infinity must fail fast with
+    InvalidHypothesisError (allow_nan=False), not become a raw driver error
+    at commit (Postgres JSONB rejects them) or a value SQLite stores but
+    production cannot."""
+    with pytest.raises(InvalidHypothesisError):
+        hyp_registry.register_hypothesis(
+            strategy_id="v1_base_momentum",
+            hypothesis_text="grid with a non-finite value",
+            param_grid_json={"rsi.lookback": [10, bad_value]},
+        )
+
+
 # ── update_param_grid (immutability) ───────────────────────────────────────────
 
 

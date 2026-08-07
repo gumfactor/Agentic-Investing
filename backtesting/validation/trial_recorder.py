@@ -114,7 +114,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import structlog
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -639,13 +639,29 @@ class TrialRecorder:
             # seal), leaving an audit event that never took effect. The
             # freeze assignment itself stays in-session/atomic with the
             # trial insert; only the LOG EMISSION moves to after commit.
+            # Freeze the linked hypothesis with an ATOMIC conditional UPDATE,
+            # not a read-then-write (Codex round-1 P2; same TOCTOU class as
+            # HypothesisRegistry.update_param_grid). Two concurrent trials for
+            # the same unfrozen hypothesis could otherwise both read
+            # frozen_at IS NULL and both write, violating the set-once
+            # invariant and double-emitting the audit event; the guard must
+            # live in the UPDATE predicate. The UPDATE runs in THIS session,
+            # so it stays atomic with the strategy_trials insert (one commit
+            # covers both, or neither lands). rowcount == 1 means THIS call
+            # won the set-once race and applied the freeze; 0 means the
+            # hypothesis was already frozen, or does not exist -- the latter
+            # is rejected at commit by the trial's composite FK, unchanged.
             freeze_applied = False
             if hypothesis_id is not None:
-                hypothesis = session.get(StrategyHypothesis, hypothesis_id)
-                if hypothesis is not None and hypothesis.frozen_at is None:
-                    hypothesis.frozen_at = started_at
-                    session.add(hypothesis)
-                    freeze_applied = True
+                freeze_result = session.execute(
+                    update(StrategyHypothesis.__table__)
+                    .where(
+                        StrategyHypothesis.__table__.c.id == hypothesis_id,
+                        StrategyHypothesis.__table__.c.frozen_at.is_(None),
+                    )
+                    .values(frozen_at=started_at)
+                )
+                freeze_applied = freeze_result.rowcount == 1
 
             trial = StrategyTrial(
                 strategy_id=strategy_id,

@@ -1687,6 +1687,51 @@ def test_second_trial_linking_already_frozen_hypothesis_is_a_noop_on_frozen_at(
     assert all(t.hypothesis_id == hypothesis_id for t in trials)
 
 
+def test_freeze_uses_conditional_update_and_never_overwrites_an_existing_timestamp(
+    recorder: TrialRecorder,
+) -> None:
+    """Codex round-1 P2: the freeze side effect is an atomic conditional
+    UPDATE (`... WHERE frozen_at IS NULL`), so a hypothesis already frozen at
+    a KNOWN earlier timestamp is never overwritten by a later linked trial,
+    and that later trial emits NO `strategy_hypothesis_frozen` event -- the
+    set-once invariant and the audit timestamp both belong to the first
+    linked trial, not whichever write commits last."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    hypothesis_id = _seed_hypothesis(recorder)
+
+    # Pre-freeze directly to a distinct sentinel timestamp (simulating a first
+    # writer that already won the set-once race).
+    sentinel = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    with Session(recorder._engine) as session:
+        hyp = session.get(StrategyHypothesis, hypothesis_id)
+        hyp.frozen_at = sentinel
+        session.add(hyp)
+        session.commit()
+
+    with structlog.testing.capture_logs() as logs:
+        recorder.run_walk_forward(
+            _mock_validator(_wf_result(sharpe=1.0)),
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+            hypothesis_id=hypothesis_id,
+        )
+
+    with Session(recorder._engine) as session:
+        after = session.get(StrategyHypothesis, hypothesis_id).frozen_at
+    # frozen_at is unchanged (conditional UPDATE matched 0 rows), and no
+    # freeze event was emitted for this (non-first) linked trial. Compare
+    # tz-naive: SQLite returns naive datetimes, so the point is that the
+    # stored instant is still the 2020 sentinel, NOT the ~current trial
+    # started_at that a non-conditional overwrite would have written.
+    assert after.replace(tzinfo=None) == sentinel.replace(tzinfo=None)
+    assert not any(e.get("event") == "strategy_hypothesis_frozen" for e in logs)
+
+
 def test_freeze_log_not_emitted_when_trial_insert_fails_after_freeze(
     recorder: TrialRecorder,
 ) -> None:
