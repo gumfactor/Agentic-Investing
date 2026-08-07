@@ -1,8 +1,29 @@
 # 04 — Strategy Identity vs. Evaluation Context (design decision)
 
-**Status:** Design decision — needs operator sign-off before implementation. No
-code ships with this note. Written 2026-08-07 after Gate 04-4 (`PromotionPipeline`,
-PR #49) surfaced a P1 whose real cause is architectural, not local.
+**Status:** **DECIDED (operator, 2026-08-07): Option 1 — exclude the backtest
+window from `config_hash`.** Backward compatibility is explicitly **waived**:
+nothing has gone live and no `config_hash` is load-bearing yet, so there is **no
+migration/versioning story** — the fingerprint algorithm is changed cleanly and
+existing fixtures/records are simply recomputed under the new rule. Implemented
+into PR #49 alongside re-enabling `holdout_mode`. Written 2026-08-07 after Gate
+04-4 (`PromotionPipeline`) surfaced a P1 whose real cause is architectural, not
+local.
+
+> **Decision summary:** `config_hash` = hash of strategy *identity* only
+> (signals, `portfolio.*`, `execution.*`, `backtest.initial_capital`).
+> Excluded from the hash: `data_version` (already) **+ `backtest.start_date` /
+> `backtest.end_date`** (new). The evaluation window becomes a per-measurement
+> input, not part of identity — so the same frozen winner can be evaluated over
+> train/OOS and then over the sealed holdout with the SAME `config_hash`,
+> making holdout confirmation honest. The date-window safety that the provenance
+> hash used to provide is preserved by `TrialRecorder`'s existing holdout guard
+> (a `final_holdout_confirmation` run must fall within the registered holdout
+> window) — that check is independent of the hash. Because nothing is live, §5's
+> migration ripple (recomputing existing hashes) does not apply; the remaining
+> ripples (§5 items 3–5: nested-key exclusion in the fingerprint; window no
+> longer part of a backtest's identity so consumers keying on
+> `config_hash`+`data_version` must add the window) are handled in the
+> implementation.
 
 ## 1. Why this note exists
 
