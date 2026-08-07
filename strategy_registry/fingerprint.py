@@ -12,7 +12,26 @@ from typing import Any, Mapping
 
 import yaml
 
+# Top-level keys stripped from the canonical hash input entirely. These are
+# "evaluation context" (how/when a config was run), never "strategy
+# identity" (what the strategy IS) -- see
+# docs/plans/04-identity-evaluation-context-design.md.
 _RUNTIME_KEYS: frozenset[str] = frozenset({"data_version"})
+
+# Nested keys stripped from the canonical hash input, scoped to a specific
+# parent section -- unlike _RUNTIME_KEYS these are NOT stripped from the
+# canonical form used for storage/display (StrategyFingerprint.config), only
+# from the input fed to _hash(). ``backtest.start_date``/``backtest.end_date``
+# are the evaluation window: per docs/plans/04-identity-evaluation-context-
+# design.md (operator decision, 2026-08-07, Option 1), the window is a
+# per-measurement input, not part of a strategy's identity, so the SAME
+# frozen config_hash must be reproducible whether evaluated over train/OOS
+# dates or the sealed holdout window. The rest of "backtest" (e.g.
+# initial_capital) remains part of identity and is NOT stripped here -- only
+# these two leaf keys, nested under "backtest".
+_IDENTITY_EXCLUDED_NESTED: dict[str, frozenset[str]] = {
+    "backtest": frozenset({"start_date", "end_date"}),
+}
 _REQUIRED_TOP_LEVEL: frozenset[str] = frozenset(
     {"version", "name", "universe", "portfolio", "execution", "backtest"}
 )
@@ -33,7 +52,9 @@ class StrategyFingerprint:
     portfolio_method: str | None
     n_long: int | None
     rebalance_frequency: str | None
-    config: dict[str, Any]  # canonical form (runtime keys stripped, keys sorted)
+    config: dict[str, Any]  # canonical form (runtime keys stripped, keys sorted;
+    # backtest.start_date/end_date are RETAINED here -- they are excluded
+    # only from config_hash's input, not from the stored/returned config)
     source_path: str
 
 
@@ -54,7 +75,7 @@ def fingerprint(
 
     strategy_id = resolve_strategy_id(raw, explicit_strategy_id)
     canonical = _canonical(raw)
-    config_hash = _hash(canonical)
+    config_hash = _hash(_identity_view(canonical))
 
     portfolio = raw.get("portfolio") or {}
 
@@ -76,8 +97,9 @@ def hash_config(config: Mapping[str, Any]) -> str:
     """Canonical ``config_hash`` for an already-in-memory config dict.
 
     Same canonicalisation as :func:`fingerprint`/:func:`recompute_hash` (key
-    sorting + ``_RUNTIME_KEYS`` stripping via :func:`_canonical`, then
-    :func:`_hash`) so a hash computed here is directly comparable to a
+    sorting + ``_RUNTIME_KEYS``/``_IDENTITY_EXCLUDED_NESTED`` stripping via
+    :func:`_canonical`/:func:`_identity_view`, then :func:`_hash`) so a hash
+    computed here is directly comparable to a
     ``StrategyDefinition.config_hash``/``StrategyFingerprint.config_hash``
     produced from the YAML file that originally registered it. Unlike
     :func:`fingerprint`, this does no file I/O and does not run
@@ -87,8 +109,15 @@ def hash_config(config: Mapping[str, Any]) -> str:
     check that the config passed to a wrapped ``validator.run``/
     ``sweeper.sweep`` call is the one that actually produced the claimed
     ``config_hash``), not for first-time registration.
+
+    Per docs/plans/04-identity-evaluation-context-design.md (operator
+    decision, 2026-08-07, Option 1), ``backtest.start_date``/
+    ``backtest.end_date`` are evaluation context, not identity: two configs
+    differing ONLY in those two nested keys hash IDENTICALLY. This is what
+    lets a promotion pipeline evaluate the SAME frozen ``config_hash`` over
+    train/OOS dates and then again over the sealed holdout window.
     """
-    return _hash(_canonical(config))
+    return _hash(_identity_view(_canonical(config)))
 
 
 def recompute_hash(config_path: str) -> str:
@@ -99,7 +128,7 @@ def recompute_hash(config_path: str) -> str:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"{config_path} must contain a YAML mapping")
-    return _hash(_canonical(raw))
+    return _hash(_identity_view(_canonical(raw)))
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
@@ -184,6 +213,36 @@ def _canonical(value: Any) -> Any:
     if isinstance(value, list):
         return [_canonical(item) for item in value]
     return value
+
+
+def _identity_view(canonical: Any) -> Any:
+    """Derive the hash-INPUT view from an already-canonical config: the same
+    structure, minus the nested evaluation-context keys in
+    ``_IDENTITY_EXCLUDED_NESTED`` (currently ``backtest.start_date``/
+    ``backtest.end_date``).
+
+    Deliberately separate from :func:`_canonical`, which is also used to
+    build ``StrategyFingerprint.config``/the stored canonical config -- the
+    date fields MUST remain in the stored/returned config (they are still
+    validated by ``backtesting.config_contract`` and consumed by the
+    backtest engine) and are only removed from what gets hashed. Never
+    mutates ``canonical`` -- returns a new top-level dict (and a new nested
+    dict for any affected section), copy-on-write for the rest.
+
+    Missing sections/keys (no ``backtest`` section at all, or a ``backtest``
+    section missing one or both date keys) are handled without error -- the
+    dict comprehension below simply has nothing to exclude in that case.
+    """
+    if not isinstance(canonical, Mapping):
+        return canonical
+    result = dict(canonical)
+    for section, excluded_keys in _IDENTITY_EXCLUDED_NESTED.items():
+        nested = result.get(section)
+        if isinstance(nested, Mapping):
+            result[section] = {
+                k: v for k, v in nested.items() if k not in excluded_keys
+            }
+    return result
 
 
 def _hash(canonical: Any) -> str:
