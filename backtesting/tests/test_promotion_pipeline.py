@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import structlog.testing
+import yaml
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,7 @@ from backtesting.validation.promotion_pipeline import (
     HoldoutIdentityMismatchError,
     MissingHoldoutWindowError,
     MissingParameterGridError,
+    NonCanonicalConfigHashError,
     PromotionPipeline,
     RESIDUAL_BUG_ACKNOWLEDGEMENTS,
     _sanitize_metrics,
@@ -47,6 +49,7 @@ from backtesting.validation.walk_forward import WalkForwardFold, WalkForwardResu
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.hypothesis import HypothesisRegistry
 from strategy_registry.models import Base, Strategy, StrategyDefinition
+from strategy_registry.registry import StrategyRegistry
 from strategy_registry.selection_models import (
     PromotionDecision,
     ResearchDataWindow,
@@ -925,6 +928,171 @@ def test_holdout_mode_default_false_train_oos_path_unaffected(db_url: str) -> No
         and result.sensitivity_verdict == "robust"
     )
     assert result.promotion_decision_id is not None
+
+
+# ── Codex P1: non-canonical config_hash for a REGISTERED strategy must be
+# rejected before dispatch, before it can consume the one-shot holdout seal
+# for the wrong definition ──────────────────────────────────────────────────
+
+
+def _write_promo_config(
+    path: Path,
+    *,
+    strategy_id: str,
+    version: int = 1,
+    n_long: int = 10,
+) -> Path:
+    """Write a valid, complete strategy YAML for StrategyRegistry.register()/
+    add_definition(). ``strategy_id`` is passed explicitly (not derived from
+    version/name) so two different ``version``s -- i.e. two different
+    ``strategy_definitions`` rows with different config hashes -- can share
+    the same ``strategy_id``."""
+    config = {
+        "version": version,
+        "name": strategy_id,
+        "strategy_id": strategy_id,
+        "description": f"Promo test strategy v{version}",
+        "universe": {"source": "sp500"},
+        "indicators": {"momentum": {"weight": 1.0, "score_col": "momentum_score"}},
+        "portfolio": {"method": "equal_weight", "n_long": n_long, "max_position_weight": 0.1},
+        "execution": {"fill_model": "perfect"},
+        "backtest": {
+            "start_date": "2022-01-01",
+            "end_date": "2022-12-31",
+            "initial_capital": 1000000.0,
+            "benchmark": "SPY",
+        },
+    }
+    path.write_text(yaml.dump(config), encoding="utf-8")
+    return path
+
+
+def _register_strategy_with_two_definitions(
+    db_url: str, tmp_path: Path, strategy_id: str = "v1_promo_test"
+) -> tuple[str, str]:
+    """Registers ``strategy_id`` (a real ``Strategy`` lifecycle row) with
+    definition A (version=1, n_long=10) as the canonical/registered winner,
+    plus a second, non-canonical definition B (version=2, n_long=20) also on
+    file for the same ``strategy_id``. Returns
+    ``(canonical_config_hash_A, non_canonical_config_hash_B)``."""
+    registry = StrategyRegistry(db_url)
+    cfg_a = _write_promo_config(tmp_path / "a.yaml", strategy_id=strategy_id, version=1, n_long=10)
+    strategy = registry.register(str(cfg_a), strategy_family="promo_test_family")
+    cfg_b = _write_promo_config(tmp_path / "b.yaml", strategy_id=strategy_id, version=2, n_long=20)
+    defn_b = registry.add_definition(str(cfg_b))
+    assert defn_b.config_hash != strategy.canonical_config_hash
+    return strategy.canonical_config_hash, defn_b.config_hash
+
+
+def test_non_canonical_config_hash_rejected_before_dispatch(db_url: str, tmp_path: Path) -> None:
+    """A registered strategy_id with a non-canonical config_hash (from a
+    second, non-registered strategy_definitions row) must be rejected before
+    any instrument dispatches or any DB row is written."""
+    strategy_id = "v1_promo_test"
+    canonical_hash, non_canonical_hash = _register_strategy_with_two_definitions(db_url, tmp_path)
+    hyp_id = _seed_hypothesis(db_url, strategy_id=strategy_id)
+
+    validator = _mock_validator()
+    sweeper = _mock_sweeper()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+    pipeline._sweeper = sweeper
+
+    with pytest.raises(NonCanonicalConfigHashError):
+        pipeline.run(
+            strategy_id,
+            non_canonical_hash,
+            data_handler=MagicMock(),
+            hypothesis_id=hyp_id,
+        )
+
+    validator.run.assert_not_called()
+    sweeper.sweep.assert_not_called()
+
+    trials = pipeline._trial_recorder.list_trials(strategy_id)
+    assert trials == []
+
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        decisions = list(
+            session.scalars(
+                select(PromotionDecision).where(PromotionDecision.strategy_id == strategy_id)
+            )
+        )
+    assert decisions == []
+
+    # The canonical hash still runs normally for the same registered strategy.
+    result = pipeline.run(
+        strategy_id,
+        canonical_hash,
+        data_handler=MagicMock(),
+        hypothesis_id=hyp_id,
+    )
+    assert result.config_hash == canonical_hash
+    assert result.promotion_decision_id is not None
+
+
+def test_non_canonical_config_hash_rejected_before_dispatch_holdout_mode(
+    db_url: str, tmp_path: Path
+) -> None:
+    """holdout_mode=True variant: a non-canonical config_hash for a
+    registered strategy must be rejected before the one-shot holdout seal
+    can be consumed for the WRONG definition -- a subsequent holdout run
+    against the canonical hash must still succeed afterward."""
+    strategy_id = "v1_promo_test"
+    canonical_hash, non_canonical_hash = _register_strategy_with_two_definitions(db_url, tmp_path)
+    _seed_window(db_url, strategy_id=strategy_id)
+    hyp_id = _seed_hypothesis(db_url, strategy_id=strategy_id)
+
+    validator = _mock_validator()
+    sweeper = _mock_sweeper()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+    pipeline._sweeper = sweeper
+
+    with pytest.raises(NonCanonicalConfigHashError):
+        pipeline.run(
+            strategy_id,
+            non_canonical_hash,
+            data_handler=MagicMock(),
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
+        )
+
+    validator.run.assert_not_called()
+    sweeper.sweep.assert_not_called()
+
+    trials = pipeline._trial_recorder.list_trials(strategy_id, run_type="holdout_confirmation")
+    assert trials == []  # the one-shot seal was NOT consumed by the rejected attempt
+
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        decisions = list(
+            session.scalars(
+                select(PromotionDecision).where(PromotionDecision.strategy_id == strategy_id)
+            )
+        )
+    assert decisions == []
+
+    # A subsequent correct holdout run against the canonical hash still
+    # succeeds -- proof the seal was untouched by the rejected attempt.
+    pipeline_ok = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(sharpe=1.0, max_dd=-0.05, is_sharpe=1.0, trade_count=20, n_folds=1),
+        stress_result=_stress_result("solid"),
+    )
+    result = pipeline_ok.run(
+        strategy_id,
+        canonical_hash,
+        data_handler=MagicMock(),
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+    assert result.config_hash == canonical_hash
+    assert result.promotion_decision_id is not None
+
+    trials_after = pipeline_ok._trial_recorder.list_trials(strategy_id, run_type="holdout_confirmation")
+    assert len(trials_after) == 1
 
 
 # ── MLflow additive DSR/FDR logging path ────────────────────────────────────────

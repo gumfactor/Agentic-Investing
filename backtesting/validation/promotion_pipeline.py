@@ -250,6 +250,29 @@ class MissingHoldoutWindowError(PromotionPipelineError):
     """
 
 
+class NonCanonicalConfigHashError(PromotionPipelineError):
+    """Raised when ``run(strategy_id, config_hash, ...)`` is called for a
+    REGISTERED ``strategy_id`` (has a ``Strategy`` lifecycle row) whose
+    requested ``config_hash`` does not equal that row's frozen
+    ``canonical_config_hash``.
+
+    A registered strategy has exactly one frozen/registered winning
+    ``strategy_definitions`` row -- the one pinned at ``register()`` time
+    as ``canonical_config_hash``. If the same ``strategy_id`` also has
+    OTHER (non-canonical) ``strategy_definitions`` rows on file (e.g. from
+    earlier sweep/trial exploration), a caller passing one of those other
+    hashes must not be allowed to generate promotion evidence -- or, worse,
+    consume the strategy-level one-shot holdout seal (§4.0 step 8) -- for a
+    definition other than the frozen winner. ``verify_config_integrity``
+    alone does not catch this: it only re-checks the lifecycle row's OWN
+    ``canonical_config_hash`` against its source YAML, never against the
+    ``config_hash`` the caller actually requested. This check is fail-closed
+    and runs BEFORE any instrument (walk-forward included) dispatches, so a
+    mismatched request never touches the holdout seal or leaves partial
+    trial evidence.
+    """
+
+
 class HoldoutIdentityMismatchError(PromotionPipelineError):
     """Raised if the holdout evaluation config's canonical ``config_hash``
     does not equal the frozen winner's ``config_hash``.
@@ -488,6 +511,31 @@ class PromotionPipeline:
             self._registry.verify_config_integrity(strategy_id)
         except StrategyNotFoundError:
             pass
+        else:
+            # verify_config_integrity only re-checks the lifecycle row's
+            # OWN canonical_config_hash against its source YAML -- it never
+            # compares that canonical hash against the config_hash THIS
+            # call actually requested. A strategy_id can have multiple
+            # strategy_definitions rows (e.g. earlier sweep/trial
+            # exploration); without this check a caller could pass a
+            # non-canonical config_hash for a REGISTERED strategy and
+            # generate promotion evidence -- and, in holdout_mode, consume
+            # the one-shot holdout seal -- for a definition other than the
+            # frozen/registered winner. Bind the run to the canonical hash
+            # here, before any instrument dispatches (see
+            # NonCanonicalConfigHashError's docstring).
+            registered_strategy = self._registry.get(strategy_id)
+            if config_hash != registered_strategy.canonical_config_hash:
+                raise NonCanonicalConfigHashError(
+                    f"strategy_id={strategy_id!r} is registered with frozen "
+                    f"canonical_config_hash="
+                    f"{registered_strategy.canonical_config_hash!r}, but this "
+                    f"run requested config_hash={config_hash!r}, which does "
+                    "not match. A promotion/holdout run must target the "
+                    "frozen registered winner -- refusing to generate "
+                    "promotion evidence (or, in holdout_mode, consume the "
+                    "one-shot holdout seal) for a non-canonical definition."
+                )
 
         # Fail-closed precondition only (§4.4): confirms a valid,
         # non-empty grid exists BEFORE any instrument runs. The value read
