@@ -46,6 +46,7 @@ from strategy_registry.hypothesis import HypothesisRegistry
 from strategy_registry.models import Base, Strategy, StrategyDefinition
 from strategy_registry.selection_models import PromotionDecision, StrategyTrial
 
+
 DATA_VERSION = "a" * 64
 
 
@@ -377,6 +378,120 @@ def test_dsr_is_computed_and_recorded(db_url: str) -> None:
     assert 0.0 <= result.dsr_value <= 1.0
 
 
+# ── FIX 2: n_trials < 2 is insufficient for a meaningful DSR ────────────────
+
+
+def test_compute_dsr_returns_none_and_skips_deflated_sharpe_fn_when_n_trials_is_one(
+    db_url: str,
+) -> None:
+    """n_trials == 1 must degenerate to dsr_value=None rather than calling
+    deflated_sharpe_ratio, which would otherwise return a spurious 1.0 for
+    ANY observed Sharpe (norm.ppf(1 - 1/1) == norm.ppf(0) == -inf)."""
+    mock_dsr_fn = MagicMock(return_value=0.5)
+    pipeline = _make_pipeline(db_url, deflated_sharpe_fn=mock_dsr_fn)
+
+    dsr = pipeline._compute_dsr(observed_sharpe=-3.0, n_trials=1, n_observations=250)
+
+    assert dsr is None
+    mock_dsr_fn.assert_not_called()
+
+
+def test_compute_dsr_computes_normally_when_n_trials_is_two(db_url: str) -> None:
+    """n_trials == 2 is the minimum sufficient count and must still compute
+    a real DSR via deflated_sharpe_fn."""
+    mock_dsr_fn = MagicMock(return_value=0.42)
+    pipeline = _make_pipeline(db_url, deflated_sharpe_fn=mock_dsr_fn)
+
+    dsr = pipeline._compute_dsr(observed_sharpe=1.1, n_trials=2, n_observations=250)
+
+    assert dsr == pytest.approx(0.42)
+    mock_dsr_fn.assert_called_once_with(
+        observed_sharpe=1.1,
+        n_trials=2,
+        n_observations=250,
+        sharpe_std=pipeline._sharpe_std,
+        risk_free_rate=pipeline._risk_free_rate,
+    )
+
+
+def test_promotion_result_dsr_none_when_n_trials_is_one_and_fdr_skips(db_url: str) -> None:
+    """End-to-end: a holdout promotion whose only prior train_oos trial is a
+    single walk_forward row (n_trials == 1, e.g. exactly one prior
+    train/OOS walk-forward before the sealed holdout) must NOT invoke
+    deflated_sharpe_ratio and must produce dsr_value=None on the returned
+    PromotionResult, with FDR treating the DSR as unavailable rather than
+    silently reporting a spurious 1.0."""
+    holdout_config = {
+        "name": "v1_test_strategy",
+        "version": 1,
+        "backtest": {"start_date": "2023-02-01", "end_date": "2023-06-01"},
+    }
+    config_hash = _seed_definition(db_url, config=holdout_config)
+    hyp_id = _seed_hypothesis(db_url)
+
+    engine = _raw_engine(db_url)
+    from strategy_registry.selection_models import ResearchDataWindow
+
+    with Session(engine) as session:
+        session.add(
+            ResearchDataWindow(
+                strategy_id="v1_test_strategy",
+                train_start=date(2022, 1, 1),
+                train_end=date(2022, 7, 1),
+                oos_start=date(2022, 7, 1),
+                oos_end=date(2023, 1, 1),
+                holdout_start=date(2023, 1, 1),
+                holdout_end=date(2023, 7, 1),
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    mock_dsr_fn = MagicMock(return_value=1.0)  # would be spuriously used if not guarded
+
+    holdout_wf = _wf_result()
+    holdout_wf.oos_returns.index = pd.date_range(
+        "2023-01-02", periods=len(holdout_wf.oos_returns), freq="D"
+    )
+    pipeline = _make_pipeline(
+        db_url, validator_result=holdout_wf, deflated_sharpe_fn=mock_dsr_fn
+    )
+
+    # Seed exactly one PRIOR train_oos walk_forward trial so
+    # _compute_n_trials counts n_trials == 1 for this holdout run (the
+    # holdout leg itself is recorded under run_type="holdout_confirmation",
+    # window="holdout", which _compute_n_trials does not count).
+    with Session(engine) as session:
+        session.add(
+            StrategyTrial(
+                strategy_id="v1_test_strategy",
+                config_hash=config_hash,
+                hypothesis_id=hyp_id,
+                run_type="walk_forward",
+                window="train_oos",
+                data_version=DATA_VERSION,
+                status="completed",
+                metrics_json={"sharpe": 1.0},
+                started_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    result = pipeline.run(
+        "v1_test_strategy",
+        config_hash,
+        data_handler=MagicMock(),
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+
+    assert result.n_trials_used == 1
+    assert result.dsr_value is None
+    mock_dsr_fn.assert_not_called()
+    assert result.evidence_json["overfitting"]["dsr_value"] is None
+    assert result.evidence_json["overfitting"]["fdr"]["skipped"] is True
+
+
 # ── Fail closed on missing/unlinked/empty hypothesis grid ──────────────────────
 
 
@@ -575,6 +690,79 @@ def test_pipeline_works_without_mlflow_logger(db_url: str) -> None:
 
     assert result.mlflow_run_id is None
     assert result.promotion_decision_id is not None
+
+
+# ── FIX 1: the DISPATCHED config (wf_result.config), not the original ───────
+# StrategyDefinition.config, must be passed to log_walk_forward_run.
+
+
+def test_mlflow_logging_passes_dispatched_config_not_original(db_url: str) -> None:
+    """TrialRecorder dispatches a COPY of the strategy config with
+    data_version injected (04-3), and WalkForwardValidator returns that copy
+    as wf_result.config. _log_to_mlflow must forward wf_result.config to
+    log_walk_forward_run, not the original StrategyDefinition.config --
+    otherwise log_walk_forward_run's real provenance check (hash(config) ==
+    hash(wf_result.config)) always fails and MLflow logging never succeeds
+    in production."""
+    original_config = _config("v1_test_strategy")
+    config_hash = _seed_definition(db_url, config=original_config)
+    hyp_id = _seed_hypothesis(db_url)
+
+    # The dispatched copy differs from the original (e.g. data_version
+    # injected by TrialRecorder), so its hash differs too.
+    dispatched_config = dict(original_config, data_version=DATA_VERSION)
+    base_wf = _wf_result()
+    dispatched_wf = WalkForwardResult(
+        folds=base_wf.folds,
+        oos_returns=base_wf.oos_returns,
+        oos_metrics=base_wf.oos_metrics,
+        config=dispatched_config,
+    )
+
+    # Simulate mlflow_logger.log_walk_forward_run's real provenance check
+    # (hash equality between the passed `config` arg and `wf_result.config`)
+    # using the actual hashing/exception types, so this test would fail if
+    # the pipeline reverted to passing the original config.
+    from backtesting.config_contract import ConfigProvenanceMismatchError
+    from backtesting.experiment_tracking.mlflow_logger import _hash_config
+
+    def _fake_log_walk_forward_run(config, wf_result_arg, experiment_name, **kwargs):
+        if _hash_config(config) != _hash_config(wf_result_arg.config):
+            raise ConfigProvenanceMismatchError(
+                f"passed config hash {_hash_config(config)} != "
+                f"wf_result.config hash {_hash_config(wf_result_arg.config)}"
+            )
+        return "fake-run-id-789"
+
+    # Prove the ORIGINAL-config path would have failed this check.
+    with pytest.raises(ConfigProvenanceMismatchError):
+        _fake_log_walk_forward_run(original_config, dispatched_wf, "exp")
+
+    mock_logger = MagicMock(spec=BacktestLogger)
+    mock_logger.log_walk_forward_run.side_effect = _fake_log_walk_forward_run
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=dispatched_wf,
+        sweep_result=_sweep_result(verdict="robust"),
+        backtest_logger=mock_logger,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+    )
+
+    mock_logger.log_walk_forward_run.assert_called_once()
+    call = mock_logger.log_walk_forward_run.call_args
+    passed_config = call.args[0] if call.args else call.kwargs["config"]
+    assert passed_config == dispatched_config
+    assert passed_config != original_config
+
+    # MLflow logging SUCCEEDS on the happy path (not silently None).
+    assert result.mlflow_run_id == "fake-run-id-789"
+    mock_logger.log_promotion_decision.assert_called_once()
+    log_kwargs = mock_logger.log_promotion_decision.call_args.kwargs
+    assert log_kwargs["run_id"] == "fake-run-id-789"
 
 
 # ── FIX 1: a supplied-but-failing MLflow logger must degrade gracefully ─────

@@ -500,7 +500,16 @@ class PromotionPipeline:
         mlflow_run_id = self._log_to_mlflow(
             strategy_id=strategy_id,
             config_hash=config_hash,
-            config=config,
+            # Pass the DISPATCHED config (wf_result.config), not the
+            # original StrategyDefinition.config. TrialRecorder dispatches
+            # a copy with data_version injected (04-3), and WalkForwardResult
+            # carries that copy as wf_result.config. log_walk_forward_run
+            # compares the passed config's hash against wf_result's config;
+            # passing the original here would always mismatch, raising
+            # ConfigProvenanceMismatchError and getting silently swallowed
+            # by the graceful-degradation catch below -- so MLflow logging
+            # would never succeed in production.
+            config=wf_result.config,
             wf_result=wf_result,
             funnel_result=funnel_result,
             stress_result=stress_result,
@@ -641,7 +650,14 @@ class PromotionPipeline:
     ) -> Optional[float]:
         if observed_sharpe is None or not math.isfinite(float(observed_sharpe)):
             return None
-        if n_trials <= 0 or n_observations <= 1:
+        # n_trials < 2 is insufficient for a meaningful DSR: the default
+        # expected-maximum-Sharpe term evaluates
+        # norm.ppf(1 - 1/n_trials) = norm.ppf(0) = -inf when n_trials == 1,
+        # which degenerates deflated_sharpe_ratio to return 1.0 for ANY
+        # observed Sharpe (even negative) -- a false certainty. Treat
+        # n_trials < 2 the same as an unavailable DSR (None) rather than
+        # calling deflated_sharpe_ratio with a single trial.
+        if n_trials < 2 or n_observations <= 1:
             logger.warning(
                 "promotion_pipeline_dsr_skipped",
                 reason="n_trials or n_observations insufficient",
