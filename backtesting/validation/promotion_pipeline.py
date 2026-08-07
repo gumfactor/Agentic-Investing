@@ -66,16 +66,19 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
   resolved policy's correctness bar (C7 data-version pinning already
   guarantees byte-identical inputs across re-runs) while deferring the
   actual compute-cost optimization to a later slice if it is ever needed.
-- **holdout_mode**: when ``True``, the walk-forward leg is dispatched with
-  ``final_holdout_confirmation=True`` (the one-shot sealed-holdout run,
-  §4.2) and the parameter-sensitivity leg is skipped entirely --
-  ``TrialRecorder.run_parameter_sweep`` itself hard-rejects
-  ``final_holdout_confirmation=True`` (a sweep would spend the one-shot
-  seal on many variants rather than the single fixed configuration the
-  seal is meant to protect), so a holdout-mode promotion evaluates
-  ``overall_passed`` as funnel-pass AND stress-solid only (sensitivity is
-  recorded as ``None``/skipped, and is excluded from the AND rather than
-  treated as an implicit failure).
+- **holdout_mode is GATED/DEFERRED (not yet supported)**: a promoted
+  strategy's ``config_hash`` INCLUDES its ``backtest.start_date``/
+  ``end_date``, so the frozen winner's config cannot be re-evaluated over
+  the sealed holdout window without changing its hash -- holdout
+  confirmation as previously built either fails the holdout guard or
+  silently confirms a DIFFERENT config than the frozen winner. Pending an
+  identity/evaluation-context design decision (see
+  ``docs/plans/04-identity-evaluation-context-design.md``), ``run(...,
+  holdout_mode=True)`` now fails closed immediately with
+  :class:`HoldoutConfirmationNotSupportedError`, before any instrument or
+  DB work happens. The parameter is kept on the signature for callers/
+  tests that reference it. The train/OOS (``holdout_mode=False``) path
+  described below is unaffected and fully supported.
 - **MLflow logging failure degrades gracefully**: when a ``backtest_logger``
   IS supplied (as opposed to the ``backtest_logger=None`` "skip MLflow
   entirely" path) but raises during ``_log_to_mlflow`` (e.g. a transient
@@ -207,6 +210,31 @@ class MissingParameterGridError(PromotionPipelineError):
     precondition checked BEFORE any instrument (walk-forward included)
     runs, so a promotion attempt without a grid leaves no partial
     trial/evidence trail.
+
+    Also raised when the grid IS structurally present but at least one
+    key's candidate list is unusable (a scalar, a string, a non-sequence,
+    or an empty list/tuple) -- ``ParameterSweeper`` would discover zero
+    combinations for such a key, but only AFTER the expensive walk-forward
+    had already run and recorded partial trial evidence. Validating shape
+    here, before any instrument runs, preserves the same fail-before-
+    instruments guarantee for this case.
+    """
+
+
+class HoldoutConfirmationNotSupportedError(PromotionPipelineError):
+    """Raised immediately when ``run(..., holdout_mode=True)`` is called.
+
+    Holdout confirmation is DEFERRED: a promoted strategy's
+    ``config_hash`` includes its ``backtest.start_date``/``end_date``, so
+    the frozen winner's config cannot be re-evaluated over the sealed
+    holdout window without changing its hash -- holdout confirmation as
+    previously built either fails the holdout guard or silently confirms
+    a DIFFERENT config than the frozen winner. This is gated fail-closed
+    pending an identity/evaluation-context design decision -- see
+    ``docs/plans/04-identity-evaluation-context-design.md``. The
+    ``holdout_mode`` parameter is kept on ``run()`` so existing callers/
+    tests referencing it still import; it now always raises before any
+    instrument or DB work happens.
     """
 
 
@@ -377,19 +405,25 @@ class PromotionPipeline:
             hypothesis_id: FK to the ``strategy_hypotheses`` row this
                 promotion's parameter grid is sourced from. Required
                 (never inferred) -- see ``MissingParameterGridError``.
-            holdout_mode: When True, runs the walk-forward leg as the
-                one-shot sealed-holdout confirmation
-                (``final_holdout_confirmation=True``) and skips the
-                parameter-sensitivity leg entirely (see module docstring).
+            holdout_mode: DEFERRED/GATED -- kept on the signature for
+                callers/tests that reference it, but passing ``True``
+                always raises ``HoldoutConfirmationNotSupportedError``
+                immediately (before any instrument or DB work). See the
+                module docstring's "holdout_mode is GATED/DEFERRED" note
+                and ``docs/plans/04-identity-evaluation-context-design.md``.
 
         Returns:
             A ``PromotionResult`` with every stage's outcome and the
             persisted ``promotion_decision_id``.
 
         Raises:
+            HoldoutConfirmationNotSupportedError: ``holdout_mode=True`` was
+                passed. Checked first, before any instrument or DB work.
             MissingParameterGridError: ``hypothesis_id`` is None, does not
                 belong to ``strategy_id``, or its ``param_grid_json`` is
-                missing/empty. Checked before any instrument runs.
+                missing/empty/malformed (a scalar, string, non-sequence, or
+                empty list/tuple for any key). Checked before any
+                instrument runs.
             DefinitionNotFoundError: No ``strategy_definitions`` row for
                 ``(strategy_id, config_hash)`` (raised by
                 ``TrialRecorder``/``StrategyRegistry``).
@@ -400,6 +434,19 @@ class PromotionPipeline:
                 violates the §4.2 train/OOS/holdout partition (propagated
                 unchanged from ``TrialRecorder``).
         """
+        if holdout_mode:
+            raise HoldoutConfirmationNotSupportedError(
+                "PromotionPipeline.run(holdout_mode=True) is not yet "
+                "supported: a promoted strategy's config_hash includes its "
+                "backtest.start_date/end_date, so the frozen winner's "
+                "config cannot be re-evaluated over the sealed holdout "
+                "window without changing its hash. Holdout confirmation is "
+                "deferred pending an identity/evaluation-context design "
+                "decision -- see "
+                "docs/plans/04-identity-evaluation-context-design.md. Use "
+                "holdout_mode=False (the train/OOS path) for now."
+            )
+
         defn = self._registry.get_definition(strategy_id, config_hash)
         config = dict(defn.config)
 
@@ -414,7 +461,11 @@ class PromotionPipeline:
         except StrategyNotFoundError:
             pass
 
-        param_grid = self._resolve_frozen_grid(strategy_id, hypothesis_id)
+        # Fail-closed precondition only (§4.4): confirms a valid,
+        # non-empty grid exists BEFORE any instrument runs. The value read
+        # here is deliberately NOT the one dispatched to the sweep below --
+        # see the FIX 2 re-read comment at the sweep dispatch site for why.
+        self._resolve_frozen_grid(strategy_id, hypothesis_id)
         strategy_family = self._resolve_strategy_family(strategy_id)
 
         # Stage 1: walk-forward (fresh; see module docstring's "re-run
@@ -445,13 +496,27 @@ class PromotionPipeline:
         # final_holdout_confirmation=True; see module docstring).
         sensitivity_result: Optional[ParameterSensitivityResult] = None
         if not holdout_mode:
+            # Re-read the hypothesis's param_grid_json from the DB here,
+            # AFTER run_walk_forward above (which freezes the linked
+            # hypothesis as a side effect of its first trial -- frozen_at
+            # is now set). This closes a TOCTOU: the initial
+            # _resolve_frozen_grid() read at the top of run() happens
+            # BEFORE the freeze, so a concurrent
+            # HypothesisRegistry.update_param_grid(...) committing between
+            # that read and the freeze would leave the sweep dispatched
+            # with the OLD grid while the now-frozen hypothesis row
+            # records the NEW grid -- promotion evidence that wouldn't
+            # match the frozen record it's supposed to attest to.
+            # Re-fetching and re-validating the grid here guarantees the
+            # sweep provably uses the immutable, already-frozen grid.
+            frozen_param_grid = self._resolve_frozen_grid(strategy_id, hypothesis_id)
             sensitivity_result = self._trial_recorder.run_parameter_sweep(
                 self._sweeper,
                 strategy_id=strategy_id,
                 config_hash=config_hash,
                 data_version=self._data_version,
                 base_config=config,
-                param_grid=param_grid,
+                param_grid=frozen_param_grid,
                 data_handler=data_handler,
                 hypothesis_id=hypothesis_id,
                 strategy_family=strategy_family,
@@ -600,6 +665,29 @@ class PromotionPipeline:
                 "HypothesisRegistry.update_param_grid(...) before recording "
                 "any trial against this hypothesis (the grid freezes on "
                 "the first linked trial)."
+            )
+        # A structurally-nonempty grid can still be unusable: a value that
+        # is a scalar, a string, a non-sequence, or an empty list/tuple
+        # means ParameterSweeper will discover ZERO combinations for that
+        # key. Left unchecked, that failure only surfaces AFTER the
+        # expensive walk-forward has already run and recorded partial
+        # trial evidence -- violating the fail-before-instruments
+        # precondition this method exists to enforce. Validate every
+        # key's candidates are a non-empty list/tuple BEFORE returning.
+        bad_keys = [
+            key
+            for key, candidates in param_grid.items()
+            if not isinstance(candidates, (list, tuple)) or len(candidates) == 0
+        ]
+        if bad_keys:
+            raise MissingParameterGridError(
+                f"strategy_hypotheses id={hypothesis_id} (strategy_id="
+                f"{strategy_id!r}) has a malformed param_grid_json: key(s) "
+                f"{sorted(bad_keys)!r} must each be a non-empty list/tuple "
+                "of candidate values (a scalar, a string, a non-sequence, "
+                "or an empty list is not admissible -- it would let the "
+                "expensive walk-forward run and record trial evidence "
+                "before the sweep discovers zero usable combinations)."
             )
         return dict(param_grid)
 

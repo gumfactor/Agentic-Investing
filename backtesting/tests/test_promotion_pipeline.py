@@ -35,6 +35,7 @@ from backtesting.validation.parameter_sensitivity import (
     ParameterSweeper,
 )
 from backtesting.validation.promotion_pipeline import (
+    HoldoutConfirmationNotSupportedError,
     MissingParameterGridError,
     PromotionPipeline,
     RESIDUAL_BUG_ACKNOWLEDGEMENTS,
@@ -44,7 +45,11 @@ from backtesting.validation.walk_forward import WalkForwardFold, WalkForwardResu
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.hypothesis import HypothesisRegistry
 from strategy_registry.models import Base, Strategy, StrategyDefinition
-from strategy_registry.selection_models import PromotionDecision, StrategyTrial
+from strategy_registry.selection_models import (
+    PromotionDecision,
+    StrategyHypothesis,
+    StrategyTrial,
+)
 
 
 DATA_VERSION = "a" * 64
@@ -414,82 +419,17 @@ def test_compute_dsr_computes_normally_when_n_trials_is_two(db_url: str) -> None
     )
 
 
-def test_promotion_result_dsr_none_when_n_trials_is_one_and_fdr_skips(db_url: str) -> None:
-    """End-to-end: a holdout promotion whose only prior train_oos trial is a
-    single walk_forward row (n_trials == 1, e.g. exactly one prior
-    train/OOS walk-forward before the sealed holdout) must NOT invoke
-    deflated_sharpe_ratio and must produce dsr_value=None on the returned
-    PromotionResult, with FDR treating the DSR as unavailable rather than
-    silently reporting a spurious 1.0."""
-    holdout_config = {
-        "name": "v1_test_strategy",
-        "version": 1,
-        "backtest": {"start_date": "2023-02-01", "end_date": "2023-06-01"},
-    }
-    config_hash = _seed_definition(db_url, config=holdout_config)
-    hyp_id = _seed_hypothesis(db_url)
-
-    engine = _raw_engine(db_url)
-    from strategy_registry.selection_models import ResearchDataWindow
-
-    with Session(engine) as session:
-        session.add(
-            ResearchDataWindow(
-                strategy_id="v1_test_strategy",
-                train_start=date(2022, 1, 1),
-                train_end=date(2022, 7, 1),
-                oos_start=date(2022, 7, 1),
-                oos_end=date(2023, 1, 1),
-                holdout_start=date(2023, 1, 1),
-                holdout_end=date(2023, 7, 1),
-                created_at=datetime.now(timezone.utc),
-            )
-        )
-        session.commit()
-
-    mock_dsr_fn = MagicMock(return_value=1.0)  # would be spuriously used if not guarded
-
-    holdout_wf = _wf_result()
-    holdout_wf.oos_returns.index = pd.date_range(
-        "2023-01-02", periods=len(holdout_wf.oos_returns), freq="D"
-    )
-    pipeline = _make_pipeline(
-        db_url, validator_result=holdout_wf, deflated_sharpe_fn=mock_dsr_fn
-    )
-
-    # Seed exactly one PRIOR train_oos walk_forward trial so
-    # _compute_n_trials counts n_trials == 1 for this holdout run (the
-    # holdout leg itself is recorded under run_type="holdout_confirmation",
-    # window="holdout", which _compute_n_trials does not count).
-    with Session(engine) as session:
-        session.add(
-            StrategyTrial(
-                strategy_id="v1_test_strategy",
-                config_hash=config_hash,
-                hypothesis_id=hyp_id,
-                run_type="walk_forward",
-                window="train_oos",
-                data_version=DATA_VERSION,
-                status="completed",
-                metrics_json={"sharpe": 1.0},
-                started_at=datetime.now(timezone.utc),
-            )
-        )
-        session.commit()
-
-    result = pipeline.run(
-        "v1_test_strategy",
-        config_hash,
-        data_handler=MagicMock(),
-        hypothesis_id=hyp_id,
-        holdout_mode=True,
-    )
-
-    assert result.n_trials_used == 1
-    assert result.dsr_value is None
-    mock_dsr_fn.assert_not_called()
-    assert result.evidence_json["overfitting"]["dsr_value"] is None
-    assert result.evidence_json["overfitting"]["fdr"]["skipped"] is True
+# NOTE: an end-to-end "holdout promotion with n_trials == 1" test used to
+# live here. It relied on a separate holdout-dated StrategyDefinition plus
+# a hand-seeded ResearchDataWindow to sidestep the fact that a promoted
+# strategy's config_hash includes its backtest.start_date/end_date -- i.e.
+# it exercised the exact flawed workaround FIX 3 (see
+# HoldoutConfirmationNotSupportedError below) gates closed. It has been
+# removed; the n_trials < 2 DSR-skip behavior it exercised is still fully
+# covered at the unit level by
+# test_compute_dsr_returns_none_and_skips_deflated_sharpe_fn_when_n_trials_is_one
+# above, which calls PromotionPipeline._compute_dsr directly and needs no
+# holdout machinery.
 
 
 # ── Fail closed on missing/unlinked/empty hypothesis grid ──────────────────────
@@ -535,6 +475,152 @@ def test_hypothesis_belonging_to_different_strategy_fails_closed(db_url: str) ->
             data_handler=MagicMock(),
             hypothesis_id=other_hyp_id,
         )
+
+
+# ── FIX 1: a structurally-nonempty grid can still have unusable values ─────────
+
+
+def test_grid_with_empty_candidate_list_fails_closed_before_walk_forward(db_url: str) -> None:
+    """{"k": []} is structurally a non-empty dict but ParameterSweeper would
+    discover zero combinations for that key -- must fail BEFORE the
+    (expensive) walk-forward is dispatched, not after."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"portfolio.n_long": []})
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_scalar_value_fails_closed_before_walk_forward(db_url: str) -> None:
+    """{"k": 10} (a bare scalar, not a candidate list) must also fail
+    closed before the walk-forward is dispatched."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"portfolio.n_long": 10})
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_string_value_fails_closed_before_walk_forward(db_url: str) -> None:
+    """A string is technically iterable/non-empty in Python but is not a
+    list of candidates -- must be rejected, not silently iterated char by
+    char."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"portfolio.n_long": "10"})
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_valid_grid_still_runs(db_url: str) -> None:
+    """Sanity check: a well-formed grid (every value a non-empty list)
+    still passes the precondition and runs normally."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"portfolio.n_long": [10, 20]})
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust"),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+    )
+
+    assert result.promotion_decision_id is not None
+
+
+# ── FIX 2: the sweep must use the FROZEN grid, not a possibly-stale pre-freeze
+#    read (closes the read/freeze TOCTOU) ──────────────────────────────────────
+
+
+def test_sweep_uses_frozen_grid_not_stale_pre_freeze_read(db_url: str) -> None:
+    """Simulates a concurrent HypothesisRegistry.update_param_grid()
+    committing between PromotionPipeline.run()'s initial fail-closed
+    precondition read (_resolve_frozen_grid, called before ANY instrument
+    runs) and the freeze TrialRecorder.run_walk_forward applies as a side
+    effect of its first trial. The sweep dispatched afterward must use the
+    grid as it stood AT FREEZE TIME (the immutable frozen record), not the
+    stale value read before the race landed."""
+    config_hash = _seed_definition(db_url)
+    grid_before_race = {"portfolio.n_long": [10, 20]}
+    grid_after_race = {"portfolio.n_long": [5, 15, 25]}
+    hyp_id = _seed_hypothesis(db_url, param_grid=grid_before_race)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust"),
+    )
+
+    real_get_hypothesis = pipeline._hypothesis_registry.get_hypothesis
+    call_count = {"n": 0}
+
+    def _get_hypothesis_with_simulated_race(hypothesis_id: int):
+        hyp = real_get_hypothesis(hypothesis_id)
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # This is the FIRST read -- the initial fail-closed precondition
+            # check at the top of run(), before run_walk_forward (and
+            # therefore before the freeze) has happened. Land the "racing"
+            # update directly against the row (bypassing the frozen_at-
+            # guarded update_param_grid() API on purpose -- this models a
+            # commit that landed a moment before TrialRecorder's atomic
+            # freeze, not a call through the guarded write path) so that by
+            # the time the freeze fires, param_grid_json is already
+            # grid_after_race.
+            engine = _raw_engine(db_url)
+            with Session(engine) as session:
+                row = session.get(StrategyHypothesis, hypothesis_id)
+                row.param_grid_json = grid_after_race
+                session.commit()
+        return hyp
+
+    with patch.object(
+        pipeline._hypothesis_registry,
+        "get_hypothesis",
+        side_effect=_get_hypothesis_with_simulated_race,
+    ):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        )
+
+    # get_hypothesis was called (at least) twice: once for the initial
+    # precondition, once more to re-read the FROZEN value for the sweep.
+    assert call_count["n"] >= 2
+
+    sweeper = pipeline._sweeper
+    sweeper.sweep.assert_called_once()
+    dispatched_param_grid = sweeper.sweep.call_args.args[1]
+    assert dispatched_param_grid == grid_after_race
+    assert dispatched_param_grid != grid_before_race
+
+    # The hypothesis is now frozen and its persisted grid is the one the
+    # sweep used -- provably the immutable frozen record.
+    frozen_hyp = pipeline._hypothesis_registry.get_hypothesis(hyp_id)
+    assert frozen_hyp.frozen_at is not None
+    assert frozen_hyp.param_grid_json == grid_after_race
 
 
 # ── n_trials sweep-counting: a sweep counts as configs_tested, not 1 ───────────
@@ -589,56 +675,83 @@ def test_residual_bug_flags_present_in_evidence(db_url: str) -> None:
     assert "BUG-066" in fail_result.evidence_json["residual_bug_acknowledgements"]
 
 
-# ── holdout_mode: skips sensitivity, gates on funnel+stress only ──────────────
+# ── FIX 3: holdout_mode=True is gated/deferred -- fails closed immediately ─────
 
 
-def test_holdout_mode_skips_sensitivity_sweep(db_url: str) -> None:
-    holdout_config = {
-        "name": "v1_test_strategy",
-        "version": 1,
-        "backtest": {"start_date": "2023-02-01", "end_date": "2023-06-01"},
-    }
-    config_hash = _seed_definition(db_url, config=holdout_config)
+def test_holdout_mode_fails_closed_before_any_instrument_or_db_work(db_url: str) -> None:
+    """holdout_mode=True must raise HoldoutConfirmationNotSupportedError
+    immediately, before ANY instrument (walk-forward, sweep) runs and
+    before any DB work (no strategy_trials or promotion_decisions rows).
+
+    This replaces the old test_holdout_mode_skips_sensitivity_sweep /
+    test_promotion_result_dsr_none_when_n_trials_is_one_and_fdr_skips
+    tests, which propped up holdout confirmation via a separate
+    holdout-dated StrategyDefinition + a hand-seeded ResearchDataWindow --
+    the exact flawed "confirms a DIFFERENT config than the frozen winner"
+    workaround this fix gates closed. holdout_mode is deferred pending
+    docs/plans/04-identity-evaluation-context-design.md; no test should
+    exercise the old path as if it worked.
+    """
+    config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
-    engine = _raw_engine(db_url)
-    from strategy_registry.selection_models import ResearchDataWindow
+    validator = _mock_validator()
+    sweeper = _mock_sweeper()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+    pipeline._sweeper = sweeper
 
-    with Session(engine) as session:
-        session.add(
-            ResearchDataWindow(
-                strategy_id="v1_test_strategy",
-                train_start=date(2022, 1, 1),
-                train_end=date(2022, 7, 1),
-                oos_start=date(2022, 7, 1),
-                oos_end=date(2023, 1, 1),
-                holdout_start=date(2023, 1, 1),
-                holdout_end=date(2023, 7, 1),
-                created_at=datetime.now(timezone.utc),
-            )
+    with pytest.raises(HoldoutConfirmationNotSupportedError):
+        pipeline.run(
+            "v1_test_strategy",
+            config_hash,
+            data_handler=MagicMock(),
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
         )
-        session.commit()
 
-    holdout_wf = _wf_result()
-    holdout_wf.oos_returns.index = pd.date_range("2023-01-02", periods=len(holdout_wf.oos_returns), freq="D")
-    pipeline = _make_pipeline(db_url, validator_result=holdout_wf)
-
-    result = pipeline.run(
-        "v1_test_strategy",
-        config_hash,
-        data_handler=MagicMock(),
-        hypothesis_id=hyp_id,
-        holdout_mode=True,
-    )
-
-    assert result.sensitivity_result is None
-    assert result.sensitivity_verdict is None
-    assert result.evidence_json["sensitivity"]["skipped"] is True
-    # overall_passed derived from funnel + stress only.
-    assert result.overall_passed == (result.funnel_passed and result.stress_verdict == "solid")
+    validator.run.assert_not_called()
+    sweeper.sweep.assert_not_called()
 
     trials = pipeline._trial_recorder.list_trials("v1_test_strategy")
-    assert all(t.run_type != "parameter_sweep_variant" for t in trials)
-    assert any(t.run_type == "holdout_confirmation" for t in trials)
+    assert trials == []
+
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        decisions = list(
+            session.scalars(
+                select(PromotionDecision).where(
+                    PromotionDecision.strategy_id == "v1_test_strategy"
+                )
+            )
+        )
+    assert decisions == []
+
+
+def test_holdout_mode_default_false_train_oos_path_unaffected(db_url: str) -> None:
+    """The default holdout_mode=False (train/OOS) path -- the core of this
+    slice -- must remain fully functional: no gating error, sensitivity
+    sweep still runs, overall_passed still derived from all three gates."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust"),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+    )
+
+    assert result.sensitivity_result is not None
+    assert result.sensitivity_verdict == "robust"
+    assert result.evidence_json["sensitivity"]["skipped"] is False
+    assert result.overall_passed == (
+        result.funnel_passed
+        and result.stress_verdict == "solid"
+        and result.sensitivity_verdict == "robust"
+    )
+    assert result.promotion_decision_id is not None
 
 
 # ── MLflow additive DSR/FDR logging path ────────────────────────────────────────
