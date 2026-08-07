@@ -521,3 +521,74 @@ def test_reporting_absent_keeps_prior_artifact_behavior(mock_mlflow):
     names = _logged_artifact_names(mock_mlflow)
     assert "trades.csv" in names
     assert "positions.csv" not in names
+
+
+# ------------------------------------------------------------------
+# Gate 04 slice 04-4: additive log_promotion_decision (DSR/FDR values).
+# Purely additive -- must not touch log_run/log_walk_forward_run at all.
+# ------------------------------------------------------------------
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_log_promotion_decision_logs_dsr_and_fdr(mock_mlflow):
+    client_mock = MagicMock()
+    mock_mlflow.tracking.MlflowClient.return_value = client_mock
+
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    logger.log_promotion_decision(
+        run_id="run-abc",
+        dsr_value=0.87,
+        n_trials=12,
+        n_observations=252,
+        fdr_rejected=True,
+        fdr_alpha=0.05,
+    )
+
+    client_mock.log_metric.assert_any_call("run-abc", "dsr.value", 0.87)
+    client_mock.log_metric.assert_any_call("run-abc", "dsr.n_trials", 12.0)
+    client_mock.log_metric.assert_any_call("run-abc", "dsr.n_observations", 252.0)
+    client_mock.set_tag.assert_any_call("run-abc", "fdr.alpha", "0.05")
+    client_mock.set_tag.assert_any_call("run-abc", "fdr.rejected", "True")
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_log_promotion_decision_handles_none_dsr_and_fdr(mock_mlflow):
+    """A None dsr_value (DSR could not be computed) must not log a bogus
+    dsr.value metric, and a None fdr_rejected (FDR leg skipped) must not
+    log an fdr.rejected tag -- both are simply absent rather than a
+    sentinel value."""
+    client_mock = MagicMock()
+    mock_mlflow.tracking.MlflowClient.return_value = client_mock
+
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    logger.log_promotion_decision(
+        run_id="run-xyz",
+        dsr_value=None,
+        n_trials=3,
+        n_observations=100,
+        fdr_rejected=None,
+    )
+
+    for call_args in client_mock.log_metric.call_args_list:
+        assert call_args.args[1] != "dsr.value"
+    for call_args in client_mock.set_tag.call_args_list:
+        assert call_args.args[1] != "fdr.rejected"
+    client_mock.log_metric.assert_any_call("run-xyz", "dsr.n_trials", 3.0)
+    client_mock.log_metric.assert_any_call("run-xyz", "dsr.n_observations", 100.0)
+
+
+@patch("backtesting.experiment_tracking.mlflow_logger.mlflow")
+def test_log_promotion_decision_does_not_affect_log_walk_forward_run(mock_mlflow):
+    """Additive-only guarantee: calling the new method does not touch
+    log_run/log_walk_forward_run's own mlflow.start_run-based call path."""
+    client_mock = MagicMock()
+    mock_mlflow.tracking.MlflowClient.return_value = client_mock
+
+    logger = BacktestLogger(tracking_uri="./test_mlruns")
+    logger.log_promotion_decision(
+        run_id="run-additive-only",
+        dsr_value=0.5,
+        n_trials=1,
+        n_observations=10,
+    )
+
+    mock_mlflow.start_run.assert_not_called()
