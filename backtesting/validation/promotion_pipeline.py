@@ -76,6 +76,18 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
   ``overall_passed`` as funnel-pass AND stress-solid only (sensitivity is
   recorded as ``None``/skipped, and is excluded from the AND rather than
   treated as an implicit failure).
+- **MLflow logging failure degrades gracefully**: when a ``backtest_logger``
+  IS supplied (as opposed to the ``backtest_logger=None`` "skip MLflow
+  entirely" path) but raises during ``_log_to_mlflow`` (e.g. a transient
+  MLflow outage), the exception is caught, a ``promotion_mlflow_logging_failed``
+  warning is logged, and the run continues with ``mlflow_run_id=None``. The
+  ``promotion_decisions`` DB row -- written by ``_persist_decision`` -- is
+  always still recorded with the real stage results in that case; MLflow is
+  a secondary convenience log and ``evidence_json`` already contains the
+  full DSR/FDR detail, so a MLflow outage must never discard an otherwise-
+  complete promotion decision. A failure inside ``_persist_decision`` itself
+  (the DB write) is NOT caught and still propagates -- the DB row is the
+  source of truth.
 """
 
 from __future__ import annotations
@@ -482,6 +494,8 @@ class PromotionPipeline:
         )
 
         mlflow_run_id = self._log_to_mlflow(
+            strategy_id=strategy_id,
+            config_hash=config_hash,
             config=config,
             wf_result=wf_result,
             funnel_result=funnel_result,
@@ -599,8 +613,19 @@ class PromotionPipeline:
             elif trial.run_type == "parameter_sweep_variant":
                 configs_tested = (trial.metrics_json or {}).get("configs_tested")
                 try:
-                    n_trials += int(configs_tested) if configs_tested is not None else 1
+                    if configs_tested is None:
+                        raise TypeError("configs_tested is None")
+                    n_trials += int(configs_tested)
                 except (TypeError, ValueError):
+                    # Understates n_trials (weakens the DSR multiple-testing
+                    # penalty) -- surface it so a reviewer can see a
+                    # corrupted/legacy row silently fell back to counting 1.
+                    logger.warning(
+                        "promotion_n_trials_configs_tested_fallback",
+                        trial_id=trial.id,
+                        strategy_id=strategy_id,
+                        raw_value=repr(configs_tested),
+                    )
                     n_trials += 1
         return n_trials
 
@@ -781,6 +806,8 @@ class PromotionPipeline:
     def _log_to_mlflow(
         self,
         *,
+        strategy_id: str,
+        config_hash: str,
         config: dict,
         wf_result: WalkForwardResult,
         funnel_result: SurvivalFunnelResult,
@@ -792,23 +819,39 @@ class PromotionPipeline:
     ) -> Optional[str]:
         if self._backtest_logger is None:
             return None
-        run_id = self._backtest_logger.log_walk_forward_run(
-            config,
-            wf_result,
-            self._experiment_name,
-            funnel_result=funnel_result,
-            stress_result=stress_result,
-            require_manifest_data_version=self._require_manifest_data_version,
-        )
-        self._backtest_logger.log_promotion_decision(
-            run_id=run_id,
-            dsr_value=dsr_value,
-            n_trials=n_trials,
-            n_observations=n_observations,
-            fdr_rejected=fdr_evidence.get("current_strategy_rejected"),
-            fdr_alpha=self._fdr_alpha,
-        )
-        return run_id
+        # MLflow is a SECONDARY convenience log; the promotion_decisions DB
+        # row is the AUTHORITATIVE audit record (evidence_json already
+        # carries the full DSR/FDR detail). A transient MLflow outage here
+        # must degrade gracefully to mlflow_run_id=None rather than
+        # discarding an otherwise-complete, expensive promotion decision.
+        try:
+            run_id = self._backtest_logger.log_walk_forward_run(
+                config,
+                wf_result,
+                self._experiment_name,
+                funnel_result=funnel_result,
+                stress_result=stress_result,
+                require_manifest_data_version=self._require_manifest_data_version,
+            )
+            self._backtest_logger.log_promotion_decision(
+                run_id=run_id,
+                dsr_value=dsr_value,
+                n_trials=n_trials,
+                n_observations=n_observations,
+                fdr_rejected=fdr_evidence.get("current_strategy_rejected"),
+                fdr_alpha=self._fdr_alpha,
+            )
+            return run_id
+        except Exception as exc:  # noqa: BLE001 -- deliberate broad catch;
+            # any MLflow failure mode (network, auth, schema) must not
+            # discard a completed promotion decision.
+            logger.warning(
+                "promotion_mlflow_logging_failed",
+                error=repr(exc),
+                strategy_id=strategy_id,
+                config_hash=config_hash[:8],
+            )
+            return None
 
     def _persist_decision(
         self,

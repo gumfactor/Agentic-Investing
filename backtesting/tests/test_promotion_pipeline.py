@@ -18,11 +18,12 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
+import structlog.testing
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
@@ -572,3 +573,156 @@ def test_pipeline_works_without_mlflow_logger(db_url: str) -> None:
 
     assert result.mlflow_run_id is None
     assert result.promotion_decision_id is not None
+
+
+# ── FIX 1: a supplied-but-failing MLflow logger must degrade gracefully ─────
+# (must NOT discard an otherwise-complete promotion_decisions row).
+
+
+@pytest.mark.parametrize(
+    "failing_method", ["log_walk_forward_run", "log_promotion_decision"]
+)
+def test_failing_mlflow_logger_does_not_discard_promotion_decision(
+    db_url: str, failing_method: str
+) -> None:
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    mock_logger = MagicMock(spec=BacktestLogger)
+    mock_logger.log_walk_forward_run.return_value = "fake-run-id-456"
+    getattr(mock_logger, failing_method).side_effect = RuntimeError("mlflow outage")
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust", configs_tested=6),
+        backtest_logger=mock_logger,
+    )
+
+    with structlog.testing.capture_logs() as captured_logs:
+        result = pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        )
+
+    # The pipeline must still complete and return a real decision id.
+    assert result.promotion_decision_id is not None
+    assert result.mlflow_run_id is None
+    assert result.overall_passed is True
+    assert result.funnel_passed is True
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert "promotion_mlflow_logging_failed" in events
+    failure_log = next(
+        entry for entry in captured_logs if entry.get("event") == "promotion_mlflow_logging_failed"
+    )
+    assert failure_log["strategy_id"] == "v1_test_strategy"
+    assert "mlflow outage" in failure_log["error"]
+
+    # promotion_decisions row must be persisted with the real stage results
+    # and mlflow_run_id NULL.
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        row = session.get(PromotionDecision, result.promotion_decision_id)
+        assert row is not None
+        assert row.overall_passed is True
+        assert row.funnel_passed is True
+        assert row.mlflow_run_id is None
+        assert row.n_trials_used == result.n_trials_used
+
+
+def test_failing_db_persist_still_propagates(db_url: str) -> None:
+    """The MLflow graceful-degradation try/except must NOT be so broad that
+    it also swallows a failure in _persist_decision -- the DB write is the
+    authoritative record, so a failure there must still raise."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust"),
+    )
+
+    with patch.object(
+        type(pipeline), "_persist_decision", side_effect=RuntimeError("db write failed")
+    ):
+        with pytest.raises(RuntimeError, match="db write failed"):
+            pipeline.run(
+                "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            )
+
+
+# ── FIX 2: an undercounted configs_tested fallback must be observable ───────
+
+
+def test_compute_n_trials_logs_warning_on_configs_tested_fallback(db_url: str) -> None:
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+    pipeline = _make_pipeline(db_url)
+
+    engine = _raw_engine(db_url)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            StrategyTrial(
+                strategy_id="v1_test_strategy",
+                config_hash=config_hash,
+                hypothesis_id=hyp_id,
+                window="train_oos",
+                run_type="parameter_sweep_variant",
+                data_version=DATA_VERSION,
+                status="completed",
+                metrics_json={},  # missing configs_tested -- corrupted/legacy row
+                started_at=now,
+                completed_at=now,
+            )
+        )
+        session.commit()
+
+    with structlog.testing.capture_logs() as captured_logs:
+        n_trials = pipeline._compute_n_trials("v1_test_strategy")
+
+    assert n_trials == 1  # fallback still counts 1
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert "promotion_n_trials_configs_tested_fallback" in events
+    fallback_log = next(
+        entry
+        for entry in captured_logs
+        if entry.get("event") == "promotion_n_trials_configs_tested_fallback"
+    )
+    assert fallback_log["strategy_id"] == "v1_test_strategy"
+    assert fallback_log["raw_value"] == repr(None)
+
+
+def test_compute_n_trials_no_warning_on_well_formed_sweep_row(db_url: str) -> None:
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+    pipeline = _make_pipeline(db_url)
+
+    engine = _raw_engine(db_url)
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            StrategyTrial(
+                strategy_id="v1_test_strategy",
+                config_hash=config_hash,
+                hypothesis_id=hyp_id,
+                window="train_oos",
+                run_type="parameter_sweep_variant",
+                data_version=DATA_VERSION,
+                status="completed",
+                metrics_json={"configs_tested": 5},
+                started_at=now,
+                completed_at=now,
+            )
+        )
+        session.commit()
+
+    with structlog.testing.capture_logs() as captured_logs:
+        n_trials = pipeline._compute_n_trials("v1_test_strategy")
+
+    assert n_trials == 5
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert "promotion_n_trials_configs_tested_fallback" not in events
