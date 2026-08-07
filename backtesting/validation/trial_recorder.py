@@ -85,13 +85,25 @@ future ``n_trials`` count or a ``promotion_decisions`` row. ``TrialRecorder``
 is the sanctioned entry point for anything that will ever feed a promotion
 decision (04-4).
 
-Out of scope for this slice (see docs/plans §7 row 04-2 vs 04-3/04-4/04-5):
-``strategy_hypotheses.frozen_at``/``param_grid_json`` immutability
-enforcement (04-3), ``PromotionPipeline`` orchestration and ``n_trials``
-querying for Deflated Sharpe (04-4), and the ``validated`` Strategy Registry
-status wiring (04-5). ``hypothesis_id`` is accepted here purely as a
-pass-through FK value; this module does not read or write
-``StrategyHypothesis.frozen_at``.
+Out of scope for this slice (see docs/plans §7 row 04-2 vs 04-4/04-5):
+``PromotionPipeline`` orchestration and ``n_trials`` querying for Deflated
+Sharpe (04-4), and the ``validated`` Strategy Registry status wiring (04-5).
+
+**04-3 addition:** ``frozen_at`` freeze-on-first-trial side effect. When a
+trial is recorded with a non-null ``hypothesis_id`` whose linked
+``strategy_hypotheses.frozen_at`` is still null, this module sets
+``frozen_at`` on that hypothesis row as a side effect of recording the
+trial -- in the SAME session/transaction as the ``strategy_trials`` insert
+(see ``_run_and_record``'s Step 1 session), so a recorded trial and its
+hypothesis freeze can never diverge (both commit together, or neither does).
+Subsequent trials linking an already-frozen hypothesis are a no-op on
+``frozen_at`` (it is only ever set once). The legacy path where
+``hypothesis_id`` is None is unaffected -- no freeze, no requirement.
+``param_grid_json`` immutability enforcement itself (rejecting an edit after
+``frozen_at`` is set) lives in ``strategy_registry.hypothesis.
+HypothesisRegistry.update_param_grid`` -- this module only ever WRITES
+``frozen_at``, it never reads or enforces anything about
+``param_grid_json``.
 """
 
 from __future__ import annotations
@@ -102,7 +114,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import structlog
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -117,7 +129,11 @@ from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardVa
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.models import Base, StrategyDefinition
 from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
-from strategy_registry.selection_models import ResearchDataWindow, StrategyTrial
+from strategy_registry.selection_models import (
+    ResearchDataWindow,
+    StrategyHypothesis,
+    StrategyTrial,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -601,6 +617,52 @@ class TrialRecorder:
             # that comparison's outcome.
             dispatch_config = _config_with_data_version(config, data_version)
 
+            # 04-3: freeze-on-first-trial side effect. If this trial links a
+            # hypothesis (hypothesis_id is not None) whose param_grid_json is
+            # still mutable (frozen_at IS NULL), set frozen_at now, in THIS
+            # session -- the same transaction as the strategy_trials insert
+            # below (both share one session.commit() call a few lines down),
+            # so a committed trial and its hypothesis freeze can never
+            # diverge. If the hypothesis row does not exist at all, leave it
+            # alone here: the composite FK
+            # (hypothesis_id, strategy_id) -> strategy_hypotheses(id,
+            # strategy_id) already rejects that case at commit time with an
+            # IntegrityError, unchanged from 04-2's behavior. An
+            # already-frozen hypothesis (frozen_at IS NOT NULL) is a no-op --
+            # frozen_at is set exactly once, on the first linked trial, and
+            # every subsequent trial linking it proceeds without altering it.
+            # Capture whether THIS call applied the freeze so the audit log
+            # line (04-3 P3 fix) can be emitted only after the commit below
+            # actually succeeds -- logging here, before commit, would record
+            # "frozen" for a freeze that a later IntegrityError rolls back
+            # (e.g. the trial insert failing the composite FK / holdout
+            # seal), leaving an audit event that never took effect. The
+            # freeze assignment itself stays in-session/atomic with the
+            # trial insert; only the LOG EMISSION moves to after commit.
+            # Freeze the linked hypothesis with an ATOMIC conditional UPDATE,
+            # not a read-then-write (Codex round-1 P2; same TOCTOU class as
+            # HypothesisRegistry.update_param_grid). Two concurrent trials for
+            # the same unfrozen hypothesis could otherwise both read
+            # frozen_at IS NULL and both write, violating the set-once
+            # invariant and double-emitting the audit event; the guard must
+            # live in the UPDATE predicate. The UPDATE runs in THIS session,
+            # so it stays atomic with the strategy_trials insert (one commit
+            # covers both, or neither lands). rowcount == 1 means THIS call
+            # won the set-once race and applied the freeze; 0 means the
+            # hypothesis was already frozen, or does not exist -- the latter
+            # is rejected at commit by the trial's composite FK, unchanged.
+            freeze_applied = False
+            if hypothesis_id is not None:
+                freeze_result = session.execute(
+                    update(StrategyHypothesis.__table__)
+                    .where(
+                        StrategyHypothesis.__table__.c.id == hypothesis_id,
+                        StrategyHypothesis.__table__.c.frozen_at.is_(None),
+                    )
+                    .values(frozen_at=started_at)
+                )
+                freeze_applied = freeze_result.rowcount == 1
+
             trial = StrategyTrial(
                 strategy_id=strategy_id,
                 config_hash=config_hash,
@@ -645,6 +707,15 @@ class TrialRecorder:
                 raise
             session.refresh(trial)
             trial_id = trial.id
+            # Commit succeeded -- if this call applied the freeze, the audit
+            # event now reflects reality (the freeze is durable, not a
+            # since-rolled-back side effect).
+            if freeze_applied:
+                logger.info(
+                    "strategy_hypothesis_frozen",
+                    hypothesis_id=hypothesis_id,
+                    strategy_id=strategy_id,
+                )
             logger.info(
                 "strategy_trial_started",
                 trial_id=trial_id,

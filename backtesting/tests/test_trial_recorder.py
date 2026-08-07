@@ -38,7 +38,7 @@ from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardVa
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
 from strategy_registry.models import StrategyDefinition
-from strategy_registry.selection_models import ResearchDataWindow
+from strategy_registry.selection_models import ResearchDataWindow, StrategyHypothesis
 from sqlalchemy.orm import Session
 
 DATA_VERSION = "a" * 64
@@ -90,6 +90,27 @@ def _seed_definition(
         )
         session.commit()
     return config_hash
+
+
+def _seed_hypothesis(
+    recorder: TrialRecorder,
+    *,
+    strategy_id: str = "v1_test_strategy",
+    hypothesis_text: str = "Momentum window sensitivity",
+    param_grid_json: dict | None = None,
+) -> int:
+    """Seed a strategy_hypotheses row with frozen_at NULL and return its id."""
+    with Session(recorder._engine) as session:
+        hyp = StrategyHypothesis(
+            strategy_id=strategy_id,
+            hypothesis_text=hypothesis_text,
+            param_grid_json=param_grid_json or {"momentum_window": [3, 6, 12]},
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(hyp)
+        session.commit()
+        session.refresh(hyp)
+        return hyp.id
 
 
 def _seed_window(
@@ -1552,3 +1573,279 @@ def test_walk_forward_folds_never_exceed_the_validated_outer_range() -> None:
     assert folds, "expected at least one fold for this date range"
     for tr_start, tr_end, te_start, te_end in folds:
         assert full_start <= tr_start <= tr_end <= te_start <= te_end <= full_end
+
+
+# ── 04-3: frozen_at freeze-on-first-trial side effect ────────────────────────────
+
+
+def test_legacy_path_hypothesis_id_none_records_trial_with_no_freeze_and_no_error(
+    recorder: TrialRecorder,
+) -> None:
+    """The pre-04-3 legacy path (hypothesis_id=None) is unaffected: no
+    strategy_hypotheses row is touched, and recording succeeds exactly as
+    before."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result(sharpe=1.1))
+
+    result = recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+        hypothesis_id=None,
+    )
+
+    assert result.oos_metrics["sharpe"] == 1.1
+    trials = recorder.list_trials("v1_test_strategy")
+    assert len(trials) == 1
+    assert trials[0].hypothesis_id is None
+
+
+def test_recording_trial_with_unfrozen_hypothesis_freezes_it_as_side_effect(
+    recorder: TrialRecorder,
+) -> None:
+    """A trial linking a hypothesis whose frozen_at is still NULL freezes it
+    (sets frozen_at) as a side effect of recording the trial (§5.1, §7 row
+    04-3 acceptance evidence)."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    hypothesis_id = _seed_hypothesis(recorder)
+    validator = _mock_validator(_wf_result(sharpe=1.3))
+
+    with Session(recorder._engine) as session:
+        before = session.get(StrategyHypothesis, hypothesis_id)
+        assert before.frozen_at is None
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+        hypothesis_id=hypothesis_id,
+    )
+
+    with Session(recorder._engine) as session:
+        after = session.get(StrategyHypothesis, hypothesis_id)
+        assert after.frozen_at is not None
+
+    trials = recorder.list_trials("v1_test_strategy")
+    assert len(trials) == 1
+    assert trials[0].hypothesis_id == hypothesis_id
+
+
+def test_second_trial_linking_already_frozen_hypothesis_is_a_noop_on_frozen_at(
+    recorder: TrialRecorder,
+) -> None:
+    """A second trial linking an already-frozen hypothesis proceeds without
+    error and does not change frozen_at (it is set exactly once, on the
+    first linked trial)."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    hypothesis_id = _seed_hypothesis(recorder)
+    validator = _mock_validator(_wf_result(sharpe=1.0))
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+        hypothesis_id=hypothesis_id,
+    )
+    with Session(recorder._engine) as session:
+        first_frozen_at = session.get(StrategyHypothesis, hypothesis_id).frozen_at
+    assert first_frozen_at is not None
+
+    # Second trial, same hypothesis -- must succeed and leave frozen_at
+    # unchanged (not bumped to a later timestamp).
+    validator2 = _mock_validator(_wf_result(sharpe=2.0))
+    recorder.run_walk_forward(
+        validator2,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+        hypothesis_id=hypothesis_id,
+    )
+
+    with Session(recorder._engine) as session:
+        second_frozen_at = session.get(StrategyHypothesis, hypothesis_id).frozen_at
+    assert second_frozen_at == first_frozen_at
+
+    trials = recorder.list_trials("v1_test_strategy")
+    assert len(trials) == 2
+    assert all(t.hypothesis_id == hypothesis_id for t in trials)
+
+
+def test_freeze_uses_conditional_update_and_never_overwrites_an_existing_timestamp(
+    recorder: TrialRecorder,
+) -> None:
+    """Codex round-1 P2: the freeze side effect is an atomic conditional
+    UPDATE (`... WHERE frozen_at IS NULL`), so a hypothesis already frozen at
+    a KNOWN earlier timestamp is never overwritten by a later linked trial,
+    and that later trial emits NO `strategy_hypothesis_frozen` event -- the
+    set-once invariant and the audit timestamp both belong to the first
+    linked trial, not whichever write commits last."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    hypothesis_id = _seed_hypothesis(recorder)
+
+    # Pre-freeze directly to a distinct sentinel timestamp (simulating a first
+    # writer that already won the set-once race).
+    sentinel = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    with Session(recorder._engine) as session:
+        hyp = session.get(StrategyHypothesis, hypothesis_id)
+        hyp.frozen_at = sentinel
+        session.add(hyp)
+        session.commit()
+
+    with structlog.testing.capture_logs() as logs:
+        recorder.run_walk_forward(
+            _mock_validator(_wf_result(sharpe=1.0)),
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+            hypothesis_id=hypothesis_id,
+        )
+
+    with Session(recorder._engine) as session:
+        after = session.get(StrategyHypothesis, hypothesis_id).frozen_at
+    # frozen_at is unchanged (conditional UPDATE matched 0 rows), and no
+    # freeze event was emitted for this (non-first) linked trial. Compare
+    # tz-naive: SQLite returns naive datetimes, so the point is that the
+    # stored instant is still the 2020 sentinel, NOT the ~current trial
+    # started_at that a non-conditional overwrite would have written.
+    assert after.replace(tzinfo=None) == sentinel.replace(tzinfo=None)
+    assert not any(e.get("event") == "strategy_hypothesis_frozen" for e in logs)
+
+
+def test_freeze_log_not_emitted_when_trial_insert_fails_after_freeze(
+    recorder: TrialRecorder,
+) -> None:
+    """FIX 3: if the in-session freeze is applied but the trial insert then
+    fails (here: the composite (hypothesis_id, strategy_id) FK rejects a
+    hypothesis registered under a DIFFERENT strategy_id than the trial),
+    the whole transaction rolls back -- frozen_at must stay NULL AND the
+    'strategy_hypothesis_frozen' audit log must never have been emitted,
+    since logging before commit would otherwise record a freeze that never
+    took effect."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, strategy_id="v2_other_strategy", config=config)
+    _seed_window(recorder, strategy_id="v2_other_strategy")
+    # Hypothesis registered for a DIFFERENT strategy_id -> composite FK
+    # mismatch when linked to a v2_other_strategy trial.
+    hypothesis_id = _seed_hypothesis(recorder, strategy_id="v1_test_strategy")
+    validator = _mock_validator(_wf_result(sharpe=0.9))
+
+    with structlog.testing.capture_logs() as captured_logs:
+        with pytest.raises(Exception):
+            recorder.run_walk_forward(
+                validator,
+                strategy_id="v2_other_strategy",
+                config_hash=config_hash,
+                data_version=DATA_VERSION,
+                config=config,
+                data_handler=MagicMock(),
+                hypothesis_id=hypothesis_id,
+            )
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert "strategy_hypothesis_frozen" not in events
+
+    with Session(recorder._engine) as session:
+        hyp = session.get(StrategyHypothesis, hypothesis_id)
+        assert hyp.frozen_at is None
+
+
+def test_freeze_log_emitted_exactly_once_after_successful_commit(
+    recorder: TrialRecorder,
+) -> None:
+    """FIX 3: a successful first linked trial DOES emit exactly one
+    'strategy_hypothesis_frozen' log line, and only after the commit that
+    durably applies the freeze."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    hypothesis_id = _seed_hypothesis(recorder)
+    validator = _mock_validator(_wf_result(sharpe=1.5))
+
+    with structlog.testing.capture_logs() as captured_logs:
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            data_handler=MagicMock(),
+            hypothesis_id=hypothesis_id,
+        )
+
+    events = [entry.get("event") for entry in captured_logs]
+    assert events.count("strategy_hypothesis_frozen") == 1
+
+    with Session(recorder._engine) as session:
+        hyp = session.get(StrategyHypothesis, hypothesis_id)
+        assert hyp.frozen_at is not None
+
+
+def test_param_grid_edit_rejected_after_recorder_freezes_hypothesis(
+    recorder: TrialRecorder, db_url: str
+) -> None:
+    """End-to-end: registering via HypothesisRegistry, freezing via
+    TrialRecorder (same DB), then confirming HypothesisRegistry.
+    update_param_grid rejects a post-freeze edit with the immutability
+    error."""
+    from strategy_registry.hypothesis import (
+        HypothesisParamGridFrozenError,
+        HypothesisRegistry,
+    )
+
+    hyp_registry = HypothesisRegistry(db_url)
+    hyp = hyp_registry.register_hypothesis(
+        strategy_id="v1_test_strategy",
+        hypothesis_text="Momentum window sensitivity",
+        param_grid_json={"momentum_window": [3, 6]},
+    )
+    assert hyp.frozen_at is None
+
+    # Editing while unfrozen is allowed.
+    hyp = hyp_registry.update_param_grid(hyp.id, {"momentum_window": [3, 6, 12]})
+    assert hyp.frozen_at is None
+
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config)
+    _seed_window(recorder)
+    validator = _mock_validator(_wf_result(sharpe=1.4))
+
+    recorder.run_walk_forward(
+        validator,
+        strategy_id="v1_test_strategy",
+        config_hash=config_hash,
+        data_version=DATA_VERSION,
+        config=config,
+        data_handler=MagicMock(),
+        hypothesis_id=hyp.id,
+    )
+
+    frozen = hyp_registry.get_hypothesis(hyp.id)
+    assert frozen.frozen_at is not None
+
+    with pytest.raises(HypothesisParamGridFrozenError):
+        hyp_registry.update_param_grid(hyp.id, {"momentum_window": [3, 6, 12, 24]})
+
+    # Grid is unchanged after the rejected edit.
+    unchanged = hyp_registry.get_hypothesis(hyp.id)
+    assert unchanged.param_grid_json == {"momentum_window": [3, 6, 12]}
