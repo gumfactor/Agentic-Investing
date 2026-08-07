@@ -15,6 +15,7 @@ spec'd against BacktestLogger.
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,11 +38,12 @@ from backtesting.validation.promotion_pipeline import (
     MissingParameterGridError,
     PromotionPipeline,
     RESIDUAL_BUG_ACKNOWLEDGEMENTS,
+    _sanitize_metrics,
 )
 from backtesting.validation.walk_forward import WalkForwardFold, WalkForwardResult, WalkForwardValidator
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.hypothesis import HypothesisRegistry
-from strategy_registry.models import Base, StrategyDefinition
+from strategy_registry.models import Base, Strategy, StrategyDefinition
 from strategy_registry.selection_models import PromotionDecision, StrategyTrial
 
 DATA_VERSION = "a" * 64
@@ -726,3 +728,245 @@ def test_compute_n_trials_no_warning_on_well_formed_sweep_row(db_url: str) -> No
 
     events = [entry.get("event") for entry in captured_logs]
     assert "promotion_n_trials_configs_tested_fallback" not in events
+
+
+# ── FIX 1: non-finite metrics must not block persistence ────────────────────
+
+
+def _assert_no_nan(obj: object) -> None:
+    """Recursively assert no non-finite float survives anywhere in obj --
+    used to confirm evidence_json is JSONB-safe after sanitization."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _assert_no_nan(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _assert_no_nan(v)
+    elif isinstance(obj, float):
+        assert math.isfinite(obj), f"non-finite float leaked into evidence_json: {obj!r}"
+
+
+def test_sanitize_metrics_recursive_normalizer_on_nested_structure() -> None:
+    """Direct unit test of the reused TrialRecorder normalizer on a nested
+    dict/list containing NaN/inf -- promotion_pipeline imports this exact
+    function rather than reimplementing it."""
+    nested = {
+        "a": float("nan"),
+        "b": [1.0, float("inf"), {"c": float("-inf"), "d": 2.5}],
+        "e": (float("nan"), 3),
+        "f": None,
+        "g": "unchanged",
+        "h": np.float64("nan"),
+        "i": np.int64(7),
+    }
+
+    sanitized = _sanitize_metrics(nested)
+
+    assert sanitized["a"] is None
+    assert sanitized["b"][0] == 1.0
+    assert sanitized["b"][1] is None
+    assert sanitized["b"][2] == {"c": None, "d": 2.5}
+    assert sanitized["e"] == [None, 3]
+    assert sanitized["f"] is None
+    assert sanitized["g"] == "unchanged"
+    assert sanitized["h"] is None
+    assert sanitized["i"] == 7
+    _assert_no_nan(sanitized)
+
+
+def test_all_nan_funnel_and_sensitivity_still_persists_decision(db_url: str) -> None:
+    """Force NaN survival-funnel gate values (missing/non-finite OOS metrics)
+    and an all-NaN sensitivity sweep, then confirm _persist_decision still
+    SUCCEEDS -- the graceful-degradation guarantee this pipeline exists to
+    provide. Before FIX 1, this raised (Postgres JSONB rejects NaN; the
+    04-1 dsr_value NUMERIC CHECK rejects NaN) and NO audit row was written,
+    exactly on a FAILED promotion where the audit trail matters most."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    # oos sharpe/max_drawdown missing entirely -> SurvivalFunnel._f(None)
+    # yields NaN gate values; zero trades -> deterministic (non-NaN) fail.
+    wf = _wf_result(
+        sharpe=float("nan"), max_dd=float("nan"), is_sharpe=float("nan"), trade_count=0
+    )
+
+    sweep = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [10, 20]},
+        configs_tested=2,
+        rows=[],
+        mean_oos_sharpe=float("nan"),
+        std_oos_sharpe=float("nan"),
+        positive_fraction=float("nan"),
+        curve_fit_flag=True,
+        verdict="curve_fit",
+    )
+
+    pipeline = _make_pipeline(db_url, validator_result=wf, sweep_result=sweep)
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+    )
+
+    assert result.overall_passed is False
+    assert result.promotion_decision_id is not None
+
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        row = session.get(PromotionDecision, result.promotion_decision_id)
+        assert row is not None
+        assert row.overall_passed is False
+        # Non-finite dsr_value (or the None _compute_dsr already returns for
+        # a non-finite observed_sharpe) must persist as None, not NaN.
+        assert row.dsr_value is None
+        _assert_no_nan(row.evidence_json)
+        gate_values = [g["value"] for g in row.evidence_json["funnel"]["gates"]]
+        assert any(v is None for v in gate_values)
+        assert row.evidence_json["sensitivity"]["mean_oos_sharpe"] is None
+        assert row.evidence_json["sensitivity"]["std_oos_sharpe"] is None
+        assert row.evidence_json["sensitivity"]["positive_fraction"] is None
+
+
+def test_nan_dsr_from_deflated_sharpe_fn_normalized_to_none(db_url: str) -> None:
+    """Even when observed_sharpe/n_trials/n_observations are all finite and
+    sufficient (so _compute_dsr actually calls the injected
+    deflated_sharpe_fn), a NaN returned directly from that fn must still be
+    normalized to None at the DB persistence boundary."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust"),
+        deflated_sharpe_fn=lambda **kwargs: float("nan"),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+    )
+
+    assert result.dsr_value is not None and math.isnan(result.dsr_value)
+
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        row = session.get(PromotionDecision, result.promotion_decision_id)
+        assert row is not None
+        assert row.dsr_value is None
+
+
+# ── FIX 2: FDR must use each sibling's LATEST decision, or omit it ──────────
+
+
+def _seed_sibling_strategy(db_url: str, strategy_id: str, family: str) -> str:
+    """Seed a strategy_definitions + strategies row (direct session.add,
+    bypassing StrategyRegistry.register()'s YAML-file requirement) so
+    _compute_family_fdr's sibling lookup by strategy_family finds it."""
+    config_hash = _seed_definition(db_url, strategy_id=strategy_id)
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        session.add(
+            Strategy(
+                strategy_id=strategy_id,
+                canonical_config_hash=config_hash,
+                status="backtesting",
+                strategy_family=family,
+                registered_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+    return config_hash
+
+
+def _seed_promotion_decision(
+    db_url: str,
+    *,
+    strategy_id: str,
+    config_hash: str,
+    dsr_value: float | None,
+    created_at: datetime,
+) -> None:
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        session.add(
+            PromotionDecision(
+                strategy_id=strategy_id,
+                config_hash=config_hash,
+                n_trials_used=1,
+                dsr_value=dsr_value,
+                funnel_passed=True,
+                sensitivity_verdict="robust",
+                stress_verdict="solid",
+                overall_passed=True,
+                mlflow_run_id=None,
+                evidence_json={},
+                created_at=created_at,
+            )
+        )
+        session.commit()
+
+
+def test_fdr_omits_sibling_whose_newest_decision_has_no_dsr_value(db_url: str) -> None:
+    """Sibling with TWO promotion_decisions rows: newest dsr_value=None,
+    older finite. FIX 2 requires the sibling be OMITTED from the FDR set
+    entirely (newest-or-omit), never falling back to the stale older row."""
+    config_hash = _seed_definition(db_url)
+    pipeline = _make_pipeline(db_url)
+
+    sibling_id = "v1_sibling_strategy"
+    sibling_hash = _seed_sibling_strategy(db_url, sibling_id, family="fam1")
+
+    now = datetime.now(timezone.utc)
+    _seed_promotion_decision(
+        db_url,
+        strategy_id=sibling_id,
+        config_hash=sibling_hash,
+        dsr_value=0.75,  # older, finite -- must NOT be used
+        created_at=now - pd.Timedelta(hours=2),
+    )
+    _seed_promotion_decision(
+        db_url,
+        strategy_id=sibling_id,
+        config_hash=sibling_hash,
+        dsr_value=None,  # newest -- unusable, sibling must be omitted
+        created_at=now - pd.Timedelta(hours=1),
+    )
+
+    fdr_evidence = pipeline._compute_family_fdr("v1_test_strategy", "fam1", dsr_value=0.6)
+
+    assert fdr_evidence["skipped"] is False
+    assert sibling_id not in fdr_evidence["compared_strategy_ids"]
+    assert fdr_evidence["compared_strategy_ids"] == ["v1_test_strategy"]
+
+
+def test_fdr_includes_sibling_whose_newest_decision_has_finite_dsr_value(db_url: str) -> None:
+    """A sibling whose NEWEST row has a finite dsr_value IS included, even
+    when an older row also exists."""
+    config_hash = _seed_definition(db_url)
+    pipeline = _make_pipeline(db_url)
+
+    sibling_id = "v1_sibling_strategy"
+    sibling_hash = _seed_sibling_strategy(db_url, sibling_id, family="fam1")
+
+    now = datetime.now(timezone.utc)
+    _seed_promotion_decision(
+        db_url,
+        strategy_id=sibling_id,
+        config_hash=sibling_hash,
+        dsr_value=None,  # older, unusable
+        created_at=now - pd.Timedelta(hours=2),
+    )
+    _seed_promotion_decision(
+        db_url,
+        strategy_id=sibling_id,
+        config_hash=sibling_hash,
+        dsr_value=0.8,  # newest, finite -- must be used
+        created_at=now - pd.Timedelta(hours=1),
+    )
+
+    fdr_evidence = pipeline._compute_family_fdr("v1_test_strategy", "fam1", dsr_value=0.6)
+
+    assert fdr_evidence["skipped"] is False
+    assert sibling_id in fdr_evidence["compared_strategy_ids"]
+    idx = fdr_evidence["compared_strategy_ids"].index(sibling_id)
+    assert fdr_evidence["p_values"][idx] == pytest.approx(1.0 - 0.8)

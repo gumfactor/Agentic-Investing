@@ -119,7 +119,11 @@ from backtesting.validation.survival_funnel import (
     avg_is_sharpe_from_wf,
     oos_trade_count_from_wf,
 )
-from backtesting.validation.trial_recorder import TrialRecorder
+from backtesting.validation.trial_recorder import (
+    TrialRecorder,
+    _normalize_metric,
+    _sanitize_metrics,
+)
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
 from strategy_registry.hypothesis import HypothesisRegistry, HypothesisNotFoundError
 from strategy_registry.models import Base
@@ -699,13 +703,22 @@ class PromotionPipeline:
 
         # Most-recent decision per sibling strategy_id (excluding the
         # current strategy_id, whose CURRENT dsr_value -- not any prior
-        # persisted row -- represents this run).
+        # persisted row -- represents this run). ``prior_rows`` is ordered
+        # newest-first, so a sibling is HANDLED the first time its row is
+        # encountered here, regardless of whether that newest row has a
+        # usable dsr_value. If the newest row's dsr_value is None/non-finite,
+        # the sibling is omitted from the FDR set entirely -- we must never
+        # fall through to an older, staler row for that sibling (that would
+        # silently violate the documented "latest decision per sibling"
+        # scope).
         latest_by_sibling: dict[str, float] = {}
+        seen_siblings: set[str] = set()
         for row in prior_rows:
             if row.strategy_id == strategy_id:
                 continue
-            if row.strategy_id in latest_by_sibling:
+            if row.strategy_id in seen_siblings:
                 continue
+            seen_siblings.add(row.strategy_id)
             if row.dsr_value is not None and math.isfinite(float(row.dsr_value)):
                 latest_by_sibling[row.strategy_id] = float(row.dsr_value)
 
@@ -879,7 +892,7 @@ class PromotionPipeline:
                 stress_verdict=stress_verdict,
                 overall_passed=overall_passed,
                 mlflow_run_id=mlflow_run_id,
-                evidence_json=evidence_json,
+                evidence_json=_sanitize_metrics(evidence_json),
                 created_at=now,
             )
             session.add(decision)
@@ -899,20 +912,3 @@ class PromotionPipeline:
                     .order_by(PromotionDecision.created_at.desc())
                 )
             )
-
-
-def _normalize_metric(value: Optional[float]) -> Optional[float]:
-    """Normalize a non-finite float to None before insert -- same app-layer
-    NaN backstop convention as ``trial_recorder._normalize_metric``
-    (``promotion_decisions.dsr_value`` carries the same Postgres-only NaN
-    CHECK backstop per selection_models.py).
-    """
-    if value is None:
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(f) or math.isinf(f):
-        return None
-    return f
