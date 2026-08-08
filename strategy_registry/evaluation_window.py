@@ -32,7 +32,7 @@ edge in the dependency graph and no third shared package to introduce.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,24 @@ class EvaluationWindow:
     end: date
 
     def __post_init__(self) -> None:
+        # PR #50 Codex round-3 fix (P2): datetime subclasses date, and two
+        # ISO strings compare lexicographically the same way two dates
+        # would, so neither a datetime pair nor a string pair is caught by
+        # the start<=end check alone -- both would construct a
+        # "validated" window here and only fail much later (e.g.
+        # DataHandler.trading_dates comparing against real date objects),
+        # after TrialRecorder has already persisted/frozen a trial on the
+        # strength of this object. Reject anything that is not an actual
+        # date -- and reject datetime specifically, since isinstance(dt,
+        # date) is True for datetime but every consumer here means a plain
+        # calendar date, not a timestamp.
+        for field_name, value in (("start", self.start), ("end", self.end)):
+            if isinstance(value, datetime) or not isinstance(value, date):
+                raise TypeError(
+                    f"EvaluationWindow.{field_name} must be a datetime.date "
+                    f"(not datetime.datetime or any other type); got "
+                    f"{type(value).__name__}: {value!r}."
+                )
         if self.start > self.end:
             raise ValueError(
                 f"EvaluationWindow.start ({self.start}) must be <= "
