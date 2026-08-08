@@ -78,6 +78,52 @@ Task branches are named `dev/R2-<order>-<slug>`. Each phased slice is one
 commit; each roadmap job (or sub-job below) is one PR into `dev/R2-phase1`.
 Token figures are reported as `<agent/effort>: <tokens>`.
 
+**PM decisions (2026-08-08, PR #49 split — 04-4 scope recovery):**
+
+- **PR #49 is split into three PRs.** The slice grew from 5 files/~3.5k lines to
+  22 files/5,709 lines and absorbed a root-of-trust fingerprint-algorithm change,
+  two migrations, and a new evaluator — none of which is 04-4. It ran **~12 Codex
+  review rounds**, blowing the mandated cap (stop at two consecutive P0/P1-clean
+  rounds, max 4). Scope, not code quality, kept the loop alive.
+  - **04-4A** (`dev/R2-04-4-promotion-pipeline`, PR [#49](https://github.com/gumfactor/Agentic-Investing/pull/49)
+    rewound to `47d6b65`): the train/OOS promotion path with `holdout_mode`
+    gated fail-closed. Verified green at **515 passed**. Ready for operator merge.
+  - **04-4W** (`dev/R2-04-4W-evaluation-window`): evaluation window as a
+    first-class measurement input.
+  - **04-4H** (`dev/R2-04-4H-holdout-confirmation`): holdout confirmation with a
+    look-triggered seal. **Depends on 04-4W — runs sequentially, not in parallel**
+    (both touch `trial_recorder.py`/`promotion_pipeline.py`).
+  - All original commits preserved on `backup/pr49-full-756aea9` and
+    `backup/pr49-core-47d6b65`. Nothing discarded.
+- **Two recurring P1 classes diagnosed; both to be closed by general rule, not
+  instance patches** — the same playbook that closed 04-2 (5 rounds, one class,
+  fixed with the general dot-path-ancestry rule) and 03A-4b (4 instances, closed
+  by PM class sweep):
+  - **Class A — the one-shot holdout seal is consumed by *intent to look*, not by
+    an actual look.** `TrialRecorder` INSERTs the seal row before dispatch, and
+    `uix_strategy_trials_one_holdout_confirmation` keys on `run_type` at ANY
+    status, so *any* exception between INSERT and the first price read burns an
+    irreplaceable asset. That is an open set, and rounds R3-A/R4-A/R5 each closed
+    one member (R5 was a regression introduced by the R4 fix). **General fix:**
+    a `holdout_look_taken` tripwire flipped on the first holdout bar read; the
+    seal index keys on that flag. Pre-look failures from *any* unenumerated cause
+    no longer burn the seal. **Constraint: this must NOT regress 04-1 round 1**,
+    which deliberately keyed the seal on any status to close the errored-holdout
+    re-read hole — a run that reads holdout and *then* errors must still burn it.
+  - **Class B — the evaluation window was removed from `config_hash` identity but
+    never promoted to a first-class input.** It still lives inside the stored
+    config dict while being non-identity, authoritative for what runs, and
+    unrecorded on measurements; every consumer that reads it or fails to persist
+    it is a bug (registry reuse, `StrategyTrial`, `StrategyRun`, …). **General
+    fix:** an `EvaluationWindow` value object, required on every measurement API
+    and injected at dispatch (as `data_version` already is), never read from the
+    stored definition.
+- **The waived back-compat finding gets encoded in code, not just docs.** Codex
+  re-raised the fingerprint migration P1 because the operator's waiver lives only
+  in a design doc. A persisted `FINGERPRINT_ALGO_VERSION` makes the finding moot
+  rather than declined, and makes a future migration trivial if this project ever
+  approaches live capital (C8).
+
 **PM decisions (2026-07-22, Gate 04 kickoff):**
 
 - **Gate 04 unblocked and started design-doc-first.** Deps 02B/03A/03B all
