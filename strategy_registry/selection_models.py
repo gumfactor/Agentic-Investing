@@ -213,6 +213,20 @@ class StrategyTrial(Base):
     hypothesis_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     window: Mapped[str] = mapped_column(Text, nullable=False)
     run_type: Mapped[str] = mapped_column(Text, nullable=False)
+    # 04-4W (migration 015): the EFFECTIVE evaluation date range this trial
+    # actually ran over (TrialRecorder._effective_range(config) ->
+    # effective_start/effective_end), persisted verbatim. Nullable only for
+    # the same documented legacy-backfill reason as hypothesis_id above --
+    # existing pre-015 rows have no value and are never backfilled here;
+    # every row TrialRecorder inserts going forward carries a non-NULL pair
+    # (enforced by the writer, not a DB CHECK -- see migration 015's
+    # docstring). Once config_hash stopped covering
+    # backtest.start_date/backtest.end_date (docs/plans/04-identity-
+    # evaluation-context-design.md), this pair is what makes a train_oos
+    # trial and a holdout trial recorded under the SAME config_hash
+    # distinguishable/reconstructable from the row alone.
+    eval_start_date: Mapped[Optional[date]] = mapped_column(Date)
+    eval_end_date: Mapped[Optional[date]] = mapped_column(Date)
     data_version: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     oos_sharpe: Mapped[Optional[float]] = mapped_column(Numeric())

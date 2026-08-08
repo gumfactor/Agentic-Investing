@@ -79,6 +79,17 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
   DB work happens. The parameter is kept on the signature for callers/
   tests that reference it. The train/OOS (``holdout_mode=False``) path
   described below is unaffected and fully supported.
+- **evaluation window is a required, explicit per-measurement input
+  (04-4W)**: ``run()`` requires an ``eval_window: EvaluationWindow``
+  argument. It is threaded to ``TrialRecorder.run_walk_forward``/
+  ``run_parameter_sweep`` unchanged, which inject it into the dispatched
+  config copy the same way ``data_version`` already is. The date fields on
+  ``StrategyDefinition.config`` (``defn.config["backtest"]["start_date"]``/
+  ``["end_date"]``) are never read for this purpose -- per
+  docs/plans/04-identity-evaluation-context-design.md, ``config_hash``
+  excludes them from identity precisely so the SAME frozen definition can be
+  measured over different windows; reading the window back out of the
+  stored definition would silently defeat that.
 - **MLflow logging failure degrades gracefully**: when a ``backtest_logger``
   IS supplied (as opposed to the ``backtest_logger=None`` "skip MLflow
   entirely" path) but raises during ``_log_to_mlflow`` (e.g. a transient
@@ -128,6 +139,7 @@ from backtesting.validation.trial_recorder import (
     _sanitize_metrics,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
+from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.hypothesis import HypothesisRegistry, HypothesisNotFoundError
 from strategy_registry.models import Base
 from strategy_registry.registry import StrategyNotFoundError, StrategyRegistry
@@ -235,6 +247,29 @@ class HoldoutConfirmationNotSupportedError(PromotionPipelineError):
     ``holdout_mode`` parameter is kept on ``run()`` so existing callers/
     tests referencing it still import; it now always raises before any
     instrument or DB work happens.
+    """
+
+
+class NonCanonicalConfigHashError(PromotionPipelineError):
+    """Raised when ``run(strategy_id, config_hash, ...)`` is called for a
+    REGISTERED ``strategy_id`` (has a ``Strategy`` lifecycle row) whose
+    requested ``config_hash`` does not equal that row's frozen
+    ``canonical_config_hash``.
+
+    A registered strategy has exactly one frozen/registered winning
+    ``strategy_definitions`` row -- the one pinned at ``register()`` time
+    as ``canonical_config_hash``. If the same ``strategy_id`` also has
+    OTHER (non-canonical) ``strategy_definitions`` rows on file (e.g. from
+    earlier sweep/trial exploration), a caller passing one of those other
+    hashes must not be allowed to generate promotion evidence -- or, worse,
+    consume the strategy-level one-shot holdout seal -- for a definition
+    other than the frozen winner. ``verify_config_integrity`` alone does
+    not catch this: it only re-checks the lifecycle row's OWN
+    ``canonical_config_hash`` against its source YAML, never against the
+    ``config_hash`` the caller actually requested. This check is fail-closed
+    and runs BEFORE any instrument (walk-forward included) dispatches, so a
+    mismatched request never touches the holdout seal or leaves partial
+    trial evidence.
     """
 
 
@@ -390,6 +425,7 @@ class PromotionPipeline:
         strategy_id: str,
         config_hash: str,
         data_handler: Any,
+        eval_window: EvaluationWindow,
         hypothesis_id: Optional[int] = None,
         holdout_mode: bool = False,
     ) -> PromotionResult:
@@ -402,6 +438,13 @@ class PromotionPipeline:
                 (composite key with ``strategy_id``).
             data_handler: Pre-loaded ``DataHandler`` covering the full
                 date range, forwarded unchanged to the wrapped instruments.
+            eval_window: The required, explicit evaluation date range for
+                this promotion run (04-4W). Threaded unchanged to
+                ``TrialRecorder.run_walk_forward``/``run_parameter_sweep``,
+                which inject it into the dispatched config copy -- never
+                read from ``StrategyDefinition.config``'s stored dates. See
+                the module docstring's "evaluation window is a required,
+                explicit per-measurement input" note.
             hypothesis_id: FK to the ``strategy_hypotheses`` row this
                 promotion's parameter grid is sourced from. Required
                 (never inferred) -- see ``MissingParameterGridError``.
@@ -419,6 +462,10 @@ class PromotionPipeline:
         Raises:
             HoldoutConfirmationNotSupportedError: ``holdout_mode=True`` was
                 passed. Checked first, before any instrument or DB work.
+            NonCanonicalConfigHashError: ``strategy_id`` is registered
+                (has a ``Strategy`` lifecycle row) and ``config_hash`` does
+                not equal that row's frozen ``canonical_config_hash``.
+                Checked before any instrument or DB work.
             MissingParameterGridError: ``hypothesis_id`` is None, does not
                 belong to ``strategy_id``, or its ``param_grid_json`` is
                 missing/empty/malformed (a scalar, string, non-sequence, or
@@ -460,6 +507,31 @@ class PromotionPipeline:
             self._registry.verify_config_integrity(strategy_id)
         except StrategyNotFoundError:
             pass
+        else:
+            # verify_config_integrity only re-checks the lifecycle row's
+            # OWN canonical_config_hash against its source YAML -- it never
+            # compares that canonical hash against the config_hash THIS
+            # call actually requested. A strategy_id can have multiple
+            # strategy_definitions rows (e.g. earlier sweep/trial
+            # exploration); without this check a caller could pass a
+            # non-canonical config_hash for a REGISTERED strategy and
+            # generate promotion evidence -- and, in holdout_mode, consume
+            # the one-shot holdout seal -- for a definition other than the
+            # frozen/registered winner. Bind the run to the canonical hash
+            # here, before any instrument dispatches (see
+            # NonCanonicalConfigHashError's docstring).
+            registered_strategy = self._registry.get(strategy_id)
+            if config_hash != registered_strategy.canonical_config_hash:
+                raise NonCanonicalConfigHashError(
+                    f"strategy_id={strategy_id!r} is registered with frozen "
+                    f"canonical_config_hash="
+                    f"{registered_strategy.canonical_config_hash!r}, but this "
+                    f"run requested config_hash={config_hash!r}, which does "
+                    "not match. A promotion/holdout run must target the "
+                    "frozen registered winner -- refusing to generate "
+                    "promotion evidence (or, in holdout_mode, consume the "
+                    "one-shot holdout seal) for a non-canonical definition."
+                )
 
         # Fail-closed precondition only (§4.4): confirms a valid,
         # non-empty grid exists BEFORE any instrument runs. The value read
@@ -477,6 +549,7 @@ class PromotionPipeline:
             config_hash=config_hash,
             data_version=self._data_version,
             config=config,
+            eval_window=eval_window,
             data_handler=data_handler,
             hypothesis_id=hypothesis_id,
             final_holdout_confirmation=holdout_mode,
@@ -516,6 +589,7 @@ class PromotionPipeline:
                 config_hash=config_hash,
                 data_version=self._data_version,
                 base_config=config,
+                eval_window=eval_window,
                 param_grid=frozen_param_grid,
                 data_handler=data_handler,
                 hypothesis_id=hypothesis_id,

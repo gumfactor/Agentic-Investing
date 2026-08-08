@@ -42,6 +42,7 @@ from backtesting.validation.promotion_pipeline import (
     _sanitize_metrics,
 )
 from backtesting.validation.walk_forward import WalkForwardFold, WalkForwardResult, WalkForwardValidator
+from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.hypothesis import HypothesisRegistry
 from strategy_registry.models import Base, Strategy, StrategyDefinition
@@ -53,6 +54,12 @@ from strategy_registry.selection_models import (
 
 
 DATA_VERSION = "a" * 64
+
+# All _config()/_seed_definition() helpers below default to this same
+# 2022-01-01..2022-12-31 window (04-4W: eval_window is now a required,
+# explicit PromotionPipeline.run() argument, never read from the seeded
+# StrategyDefinition.config's dates).
+DEFAULT_EVAL_WINDOW = EvaluationWindow(start=date(2022, 1, 1), end=date(2022, 12, 31))
 
 
 # ── Fixtures / helpers ───────────────────────────────────────────────────────
@@ -253,7 +260,7 @@ def test_promotion_pipeline_pass_produces_matching_promotion_decision(db_url: st
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is True
@@ -292,7 +299,7 @@ def test_funnel_failure_flips_overall_passed_and_is_attributed(db_url: str) -> N
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is False
@@ -315,7 +322,7 @@ def test_sensitivity_curve_fit_flips_overall_passed_and_is_attributed(db_url: st
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is True
@@ -336,7 +343,7 @@ def test_stress_fragile_flips_overall_passed_and_is_attributed(db_url: str) -> N
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is True
@@ -361,7 +368,7 @@ def test_low_dsr_does_not_flip_overall_passed(db_url: str) -> None:
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.dsr_value == pytest.approx(0.01)
@@ -376,7 +383,7 @@ def test_dsr_is_computed_and_recorded(db_url: str) -> None:
 
     pipeline = _make_pipeline(db_url)
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.dsr_value is not None
@@ -443,7 +450,7 @@ def test_missing_hypothesis_id_fails_closed(db_url: str) -> None:
     pipeline._wf_validator = validator
 
     with pytest.raises(MissingParameterGridError):
-        pipeline.run("v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=None)
+        pipeline.run("v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=None)
 
     validator.run.assert_not_called()
 
@@ -457,7 +464,7 @@ def test_hypothesis_with_no_param_grid_fails_closed(db_url: str) -> None:
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -472,7 +479,7 @@ def test_hypothesis_belonging_to_different_strategy_fails_closed(db_url: str) ->
         pipeline.run(
             "v1_test_strategy",
             config_hash,
-            data_handler=MagicMock(),
+            data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW,
             hypothesis_id=other_hyp_id,
         )
 
@@ -492,7 +499,7 @@ def test_grid_with_empty_candidate_list_fails_closed_before_walk_forward(db_url:
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -509,7 +516,7 @@ def test_grid_with_scalar_value_fails_closed_before_walk_forward(db_url: str) ->
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -527,7 +534,7 @@ def test_grid_with_string_value_fails_closed_before_walk_forward(db_url: str) ->
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -545,7 +552,7 @@ def test_valid_grid_still_runs(db_url: str) -> None:
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.promotion_decision_id is not None
@@ -603,7 +610,7 @@ def test_sweep_uses_frozen_grid_not_stale_pre_freeze_read(db_url: str) -> None:
         side_effect=_get_hypothesis_with_simulated_race,
     ):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     # get_hypothesis was called (at least) twice: once for the initial
@@ -636,7 +643,7 @@ def test_n_trials_counts_sweep_variants_not_one(db_url: str) -> None:
         sweep_result=_sweep_result(verdict="robust", configs_tested=9),
     )
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     # 1 walk_forward trial + 9 (NOT 1) for the sweep invocation.
@@ -653,7 +660,7 @@ def test_residual_bug_flags_present_in_evidence(db_url: str) -> None:
     pipeline = _make_pipeline(db_url)
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     flags = result.evidence_json["residual_bug_acknowledgements"]
@@ -670,7 +677,7 @@ def test_residual_bug_flags_present_in_evidence(db_url: str) -> None:
         sweep_result=_sweep_result(verdict="curve_fit"),
     )
     fail_result = fail_pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
     assert "BUG-066" in fail_result.evidence_json["residual_bug_acknowledgements"]
 
@@ -704,7 +711,7 @@ def test_holdout_mode_fails_closed_before_any_instrument_or_db_work(db_url: str)
         pipeline.run(
             "v1_test_strategy",
             config_hash,
-            data_handler=MagicMock(),
+            data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW,
             hypothesis_id=hyp_id,
             holdout_mode=True,
         )
@@ -740,7 +747,7 @@ def test_holdout_mode_default_false_train_oos_path_unaffected(db_url: str) -> No
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.sensitivity_result is not None
@@ -772,7 +779,7 @@ def test_dsr_fdr_logged_via_mlflow_additive_path(db_url: str) -> None:
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     mock_logger.log_walk_forward_run.assert_called_once()
@@ -798,7 +805,7 @@ def test_pipeline_works_without_mlflow_logger(db_url: str) -> None:
     pipeline = _make_pipeline(db_url, backtest_logger=None)
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.mlflow_run_id is None
@@ -862,7 +869,7 @@ def test_mlflow_logging_passes_dispatched_config_not_original(db_url: str) -> No
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     mock_logger.log_walk_forward_run.assert_called_once()
@@ -904,7 +911,7 @@ def test_failing_mlflow_logger_does_not_discard_promotion_decision(
 
     with structlog.testing.capture_logs() as captured_logs:
         result = pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     # The pipeline must still complete and return a real decision id.
@@ -951,7 +958,7 @@ def test_failing_db_persist_still_propagates(db_url: str) -> None:
     ):
         with pytest.raises(RuntimeError, match="db write failed"):
             pipeline.run(
-                "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+                "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
             )
 
 
@@ -1148,7 +1155,7 @@ def test_all_nan_funnel_and_sensitivity_still_persists_decision(db_url: str) -> 
     pipeline = _make_pipeline(db_url, validator_result=wf, sweep_result=sweep)
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.overall_passed is False
@@ -1189,7 +1196,7 @@ def test_nan_dsr_from_deflated_sharpe_fn_normalized_to_none(db_url: str) -> None
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     # Source-normalized: None everywhere, never a raw NaN surfacing anywhere.

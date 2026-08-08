@@ -126,6 +126,7 @@ from backtesting.validation.parameter_sensitivity import (
     ParameterSweeper,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
+from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.models import Base, StrategyDefinition
 from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
@@ -302,6 +303,7 @@ class TrialRecorder:
         config_hash: str,
         data_version: str,
         config: dict,
+        eval_window: EvaluationWindow,
         data_handler: DataHandler,
         hypothesis_id: Optional[int] = None,
         final_holdout_confirmation: bool = False,
@@ -319,9 +321,22 @@ class TrialRecorder:
             data_version: Manifest-hash-shaped C7 data version. Required
                 (never empty) -- mirrors ``strategy_trials.data_version NOT
                 NULL``.
-            config: Strategy config dict; ``config["backtest"]["start_date"]``/
-                ``["end_date"]`` are read to compute the effective date range
-                for the holdout guard.
+            config: Strategy config dict. Its ``backtest.start_date``/
+                ``end_date`` are IGNORED for dispatch and recording -- see
+                ``eval_window`` below (04-4W: the window is a required,
+                explicit per-measurement input, never sourced from the
+                config dict, so it can never silently diverge from what was
+                actually requested).
+            eval_window: The required, explicit evaluation date range for
+                this measurement (04-4W). Injected into the DISPATCHED
+                config copy (``dispatch_config["backtest"]["start_date"]``/
+                ``["end_date"]``) the same way ``data_version`` already is --
+                whatever ``config["backtest"]["start_date"]``/``["end_date"]``
+                contains is overwritten and never read for this purpose.
+                This is what makes ``config_hash`` (which excludes those two
+                fields, per docs/plans/04-identity-evaluation-context-
+                design.md) reproducible whether the SAME frozen identity is
+                evaluated over train/OOS dates or a different window.
             data_handler: Passed through to ``validator.run`` unchanged.
             hypothesis_id: Optional FK to a pre-registered
                 ``strategy_hypotheses`` row. Not validated/frozen here (04-3
@@ -329,10 +344,10 @@ class TrialRecorder:
             final_holdout_confirmation: One-shot holdout confirmation mode
                 (§4.2). When True, ``run_type`` becomes
                 ``'holdout_confirmation'`` and ``window`` becomes
-                ``'holdout'``; the guard additionally requires the effective
-                date range to fall entirely within the registered holdout
-                window and that no prior holdout_confirmation trial row
-                exists yet for this ``strategy_id``.
+                ``'holdout'``; the guard additionally requires
+                ``eval_window`` to fall entirely within the registered
+                holdout window and that no prior holdout_confirmation trial
+                row exists yet for this ``strategy_id``.
             strategy_family: Optional fallback scope for
                 ``research_data_windows`` lookup when no per-strategy window
                 row exists (§8 Q1: per-strategy is the enforced default; a
@@ -344,14 +359,15 @@ class TrialRecorder:
             The ``WalkForwardResult`` from the wrapped call.
 
         Raises:
-            HoldoutWindowViolationError: The effective date range overlaps a
+            HoldoutWindowViolationError: ``eval_window`` overlaps a
                 registered holdout window without a valid unconsumed
                 confirmation request (or the confirmation request itself is
                 invalid).
             DefinitionNotFoundError: No ``strategy_definitions`` row exists
                 for ``(strategy_id, config_hash)``.
             ConfigProvenanceMismatchError: The canonical hash of ``config``
-                does not equal ``config_hash`` (ignoring ``data_version``).
+                does not equal ``config_hash`` (ignoring ``data_version`` and
+                the ``backtest`` date fields).
             DataVersionProvenanceMismatchError: ``config`` already declares a
                 non-empty top-level ``data_version`` that disagrees with the
                 ``data_version`` argument.
@@ -359,7 +375,7 @@ class TrialRecorder:
             Exception: Any exception the wrapped ``validator.run`` raises is
                 recorded (trial marked ``errored``) and re-raised unchanged.
         """
-        effective_start, effective_end = _effective_range(config)
+        effective_start, effective_end = eval_window.start, eval_window.end
 
         def _dispatch(dispatch_config: dict) -> WalkForwardResult:
             return validator.run(dispatch_config, data_handler, **run_kwargs)
@@ -387,6 +403,7 @@ class TrialRecorder:
         config_hash: str,
         data_version: str,
         base_config: dict,
+        eval_window: EvaluationWindow,
         param_grid: dict[str, list],
         data_handler: DataHandler,
         hypothesis_id: Optional[int] = None,
@@ -404,7 +421,10 @@ class TrialRecorder:
         preserved verbatim (sanitized for non-finite floats) in the recorded
         row's ``metrics_json``. See ``run_walk_forward`` for the shared
         holdout-guard and hybrid-mode semantics; the same rules and error
-        types apply here.
+        types apply here -- including ``eval_window`` being the required,
+        explicit source of the evaluation date range, injected into the
+        dispatched base config copy and never read from ``base_config``
+        itself (04-4W).
 
         Note: per-variant ``ParameterSensitivityResult.rows`` detail is
         intentionally NOT persisted as separate ``strategy_trials`` rows --
@@ -452,7 +472,7 @@ class TrialRecorder:
                 "confirmation via TrialRecorder.run_walk_forward() instead."
             )
 
-        effective_start, effective_end = _effective_range(base_config)
+        effective_start, effective_end = eval_window.start, eval_window.end
 
         # Planned variant count (Cartesian product of param_grid), computed
         # BEFORE dispatch from the grid shape alone. Seeded into the initial
@@ -631,7 +651,17 @@ class TrialRecorder:
             # records below. Injected after the hash_config provenance check
             # above (which already ignores data_version) so it cannot change
             # that comparison's outcome.
-            dispatch_config = _config_with_data_version(config, data_version)
+            #
+            # 04-4W: the SAME dispatched copy also has its
+            # backtest.start_date/end_date overwritten from effective_start/
+            # effective_end -- the caller's explicit EvaluationWindow -- for
+            # exactly the same reason: whatever config["backtest"] happened
+            # to carry must never be the value that actually runs. This is
+            # what makes the evaluation window a true per-measurement input
+            # rather than something read out of the stored/passed config.
+            dispatch_config = _config_with_data_version_and_window(
+                config, data_version, effective_start, effective_end
+            )
 
             # 04-3: freeze-on-first-trial side effect. If this trial links a
             # hypothesis (hypothesis_id is not None) whose param_grid_json is
@@ -689,6 +719,19 @@ class TrialRecorder:
                 status="running",
                 metrics_json=dict(initial_metrics_json) if initial_metrics_json else {},
                 started_at=started_at,
+                # 04-4W: persist the EFFECTIVE evaluation range this trial was
+                # already validated/guarded against above -- previously
+                # computed and used only by _enforce_holdout_guard, then
+                # discarded rather than recorded on the row it gates. Once
+                # config_hash stopped covering backtest.start_date/
+                # backtest.end_date (docs/plans/04-identity-evaluation-
+                # context-design.md), this pair is what makes a train_oos
+                # trial and a holdout trial recorded under the SAME
+                # config_hash distinguishable/reconstructable from the row
+                # alone (see selection_models.py's StrategyTrial docstring
+                # and migration 015).
+                eval_start_date=effective_start,
+                eval_end_date=effective_end,
             )
             session.add(trial)
             try:
@@ -995,37 +1038,15 @@ def _planned_grid_size(param_grid: dict[str, list]) -> Optional[int]:
     return size
 
 
-def _effective_range(config: dict) -> tuple[date, date]:
-    bt_cfg = config.get("backtest")
-    if not bt_cfg or "start_date" not in bt_cfg or "end_date" not in bt_cfg:
-        raise ValueError(
-            "config['backtest'] must declare 'start_date' and 'end_date' for the "
-            "TrialRecorder holdout guard to compute the effective date range."
-        )
-    effective_start = _parse_date(bt_cfg["start_date"])
-    effective_end = _parse_date(bt_cfg["end_date"])
-    if effective_start > effective_end:
-        # Fail closed: a reversed range is invalid input to a safety guard
-        # and must never silently pass the overlap/containment arithmetic in
-        # _enforce_holdout_guard (e.g. `effective_start <= window.holdout_end
-        # and effective_end >= window.holdout_start` can spuriously read as
-        # "no overlap" for a reversed pair even when the guard should fire).
-        raise ValueError(
-            f"config['backtest'] date range is reversed: start_date "
-            f"({effective_start}) is after end_date ({effective_end})."
-        )
-    return effective_start, effective_end
-
-
-def _parse_date(value: str | date) -> date:
-    if isinstance(value, date):
-        return value
-    return date.fromisoformat(str(value))
-
-
-def _config_with_data_version(config: dict, data_version: str) -> dict:
+def _config_with_data_version_and_window(
+    config: dict,
+    data_version: str,
+    eval_start: date,
+    eval_end: date,
+) -> dict:
     """Return a deep copy of ``config`` with its top-level ``data_version``
-    set to the validated ``data_version`` argument (04-2 round-2 P2 fix).
+    AND its ``backtest.start_date``/``backtest.end_date`` set to the
+    validated arguments (04-2 round-2 P2 fix; window injection added 04-4W).
 
     Never mutates the caller's ``config`` dict. ``BacktestEngine.run`` reads
     ``config.get("data_version", "")`` directly at the top level (see
@@ -1034,11 +1055,25 @@ def _config_with_data_version(config: dict, data_version: str) -> dict:
     so this is the key that must carry the recorded value for the dispatched
     backtest -- and every downstream ``BacktestResult``/``WalkForwardResult``
     -- to agree with the ``strategy_trials`` row.
+
+    04-4W: the same reasoning applies to the evaluation window. ``config_hash``
+    (``strategy_registry.fingerprint``) deliberately excludes
+    ``backtest.start_date``/``backtest.end_date`` from identity (per
+    docs/plans/04-identity-evaluation-context-design.md), so whatever those
+    two keys happen to hold in the caller's ``config``/``base_config`` is
+    NOT authoritative for what runs -- the caller's explicit
+    ``EvaluationWindow`` argument is. Overwriting them here, on the copy
+    that is actually dispatched, is what makes the window a true
+    per-measurement input rather than something silently read back out of
+    a stored/passed config dict.
     """
     import copy
 
     cfg = copy.deepcopy(config)
     cfg["data_version"] = data_version
+    cfg.setdefault("backtest", {})
+    cfg["backtest"]["start_date"] = eval_start
+    cfg["backtest"]["end_date"] = eval_end
     return cfg
 
 
