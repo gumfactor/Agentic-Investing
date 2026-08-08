@@ -246,6 +246,57 @@ def test_add_definition_same_version_different_hash_raises(
         registry.add_definition(str(p2))
 
 
+# ── F3 (2026-08-08 adversarial review): pin the INTENDED post-cb9b4f3-
+#    deletion behavior at the exact site the deleted reuse guard used to
+#    block ──────────────────────────────────────────────────────────────────
+#
+# cb9b4f3's EvaluationWindowConflictError/_assert_reuse_config_matches()
+# guard (deliberately NOT ported into this slice, per the 04-4W brief) used
+# to fail-closed on "same identity, different evaluation window" reuse.
+# Once the window is excluded from config_hash (a000e87) and threaded as an
+# explicit per-measurement input instead (this slice), that reuse is LEGAL
+# and EXPECTED -- two configs differing ONLY in backtest.start_date/end_date
+# hash identically, so add_definition()/register() must treat the second
+# call as an idempotent no-op returning the SAME row, not raise. Nothing
+# pinned that contract until now.
+
+
+def test_add_definition_same_content_different_dates_returns_same_row(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    p1 = _write_config(tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31")
+    p2 = _write_config(tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31")
+    d1 = registry.add_definition(str(p1))
+    d2 = registry.add_definition(str(p2))
+    assert d1.config_hash == d2.config_hash
+    assert d1.strategy_id == d2.strategy_id
+    # Genuinely the SAME row (not merely two rows with equal hashes) --
+    # only one strategy_definitions row exists for this identity.
+    assert len(registry.list_definitions(d1.strategy_id)) == 1
+
+
+def test_register_same_content_different_dates_returns_same_strategy(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """register() reaches the same idempotent-reuse path via
+    session.get(StrategyDefinition, (strategy_id, config_hash)) when
+    auto-creating the definition -- a second register() attempt for an
+    ALREADY-registered strategy_id still raises StrategyAlreadyRegisteredError
+    (permanent strategy_id, unrelated to this contract), so this test
+    exercises add_definition() twice with different-dated configs sharing
+    one identity, then register()s once -- proving the definition layer's
+    reuse-on-identity-match behavior register() itself relies on."""
+    p1 = _write_config(tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31")
+    p2 = _write_config(tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31")
+    d1 = registry.add_definition(str(p1))
+    d2 = registry.add_definition(str(p2))
+    assert d1.config_hash == d2.config_hash
+
+    strategy = registry.register(str(p2))
+    assert strategy.canonical_config_hash == d1.config_hash
+    assert len(registry.list_definitions(strategy.strategy_id)) == 1
+
+
 def test_list_definitions_returns_all_versions(
     registry: StrategyRegistry, tmp_path: Path
 ) -> None:
