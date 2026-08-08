@@ -33,6 +33,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Any
+
+
+def require_date(field_name: str, value: Any) -> None:
+    """Raise ``TypeError`` unless ``value`` is a plain ``date`` (not
+    ``datetime``, not a string, not anything else).
+
+    Shared by ``EvaluationWindow.__post_init__`` and every other
+    date-window boundary check in the codebase (e.g.
+    ``StrategyRegistry.record_run``'s ``eval_start_date``/``eval_end_date``)
+    so there is exactly ONE place that defines "is this a real date" --
+    PR #50 Codex round-3 found this same gap independently in two call
+    sites (``EvaluationWindow`` and ``record_run``) because each had grown
+    its own inline ``start > end`` check with no type guard; a second
+    hand-written copy of this logic is exactly how a third instance of the
+    same gap would reappear later. ``datetime`` subclasses ``date``, and
+    two ISO strings compare lexicographically the same way two dates
+    would, so a bare ``start > end`` comparison alone accepts both a
+    ``datetime`` pair and a string pair -- constructing/recording a
+    "validated" window that only fails much later (e.g.
+    ``DataHandler.trading_dates`` comparing against real ``date`` objects,
+    or a DB driver silently truncating a ``datetime`` on a ``Date`` column
+    write), often after a trial has already been persisted/frozen on the
+    strength of it.
+    """
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise TypeError(
+            f"{field_name} must be a datetime.date (not datetime.datetime "
+            f"or any other type); got {type(value).__name__}: {value!r}."
+        )
 
 
 @dataclass(frozen=True)
@@ -50,24 +80,8 @@ class EvaluationWindow:
     end: date
 
     def __post_init__(self) -> None:
-        # PR #50 Codex round-3 fix (P2): datetime subclasses date, and two
-        # ISO strings compare lexicographically the same way two dates
-        # would, so neither a datetime pair nor a string pair is caught by
-        # the start<=end check alone -- both would construct a
-        # "validated" window here and only fail much later (e.g.
-        # DataHandler.trading_dates comparing against real date objects),
-        # after TrialRecorder has already persisted/frozen a trial on the
-        # strength of this object. Reject anything that is not an actual
-        # date -- and reject datetime specifically, since isinstance(dt,
-        # date) is True for datetime but every consumer here means a plain
-        # calendar date, not a timestamp.
-        for field_name, value in (("start", self.start), ("end", self.end)):
-            if isinstance(value, datetime) or not isinstance(value, date):
-                raise TypeError(
-                    f"EvaluationWindow.{field_name} must be a datetime.date "
-                    f"(not datetime.datetime or any other type); got "
-                    f"{type(value).__name__}: {value!r}."
-                )
+        require_date("EvaluationWindow.start", self.start)
+        require_date("EvaluationWindow.end", self.end)
         if self.start > self.end:
             raise ValueError(
                 f"EvaluationWindow.start ({self.start}) must be <= "

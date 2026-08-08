@@ -131,6 +131,7 @@ from backtesting.validation.overfitting_checks import (
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
     ParameterSweeper,
+    _apply_params as _sweep_apply_params,
 )
 from backtesting.validation.survival_funnel import (
     SurvivalFunnel,
@@ -140,6 +141,7 @@ from backtesting.validation.survival_funnel import (
 )
 from backtesting.validation.trial_recorder import (
     TrialRecorder,
+    _config_with_data_version_and_window,
     _normalize_metric,
     _sanitize_metrics,
 )
@@ -680,15 +682,53 @@ class PromotionPipeline:
         # grid entry per _resolve_frozen_grid's non-empty-list-or-tuple
         # check, and 04-3's strict-JSON param_grid validation
         # (json.dumps(..., allow_nan=False)) only guarantees candidates are
-        # JSON-serializable, not scalar. Use a canonical JSON string
-        # (sort_keys=True, so key order and nested dict-key order never
-        # affect equality) as the dedup key instead -- json.dumps is total
-        # over any JSON-serializable value, so this can never raise
-        # TypeError the way hashing a tuple containing a dict/list would.
+        # JSON-serializable, not scalar. A canonical JSON string
+        # (sort_keys=True) fixed the unhashability, but was still deduping
+        # the wrong THING -- see the round-5 fix below.
+        #
+        # PR #50 Codex round-5 fix (P1, promotion-integrity/C8): the real
+        # invariant was never "count distinct row.params representations"
+        # -- it is "count distinct EFFECTIVE, fully-applied backtest
+        # configs actually tested." Those are not the same thing the
+        # moment param_grid has overlapping/ancestor-descendant dot-paths:
+        # e.g. a "portfolio" candidate that sets a whole sub-object and a
+        # "portfolio.n_long" candidate that always overrides just that key
+        # afterward (dict iteration/dispatch order in _apply_params is
+        # insertion order, i.e. param_grid key order) can make several
+        # DISTINCT row.params dicts resolve to the IDENTICAL applied
+        # config -- ParameterSweeper backtests the same thing N times,
+        # but a raw-params-based dedupe (tuple or JSON string) still
+        # counts N variants and can clear MIN_SENSITIVITY_SWEEP_VARIANTS
+        # with zero real diversity. Reuse _apply_params -- the exact same
+        # function ParameterSweeper.sweep uses to build the config it
+        # actually backtests -- to recompute each row's effective config
+        # and dedupe THAT.
+        #
+        # Reconstructed from the exact SAME base
+        # (_config_with_data_version_and_window(config, ...), not the raw
+        # `config` this method received) that TrialRecorder.run_parameter_
+        # sweep actually dispatched to ParameterSweeper.sweep -- so this
+        # recomputation can never disagree with what was really run,
+        # because it retraces the identical two-step pipeline (inject
+        # data_version/window, then apply params) using the SAME two
+        # functions, not a reimplementation of either step that could
+        # itself drift out of sync with the real dispatch path.
         n_finite_sensitivity_variants = (
             len(
                 {
-                    json.dumps(row.params, sort_keys=True)
+                    json.dumps(
+                        _sweep_apply_params(
+                            _config_with_data_version_and_window(
+                                config,
+                                self._data_version,
+                                eval_window.start,
+                                eval_window.end,
+                            ),
+                            row.params,
+                        ),
+                        sort_keys=True,
+                        default=str,
+                    )
                     for row in sensitivity_result.rows
                     if math.isfinite(row.oos_sharpe)
                 }
@@ -1088,15 +1128,19 @@ class PromotionPipeline:
                     "std_oos_sharpe": sensitivity_result.std_oos_sharpe,
                     "positive_fraction": sensitivity_result.positive_fraction,
                     "param_grid": sensitivity_result.param_grid,
-                    # R1-B (PR #50 Codex round-1 P1) + round-2 P1 dedupe
-                    # fix: the DISTINCT (by normalized params) finite-
-                    # variant count actually used to gate overall_passed,
-                    # and whether it fell short of
-                    # MIN_SENSITIVITY_SWEEP_VARIANTS -- auditable proof the
-                    # "robust" verdict (if any) reflects a real,
+                    # R1-B (PR #50 Codex round-1 P1) + round-2/3/5 dedupe
+                    # fixes: the DISTINCT (by fully-applied effective
+                    # config, not raw params representation -- see the
+                    # round-5 fix at the n_finite_sensitivity_variants
+                    # computation above) finite-variant count actually
+                    # used to gate overall_passed, and whether it fell
+                    # short of MIN_SENSITIVITY_SWEEP_VARIANTS -- auditable
+                    # proof the "robust" verdict (if any) reflects a real,
                     # sufficiently-powered sweep over genuinely distinct
-                    # parameter combinations, not a single lucky/surviving
-                    # variant or repeated copies of the same combination.
+                    # BACKTESTED configs, not a single lucky/surviving
+                    # variant, repeated copies of the same combination, or
+                    # different param representations that happen to
+                    # resolve to the same effective config.
                     "n_finite_variants": n_finite_sensitivity_variants,
                     "underpowered": sensitivity_underpowered,
                     "min_required_variants": MIN_SENSITIVITY_SWEEP_VARIANTS,

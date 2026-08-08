@@ -88,6 +88,15 @@ def _config(strategy_id: str = "v1_test_strategy") -> dict:
         "name": strategy_id,
         "version": 1,
         "backtest": {"start_date": "2022-01-01", "end_date": "2022-12-31"},
+        # Round-5 fix: PromotionPipeline.run() now recomputes each sweep
+        # row's EFFECTIVE applied config (via _apply_params) to dedupe on,
+        # using this same seeded config as the base -- so every dot-path
+        # key any fixture's ParameterSensitivityRow.params uses ("portfolio
+        # .n_long", "universe") must already exist here for _apply_params/
+        # _set_nested to resolve it, exactly as a real strategy config
+        # would already define every tunable a param_grid can override.
+        "portfolio": {"n_long": 10},
+        "universe": {"source": "sp500"},
     }
 
 
@@ -579,6 +588,84 @@ def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
 
     # 3 rows, but only 2 distinct normalized param sets -- the two
     # identical sp500 rows collapse to one.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
+
+
+def test_ancestor_descendant_grid_paths_collapse_to_same_effective_config(db_url: str) -> None:
+    """Round-5 (PR #50 Codex P1): distinct row.params dicts can still
+    resolve to the IDENTICAL effective backtest config when the grid has
+    overlapping ancestor/descendant dot-paths -- _reject_window_override_
+    keys only blocks paths that are ancestors of backtest.start_date/
+    end_date specifically, so a grid combining e.g. "portfolio" (replaces
+    the whole subtree) with "portfolio.n_long" (a leaf within it) is
+    otherwise perfectly legal. _apply_params applies a row's params dict
+    entries in insertion order, so whichever key comes later always wins
+    for any key it also touches. Two rows whose "portfolio" candidate
+    differs but whose later "portfolio.n_long" override lands on the SAME
+    value therefore backtest the identical config -- json.dumps(row.params)
+    dedup (round-3) would still count them as 2 distinct variants; the
+    round-5 fix (dedupe on the fully-applied config) must collapse them to
+    1."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            # "portfolio" replaces the whole subtree with {"n_long": 999},
+            # then "portfolio.n_long" (applied after, same insertion
+            # order as the dict literal) overrides just that leaf to 10 --
+            # net effect: portfolio == {"n_long": 10}.
+            params={"portfolio": {"n_long": 999}, "portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            # Different "portfolio" candidate (888 vs 999 above), but the
+            # SAME final "portfolio.n_long" override (10) -- net effect is
+            # IDENTICAL to the row above: portfolio == {"n_long": 10}.
+            params={"portfolio": {"n_long": 888}, "portfolio.n_long": 10},
+            oos_sharpe=0.8,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            # Genuinely different final value (20, not 10) -- must remain
+            # a distinct variant.
+            params={"portfolio": {"n_long": 777}, "portfolio.n_long": 20},
+            oos_sharpe=0.7,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio": [{"n_long": 999}, {"n_long": 888}, {"n_long": 777}], "portfolio.n_long": [10, 20]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.8,
+        std_oos_sharpe=0.1,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, 3 DISTINCT raw params dicts, but only 2 distinct EFFECTIVE
+    # configs -- the first two rows backtest the identical config despite
+    # having different raw params.
     assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
 
 

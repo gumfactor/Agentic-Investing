@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from strategy_registry import fingerprint as fp_module
+from strategy_registry.evaluation_window import require_date
 from strategy_registry.fingerprint import StrategyFingerprint
 from strategy_registry import selection_models  # noqa: F401 -- import for side effect: registers
 # StrategyHypothesis/StrategyTrial/ResearchDataWindow/PromotionDecision on Base.metadata
@@ -680,6 +681,21 @@ class StrategyRegistry:
                     f"indistinguishable now that the window is excluded from "
                     f"config_hash. Pass the effective evaluation window."
                 )
+            # PR #50 Codex round-5 fix (P2): record_run is a public API a
+            # caller can reach without going through EvaluationWindow (the
+            # only other current caller, TrialRecorder, always derives
+            # these from an already-validated EvaluationWindow.start/.end,
+            # so this is a real second entry point, not a hypothetical
+            # one). Without a type check, two datetime values or two ISO
+            # strings pass the bare `>` comparison below (datetime
+            # subclasses date; ISO strings compare lexicographically the
+            # same way dates do) and this would persist a StrategyRun with
+            # a window SQLAlchemy's Date binding silently truncates or
+            # rejects only at the DB write. Reuse EvaluationWindow's own
+            # date-vs-datetime guard (require_date) rather than a second,
+            # possibly-drifting copy of the same check.
+            require_date("eval_start_date", eval_start_date)
+            require_date("eval_end_date", eval_end_date)
             if eval_start_date > eval_end_date:
                 raise ValueError(
                     f"eval_start_date ({eval_start_date}) is after "

@@ -619,6 +619,69 @@ def test_record_run_rejects_reversed_eval_window(
         )
 
 
+# ── PR #50 Codex round-5 (P2): record_run must reject datetime/string
+#    eval_start_date/eval_end_date, not just accept them via a bare `>`
+#    comparison -- the same gap EvaluationWindow was hardened against,
+#    found independently here since record_run is a second, direct entry
+#    point that does not go through EvaluationWindow ──────────────────────
+
+
+def test_record_run_rejects_datetime_eval_start_date(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """datetime subclasses date, so a bare `>` comparison alone would
+    accept it and only fail later at the DB Date-column write."""
+    from datetime import datetime
+
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date=datetime(2022, 1, 1),  # type: ignore[arg-type]
+            eval_end_date=date(2022, 12, 31),
+        )
+
+
+def test_record_run_rejects_datetime_eval_end_date(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    from datetime import datetime
+
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date=date(2022, 1, 1),
+            eval_end_date=datetime(2022, 12, 31),  # type: ignore[arg-type]
+        )
+
+
+def test_record_run_rejects_string_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Two ISO strings compare lexicographically the same way two dates
+    would, so the bare `>` comparison alone would not catch this either."""
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date="2022-01-01",  # type: ignore[arg-type]
+            eval_end_date=date(2022, 12, 31),
+        )
+
+
 def test_record_run_signal_ic_no_data_version_required(
     registry: StrategyRegistry, cfg: Path
 ) -> None:
