@@ -23,12 +23,13 @@ straightforward filtered UPDATE rather than an undocumented assumption.
 ``fingerprint_algo_version`` is added NOT NULL. Every EXISTING row
 unambiguously WAS computed under algorithm version 1 (the only algorithm
 that has ever existed until ``a000e87``), so there is no legitimate "unknown"
-value to leave nullable for. The column is added with a TEMPORARY
-``server_default='1'`` so ``op.add_column`` can backfill every pre-existing
-row to 1 in one DDL statement without a separate UPDATE (C2: op.add_column
-only, never a raw ALTER TABLE) -- then, in the SAME migration, that server
-default is immediately DROPPED (``op.alter_column(...,
-server_default=None)``); the column stays NOT NULL.
+value to leave nullable for. On Postgres, the column is added with a
+TEMPORARY ``server_default='1'`` so ``op.add_column`` can backfill every
+pre-existing row to 1 in one DDL statement without a separate UPDATE (C2:
+op.add_column only, never a raw ALTER TABLE) -- then, in the SAME
+migration, that server default is immediately DROPPED
+(``op.alter_column(..., server_default=None)``); the column stays NOT
+NULL. SQLite requires a different sequence -- see the R1-C note below.
 
 **PM amendment A3 (2026-08-08, P1) -- corrects an earlier, factually wrong
 claim in this docstring**: an earlier version of this migration kept the
@@ -55,6 +56,33 @@ never a driftable hard-coded literal) as the single supported path for an
 omitted field, and a raw SQL insert that bypasses the ORM and omits this
 column now fails NOT NULL instead of silently minting a mislabelled row.
 
+**R1-C (PR #50 Codex round-1 P2) -- corrects an earlier, factually wrong
+SQLite-dialect claim.** The version of this migration reviewed for A3
+skipped the server-default drop entirely on SQLite, reasoning "SQLite has
+no persistent server-side default to drop." **That reasoning was false.**
+SQLite's ``ALTER TABLE ... ADD COLUMN ... DEFAULT 1`` stores that default
+PERMANENTLY in the table definition (unlike a transient statement-time
+value) -- every future ``INSERT`` that omits the column keeps receiving
+``1`` from SQLite itself, which reintroduces the EXACT A3 mislabelling bug
+on SQLite: a fresh v2 row inserted by any writer that omits the column
+(bypassing the ORM's Python-side default, e.g. a raw SQL insert) would
+still be silently stamped v1 by the database, not merely left NULL. The
+fail-closed guarantee A3 exists to provide was therefore untrue on SQLite
+specifically.
+
+SQLite's ``ALTER TABLE`` cannot add/drop/alter a column default at all
+(there is no ``ALTER TABLE ... ALTER COLUMN`` in SQLite), so the Postgres
+"add-with-default-then-drop-default" sequence has no SQLite equivalent.
+The correct SQLite sequence instead is: add the column NULLABLE with NO
+default at all; backfill existing rows with an explicit ``UPDATE``; then
+use ``op.batch_alter_table`` (which transparently rebuilds the table under
+SQLite, the standard Alembic mechanism for column alterations SQLite's
+``ALTER TABLE`` cannot express directly) to flip the column to NOT NULL.
+The end state is identical to Postgres on both dialects: NOT NULL, NO
+persistent default anywhere -- verified by asserting on a live SQLite
+connection that a raw INSERT omitting the column fails (rather than
+silently receiving 1) after this migration runs.
+
 No existing hash is rewritten by this migration -- it is schema-only,
 exactly like migration 016/017. Recomputing/migrating old config_hash values
 themselves remains explicitly out of scope (the operator's waiver), and this
@@ -76,45 +104,63 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # C2: Alembic op.add_column only, never a raw ALTER TABLE. The temporary
-    # server_default backfills every existing row to '1' (the only algorithm
-    # that has ever existed prior to this migration) in this one statement.
-    op.add_column(
-        "strategy_definitions",
-        sa.Column(
-            "fingerprint_algo_version",
-            sa.Integer(),
-            nullable=False,
-            server_default="1",
-        ),
-    )
-    # PM amendment A3: drop the server default immediately after using it to
-    # backfill pre-existing rows above. A Postgres server_default applies to
-    # every FUTURE insert that omits the column too, not just this one-time
-    # backfill -- leaving it in place would silently mislabel v1 any row a
-    # future writer inserts without explicitly setting this column. The
-    # column stays NOT NULL; the only remaining "default" is the ORM-side
-    # strategy_registry.models.StrategyDefinition.fingerprint_algo_version
-    # Python default (always the current algorithm version), and any
-    # non-ORM writer that omits the column now fails NOT NULL instead of
-    # being silently mislabelled.
-    #
-    # F2 fix (adversarial review, 2026-08-08): dialect-gated -- SQLite's
-    # ALTER TABLE does not support dropping/altering a column default at
-    # all (op.alter_column(..., server_default=None) raises
-    # "OperationalError: near ALTER: syntax error" on SQLite, reproduced).
-    # This is not merely an "unsupported operation, skip it" workaround:
-    # SQLite has no PERSISTENT server-side default to drop in the first
-    # place in the sense Postgres does -- a SQLite column DEFAULT is a
-    # table-definition-time clause, not a live catalog attribute a future
-    # writer's INSERT silently inherits the way Postgres's server_default
-    # does. The A3 guarantee this step exists to protect (no writer can
-    # silently mint a mislabelled v1 row) is carried entirely by the
-    # Python-side ORM default already on SQLite, so skipping this
-    # Postgres-specific cleanup step there does not weaken it.
-    if op.get_bind().dialect.name != "sqlite":
+    bind = op.get_bind()
+    if bind.dialect.name == "sqlite":
+        # R1-C: SQLite's ALTER TABLE cannot add/drop/alter a column
+        # default, and an ADD COLUMN ... DEFAULT clause is PERMANENT (not a
+        # one-time backfill value like Postgres's server_default combined
+        # with a later DROP DEFAULT) -- so the Postgres sequence below
+        # cannot be used here at all. Add the column with NO default
+        # (nullable, so the ADD COLUMN itself cannot fail on existing
+        # rows), backfill explicitly, then use batch_alter_table (rebuilds
+        # the table under the hood -- the standard Alembic mechanism for a
+        # SQLite column alteration ALTER TABLE cannot express directly) to
+        # flip it NOT NULL. End state: NOT NULL, no persistent default --
+        # identical to the Postgres branch below.
+        op.add_column(
+            "strategy_definitions",
+            sa.Column("fingerprint_algo_version", sa.Integer(), nullable=True),
+        )
+        op.execute(
+            "UPDATE strategy_definitions SET fingerprint_algo_version = 1 "
+            "WHERE fingerprint_algo_version IS NULL"
+        )
+        with op.batch_alter_table("strategy_definitions") as batch_op:
+            batch_op.alter_column(
+                "fingerprint_algo_version",
+                existing_type=sa.Integer(),
+                nullable=False,
+            )
+    else:
+        # C2: Alembic op.add_column only, never a raw ALTER TABLE. The
+        # temporary server_default backfills every existing row to '1' (the
+        # only algorithm that has ever existed prior to this migration) in
+        # this one statement.
+        op.add_column(
+            "strategy_definitions",
+            sa.Column(
+                "fingerprint_algo_version",
+                sa.Integer(),
+                nullable=False,
+                server_default="1",
+            ),
+        )
+        # PM amendment A3: drop the server default immediately after using
+        # it to backfill pre-existing rows above. A Postgres server_default
+        # applies to every FUTURE insert that omits the column too, not
+        # only to this one-time backfill -- leaving it in place would
+        # silently mislabel v1 any row a future writer inserts without
+        # explicitly setting this column. The column stays NOT NULL; the
+        # only remaining "default" is the ORM-side
+        # strategy_registry.models.StrategyDefinition.fingerprint_algo_version
+        # Python default (always the current algorithm version), and any
+        # non-ORM writer that omits the column now fails NOT NULL instead
+        # of being silently mislabelled.
         op.alter_column("strategy_definitions", "fingerprint_algo_version", server_default=None)
 
 
 def downgrade() -> None:
+    # op.drop_column works natively on both dialects (modern SQLite
+    # supports DROP COLUMN directly; no batch mode needed for a drop) --
+    # verified via a live round-trip on both.
     op.drop_column("strategy_definitions", "fingerprint_algo_version")
