@@ -110,6 +110,7 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -669,12 +670,25 @@ class PromotionPipeline:
         # the SAME combination produces N identical successful rows that
         # would satisfy MIN_SENSITIVITY_SWEEP_VARIANTS without testing any
         # actual parameter sensitivity. Dedupe finite rows by their
-        # normalized params (sorted dot-path -> value tuple) before
-        # counting distinct variants against the threshold.
+        # normalized params before counting distinct variants against the
+        # threshold.
+        #
+        # PR #50 Codex round-3 fix (P2): a normalized key built from
+        # tuple(sorted(row.params.items())) is unhashable the moment any
+        # candidate value is itself a list/dict -- e.g.
+        # {"universe": [{"source": "sp500"}, ...]} is a structurally-valid
+        # grid entry per _resolve_frozen_grid's non-empty-list-or-tuple
+        # check, and 04-3's strict-JSON param_grid validation
+        # (json.dumps(..., allow_nan=False)) only guarantees candidates are
+        # JSON-serializable, not scalar. Use a canonical JSON string
+        # (sort_keys=True, so key order and nested dict-key order never
+        # affect equality) as the dedup key instead -- json.dumps is total
+        # over any JSON-serializable value, so this can never raise
+        # TypeError the way hashing a tuple containing a dict/list would.
         n_finite_sensitivity_variants = (
             len(
                 {
-                    tuple(sorted(row.params.items()))
+                    json.dumps(row.params, sort_keys=True)
                     for row in sensitivity_result.rows
                     if math.isfinite(row.oos_sharpe)
                 }

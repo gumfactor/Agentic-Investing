@@ -518,6 +518,70 @@ def test_distinct_params_at_min_threshold_still_clears_after_dedupe(db_url: str)
     assert result.overall_passed is True
 
 
+def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
+    """Round-3 (PR #50 Codex P2): _resolve_frozen_grid only requires each
+    param_grid value to be a non-empty list/tuple of candidates -- it does
+    not require the candidates themselves to be scalar. A candidate can be
+    a list/dict (e.g. {"universe": [{"source": "sp500"}, ...]}) and still
+    pass 04-3's strict-JSON param_grid validation (JSON-serializable, not
+    scalar). A dedupe key built from tuple(sorted(row.params.items()))
+    would raise TypeError: unhashable type the moment such a row is put in
+    a set. The json.dumps(..., sort_keys=True) dedupe key must handle this
+    without raising, and must still distinguish genuinely different nested
+    values."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"universe": {"source": "sp500", "as_of": "2022-01-01"}},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            params={"universe": {"source": "sp500", "as_of": "2022-01-01"}},
+            oos_sharpe=0.8,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            params={"universe": {"source": "nasdaq100", "as_of": "2022-01-01"}},
+            oos_sharpe=0.7,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"universe": [{"source": "sp500"}, {"source": "nasdaq100"}]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.8,
+        std_oos_sharpe=0.1,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, but only 2 distinct normalized param sets -- the two
+    # identical sp500 rows collapse to one.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
+
+
 def test_stress_fragile_flips_overall_passed_and_is_attributed(db_url: str) -> None:
     config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
