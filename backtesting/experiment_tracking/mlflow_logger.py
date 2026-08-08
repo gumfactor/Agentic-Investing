@@ -372,6 +372,64 @@ class BacktestLogger:
             )
             return run_id
 
+    def log_promotion_decision(
+        self,
+        run_id: str,
+        dsr_value: Optional[float],
+        n_trials: int,
+        n_observations: int,
+        fdr_rejected: Optional[bool] = None,
+        fdr_alpha: float = 0.05,
+    ) -> None:
+        """Additive Gate 04 slice 04-4 logging: attach Deflated Sharpe
+        Ratio (DSR) and Benjamini-Hochberg FDR values to an ALREADY-LOGGED
+        MLflow run (e.g. the ``run_id`` returned by ``log_walk_forward_run``).
+
+        Neither ``log_run`` nor ``log_walk_forward_run`` logs anything
+        DSR/FDR-shaped today (see
+        docs/plans/04-strategy-selection-protocol-design.md §6). This
+        method is purely additive -- it does not change either existing
+        method's signature or behavior, and is only ever called AFTER one
+        of them has already opened/closed the MLflow run it logs onto (via
+        ``mlflow.tracking.MlflowClient``, which can log metrics/tags onto a
+        finished run without reopening it).
+
+        Args:
+            run_id: An existing MLflow run id (e.g. from
+                ``log_walk_forward_run``).
+            dsr_value: Deflated Sharpe Ratio in [0, 1], or ``None`` if it
+                could not be computed (e.g. insufficient n_trials/
+                n_observations) -- informational only per design doc §8
+                Q3, never a hard promotion gate, so a ``None`` is logged as
+                simply absent rather than a sentinel value.
+            n_trials: The honest trial count (§4.1's ``strategy_trials``
+                COUNT) that ``dsr_value`` was computed with.
+            n_observations: Number of OOS daily-return observations
+                ``dsr_value`` was computed with.
+            fdr_rejected: Optional Benjamini-Hochberg rejection flag for
+                this run within its per-family comparison set (§8 Q6).
+                ``None`` when the FDR leg was skipped (e.g. no
+                ``dsr_value``).
+            fdr_alpha: The false discovery rate used for the correction.
+                Default 0.05.
+        """
+        client = mlflow.tracking.MlflowClient(tracking_uri=self._tracking_uri)
+        if dsr_value is not None and math.isfinite(float(dsr_value)):
+            client.log_metric(run_id, "dsr.value", float(dsr_value))
+        client.log_metric(run_id, "dsr.n_trials", float(n_trials))
+        client.log_metric(run_id, "dsr.n_observations", float(n_observations))
+        client.set_tag(run_id, "fdr.alpha", str(fdr_alpha))
+        if fdr_rejected is not None:
+            client.set_tag(run_id, "fdr.rejected", str(fdr_rejected))
+        logger.info(
+            "promotion_decision_logged_to_mlflow",
+            run_id=run_id,
+            dsr_value=dsr_value,
+            n_trials=n_trials,
+            n_observations=n_observations,
+            fdr_rejected=fdr_rejected,
+        )
+
     def load_result_metrics(self, run_id: str) -> dict:
         """Load the metrics dict for a previously logged run."""
         client = mlflow.tracking.MlflowClient(tracking_uri=self._tracking_uri)
