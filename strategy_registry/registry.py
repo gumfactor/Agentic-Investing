@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import structlog
@@ -528,10 +528,25 @@ class StrategyRegistry:
         artifact_path: Optional[str] = None,
         mlflow_run_id: Optional[str] = None,
         notes: Optional[str] = None,
+        eval_start_date: Optional[date] = None,
+        eval_end_date: Optional[date] = None,
     ) -> StrategyRun:
         """
         Append a run record. data_version required for backtest/walk_forward (C7).
         The (strategy_id, config_hash) must exist in strategy_definitions.
+
+        eval_start_date/eval_end_date (migration 016, 04-4W Phase W3) are the
+        EFFECTIVE evaluation window this run actually ran over. Required
+        (both non-null, start <= end) for the same run_types that require
+        data_version (backtest/walk_forward) -- since
+        docs/plans/04-identity-evaluation-context-design.md moved
+        backtest.start_date/backtest.end_date out of config_hash, the window
+        is no longer reconstructable from (strategy_id, config_hash,
+        data_version) alone, and two backtest/walk_forward runs over
+        different windows would otherwise collide and be indistinguishable.
+        Optional for unit/signal_ic/paper/live, which are not window-scoped
+        evaluations (mirrors StrategyTrial.eval_start_date/eval_end_date,
+        strategy_registry/selection_models.py, migration 015).
         """
         if run_type not in _VALID_RUN_TYPES:
             raise ValueError(
@@ -546,6 +561,23 @@ class StrategyRegistry:
                 f"data_version is required for run_type='{run_type}' (C7). "
                 f"Pass the MLflow manifest path."
             )
+        if run_type in _REQUIRE_DATA_VERSION:
+            if eval_start_date is None or eval_end_date is None:
+                raise ValueError(
+                    f"eval_start_date and eval_end_date are required for "
+                    f"run_type='{run_type}' (04-4W Phase W3, migration 016). "
+                    f"Without them, two '{run_type}' runs recorded over "
+                    f"different evaluation windows under the same "
+                    f"(strategy_id, config_hash, data_version) are "
+                    f"indistinguishable now that the window is excluded from "
+                    f"config_hash. Pass the effective evaluation window."
+                )
+            if eval_start_date > eval_end_date:
+                raise ValueError(
+                    f"eval_start_date ({eval_start_date}) is after "
+                    f"eval_end_date ({eval_end_date}) for run_type="
+                    f"'{run_type}' -- reversed evaluation window."
+                )
 
         now = datetime.now(tz=timezone.utc)
 
@@ -591,6 +623,8 @@ class StrategyRegistry:
                 notes=notes,
                 started_at=now,
                 completed_at=now if status != "running" else None,
+                eval_start_date=eval_start_date,
+                eval_end_date=eval_end_date,
             )
             session.add(run)
             session.commit()

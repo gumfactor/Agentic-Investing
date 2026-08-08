@@ -5,6 +5,7 @@ Covers the definition layer, lifecycle layer, and run recording layer.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -480,7 +481,8 @@ def test_get_not_found_raises(registry: StrategyRegistry) -> None:
 def test_record_run_requires_definition(registry: StrategyRegistry) -> None:
     with pytest.raises(DefinitionNotFoundError):
         registry.record_run("v1_test_strategy", "a" * 64, "backtest", "passed",
-                            data_version="snap/v1")
+                            data_version="snap/v1",
+                            eval_start_date=date(2022, 1, 1), eval_end_date=date(2022, 12, 31))
 
 
 def test_record_run_backtest_requires_data_version(
@@ -521,9 +523,48 @@ def test_record_run_backtest_success(registry: StrategyRegistry, cfg: Path) -> N
         data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
         metrics={"sharpe_ratio": 0.82, "annualized_return": 0.14, "max_drawdown": -0.09},
         mlflow_run_id="abc123",
+        eval_start_date=date(2022, 1, 1),
+        eval_end_date=date(2022, 12, 31),
     )
     assert run.id is not None
     assert run.metrics["sharpe_ratio"] == 0.82
+    assert run.eval_start_date == date(2022, 1, 1)
+    assert run.eval_end_date == date(2022, 12, 31)
+
+
+def test_record_run_backtest_requires_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """04-4W Phase W3: backtest/walk_forward runs must carry an explicit
+    eval_start_date/eval_end_date, mirroring the C7 data_version gate --
+    otherwise two runs over different windows recorded under the same
+    (strategy_id, config_hash, data_version) are indistinguishable now that
+    the window is excluded from config_hash."""
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="eval_start_date and eval_end_date are required"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        )
+
+
+def test_record_run_rejects_reversed_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="reversed evaluation window"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date=date(2022, 12, 31),
+            eval_end_date=date(2022, 1, 1),
+        )
 
 
 def test_record_run_signal_ic_no_data_version_required(
@@ -667,9 +708,11 @@ def test_get_runs_filters(registry: StrategyRegistry, cfg: Path) -> None:
     registry.record_run(s.strategy_id, s.canonical_config_hash, "signal_ic", "passed",
                         metrics={"ic": 0.05})
     registry.record_run(s.strategy_id, s.canonical_config_hash, "backtest", "passed",
-                        data_version="snap/v1", metrics={"sharpe": 0.8})
+                        data_version="snap/v1", metrics={"sharpe": 0.8},
+                        eval_start_date=date(2022, 1, 1), eval_end_date=date(2022, 12, 31))
     registry.record_run(s.strategy_id, s.canonical_config_hash, "backtest", "failed",
-                        data_version="snap/v2")
+                        data_version="snap/v2",
+                        eval_start_date=date(2023, 1, 1), eval_end_date=date(2023, 12, 31))
 
     all_runs = registry.get_runs(s.strategy_id)
     assert len(all_runs) == 3
