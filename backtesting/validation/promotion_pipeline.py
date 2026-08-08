@@ -152,6 +152,28 @@ from strategy_registry.selection_models import PromotionDecision
 logger = structlog.get_logger(__name__)
 
 
+# PR #50 Codex round-1 R1-B fix (P1, promotion-integrity/C8 precondition).
+# The minimum number of DISTINCT, successfully completed (finite OOS
+# Sharpe) parameter-sweep variants required for the sensitivity verdict to
+# be trusted at all. Below this, ParameterSweeper's own curve_fit_flag
+# computation has no real statistical power: positive_fraction can only
+# take the values {0.0, 1.0} at n=1 and {0.0, 0.5, 1.0} at n=2, so a
+# single-combination grid -- or a grid where all but one variant failed --
+# trivially satisfies the default min_positive_fraction=0.5 threshold on
+# ONE data point and skips the std-dispersion gate entirely (guarded by
+# n_valid > 1 in parameter_sensitivity.py), yielding a "robust" verdict
+# with zero evidentiary weight. Originally introduced in 04-4A (merged
+# a5b7e1c) and found on PR #50 (04-4W); a curve-fit strategy could
+# otherwise clear the survival funnel with real live-capital (C8)
+# consequences, since Gate 04's promotion decision is the precondition for
+# any paper-to-live discussion. 3 is the smallest count at which
+# positive_fraction stops being a near-coin-flip statistic: n=3 is the
+# first grid size fine enough to distinguish "most variants passed"
+# (0.67) from "all variants passed" (1.0) rather than collapsing to a
+# single pass/fail bit.
+MIN_SENSITIVITY_SWEEP_VARIANTS: int = 3
+
+
 # ── Acknowledged residual limitations (design doc §9) ──────────────────────────
 # Stamped inline into every evidence_json bundle per §8 Q8's resolution
 # (surface inline, not just a one-time acknowledgment in the design doc).
@@ -624,9 +646,38 @@ class PromotionPipeline:
         sensitivity_verdict = sensitivity_result.verdict if sensitivity_result else None
         stress_verdict = stress_result.verdict
 
+        # PR #50 Codex round-1 R1-B fix (P1, promotion-integrity/C8): a
+        # sweep's own curve_fit_flag computation degenerates with too few
+        # DISTINCT, successfully completed (finite OOS Sharpe) variants --
+        # a single valid variant with a positive Sharpe trivially satisfies
+        # the default min_positive_fraction=0.5 threshold (positive_fraction
+        # can only be 0.0 or 1.0 at n=1) and the std-dispersion gate is
+        # skipped entirely (guarded by n_valid > 1 in ParameterSweeper.sweep),
+        # so a single-combination grid -- or one where all but one variant
+        # failed -- gets labelled "robust" with zero statistical power, and
+        # overall_passed could become True with no meaningful parameter-
+        # sensitivity test having run at all. Recompute the finite-variant
+        # count HERE (not trusted from sensitivity_result.verdict alone) and
+        # force the gate closed when it falls short of
+        # MIN_SENSITIVITY_SWEEP_VARIANTS, regardless of what verdict the
+        # sweep itself reported.
+        n_finite_sensitivity_variants = (
+            sum(1 for row in sensitivity_result.rows if math.isfinite(row.oos_sharpe))
+            if sensitivity_result is not None
+            else None
+        )
+        sensitivity_underpowered = (
+            n_finite_sensitivity_variants is not None
+            and n_finite_sensitivity_variants < MIN_SENSITIVITY_SWEEP_VARIANTS
+        )
+
         overall_passed = funnel_result.passed and stress_verdict == "solid"
         if not holdout_mode:
-            overall_passed = overall_passed and sensitivity_verdict == "robust"
+            overall_passed = (
+                overall_passed
+                and sensitivity_verdict == "robust"
+                and not sensitivity_underpowered
+            )
 
         evidence = self._build_evidence(
             strategy_id=strategy_id,
@@ -634,6 +685,8 @@ class PromotionPipeline:
             holdout_mode=holdout_mode,
             funnel_result=funnel_result,
             sensitivity_result=sensitivity_result,
+            n_finite_sensitivity_variants=n_finite_sensitivity_variants,
+            sensitivity_underpowered=sensitivity_underpowered,
             stress_result=stress_result,
             dsr_value=dsr_value,
             n_trials=n_trials,
@@ -950,6 +1003,8 @@ class PromotionPipeline:
         holdout_mode: bool,
         funnel_result: SurvivalFunnelResult,
         sensitivity_result: Optional[ParameterSensitivityResult],
+        n_finite_sensitivity_variants: Optional[int],
+        sensitivity_underpowered: bool,
         stress_result: BootstrapStressResult,
         dsr_value: Optional[float],
         n_trials: int,
@@ -1003,6 +1058,15 @@ class PromotionPipeline:
                     "std_oos_sharpe": sensitivity_result.std_oos_sharpe,
                     "positive_fraction": sensitivity_result.positive_fraction,
                     "param_grid": sensitivity_result.param_grid,
+                    # R1-B (PR #50 Codex round-1 P1): the finite-variant
+                    # count actually used to gate overall_passed, and
+                    # whether it fell short of MIN_SENSITIVITY_SWEEP_VARIANTS
+                    # -- auditable proof the "robust" verdict (if any)
+                    # reflects a real, sufficiently-powered sweep rather
+                    # than a single lucky/surviving variant.
+                    "n_finite_variants": n_finite_sensitivity_variants,
+                    "underpowered": sensitivity_underpowered,
+                    "min_required_variants": MIN_SENSITIVITY_SWEEP_VARIANTS,
                 }
             ),
             "stress": {

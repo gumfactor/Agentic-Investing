@@ -32,6 +32,7 @@ from backtesting.experiment_tracking.mlflow_logger import BacktestLogger
 from backtesting.validation.bootstrap_stress import BootstrapStressResult
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
+    ParameterSensitivityRow,
     ParameterSweeper,
 )
 from backtesting.validation.promotion_pipeline import (
@@ -164,12 +165,33 @@ def _wf_result(
     )
 
 
-def _sweep_result(verdict: str = "robust", configs_tested: int = 6) -> ParameterSensitivityResult:
+def _sweep_result(
+    verdict: str = "robust",
+    configs_tested: int = 6,
+    n_finite_rows: int | None = None,
+) -> ParameterSensitivityResult:
+    """R1-B (PR #50): PromotionPipeline now recomputes the finite-variant
+    count directly from ``rows`` (not just ``configs_tested``) to gate the
+    sensitivity verdict -- see MIN_SENSITIVITY_SWEEP_VARIANTS. Defaults to
+    populating ``rows`` with ``configs_tested`` finite-Sharpe entries (a
+    well-powered sweep) unless ``n_finite_rows`` overrides that count, for
+    tests exercising the underpowered path specifically."""
+    n_rows = configs_tested if n_finite_rows is None else n_finite_rows
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 10 + i},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for i in range(n_rows)
+    ]
     return ParameterSensitivityResult(
         base_config_name="v1_test_strategy",
         param_grid={"portfolio.n_long": [10, 20]},
         configs_tested=configs_tested,
-        rows=[],
+        rows=rows,
         mean_oos_sharpe=0.9,
         std_oos_sharpe=0.1,
         positive_fraction=1.0,
@@ -329,6 +351,98 @@ def test_sensitivity_curve_fit_flips_overall_passed_and_is_attributed(db_url: st
     assert result.sensitivity_verdict == "curve_fit"
     assert result.overall_passed is False
     assert result.evidence_json["sensitivity"]["verdict"] == "curve_fit"
+
+
+# ── R1-B (PR #50 Codex round-1 P1): an underpowered sweep must not clear the
+#    gate even when ParameterSweeper itself labels it "robust" ────────────────
+
+
+def test_single_variant_robust_sweep_does_not_clear_overall_passed(db_url: str) -> None:
+    """A single-combination grid (or one variant that happens to survive)
+    trivially satisfies ParameterSweeper's positive_fraction >= 0.5
+    threshold and skips its std-dispersion gate (n_valid > 1 guard), so
+    ParameterSweeper itself reports verdict='robust' with zero statistical
+    power. PromotionPipeline must recompute the finite-variant count and
+    refuse to pass overall_passed on that basis -- this is the exact defect
+    class (curve-fit strategy clearing the funnel) R1-B closes."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        # ParameterSweeper itself would compute verdict="robust" here (one
+        # finite, positive Sharpe -> positive_fraction=1.0 >= 0.5, std gate
+        # skipped) -- the sweep result asserts that verdict explicitly to
+        # prove the PromotionPipeline-level override is what closes the gate,
+        # not ParameterSweeper disagreeing with itself.
+        sweep_result=_sweep_result(verdict="robust", configs_tested=1, n_finite_rows=1),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.funnel_passed is True
+    assert result.stress_verdict == "solid"
+    assert result.sensitivity_verdict == "robust"  # ParameterSweeper's own (uncorrected) verdict
+    assert result.overall_passed is False  # but PromotionPipeline refuses to trust it
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+    assert result.evidence_json["sensitivity"]["min_required_variants"] == 3
+
+
+def test_mostly_failed_sweep_with_one_survivor_does_not_clear_overall_passed(
+    db_url: str,
+) -> None:
+    """A grid where all but one variant failed (n_finite=1 out of a larger
+    configs_tested) is the other shape of the same defect -- configs_tested
+    alone would look like a real sweep ran, but only one row actually
+    produced a usable result."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust", configs_tested=8, n_finite_rows=1),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.overall_passed is False
+    assert result.evidence_json["sensitivity"]["configs_tested"] == 8
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_exactly_min_finite_variants_clears_the_underpowered_gate(db_url: str) -> None:
+    """The boundary case: exactly MIN_SENSITIVITY_SWEEP_VARIANTS (3) finite
+    variants must NOT be flagged underpowered -- pins the threshold as
+    inclusive, not exclusive."""
+    from backtesting.validation.promotion_pipeline import MIN_SENSITIVITY_SWEEP_VARIANTS
+
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(
+            verdict="robust",
+            configs_tested=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            n_finite_rows=MIN_SENSITIVITY_SWEEP_VARIANTS,
+        ),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["underpowered"] is False
+    assert result.overall_passed is True
 
 
 def test_stress_fragile_flips_overall_passed_and_is_attributed(db_url: str) -> None:
