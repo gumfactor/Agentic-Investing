@@ -98,7 +98,22 @@ def upgrade() -> None:
     # Python default (always the current algorithm version), and any
     # non-ORM writer that omits the column now fails NOT NULL instead of
     # being silently mislabelled.
-    op.alter_column("strategy_definitions", "fingerprint_algo_version", server_default=None)
+    #
+    # F2 fix (adversarial review, 2026-08-08): dialect-gated -- SQLite's
+    # ALTER TABLE does not support dropping/altering a column default at
+    # all (op.alter_column(..., server_default=None) raises
+    # "OperationalError: near ALTER: syntax error" on SQLite, reproduced).
+    # This is not merely an "unsupported operation, skip it" workaround:
+    # SQLite has no PERSISTENT server-side default to drop in the first
+    # place in the sense Postgres does -- a SQLite column DEFAULT is a
+    # table-definition-time clause, not a live catalog attribute a future
+    # writer's INSERT silently inherits the way Postgres's server_default
+    # does. The A3 guarantee this step exists to protect (no writer can
+    # silently mint a mislabelled v1 row) is carried entirely by the
+    # Python-side ORM default already on SQLite, so skipping this
+    # Postgres-specific cleanup step there does not weaken it.
+    if op.get_bind().dialect.name != "sqlite":
+        op.alter_column("strategy_definitions", "fingerprint_algo_version", server_default=None)
 
 
 def downgrade() -> None:
