@@ -661,8 +661,24 @@ class PromotionPipeline:
         # force the gate closed when it falls short of
         # MIN_SENSITIVITY_SWEEP_VARIANTS, regardless of what verdict the
         # sweep itself reported.
+        #
+        # PR #50 Codex round-2 fix (P1, promotion-integrity/C8): counting
+        # raw finite rows is itself gameable -- _resolve_frozen_grid does
+        # not reject duplicate values in a param_grid list (e.g.
+        # {"portfolio.n_long": [10, 10, 10]}), so a grid with N copies of
+        # the SAME combination produces N identical successful rows that
+        # would satisfy MIN_SENSITIVITY_SWEEP_VARIANTS without testing any
+        # actual parameter sensitivity. Dedupe finite rows by their
+        # normalized params (sorted dot-path -> value tuple) before
+        # counting distinct variants against the threshold.
         n_finite_sensitivity_variants = (
-            sum(1 for row in sensitivity_result.rows if math.isfinite(row.oos_sharpe))
+            len(
+                {
+                    tuple(sorted(row.params.items()))
+                    for row in sensitivity_result.rows
+                    if math.isfinite(row.oos_sharpe)
+                }
+            )
             if sensitivity_result is not None
             else None
         )
@@ -1058,12 +1074,15 @@ class PromotionPipeline:
                     "std_oos_sharpe": sensitivity_result.std_oos_sharpe,
                     "positive_fraction": sensitivity_result.positive_fraction,
                     "param_grid": sensitivity_result.param_grid,
-                    # R1-B (PR #50 Codex round-1 P1): the finite-variant
-                    # count actually used to gate overall_passed, and
-                    # whether it fell short of MIN_SENSITIVITY_SWEEP_VARIANTS
-                    # -- auditable proof the "robust" verdict (if any)
-                    # reflects a real, sufficiently-powered sweep rather
-                    # than a single lucky/surviving variant.
+                    # R1-B (PR #50 Codex round-1 P1) + round-2 P1 dedupe
+                    # fix: the DISTINCT (by normalized params) finite-
+                    # variant count actually used to gate overall_passed,
+                    # and whether it fell short of
+                    # MIN_SENSITIVITY_SWEEP_VARIANTS -- auditable proof the
+                    # "robust" verdict (if any) reflects a real,
+                    # sufficiently-powered sweep over genuinely distinct
+                    # parameter combinations, not a single lucky/surviving
+                    # variant or repeated copies of the same combination.
                     "n_finite_variants": n_finite_sensitivity_variants,
                     "underpowered": sensitivity_underpowered,
                     "min_required_variants": MIN_SENSITIVITY_SWEEP_VARIANTS,

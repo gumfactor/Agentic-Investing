@@ -169,17 +169,24 @@ def _sweep_result(
     verdict: str = "robust",
     configs_tested: int = 6,
     n_finite_rows: int | None = None,
+    duplicate_params: bool = False,
 ) -> ParameterSensitivityResult:
     """R1-B (PR #50): PromotionPipeline now recomputes the finite-variant
     count directly from ``rows`` (not just ``configs_tested``) to gate the
     sensitivity verdict -- see MIN_SENSITIVITY_SWEEP_VARIANTS. Defaults to
     populating ``rows`` with ``configs_tested`` finite-Sharpe entries (a
     well-powered sweep) unless ``n_finite_rows`` overrides that count, for
-    tests exercising the underpowered path specifically."""
+    tests exercising the underpowered path specifically.
+
+    Round-2 P1 fix: ``duplicate_params=True`` gives every row the SAME
+    ``params`` dict (as ``_resolve_frozen_grid`` permits when a param_grid
+    list contains repeated values), for tests exercising the dedupe-by-
+    normalized-params path -- distinct from ``n_finite_rows``, which still
+    produces DISTINCT params per row."""
     n_rows = configs_tested if n_finite_rows is None else n_finite_rows
     rows = [
         ParameterSensitivityRow(
-            params={"portfolio.n_long": 10 + i},
+            params={"portfolio.n_long": 10} if duplicate_params else {"portfolio.n_long": 10 + i},
             oos_sharpe=0.9,
             oos_max_drawdown=-0.10,
             trade_count=40,
@@ -441,6 +448,72 @@ def test_exactly_min_finite_variants_clears_the_underpowered_gate(db_url: str) -
         "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
+    assert result.evidence_json["sensitivity"]["underpowered"] is False
+    assert result.overall_passed is True
+
+
+# ── Round-2 (PR #50 Codex P1): duplicate param combinations must not count
+#    as distinct variants ────────────────────────────────────────────────
+
+
+def test_duplicate_param_variants_do_not_clear_the_underpowered_gate(db_url: str) -> None:
+    """_resolve_frozen_grid does not reject a param_grid list with repeated
+    values (e.g. {"portfolio.n_long": [10, 10, 10]}), so ParameterSweeper can
+    produce MIN_SENSITIVITY_SWEEP_VARIANTS-many finite rows that all share the
+    SAME params -- zero actual parameter-sensitivity testing occurred.
+    PromotionPipeline must dedupe by normalized params before comparing
+    against the threshold and refuse to pass overall_passed on that basis."""
+    from backtesting.validation.promotion_pipeline import MIN_SENSITIVITY_SWEEP_VARIANTS
+
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(
+            verdict="robust",
+            configs_tested=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            n_finite_rows=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            duplicate_params=True,
+        ),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.sensitivity_verdict == "robust"  # ParameterSweeper's own (uncorrected) verdict
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1  # deduped, not 3
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+    assert result.overall_passed is False
+
+
+def test_distinct_params_at_min_threshold_still_clears_after_dedupe(db_url: str) -> None:
+    """Sanity counterpart to the duplicate-params test: MIN_SENSITIVITY_SWEEP_VARIANTS
+    genuinely DISTINCT finite variants still dedupe down to the full count and
+    clear the gate -- the dedupe fix must not under-count real diversity."""
+    from backtesting.validation.promotion_pipeline import MIN_SENSITIVITY_SWEEP_VARIANTS
+
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(
+            verdict="robust",
+            configs_tested=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            n_finite_rows=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            duplicate_params=False,
+        ),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == MIN_SENSITIVITY_SWEEP_VARIANTS
     assert result.evidence_json["sensitivity"]["underpowered"] is False
     assert result.overall_passed is True
 
