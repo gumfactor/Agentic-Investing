@@ -31,7 +31,17 @@ from strategy_registry.registry import (
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 
-def _write_config(path: Path, *, version: int = 1, name: str = "test_strategy", weight: float = 1.0) -> Path:
+def _write_config(
+    path: Path,
+    *,
+    version: int = 1,
+    name: str = "test_strategy",
+    weight: float = 1.0,
+    start_date: str = "2022-01-01",
+    end_date: str = "2024-12-31",
+    initial_capital: float = 1000000.0,
+    n_long: int = 10,
+) -> Path:
     """Write a valid, complete strategy YAML."""
     config = {
         "version": version,
@@ -39,12 +49,12 @@ def _write_config(path: Path, *, version: int = 1, name: str = "test_strategy", 
         "description": f"Test strategy v{version}",
         "universe": {"source": "sp500"},
         "indicators": {"momentum": {"weight": weight, "score_col": "momentum_score"}},
-        "portfolio": {"method": "equal_weight", "n_long": 10, "max_position_weight": 0.1},
+        "portfolio": {"method": "equal_weight", "n_long": n_long, "max_position_weight": 0.1},
         "execution": {"fill_model": "perfect"},
         "backtest": {
-            "start_date": "2022-01-01",
-            "end_date": "2024-12-31",
-            "initial_capital": 1000000.0,
+            "start_date": start_date,
+            "end_date": end_date,
+            "initial_capital": initial_capital,
             "benchmark": "SPY",
         },
     }
@@ -87,6 +97,66 @@ def test_fingerprint_detects_logic_change(tmp_path: Path) -> None:
     p1 = _write_config(tmp_path / "a.yaml", weight=1.0)
     p2 = _write_config(tmp_path / "b.yaml", weight=0.5)
     assert fingerprint(str(p1)).config_hash != fingerprint(str(p2)).config_hash
+
+
+# ── identity vs. evaluation context (docs/plans/04-identity-evaluation-
+#    context-design.md, operator decision 2026-08-07, Option 1) ────────────
+
+
+def test_fingerprint_excludes_backtest_window_from_hash(tmp_path: Path) -> None:
+    """Two configs differing ONLY in backtest.start_date/end_date must hash
+    IDENTICALLY -- the evaluation window is context, not identity, so the
+    same frozen config_hash can be evaluated over train/OOS dates and then
+    again over the sealed holdout window."""
+    p1 = _write_config(
+        tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31"
+    )
+    p2 = _write_config(
+        tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31"
+    )
+    assert fingerprint(str(p1)).config_hash == fingerprint(str(p2)).config_hash
+
+
+def test_fingerprint_still_retains_backtest_dates_in_stored_config(tmp_path: Path) -> None:
+    """The date fields must remain in StrategyFingerprint.config (still
+    consumed/validated by backtesting.config_contract) -- only the HASH
+    excludes them, not the stored/returned canonical config."""
+    p = _write_config(tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31")
+    fp = fingerprint(str(p))
+    assert fp.config["backtest"]["start_date"] == "2022-01-01"
+    assert fp.config["backtest"]["end_date"] == "2022-12-31"
+
+
+def test_fingerprint_still_detects_real_param_change(tmp_path: Path) -> None:
+    """A real identity difference (portfolio.n_long) must still change the
+    hash -- the window exclusion must not blunt detection of genuine param
+    changes."""
+    p1 = _write_config(tmp_path / "a.yaml", n_long=10)
+    p2 = _write_config(tmp_path / "b.yaml", n_long=20)
+    assert fingerprint(str(p1)).config_hash != fingerprint(str(p2)).config_hash
+
+
+def test_fingerprint_still_detects_initial_capital_change(tmp_path: Path) -> None:
+    """backtest.initial_capital is a SIBLING of the two excluded date keys,
+    not itself excluded -- it remains part of identity."""
+    p1 = _write_config(tmp_path / "a.yaml", initial_capital=1_000_000.0)
+    p2 = _write_config(tmp_path / "b.yaml", initial_capital=2_000_000.0)
+    assert fingerprint(str(p1)).config_hash != fingerprint(str(p2)).config_hash
+
+
+def test_hash_config_excludes_backtest_window_and_data_version(tmp_path: Path) -> None:
+    """hash_config (the in-memory dict entry point TrialRecorder/
+    PromotionPipeline use) applies the same exclusions as fingerprint()."""
+    from strategy_registry.fingerprint import hash_config
+
+    base = yaml.safe_load(_write_config(tmp_path / "base.yaml").read_text())
+    windowed = dict(base)
+    windowed["backtest"] = dict(base["backtest"])
+    windowed["backtest"]["start_date"] = "2020-01-01"
+    windowed["backtest"]["end_date"] = "2021-01-01"
+    windowed["data_version"] = "a" * 64
+
+    assert hash_config(base) == hash_config(windowed)
 
 
 def test_fingerprint_derives_strategy_id(cfg: Path) -> None:

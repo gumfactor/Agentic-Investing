@@ -177,6 +177,7 @@ class StrategyRegistry:
                 rebalance_frequency=fp.rebalance_frequency,
                 config=fp.config,
                 source_path=fp.source_path,
+                fingerprint_algo_version=fp.fingerprint_algo_version,
                 created_at=now,
             )
             session.add(defn)
@@ -286,6 +287,7 @@ class StrategyRegistry:
                     rebalance_frequency=fp.rebalance_frequency,
                     config=fp.config,
                     source_path=fp.source_path,
+                    fingerprint_algo_version=fp.fingerprint_algo_version,
                     created_at=now,
                 )
                 session.add(defn)

@@ -50,6 +50,23 @@ class StrategyDefinition(Base):
     rebalance_frequency: Mapped[str | None] = mapped_column(Text)
     config: Mapped[dict[str, Any]] = mapped_column(sa.JSON, nullable=False)
     source_path: Mapped[str | None] = mapped_column(Text)
+    # 04-4W (migration 017): which strategy_registry.fingerprint.
+    # FINGERPRINT_ALGO_VERSION this row's config_hash was computed under.
+    # NOT NULL with server_default '1' so existing pre-migration rows are
+    # backfilled to 1 (the old algorithm, which included backtest.start_date/
+    # end_date in the hash) automatically at migration time -- every row
+    # written by the application from here on passes the current
+    # FINGERPRINT_ALGO_VERSION (2) explicitly (see
+    # strategy_registry.registry.StrategyRegistry.add_definition/register).
+    # This makes the operator's back-compat waiver (docs/plans/04-identity-
+    # evaluation-context-design.md) moot rather than merely declared: a
+    # pre-v2 row is DISTINGUISHABLE from a v2 row at the schema level, so a
+    # future recompute/migration (should this project ever approach live
+    # capital) is a straightforward filtered UPDATE rather than an
+    # undocumented assumption.
+    fingerprint_algo_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1"
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
 
     runs: Mapped[list[StrategyRun]] = relationship(
