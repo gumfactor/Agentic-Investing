@@ -157,6 +157,73 @@ class BacktestEngine:
         result = engine.run(config, data_handler, fill_simulator)
     """
 
+    @staticmethod
+    def validate_runnable(
+        config: dict,
+        data_handler: DataHandler,
+        fill_simulator: FillSimulator,
+    ) -> list[date]:
+        """The complete pre-data-read setup phase, run before ANY price is
+        read: config-contract validation, fill-simulator/config cost
+        agreement, and a non-empty resolved trading-date range for the
+        configured window.
+
+        This is the SINGLE source of truth for that setup phase (Codex
+        R4-A completion sweep,
+        ``docs/plans/04-4W-evaluation-window-threading-scope.md``). Before
+        this method existed, ``run()`` inlined these checks and
+        ``backtesting.validation.trial_recorder._preflight_holdout_viability``
+        hand-coded a second, independently-maintained copy of the same
+        checklist for the holdout one-shot-seal preflight -- and the copy
+        had already drifted (it never called
+        :func:`assert_fill_simulator_matches_config`, so a holdout config
+        whose ``execution``/``fill_model`` mismatched the evaluator's
+        ``FillSimulator`` passed preflight, the seal-committing row
+        inserted, and only then did ``run()`` raise
+        ``ExecutionConfigMismatchError`` before reading any prices --
+        permanently burning the one-shot holdout seal on a pre-look setup
+        error). Both ``run()`` (below) and
+        ``backtesting.validation.holdout_evaluator.SingleWindowEvaluator.
+        validate_runnable`` now call this ONE method, so the two checklists
+        cannot drift apart again: any future addition to the pre-data-read
+        setup phase is added here once and both callers pick it up.
+
+        Args:
+            config: Strategy configuration dict (loaded from YAML). Must
+                contain backtest.start_date, backtest.end_date, etc.
+            data_handler: PIT-safe data source.
+            fill_simulator: Transaction cost / fill model about to be used.
+
+        Returns:
+            The resolved list of trading dates in
+            ``[backtest.start_date, backtest.end_date]`` (non-empty), so a
+            caller that needs it (``run()``) does not have to recompute it.
+
+        Raises:
+            UnsupportedStrategyConfigError: ``config`` declares a field,
+                section, or value the backtest path does not implement
+                (Roadmap 02B / BUG-075, fail-closed -- see
+                ``backtesting/config_contract.py``).
+            ExecutionConfigMismatchError: ``config`` declares ``execution:``
+                cost parameters that differ from what ``fill_simulator``
+                will actually apply (02B round-2 P0-1) -- a backtest must
+                never carry cost-model labels that differ from the costs
+                actually simulated.
+            ValueError: No trading dates found in the configured range.
+        """
+        validate_backtest_config(config)
+        assert_fill_simulator_matches_config(config, fill_simulator)
+
+        bt_cfg = config["backtest"]
+        start = _parse_date(bt_cfg["start_date"])
+        end = _parse_date(bt_cfg["end_date"])
+
+        trading_dates = data_handler.trading_dates(start, end)
+        if not trading_dates:
+            raise ValueError(f"No trading dates found between {start} and {end}")
+
+        return trading_dates
+
     def run(
         self,
         config: dict,
@@ -186,8 +253,7 @@ class BacktestEngine:
                 never carry cost-model labels that differ from the costs
                 actually simulated.
         """
-        validate_backtest_config(config)
-        assert_fill_simulator_matches_config(config, fill_simulator)
+        trading_dates = self.validate_runnable(config, data_handler, fill_simulator)
 
         bt_cfg = config["backtest"]
         port_cfg = config["portfolio"]
@@ -200,10 +266,6 @@ class BacktestEngine:
         min_holding_days = int(port_cfg.get("min_holding_days", 0))
         max_position_weight = float(port_cfg.get("max_position_weight", 1.0))
         data_version = config.get("data_version", "")
-
-        trading_dates = data_handler.trading_dates(start, end)
-        if not trading_dates:
-            raise ValueError(f"No trading dates found between {start} and {end}")
 
         # O(1) held-days lookup: maps each sim date to its ordinal position.
         date_index: dict[date, int] = {d: i for i, d in enumerate(trading_dates)}

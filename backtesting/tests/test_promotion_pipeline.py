@@ -1942,3 +1942,102 @@ def test_holdout_confirmation_preflight_failure_does_not_burn_seal_and_retry_suc
     )
     assert len(trials) == 1
     assert trials[0].status == "completed"
+
+
+# ── PR #49 round-4 completion sweep (Codex R4-A): preflight = evaluator's own
+# pre-data-read setup, proven via a FillSimulator mismatch the OLD hand-coded
+# _preflight_holdout_viability checklist could never catch (it never called
+# assert_fill_simulator_matches_config) -- so a holdout config whose
+# execution/fill_model disagreed with the dispatched SingleWindowEvaluator's
+# FillSimulator used to sail through preflight, commit the seal-consuming
+# 'running' row, and only then blow up inside BacktestEngine.run with
+# ExecutionConfigMismatchError, permanently burning the one-shot seal on a
+# pre-look setup error. This is now caught in the preflight itself.
+
+
+def test_holdout_confirmation_fill_simulator_mismatch_does_not_burn_seal_and_retry_succeeds(
+    db_url: str, tmp_path: Path
+) -> None:
+    """The R4-A proof: a config declaring ``execution.fill_model: perfect``
+    dispatched against a SingleWindowEvaluator whose FillSimulator actually
+    applies ``transaction_cost`` costs must fail the preflight with
+    HoldoutEvaluationPreflightError -- BEFORE any strategy_trials/
+    promotion_decisions row commits -- because the preflight now delegates
+    to SingleWindowEvaluator.validate_runnable, which shares ONE
+    implementation with BacktestEngine.run (via
+    BacktestEngine.validate_runnable) rather than a second, independently
+    drifting checklist. A corrected retry (fill_simulator matching the
+    config) then succeeds and consumes the seal exactly once."""
+    from backtesting.engine.data_handler import DataHandler
+    from backtesting.engine.event_loop import BacktestEngine
+    from backtesting.engine.fill_simulator import FillSimulator
+    from backtesting.validation.holdout_evaluator import SingleWindowEvaluator
+    from backtesting.validation.trial_recorder import HoldoutEvaluationPreflightError
+
+    config_hash, hyp_id, data_handler = _seed_real_holdout_fixture(db_url, tmp_path)
+
+    # Config declares execution.fill_model="perfect" (see
+    # _write_holdout_promo_config), but this evaluator's FillSimulator will
+    # actually apply "transaction_cost" -- a genuine, real mismatch, not a
+    # mocked one.
+    mismatched_pipeline = PromotionPipeline(
+        db_url,
+        DATA_VERSION,
+        holdout_evaluator=SingleWindowEvaluator(
+            engine=BacktestEngine(),
+            fill_simulator=FillSimulator(fill_model="transaction_cost"),
+        ),
+        bootstrap_stress_fn=lambda *a, **kw: _stress_result("solid"),
+        n_reshuffles=10,
+    )
+
+    with pytest.raises(HoldoutEvaluationPreflightError):
+        mismatched_pipeline.run(
+            "v1_e2e_holdout",
+            config_hash,
+            data_handler=data_handler,
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
+        )
+
+    # No seal row, no promotion decision -- the mismatch was caught before
+    # anything committed.
+    assert (
+        mismatched_pipeline._trial_recorder.list_trials(
+            "v1_e2e_holdout", run_type="holdout_confirmation"
+        )
+        == []
+    )
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        decisions = list(
+            session.scalars(
+                select(PromotionDecision).where(PromotionDecision.strategy_id == "v1_e2e_holdout")
+            )
+        )
+    assert decisions == []
+
+    # A corrected retry -- fill_simulator now matches the config's declared
+    # execution.fill_model -- succeeds and consumes the seal exactly once.
+    retry_pipeline = PromotionPipeline(
+        db_url,
+        DATA_VERSION,
+        holdout_evaluator=SingleWindowEvaluator(
+            engine=BacktestEngine(), fill_simulator=FillSimulator(fill_model="perfect")
+        ),
+        bootstrap_stress_fn=lambda *a, **kw: _stress_result("solid"),
+        n_reshuffles=10,
+    )
+    result = retry_pipeline.run(
+        "v1_e2e_holdout",
+        config_hash,
+        data_handler=data_handler,
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+    assert result.promotion_decision_id is not None
+    trials = retry_pipeline._trial_recorder.list_trials(
+        "v1_e2e_holdout", run_type="holdout_confirmation"
+    )
+    assert len(trials) == 1
+    assert trials[0].status == "completed"

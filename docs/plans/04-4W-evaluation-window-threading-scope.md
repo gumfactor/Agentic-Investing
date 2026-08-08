@@ -107,7 +107,8 @@ Two independent bugs, both fixed here:
 ## 3. Numbering / coordination
 
 - This slice takes **migration 015**. The planned 04-5 `validated`-status
-  migration becomes **016** (update 04-5's spec when it starts).
+  migration shifts to **017** (see §5 below) now that migration **016** is
+  taken by the round-4 completion sweep.
 - No new roadmap PR: 04-4W lands **inside PR #49** per operator decision.
 - `holdout_mode` stays enabled (it was re-enabled with the identity fix); this
   slice makes it actually correct rather than re-gating it.
@@ -117,3 +118,57 @@ Two independent bugs, both fixed here:
 - No change to `config_hash` semantics (settled in the identity design doc).
 - No change to the train/OOS promotion evaluator or funnel/sensitivity/stress.
 - No `validated`-status work (that is 04-5).
+
+## 5. Round-4 completion sweep (PR #49 Codex round-4, bounded follow-up)
+
+Codex round-4 found two remaining surfaces of the SAME two defect classes
+this doc scoped in §1 -- not new classes, the record/evaluate side had not
+been closed out completely. Both are now closed:
+
+- **R4-B (Class 1: persist the window) extended to `strategy_runs`.** §2 W1
+  persisted `eval_start_date`/`eval_end_date` on `strategy_trials`
+  (migration 015). `strategy_runs` (`strategy_registry/models.py`) has
+  `data_version` but had no evaluation window, so two `backtest`/
+  `walk_forward` runs over different windows recorded under the same
+  `strategy_id`/`config_hash`/`data_version` were indistinguishable.
+  **Migration 016** (`infra/db/migrations/versions/016_strategy_run_eval_window.py`)
+  adds the same two nullable DATE columns to `strategy_runs`, mirroring
+  015 exactly. `StrategyRegistry.record_run` now requires
+  `eval_start_date`/`eval_end_date` (both non-null, start <= end) exactly
+  for `run_type in {'backtest', 'walk_forward'}` -- the same
+  `_REQUIRE_DATA_VERSION` set used for the existing C7 gate -- and leaves
+  them optional for `unit`/`signal_ic`/`paper`/`live`. The CLI
+  (`strategy_registry/cli.py record-run`) gained
+  `--eval-start-date`/`--eval-end-date`. `PromotionDecision` and MLflow
+  logging were left untouched (out of scope, per the original task scope:
+  `PromotionDecision` is a rollup over trials that already carry the
+  window; MLflow logging is a sink covered by the existing C7 data_version
+  gate).
+
+- **R4-A (Class 2: evaluator-owned preflight) closes the drift, not just the
+  one missing check.** §2 W2's holdout preflight
+  (`trial_recorder._preflight_holdout_viability`) hand-coded a checklist
+  that had to mirror `BacktestEngine.run`'s own pre-data-read setup, and it
+  had already drifted: it never called
+  `assert_fill_simulator_matches_config`, so a holdout config whose
+  `execution`/`fill_model` mismatched the dispatched evaluator's
+  `FillSimulator` passed preflight, the seal-committing row inserted, and
+  only then did `BacktestEngine.run` raise `ExecutionConfigMismatchError`
+  before reading any prices -- permanently burning the one-shot seal on a
+  pre-look setup error. The fix extracts that setup phase (config-contract
+  validation + fill-simulator/config agreement + non-empty resolved
+  trading dates) into **one shared method**,
+  `BacktestEngine.validate_runnable(config, data_handler, fill_simulator)`
+  (`backtesting/engine/event_loop.py`), which `BacktestEngine.run` itself
+  now calls instead of duplicating the checks.
+  `SingleWindowEvaluator.validate_runnable(config, data_handler)`
+  (`backtesting/validation/holdout_evaluator.py`) delegates to that same
+  method using the evaluator's OWN `self._engine`/`self._fill_sim`, so
+  whatever setup THIS evaluator's engine performs before its first look is
+  exactly what gets verified. `trial_recorder.run_walk_forward`'s
+  `pre_insert_check` now delegates to the dispatched validator's
+  `validate_runnable` (duck-typed via `hasattr`) when available, wrapping
+  whatever it raises into `HoldoutEvaluationPreflightError`, and falls back
+  to the hand-coded `_preflight_holdout_viability` only for a validator
+  that does not provide one (e.g. a test double) -- so the two checklists
+  can no longer independently drift for any real dispatch path.

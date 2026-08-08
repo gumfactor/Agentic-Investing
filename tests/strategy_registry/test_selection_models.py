@@ -33,7 +33,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateTable
 
-from strategy_registry.models import Base, StrategyDefinition
+from strategy_registry.models import Base, StrategyDefinition, StrategyRun
 from strategy_registry.selection_models import (
     PromotionDecision,
     ResearchDataWindow,
@@ -170,6 +170,90 @@ def test_strategy_trial_model_has_eval_window_columns_matching_migration_015(
 
     inspector = inspect(engine)
     columns = {c["name"]: c for c in inspector.get_columns("strategy_trials")}
+    assert "eval_start_date" in columns
+    assert "eval_end_date" in columns
+    assert columns["eval_start_date"]["nullable"] is True
+    assert columns["eval_end_date"]["nullable"] is True
+
+
+# ── Migration 016 (PR #49 round-4 sweep, Codex R4-B: strategy_runs eval window) ─
+
+
+def _migration_016_module():
+    return importlib.import_module(
+        "infra.db.migrations.versions.016_strategy_run_eval_window"
+    )
+
+
+def test_revision_016_chains_after_015() -> None:
+    mod = _migration_016_module()
+    assert mod.revision == "016"
+    assert mod.down_revision == "015"
+
+
+def test_upgrade_and_downgrade_functions_exist_016() -> None:
+    mod = _migration_016_module()
+    assert callable(mod.upgrade)
+    assert callable(mod.downgrade)
+
+
+def test_no_other_migration_claims_revision_016() -> None:
+    """Mirrors test_no_other_migration_claims_revision_015 -- guards against a
+    duplicate revision id."""
+    versions_dir = (
+        Path(__file__).resolve().parents[2] / "infra" / "db" / "migrations" / "versions"
+    )
+    claimants = []
+    for path in sorted(versions_dir.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("revision") and '"016"' in stripped:
+                claimants.append(path.name)
+                break
+    assert claimants == ["016_strategy_run_eval_window.py"], claimants
+
+
+def test_migration_016_adds_eval_window_columns_via_alembic_ops(monkeypatch) -> None:
+    """Mirrors test_migration_015_adds_eval_window_columns_via_alembic_ops --
+    proves upgrade() adds exactly eval_start_date/eval_end_date as nullable
+    DATE columns on strategy_runs via op.add_column (never a raw ALTER
+    TABLE, per C2), and downgrade() drops them in reverse order."""
+    mod = _migration_016_module()
+
+    added: list[tuple[str, str, bool]] = []
+    dropped: list[tuple[str, str]] = []
+
+    def _fake_add_column(table_name, column):
+        added.append((table_name, column.name, column.nullable))
+
+    def _fake_drop_column(table_name, column_name):
+        dropped.append((table_name, column_name))
+
+    monkeypatch.setattr(mod.op, "add_column", _fake_add_column)
+    monkeypatch.setattr(mod.op, "drop_column", _fake_drop_column)
+
+    mod.upgrade()
+    assert added == [
+        ("strategy_runs", "eval_start_date", True),
+        ("strategy_runs", "eval_end_date", True),
+    ]
+
+    mod.downgrade()
+    assert dropped == [
+        ("strategy_runs", "eval_end_date"),
+        ("strategy_runs", "eval_start_date"),
+    ]
+
+
+def test_strategy_run_model_has_eval_window_columns_matching_migration_016(
+    engine,
+) -> None:
+    """Model-vs-migration parity: StrategyRun's eval_start_date/eval_end_date
+    columns must exist on the create_all()-built table, be DATE-typed, and
+    nullable -- matching migration 016's op.add_column calls exactly."""
+    inspector = inspect(engine)
+    columns = {c["name"]: c for c in inspector.get_columns("strategy_runs")}
     assert "eval_start_date" in columns
     assert "eval_end_date" in columns
     assert columns["eval_start_date"]["nullable"] is True

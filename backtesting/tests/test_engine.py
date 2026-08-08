@@ -334,6 +334,67 @@ def test_engine_no_dates_raises():
 
 
 # ------------------------------------------------------------------
+# BacktestEngine.validate_runnable — the shared pre-data-read setup
+# (PR #49 round-4 completion sweep, Codex R4-A): run() must delegate to
+# this SAME method rather than duplicating the checklist, so the two never
+# drift apart again.
+# ------------------------------------------------------------------
+
+def test_validate_runnable_returns_trading_dates_and_matches_run():
+    prices = _make_prices(30, ["AAPL"])
+    signals = _make_signals(30, ["AAPL"])
+    benchmark = _make_benchmark(30)
+    handler = DataHandler(prices, signals, benchmark)
+    config = _make_config("2023-01-02", "2023-01-31")
+    fill_sim = FillSimulator(fill_model="perfect")
+    engine = BacktestEngine()
+
+    trading_dates = engine.validate_runnable(config, handler, fill_sim)
+    assert len(trading_dates) > 0
+    assert trading_dates == handler.trading_dates(date(2023, 1, 2), date(2023, 1, 31))
+
+    # run() must still succeed unchanged (behavior-preserving extraction).
+    result = engine.run(config, handler, fill_sim)
+    assert len(result.nav_series) == len(trading_dates)
+
+
+def test_validate_runnable_no_dates_raises():
+    prices = _make_prices(5, ["AAPL"])
+    signals = _make_signals(5, ["AAPL"])
+    benchmark = _make_benchmark(5)
+    handler = DataHandler(prices, signals, benchmark)
+    config = _make_config("2025-01-01", "2025-12-31")
+    fill_sim = FillSimulator(fill_model="perfect")
+    engine = BacktestEngine()
+    with pytest.raises(ValueError, match="No trading dates"):
+        engine.validate_runnable(config, handler, fill_sim)
+
+
+def test_validate_runnable_catches_fill_simulator_mismatch_before_dates_read():
+    """validate_runnable must run assert_fill_simulator_matches_config --
+    the exact check the old hand-coded holdout preflight checklist was
+    missing (Codex R4-A) -- and it must do so even against a config/
+    data_handler pair that otherwise has plenty of trading dates, since the
+    whole point is to catch this BEFORE any data is read."""
+    from backtesting.config_contract import ExecutionConfigMismatchError
+
+    prices = _make_prices(30, ["AAPL"])
+    signals = _make_signals(30, ["AAPL"])
+    benchmark = _make_benchmark(30)
+    handler = DataHandler(prices, signals, benchmark)
+    config = _make_config("2023-01-02", "2023-01-31")  # declares fill_model=perfect
+    mismatched_fill_sim = FillSimulator(fill_model="transaction_cost")
+    engine = BacktestEngine()
+
+    with pytest.raises(ExecutionConfigMismatchError):
+        engine.validate_runnable(config, handler, mismatched_fill_sim)
+
+    # run() raises the identical error for the identical reason.
+    with pytest.raises(ExecutionConfigMismatchError):
+        engine.run(config, handler, mismatched_fill_sim)
+
+
+# ------------------------------------------------------------------
 # _select_equal_weight — max_position_weight
 # ------------------------------------------------------------------
 

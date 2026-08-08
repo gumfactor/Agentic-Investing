@@ -392,8 +392,9 @@ class TrialRecorder:
         def _dispatch(dispatch_config: dict) -> WalkForwardResult:
             return validator.run(dispatch_config, data_handler, **run_kwargs)
 
-        # 04-4W W2 bug 2 fix: a data-sufficiency + config-viability preflight
-        # for a final_holdout_confirmation=True request, invoked by
+        # 04-4W W2 bug 2 fix (round-4 completion sweep, Codex R4-A): a
+        # data-sufficiency + config-viability preflight for a
+        # final_holdout_confirmation=True request, invoked by
         # _run_and_record AFTER _enforce_holdout_guard's policy checks
         # (window registered, range contained, seal not already consumed)
         # but BEFORE the seal-committing 'running' row insert -- both still
@@ -406,16 +407,60 @@ class TrialRecorder:
         # hook, a setup/insufficient-data error inside the wrapped
         # validator.run (dispatched AFTER the insert, in Step 2) would still
         # have already burned the one-shot seal, permanently blocking even a
-        # corrected retry. See _preflight_holdout_viability's docstring for
-        # the exact "availability/shape only, never a look at returns"
-        # boundary this preflight is not allowed to cross. Scoped to
-        # final_holdout_confirmation only -- a train_oos run consumes no
-        # seal, so there is nothing here for it to prematurely burn.
-        pre_insert_check = (
-            (lambda: _preflight_holdout_viability(config, data_handler))
-            if final_holdout_confirmation
-            else None
-        )
+        # corrected retry.
+        #
+        # R4-A: the checklist previously hand-coded here
+        # (_preflight_holdout_viability) was an independently-maintained
+        # copy of BacktestEngine.run's own pre-data-read setup, and it had
+        # already drifted -- it never called
+        # assert_fill_simulator_matches_config, so a holdout config whose
+        # execution/fill_model mismatched the dispatched evaluator's
+        # FillSimulator passed preflight, the seal committed, and only then
+        # did the evaluator raise ExecutionConfigMismatchError -- burning
+        # the one-shot seal on a pre-look setup error. When the dispatched
+        # validator exposes its own `validate_runnable(config, data_handler)`
+        # (duck-typed: SingleWindowEvaluator does, via
+        # BacktestEngine.validate_runnable using ITS OWN engine/fill_sim),
+        # delegate to that instead -- it is by construction exactly the
+        # setup the validator's own `.run()` will perform, so it cannot
+        # drift from it. Fall back to the hand-coded checklist only for a
+        # validator that does not provide one (e.g. a test double), so
+        # existing callers keep working.
+        pre_insert_check: Optional[Callable[[], None]] = None
+        if final_holdout_confirmation:
+            if hasattr(validator, "validate_runnable"):
+
+                def pre_insert_check(
+                    _validator: Any = validator,
+                    _config: dict = config,
+                    _data_handler: DataHandler = data_handler,
+                ) -> None:
+                    try:
+                        _validator.validate_runnable(_config, _data_handler)
+                    except HoldoutEvaluationPreflightError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 -- any setup
+                        # failure from the evaluator's own pre-data-read
+                        # setup (config-contract violation, fill-simulator
+                        # mismatch, no trading dates) is a SETUP problem,
+                        # not a code bug; wrap it uniformly so callers have
+                        # one exception type to catch for "this holdout
+                        # attempt never got to run".
+                        raise HoldoutEvaluationPreflightError(
+                            "Holdout confirmation preflight failed: the "
+                            "dispatched evaluator's own pre-data-read setup "
+                            f"rejected this config/data_handler "
+                            f"({type(exc).__name__}: {exc}). This is a SETUP "
+                            "failure caught before the one-shot holdout "
+                            "seal is consumed -- no holdout data was read. "
+                            "Fix the issue and retry; the seal remains "
+                            "unconsumed."
+                        ) from exc
+
+            else:
+                pre_insert_check = (
+                    lambda: _preflight_holdout_viability(config, data_handler)
+                )
 
         return self._run_and_record(
             _dispatch,

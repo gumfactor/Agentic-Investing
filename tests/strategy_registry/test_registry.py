@@ -5,6 +5,7 @@ Covers the definition layer, lifecycle layer, and run recording layer.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -518,8 +519,11 @@ def test_get_not_found_raises(registry: StrategyRegistry) -> None:
 
 def test_record_run_requires_definition(registry: StrategyRegistry) -> None:
     with pytest.raises(DefinitionNotFoundError):
-        registry.record_run("v1_test_strategy", "a" * 64, "backtest", "passed",
-                            data_version="snap/v1")
+        registry.record_run(
+            "v1_test_strategy", "a" * 64, "backtest", "passed",
+            data_version="snap/v1",
+            eval_start_date=date(2022, 7, 11), eval_end_date=date(2023, 12, 31),
+        )
 
 
 def test_record_run_backtest_requires_data_version(
@@ -560,9 +564,97 @@ def test_record_run_backtest_success(registry: StrategyRegistry, cfg: Path) -> N
         data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
         metrics={"sharpe_ratio": 0.82, "annualized_return": 0.14, "max_drawdown": -0.09},
         mlflow_run_id="abc123",
+        eval_start_date=date(2022, 7, 11),
+        eval_end_date=date(2023, 12, 31),
     )
     assert run.id is not None
     assert run.metrics["sharpe_ratio"] == 0.82
+    assert run.eval_start_date == date(2022, 7, 11)
+    assert run.eval_end_date == date(2023, 12, 31)
+
+
+def test_record_run_backtest_requires_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """PR #49 round-4 sweep (Codex R4-B): backtest/walk_forward runs must
+    carry the effective evaluation window now that it is excluded from
+    config_hash, mirroring the existing C7 data_version requirement."""
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="eval_start_date and eval_end_date are required"):
+        registry.record_run(
+            s.strategy_id, s.canonical_config_hash, "backtest", "passed",
+            data_version="snap/v1",
+        )
+
+
+def test_record_run_walk_forward_requires_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="eval_start_date and eval_end_date are required"):
+        registry.record_run(
+            s.strategy_id, s.canonical_config_hash, "walk_forward", "passed",
+            data_version="snap/v1",
+        )
+
+
+def test_record_run_rejects_reversed_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="reversed evaluation window"):
+        registry.record_run(
+            s.strategy_id, s.canonical_config_hash, "backtest", "passed",
+            data_version="snap/v1",
+            eval_start_date=date(2023, 12, 31),
+            eval_end_date=date(2022, 7, 11),
+        )
+
+
+def test_record_run_paper_and_unit_do_not_require_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Non-window-scoped run_types stay optional (unit/signal_ic/paper/live)."""
+    registry.register(str(cfg))
+    registry.transition("v1_test_strategy", StrategyStatus.PAPER)
+    s = registry.get("v1_test_strategy")
+    run = registry.record_run(
+        s.strategy_id, s.canonical_config_hash, "paper", "passed", metrics={"pnl": 0.0},
+    )
+    assert run.eval_start_date is None
+    assert run.eval_end_date is None
+
+
+def test_record_run_persists_eval_dates_and_distinguishes_windows(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Two backtest runs recorded over different windows under the SAME
+    (strategy_id, config_hash, data_version) are now distinguishable and
+    reconstructable from the stored eval_start_date/eval_end_date -- the
+    property the hash used to provide before the window left it (PR #49
+    round-4 sweep, Codex R4-B)."""
+    s = registry.register(str(cfg))
+    run_a = registry.record_run(
+        s.strategy_id, s.canonical_config_hash, "backtest", "passed",
+        data_version="snap/v1",
+        eval_start_date=date(2022, 7, 11), eval_end_date=date(2023, 6, 30),
+    )
+    run_b = registry.record_run(
+        s.strategy_id, s.canonical_config_hash, "backtest", "passed",
+        data_version="snap/v1",
+        eval_start_date=date(2023, 7, 1), eval_end_date=date(2024, 12, 31),
+    )
+    assert run_a.eval_start_date == date(2022, 7, 11)
+    assert run_a.eval_end_date == date(2023, 6, 30)
+    assert run_b.eval_start_date == date(2023, 7, 1)
+    assert run_b.eval_end_date == date(2024, 12, 31)
+    assert (run_a.eval_start_date, run_a.eval_end_date) != (
+        run_b.eval_start_date,
+        run_b.eval_end_date,
+    )
+
+    runs = registry.get_runs(s.strategy_id, run_type="backtest")
+    assert {r.id for r in runs} == {run_a.id, run_b.id}
 
 
 def test_record_run_signal_ic_no_data_version_required(
@@ -706,9 +798,11 @@ def test_get_runs_filters(registry: StrategyRegistry, cfg: Path) -> None:
     registry.record_run(s.strategy_id, s.canonical_config_hash, "signal_ic", "passed",
                         metrics={"ic": 0.05})
     registry.record_run(s.strategy_id, s.canonical_config_hash, "backtest", "passed",
-                        data_version="snap/v1", metrics={"sharpe": 0.8})
+                        data_version="snap/v1", metrics={"sharpe": 0.8},
+                        eval_start_date=date(2022, 7, 11), eval_end_date=date(2023, 12, 31))
     registry.record_run(s.strategy_id, s.canonical_config_hash, "backtest", "failed",
-                        data_version="snap/v2")
+                        data_version="snap/v2",
+                        eval_start_date=date(2022, 7, 11), eval_end_date=date(2024, 12, 31))
 
     all_runs = registry.get_runs(s.strategy_id)
     assert len(all_runs) == 3

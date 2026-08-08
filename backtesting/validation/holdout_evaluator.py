@@ -96,6 +96,42 @@ class SingleWindowEvaluator:
         self._engine = engine or BacktestEngine()
         self._fill_sim = fill_simulator or FillSimulator()
 
+    def validate_runnable(self, config: dict, data_handler: DataHandler) -> None:
+        """Run THIS evaluator's own complete pre-data-read setup, without
+        actually evaluating anything (Codex R4-A completion sweep).
+
+        Delegates to :meth:`BacktestEngine.validate_runnable` using this
+        evaluator's OWN ``self._engine``/``self._fill_sim`` -- the exact
+        engine and fill simulator :meth:`run` below will use -- so whatever
+        setup THIS evaluator's engine performs before its first price read
+        is exactly what gets verified here. This is what lets
+        ``backtesting.validation.trial_recorder`` run a holdout
+        one-shot-seal preflight that can never drift from the evaluator it
+        is actually about to dispatch to: the preflight and the dispatch
+        share one implementation, not two hand-maintained copies of the
+        same checklist.
+
+        Only checks availability/SHAPE of the configured window's data
+        (config validity, fill-simulator/config cost agreement, and a
+        non-empty resolved trading-date range) -- it never reads a price or
+        a return, so calling this does not itself constitute "a look" at
+        the data for one-shot-seal purposes.
+
+        Args:
+            config: Strategy config dict; ``config['backtest']['start_date']``/
+                ``['end_date']`` define the window checked.
+            data_handler: Must cover the checked date range to pass.
+
+        Raises:
+            UnsupportedStrategyConfigError: ``config`` declares a field the
+                backtest path does not implement.
+            ExecutionConfigMismatchError: ``config``'s declared
+                ``execution:`` parameters do not match what this
+                evaluator's ``FillSimulator`` will actually apply.
+            ValueError: No trading dates in the configured range.
+        """
+        self._engine.validate_runnable(config, data_handler, self._fill_sim)
+
     def run(
         self,
         config: dict,

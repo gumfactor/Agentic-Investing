@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import date
 
 from strategy_registry.registry import (
     StrategyStatus,
@@ -154,6 +155,12 @@ def cmd_record_run(args: argparse.Namespace) -> None:
         if not isinstance(metrics, dict):
             print("ERROR: --metrics-json must contain a JSON object.", file=sys.stderr)
             sys.exit(1)
+    eval_start_date = (
+        date.fromisoformat(args.eval_start_date) if args.eval_start_date else None
+    )
+    eval_end_date = (
+        date.fromisoformat(args.eval_end_date) if args.eval_end_date else None
+    )
     run = reg.record_run(
         strategy_id=args.strategy_id,
         config_hash=args.config_hash,
@@ -164,6 +171,8 @@ def cmd_record_run(args: argparse.Namespace) -> None:
         artifact_path=args.artifact_path,
         mlflow_run_id=args.mlflow_run_id,
         notes=args.notes,
+        eval_start_date=eval_start_date,
+        eval_end_date=eval_end_date,
     )
     print(f"Run recorded (id={run.id}) for '{run.strategy_id}' {run.run_type!r} status={run.status!r}")
 
@@ -324,6 +333,16 @@ def main() -> None:
         dest="run_status",
     )
     p.add_argument("--data-version", default=None, help="MLflow manifest path (required for backtest/walk_forward, C7)")
+    p.add_argument(
+        "--eval-start-date",
+        default=None,
+        help="Effective evaluation window start date (YYYY-MM-DD); required for backtest/walk_forward",
+    )
+    p.add_argument(
+        "--eval-end-date",
+        default=None,
+        help="Effective evaluation window end date (YYYY-MM-DD); required for backtest/walk_forward",
+    )
     p.add_argument("--metrics-json", default=None, help="Path to JSON file with metrics dict")
     p.add_argument("--artifact-path", default=None)
     p.add_argument("--mlflow-run-id", default=None)

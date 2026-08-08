@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
+from datetime import date, datetime
+from typing import Any, Optional
 
 import sqlalchemy as sa
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Date,
     ForeignKeyConstraint,
     Identity,
     Index,
@@ -156,6 +157,18 @@ class StrategyRun(Base):
     run_type: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     data_version: Mapped[str | None] = mapped_column(Text)
+    # PR #49 round-4 completion sweep (Codex R4-B, migration 016): the
+    # EFFECTIVE evaluation date range this run actually ran over, mirroring
+    # StrategyTrial.eval_start_date/eval_end_date (migration 015,
+    # strategy_registry/selection_models.py). Nullable only for the same
+    # documented legacy-backfill reason as that column -- existing pre-016
+    # rows have no value and are never backfilled here; every backtest/
+    # walk_forward row StrategyRegistry.record_run inserts going forward
+    # carries a non-NULL pair (enforced by the writer, not a DB CHECK --
+    # see migration 016's docstring). Optional for unit/signal_ic/paper/
+    # live run types, which are not window-scoped evaluations.
+    eval_start_date: Mapped[Optional[date]] = mapped_column(Date)
+    eval_end_date: Mapped[Optional[date]] = mapped_column(Date)
     metrics: Mapped[dict[str, Any]] = mapped_column(sa.JSON, nullable=False, default=dict)
     artifact_path: Mapped[str | None] = mapped_column(Text)
     mlflow_run_id: Mapped[str | None] = mapped_column(Text)
