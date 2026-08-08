@@ -66,19 +66,23 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
   resolved policy's correctness bar (C7 data-version pinning already
   guarantees byte-identical inputs across re-runs) while deferring the
   actual compute-cost optimization to a later slice if it is ever needed.
-- **holdout_mode is GATED/DEFERRED (not yet supported)**: a promoted
-  strategy's ``config_hash`` INCLUDES its ``backtest.start_date``/
-  ``end_date``, so the frozen winner's config cannot be re-evaluated over
-  the sealed holdout window without changing its hash -- holdout
-  confirmation as previously built either fails the holdout guard or
-  silently confirms a DIFFERENT config than the frozen winner. Pending an
-  identity/evaluation-context design decision (see
-  ``docs/plans/04-identity-evaluation-context-design.md``), ``run(...,
-  holdout_mode=True)`` now fails closed immediately with
-  :class:`HoldoutConfirmationNotSupportedError`, before any instrument or
-  DB work happens. The parameter is kept on the signature for callers/
-  tests that reference it. The train/OOS (``holdout_mode=False``) path
-  described below is unaffected and fully supported.
+- **holdout_mode is GATED/DEFERRED (not yet supported)**: as of
+  ``docs/plans/04-identity-evaluation-context-design.md`` (operator
+  decision, Option 1) and its 04-4W implementation, a promoted strategy's
+  ``config_hash`` EXCLUDES its ``backtest.start_date``/``end_date`` --
+  identity and evaluation window are separate, so the frozen winner CAN in
+  principle be re-evaluated over the sealed holdout window without
+  changing its hash. What is still missing is the seal-safe,
+  holdout-appropriate evaluation machinery itself (a single-fixed-window
+  evaluator distinct from the fold-based ``WalkForwardValidator``, and the
+  preflight that keeps a setup failure from prematurely consuming the
+  one-shot holdout seal) -- that work is deferred to slice 04-4H, which
+  builds on top of 04-4W. Until then, ``run(..., holdout_mode=True)`` fails
+  closed immediately with :class:`HoldoutConfirmationNotSupportedError`,
+  before any instrument or DB work happens. The parameter is kept on the
+  signature for callers/tests that reference it. The train/OOS
+  (``holdout_mode=False``) path described below is unaffected and fully
+  supported.
 - **evaluation window is a required, explicit per-measurement input
   (04-4W)**: ``run()`` requires an ``eval_window: EvaluationWindow``
   argument. It is threaded to ``TrialRecorder.run_walk_forward``/
@@ -236,17 +240,19 @@ class MissingParameterGridError(PromotionPipelineError):
 class HoldoutConfirmationNotSupportedError(PromotionPipelineError):
     """Raised immediately when ``run(..., holdout_mode=True)`` is called.
 
-    Holdout confirmation is DEFERRED: a promoted strategy's
-    ``config_hash`` includes its ``backtest.start_date``/``end_date``, so
-    the frozen winner's config cannot be re-evaluated over the sealed
-    holdout window without changing its hash -- holdout confirmation as
-    previously built either fails the holdout guard or silently confirms
-    a DIFFERENT config than the frozen winner. This is gated fail-closed
-    pending an identity/evaluation-context design decision -- see
-    ``docs/plans/04-identity-evaluation-context-design.md``. The
-    ``holdout_mode`` parameter is kept on ``run()`` so existing callers/
-    tests referencing it still import; it now always raises before any
-    instrument or DB work happens.
+    Holdout confirmation is DEFERRED: as of 04-4W, a promoted strategy's
+    ``config_hash`` EXCLUDES its ``backtest.start_date``/``end_date`` (see
+    ``docs/plans/04-identity-evaluation-context-design.md``, operator
+    decision, Option 1) -- so the frozen winner CAN in principle be
+    re-evaluated over the sealed holdout window without changing its hash.
+    What remains missing is the seal-safe, holdout-appropriate evaluation
+    machinery itself (a single-fixed-window evaluator, and the preflight
+    that keeps a setup failure from prematurely consuming the one-shot
+    holdout seal), deferred to slice 04-4H, which builds on top of 04-4W.
+    This is gated fail-closed until that slice lands. The ``holdout_mode``
+    parameter is kept on ``run()`` so existing callers/tests referencing it
+    still import; it now always raises before any instrument or DB work
+    happens.
     """
 
 
@@ -484,12 +490,13 @@ class PromotionPipeline:
         if holdout_mode:
             raise HoldoutConfirmationNotSupportedError(
                 "PromotionPipeline.run(holdout_mode=True) is not yet "
-                "supported: a promoted strategy's config_hash includes its "
+                "supported: as of 04-4W, config_hash EXCLUDES "
                 "backtest.start_date/end_date, so the frozen winner's "
-                "config cannot be re-evaluated over the sealed holdout "
-                "window without changing its hash. Holdout confirmation is "
-                "deferred pending an identity/evaluation-context design "
-                "decision -- see "
+                "config CAN in principle be re-evaluated over the sealed "
+                "holdout window without changing its hash -- but the "
+                "seal-safe, holdout-appropriate evaluation machinery "
+                "itself is not yet built. Holdout confirmation is deferred "
+                "to slice 04-4H -- see "
                 "docs/plans/04-identity-evaluation-context-design.md. Use "
                 "holdout_mode=False (the train/OOS path) for now."
             )
