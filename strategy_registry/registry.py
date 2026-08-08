@@ -681,6 +681,21 @@ class StrategyRegistry:
                     f"indistinguishable now that the window is excluded from "
                     f"config_hash. Pass the effective evaluation window."
                 )
+        elif (eval_start_date is None) != (eval_end_date is None):
+            # PR #50 Codex round-6 fix (P2): eval_start_date/eval_end_date
+            # are OPTIONAL for unit/signal_ic/paper/live (not window-scoped
+            # evaluations), but a CALLER can still supply them -- and until
+            # this check, supplying only one endpoint silently persisted an
+            # incomplete/meaningless pair (the column is nullable, so no DB
+            # constraint would catch it either).
+            raise ValueError(
+                f"eval_start_date and eval_end_date must both be provided or "
+                f"both omitted for run_type='{run_type}' -- got "
+                f"eval_start_date={eval_start_date!r}, "
+                f"eval_end_date={eval_end_date!r}."
+            )
+
+        if eval_start_date is not None and eval_end_date is not None:
             # PR #50 Codex round-5 fix (P2): record_run is a public API a
             # caller can reach without going through EvaluationWindow (the
             # only other current caller, TrialRecorder, always derives
@@ -694,6 +709,15 @@ class StrategyRegistry:
             # rejects only at the DB write. Reuse EvaluationWindow's own
             # date-vs-datetime guard (require_date) rather than a second,
             # possibly-drifting copy of the same check.
+            #
+            # PR #50 Codex round-6 fix (P2, same review round as the
+            # incomplete-pair check above): this type-and-order check now
+            # runs whenever BOTH dates are present, regardless of run_type
+            # -- previously it only ran inside the required-run-type
+            # branch, so a caller supplying both dates for an OPTIONAL
+            # run_type (e.g. run_type="paper") with eval_start_date after
+            # eval_end_date, or as datetime/string values, persisted a
+            # reversed or mistyped range with no check at all.
             require_date("eval_start_date", eval_start_date)
             require_date("eval_end_date", eval_end_date)
             if eval_start_date > eval_end_date:

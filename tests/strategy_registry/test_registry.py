@@ -696,6 +696,116 @@ def test_record_run_signal_ic_no_data_version_required(
     assert run.run_type == "signal_ic"
 
 
+# ── PR #50 Codex round-6 (P2): eval_start_date/eval_end_date are OPTIONAL
+#    for non-window-scoped run types, but if a caller supplies them at all
+#    they must still be validated -- an incomplete pair or a reversed/
+#    mistyped pair was previously persisted silently ─────────────────────
+
+
+def test_record_run_optional_run_type_accepts_no_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Baseline: omitting both eval dates entirely for an optional run_type
+    still works (unaffected by the round-6 fix)."""
+    s = registry.register(str(cfg))
+    run = registry.record_run(
+        strategy_id=s.strategy_id,
+        config_hash=s.canonical_config_hash,
+        run_type="signal_ic",
+        status="passed",
+        metrics={"ic_mean": 0.05},
+    )
+    assert run.eval_start_date is None
+    assert run.eval_end_date is None
+
+
+def test_record_run_optional_run_type_accepts_full_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Baseline: supplying a valid, complete pair for an optional run_type
+    still works."""
+    s = registry.register(str(cfg))
+    run = registry.record_run(
+        strategy_id=s.strategy_id,
+        config_hash=s.canonical_config_hash,
+        run_type="signal_ic",
+        status="passed",
+        metrics={"ic_mean": 0.05},
+        eval_start_date=date(2022, 1, 1),
+        eval_end_date=date(2022, 12, 31),
+    )
+    assert run.eval_start_date == date(2022, 1, 1)
+    assert run.eval_end_date == date(2022, 12, 31)
+
+
+def test_record_run_optional_run_type_rejects_incomplete_eval_window_start_only(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="must both be provided or both omitted"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_start_date=date(2022, 1, 1),
+        )
+
+
+def test_record_run_optional_run_type_rejects_incomplete_eval_window_end_only(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="must both be provided or both omitted"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_end_date=date(2022, 12, 31),
+        )
+
+
+def test_record_run_optional_run_type_rejects_reversed_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Codex's exact example: record_run(..., run_type="paper",
+    eval_start_date after eval_end_date) previously persisted a reversed
+    range silently, since the reversed-window check only ran inside the
+    required-run-type branch."""
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="reversed evaluation window"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_start_date=date(2026, 8, 8),
+            eval_end_date=date(2026, 8, 1),
+        )
+
+
+def test_record_run_optional_run_type_rejects_datetime_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    from datetime import datetime
+
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_start_date=datetime(2022, 1, 1),  # type: ignore[arg-type]
+            eval_end_date=date(2022, 12, 31),
+        )
+
+
 def test_record_run_pre_registration(
     registry: StrategyRegistry, cfg: Path
 ) -> None:

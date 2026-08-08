@@ -191,12 +191,26 @@ def _sweep_result(
     ``params`` dict (as ``_resolve_frozen_grid`` permits when a param_grid
     list contains repeated values), for tests exercising the dedupe-by-
     normalized-params path -- distinct from ``n_finite_rows``, which still
-    produces DISTINCT params per row."""
+    produces DISTINCT params per row.
+
+    Round-6 fix: PromotionPipeline now recomputes verdict/mean/std/
+    positive_fraction itself from the (deduped) rows via
+    summarize_variants, rather than trusting this object's own verdict=
+    field -- so when ``verdict="curve_fit"`` is requested, the per-row
+    ``oos_sharpe`` values alternate between a high and a deeply negative
+    value (wide dispersion, std > the 0.5 default max_sharpe_std) so a
+    REAL recomputation over these rows also independently lands on
+    curve_fit, not just this object's cosmetic label."""
     n_rows = configs_tested if n_finite_rows is None else n_finite_rows
+    sharpes = (
+        [2.0 if i % 2 == 0 else -2.0 for i in range(n_rows)]
+        if verdict == "curve_fit"
+        else [0.9] * n_rows
+    )
     rows = [
         ParameterSensitivityRow(
             params={"portfolio.n_long": 10} if duplicate_params else {"portfolio.n_long": 10 + i},
-            oos_sharpe=0.9,
+            oos_sharpe=sharpes[i],
             oos_max_drawdown=-0.10,
             trade_count=40,
             avg_is_sharpe=1.0,
@@ -669,6 +683,89 @@ def test_ancestor_descendant_grid_paths_collapse_to_same_effective_config(db_url
     assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
 
 
+def test_duplicated_winner_does_not_mask_two_distinct_losers(db_url: str) -> None:
+    """Round-6 (PR #50 Codex P1): the round-5 dedupe fix only corrected the
+    finite-variant COUNT gate -- sensitivity_verdict/positive_fraction/
+    std_oos_sharpe themselves were still sourced from sensitivity_result,
+    i.e. computed by ParameterSweeper over every RAW row. A grid with 100
+    copies of one profitable configuration and 2 distinct losing
+    configurations has 3 distinct effective configs (clears
+    MIN_SENSITIVITY_SWEEP_VARIANTS), but the duplicated winner would still
+    dominate ParameterSweeper's own positive_fraction/std -- 2 of the 3
+    real configs lose, yet the sweep would report "robust". PromotionPipeline
+    must recompute the verdict from ONE row per distinct effective config,
+    not merely check the count."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    winner_rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 10},
+            oos_sharpe=2.0,
+            oos_max_drawdown=-0.05,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for _ in range(100)
+    ]
+    loser_rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 20},
+            oos_sharpe=-0.5,
+            oos_max_drawdown=-0.30,
+            trade_count=40,
+            avg_is_sharpe=-0.2,
+        ),
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 30},
+            oos_sharpe=-0.8,
+            oos_max_drawdown=-0.35,
+            trade_count=40,
+            avg_is_sharpe=-0.3,
+        ),
+    ]
+    rows = winner_rows + loser_rows
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [10, 20, 30]},
+        configs_tested=len(rows),
+        rows=rows,
+        # ParameterSweeper's OWN (uncorrected) report over all 102 raw
+        # rows: positive_fraction dominated by the 100 duplicated winners.
+        mean_oos_sharpe=1.933,
+        std_oos_sharpe=0.35,
+        positive_fraction=100 / 102,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 distinct effective configs -- clears MIN_SENSITIVITY_SWEEP_VARIANTS.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 3
+    assert result.evidence_json["sensitivity"]["underpowered"] is False
+    # ParameterSweeper's own (uncorrected) verdict still says "robust" --
+    # the fixture asserts this explicitly to prove the PromotionPipeline-
+    # level override is what closes the gate, not ParameterSweeper
+    # disagreeing with itself.
+    assert result.evidence_json["sensitivity"]["raw_verdict"] == "robust"
+    # But the AUTHORITATIVE verdict, recomputed over one row per distinct
+    # effective config (positive_fraction = 1/3, well below the 0.5
+    # default), must be curve_fit -- and overall_passed must be False.
+    assert result.sensitivity_verdict == "curve_fit"
+    assert result.evidence_json["sensitivity"]["verdict"] == "curve_fit"
+    assert result.evidence_json["sensitivity"]["positive_fraction"] == pytest.approx(1 / 3)
+    assert result.overall_passed is False
+
+
 def test_stress_fragile_flips_overall_passed_and_is_attributed(db_url: str) -> None:
     config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
@@ -1124,6 +1221,14 @@ def test_dsr_fdr_logged_via_mlflow_additive_path(db_url: str) -> None:
     call_kwargs = mock_logger.log_walk_forward_run.call_args.kwargs
     assert call_kwargs["funnel_result"] is result.funnel_result
     assert call_kwargs["stress_result"] is result.stress_result
+    # Round-6 (PR #50 Codex P2): the MLflow-internal "config_hash" tag is a
+    # naive hash of the dispatched config (includes data_version/eval_window),
+    # which diverges from the canonical identity hash and would change across
+    # runs of the same strategy over different windows. A separately named
+    # "canonical_config_hash" tag carries the SAME config_hash this promotion
+    # decision is keyed by, so an MLflow run can be correlated back to its
+    # promotion_decisions/strategy_definitions row.
+    assert call_kwargs["tags"] == {"canonical_config_hash": config_hash}
 
     mock_logger.log_promotion_decision.assert_called_once()
     log_kwargs = mock_logger.log_promotion_decision.call_args.kwargs
@@ -1510,9 +1615,20 @@ def test_all_nan_funnel_and_sensitivity_still_persists_decision(db_url: str) -> 
         _assert_no_nan(row.evidence_json)
         gate_values = [g["value"] for g in row.evidence_json["funnel"]["gates"]]
         assert any(v is None for v in gate_values)
+        # "mean_oos_sharpe"/"std_oos_sharpe"/"positive_fraction" are now the
+        # round-6 AUTHORITATIVE (deduped) stats, computed by summarize_variants
+        # over zero finite rows -- matching real ParameterSweeper.sweep
+        # semantics for n_valid=0 (mean=NaN->None, but std/positive_fraction
+        # are legitimately 0.0, not NaN). The "raw_*" counterparts are still
+        # this fixture's directly hand-set NaN values, sanitized to None --
+        # that's what actually exercises the NaN-sanitization path this test
+        # is about.
         assert row.evidence_json["sensitivity"]["mean_oos_sharpe"] is None
-        assert row.evidence_json["sensitivity"]["std_oos_sharpe"] is None
-        assert row.evidence_json["sensitivity"]["positive_fraction"] is None
+        assert row.evidence_json["sensitivity"]["std_oos_sharpe"] == 0.0
+        assert row.evidence_json["sensitivity"]["positive_fraction"] == 0.0
+        assert row.evidence_json["sensitivity"]["raw_mean_oos_sharpe"] is None
+        assert row.evidence_json["sensitivity"]["raw_std_oos_sharpe"] is None
+        assert row.evidence_json["sensitivity"]["raw_positive_fraction"] is None
 
 
 def test_nan_dsr_from_deflated_sharpe_fn_normalized_to_none(db_url: str) -> None:

@@ -129,8 +129,12 @@ from backtesting.validation.overfitting_checks import (
     deflated_sharpe_ratio as _default_deflated_sharpe_ratio,
 )
 from backtesting.validation.parameter_sensitivity import (
+    DEFAULT_MAX_SHARPE_STD,
+    DEFAULT_MIN_POSITIVE_FRACTION,
     ParameterSensitivityResult,
+    ParameterSensitivityRow,
     ParameterSweeper,
+    summarize_variants,
     _apply_params as _sweep_apply_params,
 )
 from backtesting.validation.survival_funnel import (
@@ -646,7 +650,6 @@ class PromotionPipeline:
         # overall_passed).
         fdr_evidence = self._compute_family_fdr(strategy_id, strategy_family, dsr_value)
 
-        sensitivity_verdict = sensitivity_result.verdict if sensitivity_result else None
         stress_verdict = stress_result.verdict
 
         # PR #50 Codex round-1 R1-B fix (P1, promotion-integrity/C8): a
@@ -713,33 +716,66 @@ class PromotionPipeline:
         # data_version/window, then apply params) using the SAME two
         # functions, not a reimplementation of either step that could
         # itself drift out of sync with the real dispatch path.
-        n_finite_sensitivity_variants = (
-            len(
-                {
-                    json.dumps(
-                        _sweep_apply_params(
-                            _config_with_data_version_and_window(
-                                config,
-                                self._data_version,
-                                eval_window.start,
-                                eval_window.end,
-                            ),
-                            row.params,
+        #
+        # PR #50 Codex round-6 fix (P1, promotion-integrity/C8): the
+        # round-5 fix only corrected the finite-variant COUNT gate -- it
+        # left sensitivity_verdict/positive_fraction/std_oos_sharpe
+        # themselves sourced from sensitivity_result, i.e. ParameterSweeper
+        # computing them over EVERY raw row including duplicates. A grid
+        # with 100 copies of one profitable config and 2 distinct losing
+        # configs has 3 distinct effective configs (clears
+        # MIN_SENSITIVITY_SWEEP_VARIANTS), but the duplicated winner still
+        # dominates ParameterSweeper's own positive_fraction/std -- 2 of
+        # the 3 real configs lose, yet the sweep reports "robust". Build
+        # ONE row per distinct effective config (first occurrence, in row
+        # order) and recompute mean/std/positive_fraction/verdict from
+        # THAT deduped set via summarize_variants -- the same function
+        # ParameterSweeper.sweep itself uses (extracted, not
+        # reimplemented, so this can never drift from what "robust" means
+        # there) -- rather than trusting sensitivity_result's stats, which
+        # remain over the raw (possibly duplicate-inflated) rows.
+        effective_config_to_row: dict[str, ParameterSensitivityRow] = {}
+        if sensitivity_result is not None:
+            for row in sensitivity_result.rows:
+                if not math.isfinite(row.oos_sharpe):
+                    continue
+                effective_key = json.dumps(
+                    _sweep_apply_params(
+                        _config_with_data_version_and_window(
+                            config, self._data_version, eval_window.start, eval_window.end
                         ),
-                        sort_keys=True,
-                        default=str,
-                    )
-                    for row in sensitivity_result.rows
-                    if math.isfinite(row.oos_sharpe)
-                }
-            )
-            if sensitivity_result is not None
-            else None
+                        row.params,
+                    ),
+                    sort_keys=True,
+                    default=str,
+                )
+                effective_config_to_row.setdefault(effective_key, row)
+
+        n_finite_sensitivity_variants = (
+            len(effective_config_to_row) if sensitivity_result is not None else None
         )
         sensitivity_underpowered = (
             n_finite_sensitivity_variants is not None
             and n_finite_sensitivity_variants < MIN_SENSITIVITY_SWEEP_VARIANTS
         )
+
+        if sensitivity_result is not None:
+            (
+                dedup_mean_oos_sharpe,
+                dedup_std_oos_sharpe,
+                dedup_positive_fraction,
+                _dedup_curve_fit_flag,
+                sensitivity_verdict,
+            ) = summarize_variants(
+                list(effective_config_to_row.values()),
+                getattr(self._sweeper, "_min_positive_fraction", DEFAULT_MIN_POSITIVE_FRACTION),
+                getattr(self._sweeper, "_max_sharpe_std", DEFAULT_MAX_SHARPE_STD),
+            )
+        else:
+            dedup_mean_oos_sharpe = None
+            dedup_std_oos_sharpe = None
+            dedup_positive_fraction = None
+            sensitivity_verdict = None
 
         overall_passed = funnel_result.passed and stress_verdict == "solid"
         if not holdout_mode:
@@ -755,6 +791,10 @@ class PromotionPipeline:
             holdout_mode=holdout_mode,
             funnel_result=funnel_result,
             sensitivity_result=sensitivity_result,
+            sensitivity_verdict=sensitivity_verdict,
+            dedup_mean_oos_sharpe=dedup_mean_oos_sharpe,
+            dedup_std_oos_sharpe=dedup_std_oos_sharpe,
+            dedup_positive_fraction=dedup_positive_fraction,
             n_finite_sensitivity_variants=n_finite_sensitivity_variants,
             sensitivity_underpowered=sensitivity_underpowered,
             stress_result=stress_result,
@@ -1073,6 +1113,10 @@ class PromotionPipeline:
         holdout_mode: bool,
         funnel_result: SurvivalFunnelResult,
         sensitivity_result: Optional[ParameterSensitivityResult],
+        sensitivity_verdict: Optional[str],
+        dedup_mean_oos_sharpe: Optional[float],
+        dedup_std_oos_sharpe: Optional[float],
+        dedup_positive_fraction: Optional[float],
         n_finite_sensitivity_variants: Optional[int],
         sensitivity_underpowered: bool,
         stress_result: BootstrapStressResult,
@@ -1122,11 +1166,31 @@ class PromotionPipeline:
                 if sensitivity_result is None
                 else {
                     "skipped": False,
-                    "verdict": sensitivity_result.verdict,
+                    # AUTHORITATIVE (PR #50 Codex round-6 fix): recomputed
+                    # from ONE row per distinct effective config (see
+                    # n_finite_sensitivity_variants below) via the same
+                    # summarize_variants function ParameterSweeper.sweep
+                    # itself uses -- this is what actually gates
+                    # overall_passed, NOT sensitivity_result.verdict/
+                    # positive_fraction/std_oos_sharpe (those are computed
+                    # over every raw row, including duplicate-effective-
+                    # config ones, and are recorded separately below as
+                    # "raw_*" for audit/comparison only).
+                    "verdict": sensitivity_verdict,
+                    "mean_oos_sharpe": dedup_mean_oos_sharpe,
+                    "std_oos_sharpe": dedup_std_oos_sharpe,
+                    "positive_fraction": dedup_positive_fraction,
+                    # RAW (uncorrected): ParameterSweeper's own report over
+                    # every row it ran, including any that share an
+                    # effective config with another row. Kept for audit --
+                    # a divergence between "raw_verdict" and "verdict"
+                    # above is itself evidence the grid had duplicate-
+                    # effect combinations.
+                    "raw_verdict": sensitivity_result.verdict,
+                    "raw_mean_oos_sharpe": sensitivity_result.mean_oos_sharpe,
+                    "raw_std_oos_sharpe": sensitivity_result.std_oos_sharpe,
+                    "raw_positive_fraction": sensitivity_result.positive_fraction,
                     "configs_tested": sensitivity_result.configs_tested,
-                    "mean_oos_sharpe": sensitivity_result.mean_oos_sharpe,
-                    "std_oos_sharpe": sensitivity_result.std_oos_sharpe,
-                    "positive_fraction": sensitivity_result.positive_fraction,
                     "param_grid": sensitivity_result.param_grid,
                     # R1-B (PR #50 Codex round-1 P1) + round-2/3/5 dedupe
                     # fixes: the DISTINCT (by fully-applied effective
@@ -1191,6 +1255,25 @@ class PromotionPipeline:
                 config,
                 wf_result,
                 self._experiment_name,
+                # PR #50 Codex round-6 fix (P2): the built-in "config_hash"
+                # tag mlflow_logger.py sets is _hash_config(wf_result.config)
+                # -- a naive full-dict SHA-256 over the DISPATCHED config,
+                # which includes data_version and the injected eval_window
+                # dates. That tag therefore differs from the canonical v2
+                # identity hash stored in StrategyDefinition/PromotionDecision
+                # (which deliberately EXCLUDES those dates per
+                # docs/plans/04-identity-evaluation-context-design.md) and
+                # changes across two promotion runs of the SAME strategy
+                # identity over different windows -- exactly the two runs
+                # 04-4W's identity/window split defines as correlatable. Add
+                # the authoritative config_hash as a SEPARATELY named tag
+                # (additive only -- does not touch _hash_config or the
+                # existing provenance-mismatch check, which serve a
+                # different purpose: proving the logged config is literally
+                # the object the engine ran, not identity correlation) so an
+                # MLflow run can be looked up by the same config_hash a
+                # promotion_decisions/strategy_definitions row carries.
+                tags={"canonical_config_hash": config_hash},
                 funnel_result=funnel_result,
                 stress_result=stress_result,
                 require_manifest_data_version=self._require_manifest_data_version,

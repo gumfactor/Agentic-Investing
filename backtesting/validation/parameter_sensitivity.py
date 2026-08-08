@@ -44,6 +44,44 @@ from backtesting.validation.survival_funnel import oos_trade_count_from_wf
 
 logger = structlog.get_logger(__name__)
 
+DEFAULT_MIN_POSITIVE_FRACTION = 0.5
+DEFAULT_MAX_SHARPE_STD = 0.5
+
+
+def summarize_variants(
+    rows: "list[ParameterSensitivityRow]",
+    min_positive_fraction: float,
+    max_sharpe_std: float,
+) -> tuple[float, float, float, bool, str]:
+    """Compute (mean_oos_sharpe, std_oos_sharpe, positive_fraction,
+    curve_fit_flag, verdict) over ``rows``.
+
+    The single definition of "what makes a sweep robust," extracted so
+    every caller that needs a robustness verdict over some SET of rows --
+    ``ParameterSweeper.sweep`` over all rows, or ``PromotionPipeline`` over
+    a deduped subset (PR #50 Codex round-6 fix: the round-5 dedupe fix
+    only corrected the finite-variant COUNT gate; ``sensitivity_verdict``/
+    ``positive_fraction``/``std_oos_sharpe`` themselves were still computed
+    by ``ParameterSweeper`` over every raw row, so e.g. 100 copies of one
+    winning config plus 2 distinct losers still reported "robust" -- the
+    duplicated winner dominates the statistics even though only 1 of 3
+    distinct configs actually won) -- gets it from ONE place, not a second
+    copy of this arithmetic that could itself drift out of sync with the
+    first, which is exactly how BUG-088 (record_run's date check)
+    recurred after being fixed once already in ``EvaluationWindow``.
+    """
+    finite_sharpes = [r.oos_sharpe for r in rows if math.isfinite(r.oos_sharpe)]
+    n_valid = len(finite_sharpes)
+    mean_sharpe = float(np.mean(finite_sharpes)) if n_valid else float("nan")
+    std_sharpe = float(np.std(finite_sharpes, ddof=1)) if n_valid > 1 else 0.0
+    pos_frac = float(sum(s > 0 for s in finite_sharpes) / n_valid) if n_valid else 0.0
+    curve_fit_flag = (
+        pos_frac < min_positive_fraction
+        or (n_valid > 1 and std_sharpe > max_sharpe_std)
+    )
+    verdict = "curve_fit" if curve_fit_flag else "robust"
+    return mean_sharpe, std_sharpe, pos_frac, curve_fit_flag, verdict
+
 
 @dataclass
 class ParameterSensitivityRow:
@@ -135,8 +173,8 @@ class ParameterSweeper:
         self,
         engine: Optional[BacktestEngine] = None,
         fill_simulator: Optional[FillSimulator] = None,
-        min_positive_fraction: float = 0.5,
-        max_sharpe_std: float = 0.5,
+        min_positive_fraction: float = DEFAULT_MIN_POSITIVE_FRACTION,
+        max_sharpe_std: float = DEFAULT_MAX_SHARPE_STD,
     ) -> None:
         self._engine = engine or BacktestEngine()
         self._fill_sim = fill_simulator or FillSimulator()
@@ -248,12 +286,7 @@ class ParameterSweeper:
                 avg_is_sharpe=avg_is,
             ))
 
-        finite_sharpes = [r.oos_sharpe for r in rows if math.isfinite(r.oos_sharpe)]
-        n_valid = len(finite_sharpes)
-        mean_sharpe = float(np.mean(finite_sharpes)) if n_valid else float("nan")
-        std_sharpe = float(np.std(finite_sharpes, ddof=1)) if n_valid > 1 else 0.0
-        pos_frac = float(sum(s > 0 for s in finite_sharpes) / n_valid) if n_valid else 0.0
-
+        n_valid = sum(1 for r in rows if math.isfinite(r.oos_sharpe))
         if n_valid == 0:
             logger.warning(
                 "parameter_sweep_all_variants_failed",
@@ -271,11 +304,9 @@ class ParameterSweeper:
                 ),
             )
 
-        curve_fit_flag = (
-            pos_frac < self._min_positive_fraction
-            or (n_valid > 1 and std_sharpe > self._max_sharpe_std)
+        mean_sharpe, std_sharpe, pos_frac, curve_fit_flag, verdict = summarize_variants(
+            rows, self._min_positive_fraction, self._max_sharpe_std
         )
-        verdict = "curve_fit" if curve_fit_flag else "robust"
 
         logger.info(
             "parameter_sweep_complete",
