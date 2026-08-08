@@ -357,6 +357,24 @@ class PromotionDecision(Base):
     sensitivity_verdict: Mapped[Optional[str]] = mapped_column(Text)
     stress_verdict: Mapped[Optional[str]] = mapped_column(Text)
     overall_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # 04-4W R1-A (PR #50 Codex round-1 P1, migration 018): the EFFECTIVE
+    # evaluation date range this promotion decision's walk-forward/
+    # sensitivity/stress legs actually ran over, mirroring
+    # StrategyTrial.eval_start_date/eval_end_date (migration 016) and
+    # StrategyRun.eval_start_date/eval_end_date (migration 017). Without
+    # this, two promotion_decisions rows for the SAME (strategy_id,
+    # config_hash, data_version) but DIFFERENT eval_window values -- now
+    # legal since config_hash excludes the window -- would be
+    # indistinguishable by interval: the authoritative promotion record
+    # would carry only data_version, not which window was actually
+    # promoted. Nullable only for the same documented legacy-backfill
+    # reason as StrategyTrial's columns; every row
+    # PromotionPipeline._persist_decision inserts going forward carries a
+    # non-NULL pair, sourced directly from the eval_window already
+    # threaded into PromotionPipeline.run() (never re-derived from
+    # StrategyDefinition.config).
+    eval_start_date: Mapped[Optional[date]] = mapped_column(Date)
+    eval_end_date: Mapped[Optional[date]] = mapped_column(Date)
     mlflow_run_id: Mapped[Optional[str]] = mapped_column(Text)
     evidence_json: Mapped[dict[str, Any]] = mapped_column(sa.JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)

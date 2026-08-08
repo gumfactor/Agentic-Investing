@@ -108,7 +108,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Optional
 
 import structlog
@@ -634,6 +634,7 @@ class PromotionPipeline:
             observed_sharpe=observed_sharpe,
             fdr_evidence=fdr_evidence,
             overall_passed=overall_passed,
+            eval_window=eval_window,
         )
 
         mlflow_run_id = self._log_to_mlflow(
@@ -669,6 +670,12 @@ class PromotionPipeline:
             overall_passed=overall_passed,
             mlflow_run_id=mlflow_run_id,
             evidence_json=evidence,
+            # R1-A: sourced directly from the eval_window argument threaded
+            # into this run() call -- never re-derived from
+            # StrategyDefinition.config -- so promotion_decisions carries
+            # the SAME window every other measurement sink now records.
+            eval_start_date=eval_window.start,
+            eval_end_date=eval_window.end,
         )
 
         logger.info(
@@ -943,11 +950,21 @@ class PromotionPipeline:
         observed_sharpe: Optional[float],
         fdr_evidence: dict[str, Any],
         overall_passed: bool,
+        eval_window: EvaluationWindow,
     ) -> dict[str, Any]:
         return {
             "strategy_id": strategy_id,
             "config_hash": config_hash,
             "data_version": self._data_version,
+            # R1-A: the same eval_window persisted on this row's
+            # eval_start_date/eval_end_date columns (migration 018),
+            # surfaced in evidence_json too for auditability -- mirrors
+            # data_version already being both a first-class column AND an
+            # evidence_json field.
+            "eval_window": {
+                "start": eval_window.start.isoformat(),
+                "end": eval_window.end.isoformat(),
+            },
             "holdout_mode": holdout_mode,
             "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
             "overall_passed": overall_passed,
@@ -1063,6 +1080,8 @@ class PromotionPipeline:
         overall_passed: bool,
         mlflow_run_id: Optional[str],
         evidence_json: dict[str, Any],
+        eval_start_date: date,
+        eval_end_date: date,
     ) -> int:
         now = datetime.now(tz=timezone.utc)
         with Session(self._engine) as session:
@@ -1078,6 +1097,12 @@ class PromotionPipeline:
                 mlflow_run_id=mlflow_run_id,
                 evidence_json=_sanitize_metrics(evidence_json),
                 created_at=now,
+                # R1-A: the EFFECTIVE evaluation window this decision's
+                # walk-forward/sensitivity/stress legs actually ran over --
+                # see migration 018's docstring for why this must never be
+                # re-derived from StrategyDefinition.config.
+                eval_start_date=eval_start_date,
+                eval_end_date=eval_end_date,
             )
             session.add(decision)
             session.commit()

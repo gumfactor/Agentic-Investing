@@ -31,17 +31,34 @@ Two complementary checks, matching how this repo already treats
    about" to go stale.
 
    Every model, on every discovered Base, that carries a ``data_version``
-   column (the repo's existing C7 marker of "this row records a
-   measurement over a specific data snapshot") must EITHER also carry
-   ``eval_start_date``/``eval_end_date`` columns, OR appear in
-   ``_NOT_WINDOW_SCOPED_ALLOWLIST`` below with a one-line reason it is
-   legitimately not a window-scoped evaluation (``ResearchRun`` is the
-   first entry: it is scoped by a data_version snapshot, not a
-   backtest/walk-forward date range). A future measurement-persisting
-   model added anywhere in the repo therefore CANNOT pass silently --
-   whoever adds it must consciously either add the window columns or write
-   down why the model is exempt. That is what actually closes the class;
-   see the failure message below, which states both options explicitly.
+   column OR a ``config_hash``-shaped column (exact ``data_version``;
+   ``config_hash`` matched as a SUBSTRING, so it also catches
+   ``canonical_config_hash``/``code_config_hash`` -- the repo's existing C7
+   marker of "this row records a measurement over a specific data snapshot"
+   and/or "this row pertains to a specific strategy/methodology identity")
+   must EITHER also carry ``eval_start_date``/``eval_end_date`` columns, OR
+   appear in ``_NOT_WINDOW_SCOPED_ALLOWLIST`` below with a one-line reason
+   it is legitimately not a window-scoped evaluation. A future
+   measurement-persisting model added anywhere in the repo therefore CANNOT
+   pass silently -- whoever adds it must consciously either add the window
+   columns or write down why the model is exempt. That is what actually
+   closes the class; see the failure message below, which states both
+   options explicitly.
+
+   **Why ``config_hash`` was added to the predicate (PR #50 Codex R1-A)**:
+   the original ``data_version``-only predicate never looked at
+   ``PromotionDecision`` -- it carries ``config_hash`` but no
+   ``data_version`` column of its own -- so a live instance of this exact
+   defect class (two promotions of the same strategy/config/data-snapshot
+   over different windows, indistinguishable by interval) shipped
+   undetected. A row claiming EITHER a specific data snapshot OR a specific
+   strategy identity is claiming to be a measurement; the predicate now
+   reflects that.
+
+   Widening the predicate legitimately pulls in identity/lifecycle rows
+   that record what a strategy/methodology IS or its lifecycle STATE, not
+   a measurement taken over an interval -- these are enumerated in
+   ``_NOT_WINDOW_SCOPED_ALLOWLIST`` with real justifications, not guessed.
 
 2. **API-level (the known dispatch sinks today)**: the public methods that
    actually populate those tables -- ``TrialRecorder.run_walk_forward``,
@@ -99,17 +116,39 @@ _EXCLUDED_DIR_NAMES = {
     ".pytest_cache", ".mypy_cache", ".pytest-tmp",
 }
 
-# Models that legitimately carry a C7 data_version column but are NOT
-# window-scoped evaluations -- explicit, justified exemptions from the
-# "must carry eval_start_date/eval_end_date" rule. Adding a model here is a
-# conscious declaration, not a silent pass: a new data_version-bearing
-# model that is neither windowed nor listed here fails this test.
+# Models that legitimately carry a C7 data_version and/or config_hash-shaped
+# column but are NOT window-scoped evaluations -- explicit, justified
+# exemptions from the "must carry eval_start_date/eval_end_date" rule.
+# Adding a model here is a conscious declaration, not a silent pass: a new
+# data_version/config_hash-bearing model that is neither windowed nor
+# listed here fails this test. Enumerated by actually running the widened
+# discovery (2026-08-08, PR #50 R1-A) against this repo, not guessed.
 _NOT_WINDOW_SCOPED_ALLOWLIST: dict[str, str] = {
     "ResearchRun": (
         "data/research/models.py -- a signal-research provenance record "
         "scoped by a data_version SNAPSHOT (point-in-time cutoff), not a "
         "backtest/walk-forward date RANGE; it has no start/end evaluation "
         "window concept to record."
+    ),
+    "StrategyDefinition": (
+        "strategy_registry/models.py -- records WHAT a strategy config IS "
+        "(identity). config_hash here IS the identity key itself, not a "
+        "reference to a measurement -- there is no evaluation to have a "
+        "window over; the window is what OTHER rows (StrategyTrial/"
+        "StrategyRun/PromotionDecision) measure THIS definition against."
+    ),
+    "Strategy": (
+        "strategy_registry/models.py -- records a strategy's LIFECYCLE "
+        "STATE (backtesting/paper/live/archived) via canonical_config_hash, "
+        "not a measurement taken over an interval. Its status_history "
+        "audit trail (StrategyStatusHistory) is a transition log, not a "
+        "windowed evaluation either."
+    ),
+    "ResearchMethodology": (
+        "data/research/models.py -- records WHAT a research methodology IS "
+        "(via code_config_hash, a fingerprint of methodology code/config), "
+        "mirroring StrategyDefinition's identity role in the signal-"
+        "research domain. Not a measurement over an interval."
     ),
 }
 
@@ -188,11 +227,25 @@ def _discover_declarative_base_classes() -> list[type]:
     return discovered
 
 
-def _models_with_data_version_column() -> list[type]:
+def _is_measurement_marker_column(column_name: str) -> bool:
+    """True iff ``column_name`` marks a row as pertaining to a specific data
+    snapshot (C7 ``data_version``, exact match) or a specific strategy/
+    methodology identity (``config_hash``-shaped, matched as a SUBSTRING so
+    it also catches ``canonical_config_hash``/``code_config_hash``).
+
+    PR #50 R1-A: the ``data_version``-only predicate missed
+    ``PromotionDecision`` (``config_hash``, no ``data_version`` of its own)
+    entirely -- a live instance of the defect class this test exists to
+    close. Either marker means "this row is claiming to record something
+    about a specific measurement," which is what check 1 must catch.
+    """
+    return column_name == "data_version" or "config_hash" in column_name
+
+
+def _models_with_measurement_marker_column() -> list[type]:
     """Every ORM model, on EVERY discovered DeclarativeBase subclass
-    anywhere in the repo, that carries a ``data_version`` column -- the
-    repo's existing C7 marker for "this row records a measurement over a
-    specific data snapshot."
+    anywhere in the repo, that carries a ``data_version`` and/or
+    ``config_hash``-shaped column -- see ``_is_measurement_marker_column``.
     """
     matches: list[type] = []
     seen_ids: set[int] = set()
@@ -204,28 +257,35 @@ def _models_with_data_version_column() -> list[type]:
             cls = mapper.class_
             if id(cls) in seen_ids:
                 continue
-            if "data_version" in cls.__table__.columns:
+            if any(_is_measurement_marker_column(c) for c in cls.__table__.columns.keys()):
                 seen_ids.add(id(cls))
                 matches.append(cls)
     return matches
 
 
-def test_every_data_version_bearing_table_also_has_eval_window_columns() -> None:
+def test_every_measurement_marker_table_also_has_eval_window_columns() -> None:
     """The class-closing schema assertion. If this fails, a new
     measurement-persisting model was added -- ANYWHERE in the repo, on ANY
-    DeclarativeBase -- with a data_version column (the existing C7
-    convention) but no eval_start_date/eval_end_date columns and no
-    allowlist entry: exactly the 04-4W defect class re-opening in a new
-    location.
+    DeclarativeBase -- with a data_version and/or config_hash-shaped column
+    (the existing C7/identity convention) but no eval_start_date/
+    eval_end_date columns and no allowlist entry: exactly the 04-4W defect
+    class re-opening in a new location.
     """
-    models = _models_with_data_version_column()
+    models = _models_with_measurement_marker_column()
     # Sanity: this must find models from multiple DISTINCT Bases (proving
     # the repo-wide discovery actually crossed module boundaries, not just
-    # strategy_registry's), or the test is vacuously passing because
-    # discovery itself silently regressed to single-Base behavior.
+    # strategy_registry's), and must find PromotionDecision specifically
+    # (the R1-A instance the data_version-only predicate missed), or the
+    # test is vacuously passing because discovery/predicate silently
+    # regressed.
     model_names = {m.__name__ for m in models}
     assert "StrategyTrial" in model_names, "strategy_registry Base discovery regressed"
     assert "StrategyRun" in model_names, "strategy_registry Base discovery regressed"
+    assert "PromotionDecision" in model_names, (
+        "config_hash-shaped-column matching has regressed -- this is the "
+        "exact R1-A instance (PromotionDecision has config_hash but no "
+        "data_version) the widened predicate exists to catch."
+    )
     assert "ResearchRun" in model_names, (
         "data/research/models.py's Base was not discovered -- check 1 has "
         "regressed to single-Base behavior (the exact F1 defect)."
@@ -240,18 +300,20 @@ def test_every_data_version_bearing_table_also_has_eval_window_columns() -> None
         if "eval_start_date" not in cols or "eval_end_date" not in cols:
             missing.append(name)
     assert missing == [], (
-        f"Model(s) {missing} carry a data_version column (a measurement "
-        "marker, per C7) but no eval_start_date/eval_end_date columns and "
-        "no entry in this module's _NOT_WINDOW_SCOPED_ALLOWLIST. Every "
-        "measurement-persisting sink must record the evaluation window it "
-        "ran over -- see docs/plans/04-identity-evaluation-context-"
-        "design.md. You have exactly two ways to make this pass: (1) add "
-        "eval_start_date/eval_end_date DATE columns to the model (mirroring "
-        "StrategyTrial/StrategyRun) if it genuinely represents a "
+        f"Model(s) {missing} carry a data_version and/or config_hash-shaped "
+        "column (a measurement/identity marker) but no eval_start_date/"
+        "eval_end_date columns and no entry in this module's "
+        "_NOT_WINDOW_SCOPED_ALLOWLIST. Every measurement-persisting sink "
+        "must record the evaluation window it ran over -- see "
+        "docs/plans/04-identity-evaluation-context-design.md. You have "
+        "exactly two ways to make this pass: (1) add eval_start_date/"
+        "eval_end_date DATE columns to the model (mirroring StrategyTrial/"
+        "StrategyRun/PromotionDecision) if it genuinely represents a "
         "window-scoped evaluation, or (2) if it is NOT a window-scoped "
-        "evaluation (e.g. it is scoped by a data snapshot rather than a "
-        "date range), add it to _NOT_WINDOW_SCOPED_ALLOWLIST here with a "
-        "one-line reason -- a silent omission is not an option."
+        "evaluation (e.g. it records identity/lifecycle state, or is "
+        "scoped by a data snapshot rather than a date range), add it to "
+        "_NOT_WINDOW_SCOPED_ALLOWLIST here with a one-line reason -- a "
+        "silent omission is not an option."
     )
 
 
