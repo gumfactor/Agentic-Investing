@@ -19,6 +19,7 @@ import math
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -1761,13 +1762,21 @@ def _write_holdout_promo_config(path: Path, *, strategy_id: str) -> Path:
 
 
 def _seed_real_holdout_fixture(
-    db_url: str, tmp_path: Path, strategy_id: str = "v1_e2e_holdout"
+    db_url: str,
+    tmp_path: Path,
+    strategy_id: str = "v1_e2e_holdout",
+    holdout_start: date = date(2023, 1, 2),
+    holdout_end: date = date(2023, 6, 30),
+    coverage_end: Optional[date] = None,
 ) -> tuple[str, int, "DataHandler"]:
     """Shared setup for the real end-to-end holdout tests: registers a real
     strategy definition, a matching hypothesis, a research_data_windows row
-    whose holdout is a realistic ~6-month window (2023-01-02..2023-06-30),
-    and a real DataHandler covering BOTH the train/OOS range and the holdout
-    range with actual price/signal/benchmark data. Returns
+    whose holdout defaults to a realistic ~6-month window
+    (2023-01-02..2023-06-30), and a real DataHandler covering BOTH the
+    train/OOS range and the holdout range with actual price/signal/benchmark
+    data. ``holdout_start``/``holdout_end`` are overridable so a test can seed
+    a deliberately too-short holdout (e.g. two sessions) to exercise the
+    pre-seal data-sufficiency floor. Returns
     (config_hash, hypothesis_id, data_handler)."""
     from backtesting.engine.data_handler import DataHandler
 
@@ -1785,11 +1794,11 @@ def _seed_real_holdout_fixture(
         train_end=date(2022, 7, 1),
         oos_start=date(2022, 7, 1),
         oos_end=date(2022, 12, 31),
-        holdout_start=date(2023, 1, 2),
-        holdout_end=date(2023, 6, 30),
+        holdout_start=holdout_start,
+        holdout_end=holdout_end,
     )
 
-    all_dates = _business_days(date(2022, 1, 1), date(2023, 6, 30))
+    all_dates = _business_days(date(2022, 1, 1), coverage_end or holdout_end)
     tickers = ["AAA", "BBB", "CCC"]
     data_handler = DataHandler(
         _real_prices(all_dates, tickers),
@@ -2041,3 +2050,120 @@ def test_holdout_confirmation_fill_simulator_mismatch_does_not_burn_seal_and_ret
     )
     assert len(trials) == 1
     assert trials[0].status == "completed"
+
+
+# ── Codex R5: the real-evaluator preflight must COMPOSE the recorder's
+# data-sufficiency floor with the evaluator's own setup check, not be replaced
+# by it. BacktestEngine.validate_runnable only rejects an EMPTY date list, so a
+# too-short (but non-empty) holdout would clear the evaluator setup, commit the
+# one-shot seal, then die inside bootstrap_stress (needs MIN_OOS_RETURNS
+# returns) -- burning the seal on an insufficiency knowable from the date
+# index. The earlier insufficient-session test used a mock validator with no
+# validate_runnable hook, so it exercised only the fallback path and missed
+# this. This test uses the REAL SingleWindowEvaluator. ──────────────────────
+
+
+def test_holdout_confirmation_too_short_window_rejected_before_seal_real_evaluator(
+    db_url: str, tmp_path: Path
+) -> None:
+    """A registered holdout window of only two trading sessions (one non-NaN
+    return, below bootstrap_stress's MIN_OOS_RETURNS) must be rejected in the
+    pre-seal preflight even though the evaluator's own validate_runnable would
+    pass (the date list is non-empty). No strategy_trials row, no
+    promotion_decisions row. After the registered window is widened to a
+    sufficient range, a rerun of the SAME strategy succeeds -- proving the
+    one-shot seal was never consumed by the too-short attempt."""
+    from backtesting.engine.event_loop import BacktestEngine
+    from backtesting.engine.fill_simulator import FillSimulator
+    from backtesting.validation.holdout_evaluator import SingleWindowEvaluator
+    from backtesting.validation.trial_recorder import (
+        HoldoutEvaluationPreflightError,
+        _MIN_HOLDOUT_TRADING_SESSIONS,
+    )
+
+    # Two business days = one non-NaN daily return, i.e. one short of the
+    # MIN_OOS_RETURNS bootstrap_stress requires. Data coverage is wide so the
+    # ONLY thing making this run non-viable is the registered window's length.
+    short_start, short_end = date(2023, 1, 2), date(2023, 1, 3)
+    assert len(_business_days(short_start, short_end)) < _MIN_HOLDOUT_TRADING_SESSIONS
+    config_hash, hyp_id, data_handler = _seed_real_holdout_fixture(
+        db_url,
+        tmp_path,
+        holdout_start=short_start,
+        holdout_end=short_end,
+        coverage_end=date(2023, 6, 30),
+    )
+
+    def _make_pipeline() -> PromotionPipeline:
+        return PromotionPipeline(
+            db_url,
+            DATA_VERSION,
+            holdout_evaluator=SingleWindowEvaluator(
+                engine=BacktestEngine(), fill_simulator=FillSimulator(fill_model="perfect")
+            ),
+            bootstrap_stress_fn=lambda *a, **kw: _stress_result("solid"),
+            n_reshuffles=10,
+        )
+
+    with pytest.raises(HoldoutEvaluationPreflightError):
+        _make_pipeline().run(
+            "v1_e2e_holdout",
+            config_hash,
+            data_handler=data_handler,
+            hypothesis_id=hyp_id,
+            holdout_mode=True,
+        )
+
+    engine = _raw_engine(db_url)
+    with Session(engine) as session:
+        assert (
+            _make_pipeline()._trial_recorder.list_trials(
+                "v1_e2e_holdout", run_type="holdout_confirmation"
+            )
+            == []
+        )
+        decisions = list(
+            session.scalars(
+                select(PromotionDecision).where(
+                    PromotionDecision.strategy_id == "v1_e2e_holdout"
+                )
+            )
+        )
+    assert decisions == []
+
+    # Widen the registered holdout window to a sufficient range (data already
+    # covers it) and rerun the SAME strategy: it now clears preflight and
+    # consumes the seal exactly once -- the too-short attempt never burned it.
+    with Session(engine) as session:
+        window = session.scalar(
+            select(ResearchDataWindow).where(
+                ResearchDataWindow.strategy_id == "v1_e2e_holdout"
+            )
+        )
+        window.holdout_end = date(2023, 6, 30)
+        session.commit()
+
+    result = _make_pipeline().run(
+        "v1_e2e_holdout",
+        config_hash,
+        data_handler=data_handler,
+        hypothesis_id=hyp_id,
+        holdout_mode=True,
+    )
+    assert result.promotion_decision_id is not None
+    trials = _make_pipeline()._trial_recorder.list_trials(
+        "v1_e2e_holdout", run_type="holdout_confirmation"
+    )
+    assert len(trials) == 1
+    assert trials[0].status == "completed"
+
+
+def test_min_holdout_sessions_derived_from_bootstrap_min_returns() -> None:
+    """Guard the anti-drift derivation: the holdout data-sufficiency floor must
+    track bootstrap_stress's own minimum-observations constant, so widening or
+    tightening that requirement can never silently outrun the preflight."""
+    from backtesting.validation.bootstrap_stress import MIN_OOS_RETURNS
+    from backtesting.validation.trial_recorder import _MIN_HOLDOUT_TRADING_SESSIONS
+
+    # N sessions -> N-1 non-NaN daily returns; need MIN_OOS_RETURNS returns.
+    assert _MIN_HOLDOUT_TRADING_SESSIONS == MIN_OOS_RETURNS + 1

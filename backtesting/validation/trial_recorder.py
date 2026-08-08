@@ -121,6 +121,7 @@ from sqlalchemy.orm import Session
 from backtesting.config_contract import ConfigProvenanceMismatchError, validate_backtest_config
 from backtesting.dataset_manifest import require_manifest_hash_data_version
 from backtesting.engine.data_handler import DataHandler
+from backtesting.validation.bootstrap_stress import MIN_OOS_RETURNS
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
     ParameterSweeper,
@@ -435,6 +436,16 @@ class TrialRecorder:
                     _config: dict = config,
                     _data_handler: DataHandler = data_handler,
                 ) -> None:
+                    # COMPOSE, don't replace (Codex R5-A): the evaluator's own
+                    # validate_runnable covers engine setup (config contract,
+                    # fill-simulator match, non-EMPTY date list) but not the
+                    # recorder's stricter data-sufficiency floor, which reflects
+                    # a DOWNSTREAM requirement (bootstrap_stress needs
+                    # MIN_OOS_RETURNS returns) the evaluator's engine setup knows
+                    # nothing about. Run the date-index sufficiency check here
+                    # too, so a too-short holdout fails BEFORE the seal commits
+                    # on the real-evaluator path exactly as on the fallback path.
+                    _assert_holdout_data_sufficiency(_config, _data_handler)
                     try:
                         _validator.validate_runnable(_config, _data_handler)
                     except HoldoutEvaluationPreflightError:
@@ -1157,12 +1168,22 @@ def _parse_date(value: str | date) -> date:
 # effective holdout range before it will let a final_holdout_confirmation
 # request proceed to the seal-committing insert. A single-window evaluation
 # (backtesting.validation.holdout_evaluator.SingleWindowEvaluator) computes
-# daily returns via nav_series.pct_change().dropna() -- one trading session
-# produces zero usable return rows (the diff has nothing to compare against),
-# which would insert a 'running' row, consume the one-shot seal, and then
-# hand SurvivalFunnel/bootstrap_stress an all-empty oos_returns series. Two
-# is the minimum that can ever produce a single non-NaN daily return.
-_MIN_HOLDOUT_TRADING_SESSIONS = 2
+# Minimum trading sessions a holdout window must contain BEFORE the seal
+# commits. This is DERIVED from the strictest downstream pre-look-knowable
+# requirement, not guessed: bootstrap_stress (run unconditionally by
+# PromotionPipeline after the holdout evaluation) needs at least
+# ``MIN_OOS_RETURNS`` non-NaN daily returns, and the single-window evaluator
+# builds daily returns via nav_series.pct_change().dropna(), so N trading
+# sessions yield only N-1 non-NaN returns (the first diff has nothing to
+# compare against). Requiring ``MIN_OOS_RETURNS + 1`` sessions therefore
+# guarantees bootstrap_stress will have enough observations, closing the
+# Codex R5 gap where a 2-session holdout passed preflight (1 return),
+# committed the one-shot seal, and then died inside bootstrap_stress --
+# burning the seal on an insufficiency that was knowable from the date index.
+# Deriving from MIN_OOS_RETURNS (rather than re-hard-coding 3) keeps this in
+# lockstep with bootstrap_stress's actual requirement so it cannot drift, the
+# same anti-drift principle as BacktestEngine.validate_runnable (R4-A).
+_MIN_HOLDOUT_TRADING_SESSIONS = MIN_OOS_RETURNS + 1
 
 
 def _preflight_holdout_viability(config: dict, data_handler: "DataHandler") -> None:
@@ -1218,6 +1239,28 @@ def _preflight_holdout_viability(config: dict, data_handler: "DataHandler") -> N
             "remains unconsumed."
         ) from exc
 
+    _assert_holdout_data_sufficiency(config, data_handler)
+
+
+def _assert_holdout_data_sufficiency(
+    config: dict, data_handler: "DataHandler"
+) -> None:
+    """Date-index-only data-sufficiency check: the effective holdout window
+    must contain at least ``_MIN_HOLDOUT_TRADING_SESSIONS`` trading sessions
+    (enough for the whole downstream pipeline -- evaluation AND bootstrap_stress
+    -- to have the observations it needs). Reads only the date INDEX shape
+    (``DataHandler.trading_dates``), never a price or return, so it is safe to
+    run before the one-shot seal commits (see ``_preflight_holdout_viability``'s
+    boundary note).
+
+    Split out of ``_preflight_holdout_viability`` so it can be COMPOSED with an
+    evaluator's own ``validate_runnable`` setup check rather than replaced by it
+    (Codex R5-A: delegating to ``BacktestEngine.validate_runnable`` -- which
+    only rejects an EMPTY date list -- dropped this stricter minimum on the real
+    evaluator path). Both the fallback preflight and the real-evaluator
+    ``pre_insert_check`` call this, so the data-sufficiency floor holds
+    regardless of which dispatch path runs.
+    """
     bt_cfg = config["backtest"]
     start = _parse_date(bt_cfg["start_date"])
     end = _parse_date(bt_cfg["end_date"])
@@ -1227,12 +1270,12 @@ def _preflight_holdout_viability(config: dict, data_handler: "DataHandler") -> N
             f"Holdout confirmation preflight failed: only {len(sessions)} "
             f"trading session(s) available in the effective holdout window "
             f"({start} .. {end}); at least {_MIN_HOLDOUT_TRADING_SESSIONS} "
-            "are required to run a single-window backtest and compute even "
-            "one daily return. This is a SETUP failure -- no holdout "
-            "returns were read -- caught before the one-shot holdout seal "
-            "is consumed. Provide a data_handler that actually covers the "
-            "registered holdout window and retry; the seal remains "
-            "unconsumed."
+            "are required so the single-window backtest yields the "
+            f"{MIN_OOS_RETURNS} non-NaN daily returns bootstrap_stress needs "
+            "downstream. This is a SETUP failure -- no holdout returns were "
+            "read -- caught before the one-shot holdout seal is consumed. "
+            "Provide a data_handler that actually covers the registered "
+            "holdout window and retry; the seal remains unconsumed."
         )
 
 

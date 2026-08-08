@@ -36,6 +36,15 @@ import pandas as pd
 
 _TRADING_DAYS_PER_YEAR = 252
 
+# Minimum non-NaN OOS return observations bootstrap_stress can operate on: a
+# permutation of a single return is degenerate, so at least two are required.
+# Exposed as a named constant (not a bare literal) so upstream preflights --
+# e.g. the holdout confirmation data-sufficiency check in
+# backtesting/validation/trial_recorder.py -- can DERIVE their own minimum from
+# this single source of truth instead of hard-coding a copy that could silently
+# drift from the actual requirement enforced below.
+MIN_OOS_RETURNS = 2
+
 
 @dataclass
 class BootstrapStressResult:
@@ -95,10 +104,10 @@ def bootstrap_stress(
         ValueError: If oos_returns has fewer than 2 non-NaN observations.
     """
     returns_arr = oos_returns.dropna().to_numpy(dtype=float)
-    if len(returns_arr) < 2:
+    if len(returns_arr) < MIN_OOS_RETURNS:
         raise ValueError(
-            f"oos_returns must have at least 2 non-NaN observations; "
-            f"got {len(returns_arr)}."
+            f"oos_returns must have at least {MIN_OOS_RETURNS} non-NaN "
+            f"observations; got {len(returns_arr)}."
         )
     if np.any(returns_arr <= -1.0):
         raise ValueError(
