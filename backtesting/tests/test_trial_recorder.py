@@ -37,7 +37,11 @@ from backtesting.validation.trial_recorder import (
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
 from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.fingerprint import hash_config
-from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
+from strategy_registry.registry import (
+    DefinitionNotFoundError,
+    FingerprintAlgorithmVersionError,
+    MissingDataVersionError,
+)
 from strategy_registry.models import StrategyDefinition
 from strategy_registry.selection_models import ResearchDataWindow, StrategyHypothesis
 from sqlalchemy.orm import Session
@@ -64,6 +68,7 @@ def _seed_definition(
     strategy_id: str = "v1_test_strategy",
     config: dict | None = None,
     config_hash: str | None = None,
+    fingerprint_algo_version: int = 2,
 ) -> str:
     """Seed a ``strategy_definitions`` row and return the ``config_hash`` used.
 
@@ -75,6 +80,11 @@ def _seed_definition(
     that only exercise a guard which rejects BEFORE the provenance check
     (e.g. the holdout-overlap tests) can omit it and keep the arbitrary
     legacy placeholder hash, since it is never compared in that path.
+
+    04-4W (PM amendment A1): ``fingerprint_algo_version`` defaults to the
+    current algorithm (2) so ordinary tests are unaffected; pass 1 to
+    simulate a pre-04-4W legacy row for the FingerprintAlgorithmVersionError
+    precedence tests.
     """
     if config_hash is None:
         config_hash = hash_config(config) if config is not None else "a" * 64
@@ -86,6 +96,7 @@ def _seed_definition(
                 name=strategy_id,
                 version=1,
                 config={"foo": "bar"},
+                fingerprint_algo_version=fingerprint_algo_version,
                 created_at=datetime.now(timezone.utc),
             )
         )
@@ -993,6 +1004,38 @@ def test_config_hash_mismatch_is_rejected_before_dispatch(recorder: TrialRecorde
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=mutated_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_legacy_fingerprint_algo_version_raises_before_provenance_check(
+    recorder: TrialRecorder,
+) -> None:
+    """04-4W PM amendment A1: a definition row hashed under a fingerprint
+    algorithm version other than the current one must raise
+    FingerprintAlgorithmVersionError -- NOT ConfigProvenanceMismatchError --
+    even when the passed config is completely unmodified. A fresh
+    hash_config(config) computed under the CURRENT algorithm would differ
+    from a pre-v2 row's stored config_hash purely from the algorithm
+    change, and misdiagnosing that as "the config passed does not match its
+    own config_hash" would send an operator chasing a nonexistent content
+    mutation."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config, fingerprint_algo_version=1)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
             eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
         )

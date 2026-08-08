@@ -17,6 +17,7 @@ from strategy_registry.registry import (
     ConflictingActiveStrategyError,
     DefinitionNotFoundError,
     DuplicateVersionError,
+    FingerprintAlgorithmVersionError,
     InsufficientPaperQualificationError,
     InvalidTransitionError,
     MissingDataVersionError,
@@ -746,3 +747,155 @@ def test_public_registry_setup_creates_selection_schema_tables(
         "promotion_decisions",
     ):
         assert expected in table_names, f"{expected} missing from public registry setup"
+
+
+# ── FingerprintAlgorithmVersionError precedence (04-4W PM amendment A1) ────────
+#
+# fingerprint_algo_version must be load-bearing on every read path that
+# compares a stored config_hash against a freshly computed one -- otherwise
+# a pre-v2 row silently misdiagnoses as C6 drift (verify_config_integrity)
+# or a genuine config variant (DuplicateVersionError), when the real cause
+# is that the fingerprint algorithm changed underneath unmodified content.
+
+
+def _downgrade_fingerprint_algo_version(
+    registry: StrategyRegistry, strategy_id: str, config_hash: str, *, version: int = 1
+) -> None:
+    """Simulate a pre-04-4W legacy row by forcing its fingerprint_algo_version
+    back to an older value directly in the DB, bypassing the application
+    (which always writes the current FINGERPRINT_ALGO_VERSION)."""
+    from sqlalchemy.orm import Session as _Session
+
+    from strategy_registry.models import StrategyDefinition as _StrategyDefinition
+
+    with _Session(registry._engine) as session:
+        defn = session.get(_StrategyDefinition, (strategy_id, config_hash))
+        defn.fingerprint_algo_version = version
+        session.commit()
+
+
+def test_verify_config_integrity_raises_algo_version_error_not_drift_for_legacy_row(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """A v1-algorithm-hashed row, re-checked against UNMODIFIED YAML, must
+    raise FingerprintAlgorithmVersionError -- NOT ConfigDriftError. The YAML
+    never changed; only the fingerprint algorithm did (a000e87 excluded
+    backtest.start_date/end_date from identity). Diagnosing this as C6
+    drift would send an operator to author a needless new YAML version."""
+    s = registry.register(str(cfg))
+    _downgrade_fingerprint_algo_version(registry, s.strategy_id, s.canonical_config_hash, version=1)
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        registry.verify_config_integrity(s.strategy_id)
+
+
+def test_verify_config_integrity_still_raises_drift_for_current_algo_row(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """A genuinely-drifted row hashed under the CURRENT algorithm must still
+    raise ConfigDriftError -- the version-precedence check must not mask
+    real C6 violations."""
+    registry.register(str(cfg))
+    raw = yaml.safe_load(cfg.read_text())
+    raw["indicators"]["momentum"]["weight"] = 0.5
+    cfg.write_text(yaml.dump(raw))
+    with pytest.raises(ConfigDriftError):
+        registry.verify_config_integrity("v1_test_strategy")
+
+
+def _seed_legacy_definition_row(
+    registry: StrategyRegistry,
+    *,
+    strategy_id: str,
+    config_hash: str,
+    name: str,
+    version: int,
+) -> None:
+    """Directly insert a synthetic pre-04-4W StrategyDefinition row --
+    fingerprint_algo_version=1, an ARBITRARY config_hash distinct from
+    anything the current (v2) algorithm would ever produce for real content
+    -- bypassing fingerprint()/add_definition() entirely (fingerprint()
+    always computes under the current algorithm; there is no way to
+    produce a genuine v1-shaped hash through current code, since a000e87
+    permanently changed _identity_view). This is the only way to construct
+    a real uq_strategy_definitions_version collision (same strategy_id +
+    version, DIFFERENT config_hash) whose existing side is a legacy row,
+    which is what the add_definition/register collision-handling tests
+    below need to exercise."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm import Session as _Session
+
+    from strategy_registry.models import StrategyDefinition as _StrategyDefinition
+
+    with _Session(registry._engine) as session:
+        session.add(
+            _StrategyDefinition(
+                strategy_id=strategy_id,
+                config_hash=config_hash,
+                name=name,
+                version=version,
+                config={"legacy": True},
+                fingerprint_algo_version=1,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+
+def test_add_definition_version_collision_raises_algo_version_error_for_legacy_row(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """A genuine uq_strategy_definitions_version collision (same
+    strategy_id + version, different config_hash) whose EXISTING row is a
+    pre-v2 legacy fingerprint must raise FingerprintAlgorithmVersionError,
+    not DuplicateVersionError -- the collision may be an algorithm-version
+    artifact rather than a genuine second config variant, and "bump
+    version" is the wrong remedy until that is ruled out."""
+    p = _write_config(tmp_path / "v1.yaml", version=1)
+    fp = fingerprint(str(p))
+    _seed_legacy_definition_row(
+        registry,
+        strategy_id=fp.strategy_id,
+        config_hash="f" * 64,  # arbitrary, distinct from fp.config_hash
+        name=fp.name,
+        version=fp.version,
+    )
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        registry.add_definition(str(p))
+
+
+def test_add_definition_version_collision_still_raises_duplicate_for_genuine_variant(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """Two genuinely different configs sharing a version (both hashed under
+    the current algorithm) must still raise DuplicateVersionError -- the
+    version-precedence check must not mask a real variant collision."""
+    p1 = _write_config(tmp_path / "v1a.yaml", version=1, weight=1.0)
+    p2 = _write_config(tmp_path / "v1b.yaml", version=1, weight=0.5)
+    registry.add_definition(str(p1))
+    with pytest.raises(DuplicateVersionError):
+        registry.add_definition(str(p2))
+
+
+def test_register_version_collision_raises_algo_version_error_for_legacy_row(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """Same as the add_definition case above, but through register()'s
+    flush()-time collision path. Reachable because the seeded legacy row
+    has no corresponding Strategy lifecycle row, so register() passes its
+    StrategyAlreadyRegisteredError check and proceeds to the definition
+    insert, which collides on uq_strategy_definitions_version."""
+    p = _write_config(tmp_path / "v1.yaml", version=1, name="alpha")
+    fp = fingerprint(str(p))
+    _seed_legacy_definition_row(
+        registry,
+        strategy_id=fp.strategy_id,
+        config_hash="e" * 64,
+        name=fp.name,
+        version=fp.version,
+    )
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        registry.register(str(p))

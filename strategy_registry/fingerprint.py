@@ -21,7 +21,7 @@ import yaml
 #
 # Persisted verbatim on every new StrategyDefinition row
 # (StrategyDefinition.fingerprint_algo_version, migration
-# 017_fingerprint_algo_version.py) so the waiver is encoded in the schema,
+# 015_fingerprint_algo_version.py) so the waiver is encoded in the schema,
 # not just in a design doc: a pre-v2 row is now DISTINGUISHABLE from a v2
 # row rather than silently assumed to have been hashed under the current
 # algorithm. Existing (pre-migration) rows default to 1 (the old
@@ -77,7 +77,7 @@ class StrategyFingerprint:
     # 04-4W: the FINGERPRINT_ALGO_VERSION this config_hash was computed
     # under. Always FINGERPRINT_ALGO_VERSION for a freshly computed
     # fingerprint -- see StrategyDefinition.fingerprint_algo_version
-    # (migration 017) for why this is persisted rather than assumed.
+    # (migration 015) for why this is persisted rather than assumed.
     fingerprint_algo_version: int = FINGERPRINT_ALGO_VERSION
 
 

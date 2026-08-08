@@ -31,13 +31,8 @@ No CHECK-constraint change: ``ck_strategy_trials_window`` /
 this migration only adds descriptive DATE columns, it does not change which
 combinations of window/run_type/eval dates are permitted.
 
-**Chain-order note**: chains onto 017 (``strategy_definitions.
-fingerprint_algo_version``, Phase W1), not 014 directly -- see 017's
-docstring for why the true revision chain (``014 -> 017 -> 015 -> 016``)
-does not match filename sort order.
-
-Revision ID: 015
-Revises: 017
+Revision ID: 016
+Revises: 015
 """
 
 from __future__ import annotations
@@ -45,8 +40,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "015"
-down_revision: str = "017"
+revision: str = "016"
+down_revision: str = "015"
 branch_labels = None
 depends_on = None
 

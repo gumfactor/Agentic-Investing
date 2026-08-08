@@ -1,6 +1,6 @@
 """Persist the effective evaluation window on every strategy_runs row.
 
-Roadmap Gate 04, slice 04-4W (Phase W3), extending the 04-4W / migration 015
+Roadmap Gate 04, slice 04-4W (Phase W3), extending the 04-4W / migration 016
 fix (``strategy_trials.eval_start_date``/``eval_end_date``,
 docs/plans/04-identity-evaluation-context-design.md) to the
 ``strategy_runs`` recording path. ``StrategyRun`` (``strategy_registry/
@@ -11,10 +11,10 @@ indistinguishable and unreconstructable now that
 docs/plans/04-identity-evaluation-context-design.md moved
 ``backtest.start_date``/``backtest.end_date`` out of ``config_hash`` and into
 "evaluation context." This migration adds the two columns that close that
-gap for ``strategy_runs``, mirroring migration 015's approach exactly.
+gap for ``strategy_runs``, mirroring migration 016's approach exactly.
 
 ``eval_start_date``/``eval_end_date`` are added NULLABLE, mirroring
-migration 015's ``strategy_trials`` precedent: existing rows predate this
+migration 016's ``strategy_trials`` precedent: existing rows predate this
 column and have no value to backfill from without re-deriving it from
 historical config snapshots, which is out of scope here. Nullability is NOT
 relaxed for new rows at the DB layer (no NOT NULL CHECK is added) -- the
@@ -29,8 +29,8 @@ No CHECK-constraint change: ``ck_strategy_runs_run_type``/
 ``ck_strategy_runs_status`` are untouched -- this migration only adds
 descriptive DATE columns.
 
-Revision ID: 016
-Revises: 015
+Revision ID: 017
+Revises: 016
 """
 
 from __future__ import annotations
@@ -38,8 +38,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "016"
-down_revision: str = "015"
+revision: str = "017"
+down_revision: str = "016"
 branch_labels = None
 depends_on = None
 

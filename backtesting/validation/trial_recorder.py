@@ -129,7 +129,11 @@ from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardVa
 from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.models import Base, StrategyDefinition
-from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
+from strategy_registry.registry import (
+    DefinitionNotFoundError,
+    MissingDataVersionError,
+    require_current_fingerprint_algo_version,
+)
 from strategy_registry.selection_models import (
     ResearchDataWindow,
     StrategyHypothesis,
@@ -584,11 +588,26 @@ class TrialRecorder:
                 strategy_family=strategy_family,
             )
 
-            if session.get(StrategyDefinition, (strategy_id, config_hash)) is None:
+            defn = session.get(StrategyDefinition, (strategy_id, config_hash))
+            if defn is None:
                 raise DefinitionNotFoundError(
                     f"No definition found for ('{strategy_id}', '{config_hash[:8]}…'). "
                     f"Call StrategyRegistry.add_definition()/register() before recording a trial."
                 )
+
+            # 04-4W: before comparing hashes below, check whether THIS row
+            # was itself hashed under a different fingerprint algorithm
+            # version. If so, a fresh hash_config(config) computed under the
+            # CURRENT algorithm would differ from this row's stored
+            # config_hash even for byte-identical, unmodified config content
+            # -- misdiagnosing an algorithm-version change as
+            # ConfigProvenanceMismatchError ("the config passed does not
+            # match its own config_hash"), which is wrong and would send an
+            # operator chasing a nonexistent content mutation. See
+            # require_current_fingerprint_algo_version's docstring.
+            require_current_fingerprint_algo_version(
+                defn, context="TrialRecorder config-provenance check"
+            )
 
             # P1 fix: a (strategy_id, config_hash) row existing is not enough
             # -- verify the config actually PASSED to this call is the one
@@ -729,7 +748,7 @@ class TrialRecorder:
                 # trial and a holdout trial recorded under the SAME
                 # config_hash distinguishable/reconstructable from the row
                 # alone (see selection_models.py's StrategyTrial docstring
-                # and migration 015).
+                # and migration 016).
                 eval_start_date=effective_start,
                 eval_end_date=effective_end,
             )
