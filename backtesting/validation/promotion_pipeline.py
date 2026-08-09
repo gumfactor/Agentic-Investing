@@ -120,7 +120,12 @@ import structlog
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
-from backtesting.config_contract import is_behavioral, prune_to_behavioral_leaves
+from backtesting.config_contract import (
+    UnsupportedStrategyConfigError,
+    assert_fill_simulator_matches_config,
+    is_behavioral,
+    validate_backtest_config,
+)
 from backtesting.validation.bootstrap_stress import (
     BootstrapStressResult,
     bootstrap_stress as _default_bootstrap_stress,
@@ -146,7 +151,6 @@ from backtesting.validation.survival_funnel import (
 )
 from backtesting.validation.trial_recorder import (
     TrialRecorder,
-    _config_with_data_version_and_window,
     _normalize_metric,
     _sanitize_metrics,
 )
@@ -574,7 +578,7 @@ class PromotionPipeline:
         # non-empty grid exists BEFORE any instrument runs. The value read
         # here is deliberately NOT the one dispatched to the sweep below --
         # see the FIX 2 re-read comment at the sweep dispatch site for why.
-        self._resolve_frozen_grid(strategy_id, hypothesis_id)
+        self._resolve_frozen_grid(strategy_id, hypothesis_id, config)
         strategy_family = self._resolve_strategy_family(strategy_id)
 
         # Stage 1: walk-forward (fresh; see module docstring's "re-run
@@ -619,7 +623,7 @@ class PromotionPipeline:
             # match the frozen record it's supposed to attest to.
             # Re-fetching and re-validating the grid here guarantees the
             # sweep provably uses the immutable, already-frozen grid.
-            frozen_param_grid = self._resolve_frozen_grid(strategy_id, hypothesis_id)
+            frozen_param_grid = self._resolve_frozen_grid(strategy_id, hypothesis_id, config)
             sensitivity_result = self._trial_recorder.run_parameter_sweep(
                 self._sweeper,
                 strategy_id=strategy_id,
@@ -771,31 +775,60 @@ class PromotionPipeline:
         # are CONSUMED_LOGGING_ONLY after round-8), so
         # is_behavioral("reporting") is True (bare sections are never
         # themselves classified non-behavioral -- only their sub-keys are)
-        # yet every possible value assigned to it is non-behavioral. Apply
-        # row.params UNFILTERED first (so ancestor/descendant/section-
-        # replace semantics work exactly as the real sweep does), THEN
-        # prune the resulting FULL effective config recursively by real
-        # leaf classification via prune_to_behavioral_leaves -- this closes
-        # the class regardless of which grid key or nesting depth
-        # introduced a non-behavioral value, rather than requiring another
-        # fix each time a new non-behavioral shape is found.
-        effective_config_to_row: dict[str, ParameterSensitivityRow] = {}
+        # yet every possible value assigned to it is non-behavioral. Fixed
+        # by applying row.params UNFILTERED then pruning the FULL resulting
+        # config recursively via prune_to_behavioral_leaves.
+        #
+        # PR #50 Codex round-10 fix (P1, promotion-integrity/C8) -- the
+        # class TERMINATES here: rounds 5-9 all tried to PREDICT, from the
+        # config alone, whether two variants would behave identically.
+        # Round 10 found the fundamental hole in that strategy: value
+        # COERCION. {"portfolio.n_long": [1, 1.0, True]} produces 3
+        # genuinely different serialized values, but BacktestEngine.run
+        # applies int(...) to n_long, so all 3 execute with n_long == 1 --
+        # no config-shape classification (behavioral vs not, section vs
+        # leaf) can ever predict this, because it depends on ENGINE-
+        # INTERNAL type coercion that can exist for any field, today or in
+        # the future, and reimplementing every such coercion rule here
+        # would be an unbounded, permanently-incomplete parallel model of
+        # the engine -- the exact "reimplementation that can drift"
+        # anti-pattern every fix since round-5 has been careful to avoid
+        # for the APPLY step. There is no config-level fix that closes this
+        # FOR REAL, because the question "will these two configs behave
+        # identically" is fundamentally a question about the engine's
+        # behavior, not the config's shape.
+        #
+        # So stop asking the config. The walk-forward/backtest simulation
+        # is deterministic given the same effective inputs (C7 data_version
+        # pinning already guarantees byte-identical inputs across re-runs,
+        # per this module's "re-run staleness" note above) -- so two
+        # variants that behave identically MUST produce bit-identical
+        # metrics, regardless of WHY they behave identically (raw-param
+        # duplication, ancestor/descendant collapse, non-behavioral fields,
+        # or a coercion neither this module nor config_contract.py has ever
+        # heard of). Dedupe on the row's own OBSERVED OUTCOME -- the same
+        # four metrics ParameterSensitivityRow already carries from the
+        # REAL simulation -- instead of trying to predict equivalence from
+        # the config. This is not a reimplementation of the engine's
+        # coercion rules; it is reading the engine's own answer directly,
+        # so it cannot drift out of sync with the engine no matter what
+        # coercion/aliasing exists now or is added later. (is_behavioral is
+        # still used below, in _resolve_frozen_grid's SEPARATE fail-closed
+        # pre-flight quality gate -- a config-shape question, unlike THIS
+        # dedupe, which is purely about counting
+        # distinct observed outcomes.)
+        effective_config_to_row: dict[tuple, ParameterSensitivityRow] = {}
         if sensitivity_result is not None:
             for row in sensitivity_result.rows:
                 if not math.isfinite(row.oos_sharpe):
                     continue
-                effective_config = _sweep_apply_params(
-                    _config_with_data_version_and_window(
-                        config, self._data_version, eval_window.start, eval_window.end
-                    ),
-                    row.params,
+                outcome_key = (
+                    row.oos_sharpe,
+                    row.oos_max_drawdown,
+                    row.trade_count,
+                    row.avg_is_sharpe,
                 )
-                effective_key = json.dumps(
-                    prune_to_behavioral_leaves(effective_config),
-                    sort_keys=True,
-                    default=str,
-                )
-                effective_config_to_row.setdefault(effective_key, row)
+                effective_config_to_row.setdefault(outcome_key, row)
 
         n_finite_sensitivity_variants = (
             len(effective_config_to_row) if sensitivity_result is not None else None
@@ -925,7 +958,7 @@ class PromotionPipeline:
     # ── Stage helpers ─────────────────────────────────────────────────────────
 
     def _resolve_frozen_grid(
-        self, strategy_id: str, hypothesis_id: Optional[int]
+        self, strategy_id: str, hypothesis_id: Optional[int], config: dict
     ) -> dict[str, list]:
         """Fail closed unless a pre-registered hypothesis with a non-empty
         ``param_grid_json`` is linked (§4.4: "an ad hoc grid invented after
@@ -986,23 +1019,24 @@ class PromotionPipeline:
                 "expensive walk-forward run and record trial evidence "
                 "before the sweep discovers zero usable combinations)."
             )
-        # PR #50 Codex round-7 fix (P1, promotion-integrity/C8), refined
-        # round-8: a grid key that is not behavioral per
+        # PR #50 Codex round-7/8 fix: a grid key that is not behavioral per
         # backtesting.config_contract.is_behavioral (INFORMATIONAL -- e.g.
-        # "description", "created", the whole "universe" section -- or
-        # CONSUMED_LOGGING_ONLY -- e.g. "version", "reporting.save_trades",
-        # read only by BacktestLogger, never per-sweep-variant) can never
-        # change what a variant actually backtests. Sweeping over such a
-        # key wastes N identical backtests AND creates exactly the
-        # "distinct row.params but IDENTICAL effective behavior"
-        # overcounting class the round-5/6 dedupe fixes exist to close --
-        # closing it at the SOURCE (reject the grid outright, before any
-        # instrument runs) rather than only downstream in the dedupe is both
-        # cheaper (no wasted walk-forward/sweep compute) and cannot be
-        # bypassed by a future dedupe-key change that forgets to filter.
-        # (backtesting.validation.promotion_pipeline.run() ALSO filters
-        # non-behavioral keys before computing the dedupe key, as defense
-        # in depth for any grid frozen before this fix shipped.)
+        # "description" -- or CONSUMED_LOGGING_ONLY -- e.g. "version", read
+        # only by BacktestLogger, never per-sweep-variant) can never change
+        # what a variant actually backtests. Sweeping over such a key
+        # wastes N identical backtests for zero sensitivity information.
+        #
+        # NOTE (round-10): this is now a fail-fast QUALITY gate, not a
+        # correctness dependency -- the n_finite_sensitivity_variants dedupe
+        # in run() no longer filters by is_behavioral at all; it dedupes on
+        # each row's OBSERVED metrics (see the round-10 comment at that
+        # computation), which correctly collapses non-behavioral-field
+        # duplicates unconditionally, without needing to know WHY two rows
+        # produced the same outcome. This check still runs because failing
+        # here is cheaper (no wasted walk-forward/sweep compute) and gives
+        # a clearer diagnostic than "your sweep produced 1 distinct outcome"
+        # after the fact -- but it is no longer the thing standing between
+        # a non-behavioral grid and a false "robust" verdict.
         non_behavioral_keys = sorted(key for key in param_grid if not is_behavioral(key))
         if non_behavioral_keys:
             raise MissingParameterGridError(
@@ -1017,6 +1051,56 @@ class PromotionPipeline:
                 "sweep must vary fields that actually affect what gets "
                 "backtested; remove these key(s) from the grid via "
                 "HypothesisRegistry.update_param_grid(...)."
+            )
+
+        # PR #50 Codex round-10 fix (P2-class efficiency/fail-fast, found
+        # alongside the P1 value-coercion finding above): a grid key or
+        # candidate value the backtest config contract cannot accept at
+        # all -- e.g. a REJECTED section ("constraints"), a genuinely
+        # unknown/typo'd field, an out-of-range portfolio.method value, or
+        # an execution.* value that mismatches the fixed FillSimulator --
+        # previously surfaced only when ParameterSweeper.sweep actually
+        # tried that variant, which is AFTER the (expensive) walk-forward
+        # leg has already run and recorded trial evidence (Stage 1 runs
+        # before Stage 3). UnsupportedStrategyConfigError/
+        # ExecutionConfigMismatchError are deliberately not swallowed as a
+        # NaN variant (see their docstrings), so this crashed the whole
+        # promotion run instead of failing the SAME fail-closed precondition
+        # check this method already performs for every other malformed-grid
+        # shape. Validate every (key, candidate) pair against the REAL
+        # validate_backtest_config/assert_fill_simulator_matches_config
+        # machinery here -- reusing it rather than reimplementing
+        # rejected/unknown/value-restricted logic a second time -- so any
+        # variant that would crash the sweep is caught before any
+        # instrument runs, exactly like every other check in this method.
+        # A dot-path absent from `config` entirely (_apply_params/
+        # _set_nested only OVERRIDES existing keys) raises KeyError from
+        # ParameterSweeper.sweep the same way -- also fail-closed here.
+        fill_simulator = getattr(self._sweeper, "_fill_sim", None)
+        invalid_candidates: list[str] = []
+        for key, candidates in param_grid.items():
+            for candidate in candidates:
+                try:
+                    candidate_config = _sweep_apply_params(config, {key: candidate})
+                except KeyError as exc:
+                    invalid_candidates.append(f"{key}={candidate!r}: {exc}")
+                    continue
+                try:
+                    validate_backtest_config(candidate_config)
+                    if fill_simulator is not None:
+                        assert_fill_simulator_matches_config(candidate_config, fill_simulator)
+                except UnsupportedStrategyConfigError as exc:
+                    invalid_candidates.append(f"{key}={candidate!r}: {exc}")
+        if invalid_candidates:
+            raise MissingParameterGridError(
+                f"strategy_hypotheses id={hypothesis_id} (strategy_id="
+                f"{strategy_id!r}) has param_grid_json candidate value(s) "
+                "that the backtest config contract cannot accept -- would "
+                "crash ParameterSweeper.sweep on that variant, AFTER the "
+                "walk-forward leg has already run. Checked BEFORE any "
+                "instrument runs, same as every other fail-closed "
+                f"precondition here:\n"
+                + "\n".join(f"  - {c}" for c in invalid_candidates)
             )
         return dict(param_grid)
 

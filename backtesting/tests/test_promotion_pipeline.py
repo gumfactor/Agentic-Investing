@@ -88,36 +88,39 @@ def _config(strategy_id: str = "v1_test_strategy") -> dict:
         "name": strategy_id,
         "version": 1,
         "backtest": {"start_date": "2022-01-01", "end_date": "2022-12-31"},
-        # Round-5 fix: PromotionPipeline.run() now recomputes each sweep
-        # row's EFFECTIVE applied config (via _apply_params) to dedupe on,
-        # using this same seeded config as the base -- so every dot-path
-        # key any fixture's ParameterSensitivityRow.params uses ("portfolio
-        # .n_long", "universe", "custom_metadata", "description") must
-        # already exist here for _apply_params/_set_nested to resolve it
-        # (it only OVERRIDES existing keys, never creates new ones -- see
-        # round-9's fix note below), exactly as a real strategy config
-        # would already define every tunable a param_grid can override.
-        # Round-9 fix: pruning now happens AFTER applying row.params
-        # (unfiltered) rather than before, so every dot-path a test's rows
-        # touch -- including non-behavioral ones like "description" --
-        # must resolve via _apply_params first, same as v1_base_momentum
-        # .yaml (a real config) always declares a "description" field.
+        # Round-5 fix: PromotionPipeline.run() recomputes each sweep row's
+        # EFFECTIVE applied config (via _apply_params) using this same
+        # seeded config as the base -- so every dot-path key any fixture's
+        # ParameterSensitivityRow.params uses ("portfolio.n_long",
+        # "universe", "description") must already exist here for
+        # _apply_params/_set_nested to resolve it (it only OVERRIDES
+        # existing keys, never creates new ones), exactly as a real
+        # strategy config would already define every tunable a param_grid
+        # can override.
+        #
+        # Round-10 fix: _resolve_frozen_grid now runs
+        # validate_backtest_config on every (grid key, candidate) pair
+        # applied to this base config, BEFORE any instrument runs -- so
+        # this fixture must be a genuinely CONTRACT-VALID config (every
+        # top-level/section key classified CONSUMED/CONSUMED_LOGGING_ONLY/
+        # INFORMATIONAL by backtesting/config_contract.py), not just
+        # "has the keys some test's row.params happens to touch." A
+        # previous "custom_metadata" placeholder field (deliberately
+        # unclassified, for a round-3 crash-safety test) is gone -- dedup
+        # is metrics-based now (round-10), so it never needed a params-
+        # level placeholder anyway; see
+        # test_nested_dict_param_values_do_not_crash_the_dedupe's updated
+        # docstring for why that test's original premise is now moot.
         "description": "placeholder description",
-        "portfolio": {"n_long": 10},
+        # "method" is required for the round-10 invalid-value pre-flight
+        # test (portfolio.method is consumed_value_restricted) --
+        # _set_nested only overrides EXISTING keys, so a grid touching
+        # "portfolio.method" needs it present in the base config first.
+        "portfolio": {"n_long": 10, "method": "equal_weight"},
         # "universe" is a REAL INFORMATIONAL section per
         # backtesting.config_contract (upstream signal-pipeline metadata,
-        # never read by the backtest path) -- round-7's dedupe fix filters
-        # it out of the effective-config key entirely.
+        # never read by the backtest path).
         "universe": {"source": "sp500"},
-        # "custom_metadata" is deliberately NOT a field config_contract.py
-        # knows about at all (field_status returns "unknown", not
-        # "informational"), so it is NOT filtered by the round-7 fix --
-        # used by tests that need a nested-value field that still
-        # participates in the dedupe key, to keep the round-3 crash-safety
-        # property (arbitrary nested list/dict values must not raise) and
-        # the round-7 informational-filtering property independently
-        # testable.
-        "custom_metadata": {},
         # "reporting" is a known section whose ONLY two sub-keys
         # (save_positions/save_trades) are BOTH CONSUMED_LOGGING_ONLY
         # (round-8) -- used by the round-9 test proving a section-level
@@ -227,13 +230,26 @@ def _sweep_result(
     ``oos_sharpe`` values alternate between a high and a deeply negative
     value (wide dispersion, std > the 0.5 default max_sharpe_std) so a
     REAL recomputation over these rows also independently lands on
-    curve_fit, not just this object's cosmetic label."""
+    curve_fit, not just this object's cosmetic label.
+
+    Round-10 fix: PromotionPipeline now dedupes on each row's OBSERVED
+    METRICS (oos_sharpe/oos_max_drawdown/trade_count/avg_is_sharpe), not
+    on row.params at all -- a deterministic engine means identical params
+    (or params that coerce/collapse to the same effective config) MUST
+    produce identical metrics, and vice versa. So ``oos_sharpe`` must vary
+    per row here to represent genuinely DISTINCT params (the default,
+    non-duplicate case) -- previously it was fixed at 0.9 for every row,
+    which was fine when dedup looked at row.params, but would make every
+    row collapse to one outcome now regardless of params.
+    ``duplicate_params=True`` keeps identical oos_sharpe across rows,
+    correctly representing "same params -> same observed outcome"."""
     n_rows = configs_tested if n_finite_rows is None else n_finite_rows
-    sharpes = (
-        [2.0 if i % 2 == 0 else -2.0 for i in range(n_rows)]
-        if verdict == "curve_fit"
-        else [0.9] * n_rows
-    )
+    if verdict == "curve_fit":
+        sharpes = [2.0 if i % 2 == 0 else -2.0 for i in range(n_rows)]
+    elif duplicate_params:
+        sharpes = [0.9] * n_rows
+    else:
+        sharpes = [0.9 + i * 0.01 for i in range(n_rows)]
     rows = [
         ParameterSensitivityRow(
             params={"portfolio.n_long": 10} if duplicate_params else {"portfolio.n_long": 10 + i},
@@ -569,43 +585,50 @@ def test_distinct_params_at_min_threshold_still_clears_after_dedupe(db_url: str)
 
 
 def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
-    """Round-3 (PR #50 Codex P2): _resolve_frozen_grid only requires each
-    param_grid value to be a non-empty list/tuple of candidates -- it does
-    not require the candidates themselves to be scalar. A candidate can be
-    a list/dict and still pass 04-3's strict-JSON param_grid validation
-    (JSON-serializable, not scalar). A dedupe key built from
-    tuple(sorted(row.params.items())) would raise TypeError: unhashable
-    type the moment such a row is put in a set. The
-    json.dumps(..., sort_keys=True) dedupe key must handle this without
-    raising, and must still distinguish genuinely different nested values.
+    """Round-3 (PR #50 Codex P2), superseded by round-10: the ORIGINAL
+    concern here was that a dedupe key built from
+    tuple(sorted(row.params.items())) raises TypeError: unhashable type
+    the moment a param candidate is itself a list/dict. Rounds 5-9 all
+    tried to derive the dedupe key from row.params (directly, or via the
+    fully-applied effective config) -- each fix closing one more way two
+    DIFFERENT param representations could resolve to the SAME effective
+    config, but round-10 found the fundamentally unclosable hole in that
+    whole strategy (engine-internal value COERCION, e.g. int(1) ==
+    int(1.0) == int(True)) and pivoted the dedupe to the row's OBSERVED
+    METRICS instead -- which never reads row.params AT ALL.
 
-    Uses "custom_metadata" (deliberately unclassified by config_contract.py
-    -- field_status returns "unknown", not "informational") rather than
-    "universe" (a REAL informational section, round-7 fix), so this test's
-    nested-value crash-safety property stays independent of round-7's
-    informational-field-filtering property -- see
-    test_informational_grid_key_variants_collapse_to_one_effective_config
-    for that one."""
+    That pivot makes THIS test's original premise structurally moot: since
+    ParameterSensitivityRow's metrics fields (oos_sharpe/oos_max_drawdown/
+    trade_count/avg_is_sharpe) are always plain hashable scalars by
+    dataclass construction, the dedupe can no longer be reached by
+    whatever garbage lives in row.params, regardless of its shape. This
+    test now instead documents and pins that pivot directly: two rows with
+    WILDLY different (including unhashable, deeply nested) params but
+    IDENTICAL metrics still collapse to one variant -- proving params
+    content is irrelevant to dedup now, only the observed outcome is."""
     config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
 
     rows = [
         ParameterSensitivityRow(
-            params={"custom_metadata": {"source": "sp500", "as_of": "2022-01-01"}},
+            params={"portfolio.n_long": 10},
             oos_sharpe=0.9,
             oos_max_drawdown=-0.10,
             trade_count=40,
             avg_is_sharpe=1.0,
         ),
         ParameterSensitivityRow(
-            params={"custom_metadata": {"source": "sp500", "as_of": "2022-01-01"}},
-            oos_sharpe=0.8,
+            # Unhashable nested params, and utterly unrelated to the row
+            # above's params -- but IDENTICAL metrics (same deterministic
+            # outcome). Must still collapse with the row above.
+            params={"portfolio.n_long": [{"deeply": {"nested": ["unhashable", "garbage"]}}]},
+            oos_sharpe=0.9,
             oos_max_drawdown=-0.10,
             trade_count=40,
             avg_is_sharpe=1.0,
         ),
         ParameterSensitivityRow(
-            params={"custom_metadata": {"source": "nasdaq100", "as_of": "2022-01-01"}},
+            params={"portfolio.n_long": 20},
             oos_sharpe=0.7,
             oos_max_drawdown=-0.10,
             trade_count=40,
@@ -614,7 +637,7 @@ def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
     ]
     sweep_result = ParameterSensitivityResult(
         base_config_name="v1_test_strategy",
-        param_grid={"custom_metadata": [{"source": "sp500"}, {"source": "nasdaq100"}]},
+        param_grid={"portfolio.n_long": [10, 20]},
         configs_tested=3,
         rows=rows,
         mean_oos_sharpe=0.8,
@@ -634,8 +657,9 @@ def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
         "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
-    # 3 rows, but only 2 distinct normalized param sets -- the two
-    # identical sp500 rows collapse to one.
+    # 3 rows, but only 2 distinct OBSERVED OUTCOMES -- the two rows
+    # sharing metrics collapse to one, regardless of how different (or
+    # unhashable) their params are.
     assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
 
 
@@ -812,20 +836,27 @@ def test_section_level_override_of_all_logging_only_subkeys_collapses(db_url: st
 
 
 def test_ancestor_descendant_grid_paths_collapse_to_same_effective_config(db_url: str) -> None:
-    """Round-5 (PR #50 Codex P1): distinct row.params dicts can still
-    resolve to the IDENTICAL effective backtest config when the grid has
-    overlapping ancestor/descendant dot-paths -- _reject_window_override_
-    keys only blocks paths that are ancestors of backtest.start_date/
-    end_date specifically, so a grid combining e.g. "portfolio" (replaces
-    the whole subtree) with "portfolio.n_long" (a leaf within it) is
-    otherwise perfectly legal. _apply_params applies a row's params dict
-    entries in insertion order, so whichever key comes later always wins
-    for any key it also touches. Two rows whose "portfolio" candidate
-    differs but whose later "portfolio.n_long" override lands on the SAME
-    value therefore backtest the identical config -- json.dumps(row.params)
-    dedup (round-3) would still count them as 2 distinct variants; the
-    round-5 fix (dedupe on the fully-applied config) must collapse them to
-    1."""
+    """Round-5 (PR #50 Codex P1), dedupe mechanism superseded by round-10:
+    distinct row.params dicts can resolve to the IDENTICAL effective
+    backtest config when the grid has overlapping ancestor/descendant
+    dot-paths -- e.g. a grid combining "portfolio" (replaces the whole
+    subtree) with "portfolio.n_long" (a leaf within it) is legal, and
+    _apply_params applies entries in insertion order, so whichever key
+    comes later always wins for any key it also touches. Two rows whose
+    "portfolio" candidate differs but whose later "portfolio.n_long"
+    override lands on the SAME value therefore backtest the identical
+    config.
+
+    Round-5 originally closed this by dedupeing on the fully-applied
+    config; round-10 replaced that mechanism with dedupeing on each row's
+    OBSERVED metrics instead (config-shape reasoning can never predict
+    engine-internal value coercion -- see
+    test_nested_dict_param_values_do_not_crash_the_dedupe). Under a
+    deterministic engine, two rows that backtest the identical effective
+    config MUST also produce identical metrics -- so this fixture gives
+    the two ancestor/descendant-collapsed rows IDENTICAL metrics (as a
+    real sweep would), pinning that the historical motivating scenario
+    still collapses correctly under the new mechanism."""
     config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
 
@@ -844,16 +875,19 @@ def test_ancestor_descendant_grid_paths_collapse_to_same_effective_config(db_url
         ParameterSensitivityRow(
             # Different "portfolio" candidate (888 vs 999 above), but the
             # SAME final "portfolio.n_long" override (10) -- net effect is
-            # IDENTICAL to the row above: portfolio == {"n_long": 10}.
+            # IDENTICAL to the row above: portfolio == {"n_long": 10}, so
+            # a real (deterministic) sweep would ALSO produce identical
+            # metrics -- given here directly, since dedup is metrics-based.
             params={"portfolio": {"n_long": 888}, "portfolio.n_long": 10},
-            oos_sharpe=0.8,
+            oos_sharpe=0.9,
             oos_max_drawdown=-0.10,
             trade_count=40,
             avg_is_sharpe=1.0,
         ),
         ParameterSensitivityRow(
-            # Genuinely different final value (20, not 10) -- must remain
-            # a distinct variant.
+            # Genuinely different final value (20, not 10) -- a real sweep
+            # would produce a different outcome, so this row gets distinct
+            # metrics -- must remain a distinct variant.
             params={"portfolio": {"n_long": 777}, "portfolio.n_long": 20},
             oos_sharpe=0.7,
             oos_max_drawdown=-0.10,
@@ -1240,6 +1274,130 @@ def test_grid_with_logging_only_key_fails_closed_before_walk_forward(db_url: str
     pipeline._wf_validator = validator
 
     with pytest.raises(MissingParameterGridError, match="not behavioral"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+# ── Round-10 (PR #50 Codex P1): value coercion defeats config-shape dedup;
+#    the fix pivots to dedupeing on OBSERVED metrics instead ─────────────
+
+
+def test_coerced_values_collapse_to_one_effective_variant(db_url: str) -> None:
+    """Codex's exact example: {"portfolio.n_long": [1, 1.0, True]} produces
+    3 genuinely different serialized/typed values (int, float, bool), but
+    BacktestEngine.run applies int(...) to n_long, so all 3 execute with
+    n_long == 1 -- no config-shape classification can predict this,
+    because it depends on engine-internal type coercion. Since the engine
+    is deterministic, all 3 rows produce IDENTICAL metrics in a real
+    sweep -- given identically here, since dedup is metrics-based and
+    never inspects row.params at all."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": value},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for value in (1, 1.0, True)
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [1, 1.0, True]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+# ── Round-10 (P2-class efficiency/fail-fast): a grid candidate the config
+#    contract cannot accept at all must fail closed BEFORE any instrument
+#    runs, not crash mid-sweep after the walk-forward leg already ran ────
+
+
+def test_grid_with_rejected_section_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """"constraints" is an entire REJECTED section (backend never reads it
+    at all -- BUG-075) -- previously this would only surface as
+    UnsupportedStrategyConfigError when ParameterSweeper.sweep actually
+    tried the variant, AFTER the walk-forward leg already ran. Must fail
+    the same fail-closed precondition every other malformed-grid shape
+    does here."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"constraints": [{"max_sector_weight": 0.3}]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="cannot accept"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_unknown_field_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """A dot-path absent from the base config entirely -- _apply_params/
+    _set_nested only OVERRIDES existing keys, so this raises KeyError
+    inside ParameterSweeper.sweep's per-variant loop, which (like
+    UnsupportedStrategyConfigError) is not caught as a NaN variant and
+    crashes the whole sweep. Must fail closed at the SAME precondition,
+    before any instrument runs."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"totally_made_up_field": ["a", "b"]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="cannot accept"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_invalid_portfolio_method_value_fails_closed(db_url: str) -> None:
+    """portfolio.method is consumed_value_restricted -- only "equal_weight"
+    is implemented (BUG-075). A grid sweeping to an unsupported value would
+    previously crash ParameterSweeper.sweep on that variant, after the
+    walk-forward leg already ran."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"portfolio.method": ["equal_weight", "mvo"]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="cannot accept"):
         pipeline.run(
             "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
