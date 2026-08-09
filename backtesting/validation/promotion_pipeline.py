@@ -120,6 +120,7 @@ import structlog
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
+from backtesting.config_contract import INFORMATIONAL, field_status
 from backtesting.validation.bootstrap_stress import (
     BootstrapStressResult,
     bootstrap_stress as _default_bootstrap_stress,
@@ -734,17 +735,39 @@ class PromotionPipeline:
         # reimplemented, so this can never drift from what "robust" means
         # there) -- rather than trusting sensitivity_result's stats, which
         # remain over the raw (possibly duplicate-inflated) rows.
+        #
+        # PR #50 Codex round-7 fix (P1, promotion-integrity/C8): "distinct
+        # effective config" (round-5) is still not the same as "distinct
+        # BACKTEST BEHAVIOR" -- a grid entry like
+        # {"description": ["a", "b", "c"]} produces three genuinely
+        # different serialized configs, but backtesting/config_contract.py
+        # explicitly classifies "description" (and other such fields) as
+        # INFORMATIONAL: accepted, but never read by the backtest path
+        # (see field_status()). Three rows that only differ in an
+        # informational field all execute the IDENTICAL backtest, so they
+        # must count as ONE variant, not three. Filter each row's params
+        # to exclude informational dot-paths BEFORE building the dedup
+        # key -- a row whose params become empty after filtering (every
+        # grid key it touched was informational) correctly collapses to
+        # the base config's own key, same as every other such row, which
+        # is exactly right: if nothing behavioral varies, there is only
+        # one real variant regardless of row count.
         effective_config_to_row: dict[str, ParameterSensitivityRow] = {}
         if sensitivity_result is not None:
             for row in sensitivity_result.rows:
                 if not math.isfinite(row.oos_sharpe):
                     continue
+                behavioral_params = {
+                    dot_path: value
+                    for dot_path, value in row.params.items()
+                    if field_status(dot_path) != INFORMATIONAL
+                }
                 effective_key = json.dumps(
                     _sweep_apply_params(
                         _config_with_data_version_and_window(
                             config, self._data_version, eval_window.start, eval_window.end
                         ),
-                        row.params,
+                        behavioral_params,
                     ),
                     sort_keys=True,
                     default=str,
@@ -939,6 +962,37 @@ class PromotionPipeline:
                 "or an empty list is not admissible -- it would let the "
                 "expensive walk-forward run and record trial evidence "
                 "before the sweep discovers zero usable combinations)."
+            )
+        # PR #50 Codex round-7 fix (P1, promotion-integrity/C8): a grid key
+        # classified INFORMATIONAL by backtesting.config_contract.field_status
+        # (e.g. "description", "created", or the whole "universe" section --
+        # accepted by validate_backtest_config, but never READ by the
+        # backtest path) can never change what a variant actually backtests.
+        # Sweeping over such a key wastes N identical backtests AND creates
+        # exactly the "distinct row.params but IDENTICAL effective behavior"
+        # overcounting class the round-5/6 dedupe fixes exist to close --
+        # closing it at the SOURCE (reject the grid outright, before any
+        # instrument runs) rather than only downstream in the dedupe is both
+        # cheaper (no wasted walk-forward/sweep compute) and cannot be
+        # bypassed by a future dedupe-key change that forgets to filter.
+        # (backtesting.validation.promotion_pipeline.run() ALSO filters
+        # informational keys before computing the dedupe key, as defense in
+        # depth for any grid frozen before this fix shipped.)
+        informational_keys = sorted(
+            key for key in param_grid if field_status(key) == INFORMATIONAL
+        )
+        if informational_keys:
+            raise MissingParameterGridError(
+                f"strategy_hypotheses id={hypothesis_id} (strategy_id="
+                f"{strategy_id!r}) has param_grid_json key(s) "
+                f"{informational_keys!r} classified INFORMATIONAL by "
+                "backtesting.config_contract.field_status -- accepted by "
+                "the backtest config contract, but never read by the "
+                "backtest path, so sweeping over them can never produce a "
+                "behaviorally different variant. A parameter-sensitivity "
+                "sweep must vary fields that actually affect what gets "
+                "backtested; remove these key(s) from the grid via "
+                "HypothesisRegistry.update_param_grid(...)."
             )
         return dict(param_grid)
 

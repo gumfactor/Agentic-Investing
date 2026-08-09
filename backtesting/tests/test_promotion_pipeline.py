@@ -92,11 +92,25 @@ def _config(strategy_id: str = "v1_test_strategy") -> dict:
         # row's EFFECTIVE applied config (via _apply_params) to dedupe on,
         # using this same seeded config as the base -- so every dot-path
         # key any fixture's ParameterSensitivityRow.params uses ("portfolio
-        # .n_long", "universe") must already exist here for _apply_params/
-        # _set_nested to resolve it, exactly as a real strategy config
-        # would already define every tunable a param_grid can override.
+        # .n_long", "universe", "custom_metadata") must already exist here
+        # for _apply_params/_set_nested to resolve it, exactly as a real
+        # strategy config would already define every tunable a param_grid
+        # can override.
         "portfolio": {"n_long": 10},
+        # "universe" is a REAL INFORMATIONAL section per
+        # backtesting.config_contract (upstream signal-pipeline metadata,
+        # never read by the backtest path) -- round-7's dedupe fix filters
+        # it out of the effective-config key entirely.
         "universe": {"source": "sp500"},
+        # "custom_metadata" is deliberately NOT a field config_contract.py
+        # knows about at all (field_status returns "unknown", not
+        # "informational"), so it is NOT filtered by the round-7 fix --
+        # used by tests that need a nested-value field that still
+        # participates in the dedupe key, to keep the round-3 crash-safety
+        # property (arbitrary nested list/dict values must not raise) and
+        # the round-7 informational-filtering property independently
+        # testable.
+        "custom_metadata": {},
     }
 
 
@@ -545,33 +559,40 @@ def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
     """Round-3 (PR #50 Codex P2): _resolve_frozen_grid only requires each
     param_grid value to be a non-empty list/tuple of candidates -- it does
     not require the candidates themselves to be scalar. A candidate can be
-    a list/dict (e.g. {"universe": [{"source": "sp500"}, ...]}) and still
-    pass 04-3's strict-JSON param_grid validation (JSON-serializable, not
-    scalar). A dedupe key built from tuple(sorted(row.params.items()))
-    would raise TypeError: unhashable type the moment such a row is put in
-    a set. The json.dumps(..., sort_keys=True) dedupe key must handle this
-    without raising, and must still distinguish genuinely different nested
-    values."""
+    a list/dict and still pass 04-3's strict-JSON param_grid validation
+    (JSON-serializable, not scalar). A dedupe key built from
+    tuple(sorted(row.params.items())) would raise TypeError: unhashable
+    type the moment such a row is put in a set. The
+    json.dumps(..., sort_keys=True) dedupe key must handle this without
+    raising, and must still distinguish genuinely different nested values.
+
+    Uses "custom_metadata" (deliberately unclassified by config_contract.py
+    -- field_status returns "unknown", not "informational") rather than
+    "universe" (a REAL informational section, round-7 fix), so this test's
+    nested-value crash-safety property stays independent of round-7's
+    informational-field-filtering property -- see
+    test_informational_grid_key_variants_collapse_to_one_effective_config
+    for that one."""
     config_hash = _seed_definition(db_url)
     hyp_id = _seed_hypothesis(db_url)
 
     rows = [
         ParameterSensitivityRow(
-            params={"universe": {"source": "sp500", "as_of": "2022-01-01"}},
+            params={"custom_metadata": {"source": "sp500", "as_of": "2022-01-01"}},
             oos_sharpe=0.9,
             oos_max_drawdown=-0.10,
             trade_count=40,
             avg_is_sharpe=1.0,
         ),
         ParameterSensitivityRow(
-            params={"universe": {"source": "sp500", "as_of": "2022-01-01"}},
+            params={"custom_metadata": {"source": "sp500", "as_of": "2022-01-01"}},
             oos_sharpe=0.8,
             oos_max_drawdown=-0.10,
             trade_count=40,
             avg_is_sharpe=1.0,
         ),
         ParameterSensitivityRow(
-            params={"universe": {"source": "nasdaq100", "as_of": "2022-01-01"}},
+            params={"custom_metadata": {"source": "nasdaq100", "as_of": "2022-01-01"}},
             oos_sharpe=0.7,
             oos_max_drawdown=-0.10,
             trade_count=40,
@@ -580,7 +601,7 @@ def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
     ]
     sweep_result = ParameterSensitivityResult(
         base_config_name="v1_test_strategy",
-        param_grid={"universe": [{"source": "sp500"}, {"source": "nasdaq100"}]},
+        param_grid={"custom_metadata": [{"source": "sp500"}, {"source": "nasdaq100"}]},
         configs_tested=3,
         rows=rows,
         mean_oos_sharpe=0.8,
@@ -603,6 +624,60 @@ def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
     # 3 rows, but only 2 distinct normalized param sets -- the two
     # identical sp500 rows collapse to one.
     assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
+
+
+def test_informational_grid_key_variants_collapse_to_one_effective_config(db_url: str) -> None:
+    """Round-7 (PR #50 Codex P1): Codex's exact example -- a grid entry
+    like {"description": ["a", "b", "c"]} produces 3 genuinely different
+    serialized configs (round-5's dedupe key), but "description" is
+    classified INFORMATIONAL by backtesting.config_contract.field_status:
+    accepted, but never read by the backtest path. All 3 rows execute the
+    IDENTICAL backtest, so they must count as ONE variant.
+
+    This exercises the dedupe-level filter directly (bypassing
+    _resolve_frozen_grid's round-7 validation-time rejection, the same way
+    test_ancestor_descendant_grid_paths_collapse_to_same_effective_config
+    bypasses it) -- the defense-in-depth path documented for any grid
+    frozen before the round-7 fix shipped."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"description": label},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for label in ("a", "b", "c")
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"description": ["a", "b", "c"]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows differing only in an INFORMATIONAL field -- all 3 execute the
+    # identical backtest, so exactly 1 distinct effective variant.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
 
 
 def test_ancestor_descendant_grid_paths_collapse_to_same_effective_config(db_url: str) -> None:
@@ -968,6 +1043,49 @@ def test_grid_with_string_value_fails_closed_before_walk_forward(db_url: str) ->
     pipeline._wf_validator = validator
 
     with pytest.raises(MissingParameterGridError):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_informational_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """Round-7 (PR #50 Codex P1): a grid key classified INFORMATIONAL by
+    backtesting.config_contract.field_status (e.g. "description") can
+    never produce a behaviorally different backtest -- sweeping over it
+    wastes N identical backtests and creates the exact "distinct params,
+    identical behavior" overcounting class the dedupe fixes exist to
+    close. Reject it at the SOURCE, before any instrument runs, rather
+    than relying solely on downstream dedupe filtering."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"description": ["a", "b", "c"]})
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="INFORMATIONAL"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_mixed_informational_and_behavioral_keys_fails_closed(db_url: str) -> None:
+    """A grid mixing one genuinely behavioral key with one informational
+    key must still be rejected outright -- a caller cannot smuggle an
+    informational sweep dimension past validation just by pairing it with
+    a valid one."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"portfolio.n_long": [10, 20], "description": ["a", "b"]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="INFORMATIONAL"):
         pipeline.run(
             "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
