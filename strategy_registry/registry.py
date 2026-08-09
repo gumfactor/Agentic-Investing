@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import structlog
@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from strategy_registry import fingerprint as fp_module
+from strategy_registry.evaluation_window import require_date
 from strategy_registry.fingerprint import StrategyFingerprint
 from strategy_registry import selection_models  # noqa: F401 -- import for side effect: registers
 # StrategyHypothesis/StrategyTrial/ResearchDataWindow/PromotionDecision on Base.metadata
@@ -70,6 +71,37 @@ class ConfigDriftError(StrategyRegistryError):
     pass
 
 
+class FingerprintAlgorithmVersionError(StrategyRegistryError):
+    """Raised when a stored ``StrategyDefinition``'s ``config_hash`` was
+    computed under a ``strategy_registry.fingerprint`` algorithm version
+    different from the current
+    ``strategy_registry.fingerprint.FINGERPRINT_ALGO_VERSION`` (04-4W).
+
+    This must be checked and raised BEFORE any hash-equality-based
+    diagnosis (``ConfigDriftError``, ``DuplicateVersionError``) is made, or
+    such a diagnosis is actively misleading: a stored v1 row and a
+    freshly-computed v2 hash of the IDENTICAL, unmodified YAML will differ
+    -- not because the YAML drifted (C6) and not because a genuine config
+    variant exists (``DuplicateVersionError``'s "bump version" advice), but
+    because ``backtest.start_date``/``backtest.end_date`` stopped being
+    part of identity the moment the algorithm moved from v1 to v2 (see
+    docs/plans/04-identity-evaluation-context-design.md, operator decision,
+    Option 1). ``config_hash`` comparisons against a pre-v2 row are not
+    meaningful until it is re-registered under the current algorithm.
+
+    Remedy: re-register the strategy so ``config_hash`` is recomputed under
+    the current ``FINGERPRINT_ALGO_VERSION`` -- do NOT author a new
+    versioned YAML (that is the C6 remedy for genuine drift, not this) and
+    do NOT bump ``version`` (that is the ``DuplicateVersionError`` remedy
+    for a genuine config variant, not this). Nothing is live -- C8
+    qualification has not started -- so re-registration carries no
+    live-session risk. The operator has explicitly waived rewriting
+    existing hashes/FKs in bulk; this error exists so a human sees an
+    accurate diagnosis and can re-register the specific strategy affected,
+    not so this module performs that rewrite automatically.
+    """
+
+
 class MissingDataVersionError(StrategyRegistryError):
     pass
 
@@ -113,6 +145,31 @@ _RUN_TYPE_LIFECYCLE_GATE: dict[str, set[StrategyStatus]] = {
 
 _VALID_RUN_TYPES = frozenset({"unit", "signal_ic", "backtest", "walk_forward", "paper", "live"})
 _VALID_RUN_STATUSES = frozenset({"running", "passed", "failed", "blocked"})
+
+
+def require_current_fingerprint_algo_version(defn: StrategyDefinition, *, context: str) -> None:
+    """Raise FingerprintAlgorithmVersionError if ``defn.fingerprint_algo_version``
+    is not the current ``strategy_registry.fingerprint.FINGERPRINT_ALGO_VERSION``
+    (04-4W). Callers must invoke this BEFORE using ``defn.config_hash`` in any
+    hash-equality-based diagnosis -- see that error's docstring.
+    """
+    if defn.fingerprint_algo_version != fp_module.FINGERPRINT_ALGO_VERSION:
+        raise FingerprintAlgorithmVersionError(
+            f"{context}: strategy_id={defn.strategy_id!r} config_hash="
+            f"{defn.config_hash[:12]}… was computed under fingerprint "
+            f"algorithm v{defn.fingerprint_algo_version}, but the current "
+            f"algorithm is v{fp_module.FINGERPRINT_ALGO_VERSION} (which "
+            "excludes backtest.start_date/backtest.end_date from identity -- "
+            "see docs/plans/04-identity-evaluation-context-design.md). A "
+            "hash comparison against this row is not meaningful until it is "
+            "re-registered under the current algorithm. Nothing is live "
+            "(C8 qualification has not started); the remedy is to "
+            "re-register this strategy so config_hash is recomputed under "
+            f"v{fp_module.FINGERPRINT_ALGO_VERSION} -- NOT to author a new "
+            "versioned YAML (that is the C6 remedy for genuine content "
+            "drift) and NOT to bump 'version' (that is the "
+            "DuplicateVersionError remedy for a genuine config variant)."
+        )
 
 
 # ── StrategyRegistry ──────────────────────────────────────────────────────────
@@ -177,6 +234,7 @@ class StrategyRegistry:
                 rebalance_frequency=fp.rebalance_frequency,
                 config=fp.config,
                 source_path=fp.source_path,
+                fingerprint_algo_version=fp.fingerprint_algo_version,
                 created_at=now,
             )
             session.add(defn)
@@ -188,6 +246,22 @@ class StrategyRegistry:
                 if "uq_strategy_definitions_version" in exc_str or (
                     "unique" in exc_str and "version" in exc_str
                 ):
+                    # 04-4W: before diagnosing this as a genuine config
+                    # variant (DuplicateVersionError), check whether the
+                    # EXISTING colliding row was hashed under a different
+                    # fingerprint algorithm version -- if so, the collision
+                    # is an algorithm-version artifact, not a real second
+                    # variant, and "bump version" is the wrong remedy.
+                    existing = session.scalar(
+                        select(StrategyDefinition).where(
+                            StrategyDefinition.strategy_id == fp.strategy_id,
+                            StrategyDefinition.version == fp.version,
+                        )
+                    )
+                    if existing is not None:
+                        require_current_fingerprint_algo_version(
+                            existing, context="add_definition version collision"
+                        )
                     raise DuplicateVersionError(
                         f"Version {fp.version} is already registered for "
                         f"'{fp.strategy_id}' with a different config hash. "
@@ -286,6 +360,7 @@ class StrategyRegistry:
                     rebalance_frequency=fp.rebalance_frequency,
                     config=fp.config,
                     source_path=fp.source_path,
+                    fingerprint_algo_version=fp.fingerprint_algo_version,
                     created_at=now,
                 )
                 session.add(defn)
@@ -300,6 +375,20 @@ class StrategyRegistry:
                     if "uq_strategy_definitions_version" in exc_str or (
                         "unique" in exc_str and "version" in exc_str
                     ):
+                        # 04-4W: same precedence as add_definition -- check
+                        # the EXISTING colliding row's fingerprint algorithm
+                        # version before diagnosing this as a genuine config
+                        # variant.
+                        existing = session.scalar(
+                            select(StrategyDefinition).where(
+                                StrategyDefinition.strategy_id == fp.strategy_id,
+                                StrategyDefinition.version == fp.version,
+                            )
+                        )
+                        if existing is not None:
+                            require_current_fingerprint_algo_version(
+                                existing, context="register version collision"
+                            )
                         raise DuplicateVersionError(
                             f"Version {fp.version} is already registered for '{fp.strategy_id}' "
                             f"with a different config hash. "
@@ -348,6 +437,20 @@ class StrategyRegistry:
                 if "uq_strategy_definitions_version" in exc_str or (
                     "unique" in exc_str and "version" in exc_str
                 ):
+                    # 04-4W: same precedence as add_definition/the earlier
+                    # flush() collision above -- a concurrent-registration
+                    # race lands here too, and the colliding row could
+                    # still be a pre-v2 algorithm artifact.
+                    existing = session.scalar(
+                        select(StrategyDefinition).where(
+                            StrategyDefinition.strategy_id == fp.strategy_id,
+                            StrategyDefinition.version == fp.version,
+                        )
+                    )
+                    if existing is not None:
+                        require_current_fingerprint_algo_version(
+                            existing, context="register commit-race version collision"
+                        )
                     raise DuplicateVersionError(
                         f"Version {fp.version} is already registered for '{fp.strategy_id}' "
                         f"with a different config hash."
@@ -486,6 +589,13 @@ class StrategyRegistry:
         """
         Re-fingerprint the YAML at source_path and compare against
         canonical_config_hash. Raises ConfigDriftError if they differ (C6).
+
+        Raises FingerprintAlgorithmVersionError instead, BEFORE attempting
+        that comparison, when the stored definition's config_hash was
+        computed under a fingerprint algorithm version other than the
+        current one (04-4W) -- see that error's docstring for why a hash
+        comparison against such a row would otherwise misdiagnose an
+        algorithm-version change as C6 config drift.
         """
         with Session(self._engine) as session:
             strategy = self._get_or_raise(session, strategy_id)
@@ -498,6 +608,7 @@ class StrategyRegistry:
                     f"No definition row found for '{strategy_id}' with its canonical config hash. "
                     f"The definition may have been removed from the DB."
                 )
+            require_current_fingerprint_algo_version(defn, context="verify_config_integrity")
             if not defn.source_path:
                 raise ConfigDriftError(
                     f"Cannot verify '{strategy_id}': source_path not recorded in definition."
@@ -526,10 +637,25 @@ class StrategyRegistry:
         artifact_path: Optional[str] = None,
         mlflow_run_id: Optional[str] = None,
         notes: Optional[str] = None,
+        eval_start_date: Optional[date] = None,
+        eval_end_date: Optional[date] = None,
     ) -> StrategyRun:
         """
         Append a run record. data_version required for backtest/walk_forward (C7).
         The (strategy_id, config_hash) must exist in strategy_definitions.
+
+        eval_start_date/eval_end_date (migration 017, 04-4W Phase W3) are the
+        EFFECTIVE evaluation window this run actually ran over. Required
+        (both non-null, start <= end) for the same run_types that require
+        data_version (backtest/walk_forward) -- since
+        docs/plans/04-identity-evaluation-context-design.md moved
+        backtest.start_date/backtest.end_date out of config_hash, the window
+        is no longer reconstructable from (strategy_id, config_hash,
+        data_version) alone, and two backtest/walk_forward runs over
+        different windows would otherwise collide and be indistinguishable.
+        Optional for unit/signal_ic/paper/live, which are not window-scoped
+        evaluations (mirrors StrategyTrial.eval_start_date/eval_end_date,
+        strategy_registry/selection_models.py, migration 016).
         """
         if run_type not in _VALID_RUN_TYPES:
             raise ValueError(
@@ -544,6 +670,62 @@ class StrategyRegistry:
                 f"data_version is required for run_type='{run_type}' (C7). "
                 f"Pass the MLflow manifest path."
             )
+        if run_type in _REQUIRE_DATA_VERSION:
+            if eval_start_date is None or eval_end_date is None:
+                raise ValueError(
+                    f"eval_start_date and eval_end_date are required for "
+                    f"run_type='{run_type}' (04-4W Phase W3, migration 017). "
+                    f"Without them, two '{run_type}' runs recorded over "
+                    f"different evaluation windows under the same "
+                    f"(strategy_id, config_hash, data_version) are "
+                    f"indistinguishable now that the window is excluded from "
+                    f"config_hash. Pass the effective evaluation window."
+                )
+        elif (eval_start_date is None) != (eval_end_date is None):
+            # PR #50 Codex round-6 fix (P2): eval_start_date/eval_end_date
+            # are OPTIONAL for unit/signal_ic/paper/live (not window-scoped
+            # evaluations), but a CALLER can still supply them -- and until
+            # this check, supplying only one endpoint silently persisted an
+            # incomplete/meaningless pair (the column is nullable, so no DB
+            # constraint would catch it either).
+            raise ValueError(
+                f"eval_start_date and eval_end_date must both be provided or "
+                f"both omitted for run_type='{run_type}' -- got "
+                f"eval_start_date={eval_start_date!r}, "
+                f"eval_end_date={eval_end_date!r}."
+            )
+
+        if eval_start_date is not None and eval_end_date is not None:
+            # PR #50 Codex round-5 fix (P2): record_run is a public API a
+            # caller can reach without going through EvaluationWindow (the
+            # only other current caller, TrialRecorder, always derives
+            # these from an already-validated EvaluationWindow.start/.end,
+            # so this is a real second entry point, not a hypothetical
+            # one). Without a type check, two datetime values or two ISO
+            # strings pass the bare `>` comparison below (datetime
+            # subclasses date; ISO strings compare lexicographically the
+            # same way dates do) and this would persist a StrategyRun with
+            # a window SQLAlchemy's Date binding silently truncates or
+            # rejects only at the DB write. Reuse EvaluationWindow's own
+            # date-vs-datetime guard (require_date) rather than a second,
+            # possibly-drifting copy of the same check.
+            #
+            # PR #50 Codex round-6 fix (P2, same review round as the
+            # incomplete-pair check above): this type-and-order check now
+            # runs whenever BOTH dates are present, regardless of run_type
+            # -- previously it only ran inside the required-run-type
+            # branch, so a caller supplying both dates for an OPTIONAL
+            # run_type (e.g. run_type="paper") with eval_start_date after
+            # eval_end_date, or as datetime/string values, persisted a
+            # reversed or mistyped range with no check at all.
+            require_date("eval_start_date", eval_start_date)
+            require_date("eval_end_date", eval_end_date)
+            if eval_start_date > eval_end_date:
+                raise ValueError(
+                    f"eval_start_date ({eval_start_date}) is after "
+                    f"eval_end_date ({eval_end_date}) for run_type="
+                    f"'{run_type}' -- reversed evaluation window."
+                )
 
         now = datetime.now(tz=timezone.utc)
 
@@ -589,6 +771,8 @@ class StrategyRegistry:
                 notes=notes,
                 started_at=now,
                 completed_at=now if status != "running" else None,
+                eval_start_date=eval_start_date,
+                eval_end_date=eval_end_date,
             )
             session.add(run)
             session.commit()

@@ -5,6 +5,7 @@ Covers the definition layer, lifecycle layer, and run recording layer.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from strategy_registry.registry import (
     ConflictingActiveStrategyError,
     DefinitionNotFoundError,
     DuplicateVersionError,
+    FingerprintAlgorithmVersionError,
     InsufficientPaperQualificationError,
     InvalidTransitionError,
     MissingDataVersionError,
@@ -31,7 +33,17 @@ from strategy_registry.registry import (
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 
-def _write_config(path: Path, *, version: int = 1, name: str = "test_strategy", weight: float = 1.0) -> Path:
+def _write_config(
+    path: Path,
+    *,
+    version: int = 1,
+    name: str = "test_strategy",
+    weight: float = 1.0,
+    start_date: str = "2022-01-01",
+    end_date: str = "2024-12-31",
+    initial_capital: float = 1000000.0,
+    n_long: int = 10,
+) -> Path:
     """Write a valid, complete strategy YAML."""
     config = {
         "version": version,
@@ -39,12 +51,12 @@ def _write_config(path: Path, *, version: int = 1, name: str = "test_strategy", 
         "description": f"Test strategy v{version}",
         "universe": {"source": "sp500"},
         "indicators": {"momentum": {"weight": weight, "score_col": "momentum_score"}},
-        "portfolio": {"method": "equal_weight", "n_long": 10, "max_position_weight": 0.1},
+        "portfolio": {"method": "equal_weight", "n_long": n_long, "max_position_weight": 0.1},
         "execution": {"fill_model": "perfect"},
         "backtest": {
-            "start_date": "2022-01-01",
-            "end_date": "2024-12-31",
-            "initial_capital": 1000000.0,
+            "start_date": start_date,
+            "end_date": end_date,
+            "initial_capital": initial_capital,
             "benchmark": "SPY",
         },
     }
@@ -87,6 +99,66 @@ def test_fingerprint_detects_logic_change(tmp_path: Path) -> None:
     p1 = _write_config(tmp_path / "a.yaml", weight=1.0)
     p2 = _write_config(tmp_path / "b.yaml", weight=0.5)
     assert fingerprint(str(p1)).config_hash != fingerprint(str(p2)).config_hash
+
+
+# ── identity vs. evaluation context (docs/plans/04-identity-evaluation-
+#    context-design.md, operator decision 2026-08-07, Option 1) ────────────
+
+
+def test_fingerprint_excludes_backtest_window_from_hash(tmp_path: Path) -> None:
+    """Two configs differing ONLY in backtest.start_date/end_date must hash
+    IDENTICALLY -- the evaluation window is context, not identity, so the
+    same frozen config_hash can be evaluated over train/OOS dates and then
+    again over the sealed holdout window."""
+    p1 = _write_config(
+        tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31"
+    )
+    p2 = _write_config(
+        tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31"
+    )
+    assert fingerprint(str(p1)).config_hash == fingerprint(str(p2)).config_hash
+
+
+def test_fingerprint_still_retains_backtest_dates_in_stored_config(tmp_path: Path) -> None:
+    """The date fields must remain in StrategyFingerprint.config (still
+    consumed/validated by backtesting.config_contract) -- only the HASH
+    excludes them, not the stored/returned canonical config."""
+    p = _write_config(tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31")
+    fp = fingerprint(str(p))
+    assert fp.config["backtest"]["start_date"] == "2022-01-01"
+    assert fp.config["backtest"]["end_date"] == "2022-12-31"
+
+
+def test_fingerprint_still_detects_real_param_change(tmp_path: Path) -> None:
+    """A real identity difference (portfolio.n_long) must still change the
+    hash -- the window exclusion must not blunt detection of genuine param
+    changes."""
+    p1 = _write_config(tmp_path / "a.yaml", n_long=10)
+    p2 = _write_config(tmp_path / "b.yaml", n_long=20)
+    assert fingerprint(str(p1)).config_hash != fingerprint(str(p2)).config_hash
+
+
+def test_fingerprint_still_detects_initial_capital_change(tmp_path: Path) -> None:
+    """backtest.initial_capital is a SIBLING of the two excluded date keys,
+    not itself excluded -- it remains part of identity."""
+    p1 = _write_config(tmp_path / "a.yaml", initial_capital=1_000_000.0)
+    p2 = _write_config(tmp_path / "b.yaml", initial_capital=2_000_000.0)
+    assert fingerprint(str(p1)).config_hash != fingerprint(str(p2)).config_hash
+
+
+def test_hash_config_excludes_backtest_window_and_data_version(tmp_path: Path) -> None:
+    """hash_config (the in-memory dict entry point TrialRecorder/
+    PromotionPipeline use) applies the same exclusions as fingerprint()."""
+    from strategy_registry.fingerprint import hash_config
+
+    base = yaml.safe_load(_write_config(tmp_path / "base.yaml").read_text())
+    windowed = dict(base)
+    windowed["backtest"] = dict(base["backtest"])
+    windowed["backtest"]["start_date"] = "2020-01-01"
+    windowed["backtest"]["end_date"] = "2021-01-01"
+    windowed["data_version"] = "a" * 64
+
+    assert hash_config(base) == hash_config(windowed)
 
 
 def test_fingerprint_derives_strategy_id(cfg: Path) -> None:
@@ -172,6 +244,57 @@ def test_add_definition_same_version_different_hash_raises(
     registry.add_definition(str(p1))
     with pytest.raises(DuplicateVersionError):
         registry.add_definition(str(p2))
+
+
+# ── F3 (2026-08-08 adversarial review): pin the INTENDED post-cb9b4f3-
+#    deletion behavior at the exact site the deleted reuse guard used to
+#    block ──────────────────────────────────────────────────────────────────
+#
+# cb9b4f3's EvaluationWindowConflictError/_assert_reuse_config_matches()
+# guard (deliberately NOT ported into this slice, per the 04-4W brief) used
+# to fail-closed on "same identity, different evaluation window" reuse.
+# Once the window is excluded from config_hash (a000e87) and threaded as an
+# explicit per-measurement input instead (this slice), that reuse is LEGAL
+# and EXPECTED -- two configs differing ONLY in backtest.start_date/end_date
+# hash identically, so add_definition()/register() must treat the second
+# call as an idempotent no-op returning the SAME row, not raise. Nothing
+# pinned that contract until now.
+
+
+def test_add_definition_same_content_different_dates_returns_same_row(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    p1 = _write_config(tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31")
+    p2 = _write_config(tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31")
+    d1 = registry.add_definition(str(p1))
+    d2 = registry.add_definition(str(p2))
+    assert d1.config_hash == d2.config_hash
+    assert d1.strategy_id == d2.strategy_id
+    # Genuinely the SAME row (not merely two rows with equal hashes) --
+    # only one strategy_definitions row exists for this identity.
+    assert len(registry.list_definitions(d1.strategy_id)) == 1
+
+
+def test_register_same_content_different_dates_returns_same_strategy(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """register() reaches the same idempotent-reuse path via
+    session.get(StrategyDefinition, (strategy_id, config_hash)) when
+    auto-creating the definition -- a second register() attempt for an
+    ALREADY-registered strategy_id still raises StrategyAlreadyRegisteredError
+    (permanent strategy_id, unrelated to this contract), so this test
+    exercises add_definition() twice with different-dated configs sharing
+    one identity, then register()s once -- proving the definition layer's
+    reuse-on-identity-match behavior register() itself relies on."""
+    p1 = _write_config(tmp_path / "a.yaml", start_date="2022-01-01", end_date="2022-12-31")
+    p2 = _write_config(tmp_path / "b.yaml", start_date="2023-06-01", end_date="2024-03-31")
+    d1 = registry.add_definition(str(p1))
+    d2 = registry.add_definition(str(p2))
+    assert d1.config_hash == d2.config_hash
+
+    strategy = registry.register(str(p2))
+    assert strategy.canonical_config_hash == d1.config_hash
+    assert len(registry.list_definitions(strategy.strategy_id)) == 1
 
 
 def test_list_definitions_returns_all_versions(
@@ -410,7 +533,8 @@ def test_get_not_found_raises(registry: StrategyRegistry) -> None:
 def test_record_run_requires_definition(registry: StrategyRegistry) -> None:
     with pytest.raises(DefinitionNotFoundError):
         registry.record_run("v1_test_strategy", "a" * 64, "backtest", "passed",
-                            data_version="snap/v1")
+                            data_version="snap/v1",
+                            eval_start_date=date(2022, 1, 1), eval_end_date=date(2022, 12, 31))
 
 
 def test_record_run_backtest_requires_data_version(
@@ -451,9 +575,111 @@ def test_record_run_backtest_success(registry: StrategyRegistry, cfg: Path) -> N
         data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
         metrics={"sharpe_ratio": 0.82, "annualized_return": 0.14, "max_drawdown": -0.09},
         mlflow_run_id="abc123",
+        eval_start_date=date(2022, 1, 1),
+        eval_end_date=date(2022, 12, 31),
     )
     assert run.id is not None
     assert run.metrics["sharpe_ratio"] == 0.82
+    assert run.eval_start_date == date(2022, 1, 1)
+    assert run.eval_end_date == date(2022, 12, 31)
+
+
+def test_record_run_backtest_requires_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """04-4W Phase W3: backtest/walk_forward runs must carry an explicit
+    eval_start_date/eval_end_date, mirroring the C7 data_version gate --
+    otherwise two runs over different windows recorded under the same
+    (strategy_id, config_hash, data_version) are indistinguishable now that
+    the window is excluded from config_hash."""
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="eval_start_date and eval_end_date are required"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+        )
+
+
+def test_record_run_rejects_reversed_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="reversed evaluation window"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date=date(2022, 12, 31),
+            eval_end_date=date(2022, 1, 1),
+        )
+
+
+# ── PR #50 Codex round-5 (P2): record_run must reject datetime/string
+#    eval_start_date/eval_end_date, not just accept them via a bare `>`
+#    comparison -- the same gap EvaluationWindow was hardened against,
+#    found independently here since record_run is a second, direct entry
+#    point that does not go through EvaluationWindow ──────────────────────
+
+
+def test_record_run_rejects_datetime_eval_start_date(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """datetime subclasses date, so a bare `>` comparison alone would
+    accept it and only fail later at the DB Date-column write."""
+    from datetime import datetime
+
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date=datetime(2022, 1, 1),  # type: ignore[arg-type]
+            eval_end_date=date(2022, 12, 31),
+        )
+
+
+def test_record_run_rejects_datetime_eval_end_date(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    from datetime import datetime
+
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date=date(2022, 1, 1),
+            eval_end_date=datetime(2022, 12, 31),  # type: ignore[arg-type]
+        )
+
+
+def test_record_run_rejects_string_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Two ISO strings compare lexicographically the same way two dates
+    would, so the bare `>` comparison alone would not catch this either."""
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            s.strategy_id,
+            s.canonical_config_hash,
+            "backtest",
+            "passed",
+            data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
+            eval_start_date="2022-01-01",  # type: ignore[arg-type]
+            eval_end_date=date(2022, 12, 31),
+        )
 
 
 def test_record_run_signal_ic_no_data_version_required(
@@ -468,6 +694,116 @@ def test_record_run_signal_ic_no_data_version_required(
         metrics={"ic_mean": 0.05, "ic_ir": 0.8},
     )
     assert run.run_type == "signal_ic"
+
+
+# ── PR #50 Codex round-6 (P2): eval_start_date/eval_end_date are OPTIONAL
+#    for non-window-scoped run types, but if a caller supplies them at all
+#    they must still be validated -- an incomplete pair or a reversed/
+#    mistyped pair was previously persisted silently ─────────────────────
+
+
+def test_record_run_optional_run_type_accepts_no_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Baseline: omitting both eval dates entirely for an optional run_type
+    still works (unaffected by the round-6 fix)."""
+    s = registry.register(str(cfg))
+    run = registry.record_run(
+        strategy_id=s.strategy_id,
+        config_hash=s.canonical_config_hash,
+        run_type="signal_ic",
+        status="passed",
+        metrics={"ic_mean": 0.05},
+    )
+    assert run.eval_start_date is None
+    assert run.eval_end_date is None
+
+
+def test_record_run_optional_run_type_accepts_full_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Baseline: supplying a valid, complete pair for an optional run_type
+    still works."""
+    s = registry.register(str(cfg))
+    run = registry.record_run(
+        strategy_id=s.strategy_id,
+        config_hash=s.canonical_config_hash,
+        run_type="signal_ic",
+        status="passed",
+        metrics={"ic_mean": 0.05},
+        eval_start_date=date(2022, 1, 1),
+        eval_end_date=date(2022, 12, 31),
+    )
+    assert run.eval_start_date == date(2022, 1, 1)
+    assert run.eval_end_date == date(2022, 12, 31)
+
+
+def test_record_run_optional_run_type_rejects_incomplete_eval_window_start_only(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="must both be provided or both omitted"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_start_date=date(2022, 1, 1),
+        )
+
+
+def test_record_run_optional_run_type_rejects_incomplete_eval_window_end_only(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="must both be provided or both omitted"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_end_date=date(2022, 12, 31),
+        )
+
+
+def test_record_run_optional_run_type_rejects_reversed_eval_window(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """Codex's exact example: record_run(..., run_type="paper",
+    eval_start_date after eval_end_date) previously persisted a reversed
+    range silently, since the reversed-window check only ran inside the
+    required-run-type branch."""
+    s = registry.register(str(cfg))
+    with pytest.raises(ValueError, match="reversed evaluation window"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_start_date=date(2026, 8, 8),
+            eval_end_date=date(2026, 8, 1),
+        )
+
+
+def test_record_run_optional_run_type_rejects_datetime_eval_dates(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    from datetime import datetime
+
+    s = registry.register(str(cfg))
+    with pytest.raises(TypeError, match="datetime.date"):
+        registry.record_run(
+            strategy_id=s.strategy_id,
+            config_hash=s.canonical_config_hash,
+            run_type="signal_ic",
+            status="passed",
+            metrics={"ic_mean": 0.05},
+            eval_start_date=datetime(2022, 1, 1),  # type: ignore[arg-type]
+            eval_end_date=date(2022, 12, 31),
+        )
 
 
 def test_record_run_pre_registration(
@@ -597,9 +933,11 @@ def test_get_runs_filters(registry: StrategyRegistry, cfg: Path) -> None:
     registry.record_run(s.strategy_id, s.canonical_config_hash, "signal_ic", "passed",
                         metrics={"ic": 0.05})
     registry.record_run(s.strategy_id, s.canonical_config_hash, "backtest", "passed",
-                        data_version="snap/v1", metrics={"sharpe": 0.8})
+                        data_version="snap/v1", metrics={"sharpe": 0.8},
+                        eval_start_date=date(2022, 1, 1), eval_end_date=date(2022, 12, 31))
     registry.record_run(s.strategy_id, s.canonical_config_hash, "backtest", "failed",
-                        data_version="snap/v2")
+                        data_version="snap/v2",
+                        eval_start_date=date(2023, 1, 1), eval_end_date=date(2023, 12, 31))
 
     all_runs = registry.get_runs(s.strategy_id)
     assert len(all_runs) == 3
@@ -633,3 +971,155 @@ def test_public_registry_setup_creates_selection_schema_tables(
         "promotion_decisions",
     ):
         assert expected in table_names, f"{expected} missing from public registry setup"
+
+
+# ── FingerprintAlgorithmVersionError precedence (04-4W PM amendment A1) ────────
+#
+# fingerprint_algo_version must be load-bearing on every read path that
+# compares a stored config_hash against a freshly computed one -- otherwise
+# a pre-v2 row silently misdiagnoses as C6 drift (verify_config_integrity)
+# or a genuine config variant (DuplicateVersionError), when the real cause
+# is that the fingerprint algorithm changed underneath unmodified content.
+
+
+def _downgrade_fingerprint_algo_version(
+    registry: StrategyRegistry, strategy_id: str, config_hash: str, *, version: int = 1
+) -> None:
+    """Simulate a pre-04-4W legacy row by forcing its fingerprint_algo_version
+    back to an older value directly in the DB, bypassing the application
+    (which always writes the current FINGERPRINT_ALGO_VERSION)."""
+    from sqlalchemy.orm import Session as _Session
+
+    from strategy_registry.models import StrategyDefinition as _StrategyDefinition
+
+    with _Session(registry._engine) as session:
+        defn = session.get(_StrategyDefinition, (strategy_id, config_hash))
+        defn.fingerprint_algo_version = version
+        session.commit()
+
+
+def test_verify_config_integrity_raises_algo_version_error_not_drift_for_legacy_row(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """A v1-algorithm-hashed row, re-checked against UNMODIFIED YAML, must
+    raise FingerprintAlgorithmVersionError -- NOT ConfigDriftError. The YAML
+    never changed; only the fingerprint algorithm did (a000e87 excluded
+    backtest.start_date/end_date from identity). Diagnosing this as C6
+    drift would send an operator to author a needless new YAML version."""
+    s = registry.register(str(cfg))
+    _downgrade_fingerprint_algo_version(registry, s.strategy_id, s.canonical_config_hash, version=1)
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        registry.verify_config_integrity(s.strategy_id)
+
+
+def test_verify_config_integrity_still_raises_drift_for_current_algo_row(
+    registry: StrategyRegistry, cfg: Path
+) -> None:
+    """A genuinely-drifted row hashed under the CURRENT algorithm must still
+    raise ConfigDriftError -- the version-precedence check must not mask
+    real C6 violations."""
+    registry.register(str(cfg))
+    raw = yaml.safe_load(cfg.read_text())
+    raw["indicators"]["momentum"]["weight"] = 0.5
+    cfg.write_text(yaml.dump(raw))
+    with pytest.raises(ConfigDriftError):
+        registry.verify_config_integrity("v1_test_strategy")
+
+
+def _seed_legacy_definition_row(
+    registry: StrategyRegistry,
+    *,
+    strategy_id: str,
+    config_hash: str,
+    name: str,
+    version: int,
+) -> None:
+    """Directly insert a synthetic pre-04-4W StrategyDefinition row --
+    fingerprint_algo_version=1, an ARBITRARY config_hash distinct from
+    anything the current (v2) algorithm would ever produce for real content
+    -- bypassing fingerprint()/add_definition() entirely (fingerprint()
+    always computes under the current algorithm; there is no way to
+    produce a genuine v1-shaped hash through current code, since a000e87
+    permanently changed _identity_view). This is the only way to construct
+    a real uq_strategy_definitions_version collision (same strategy_id +
+    version, DIFFERENT config_hash) whose existing side is a legacy row,
+    which is what the add_definition/register collision-handling tests
+    below need to exercise."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm import Session as _Session
+
+    from strategy_registry.models import StrategyDefinition as _StrategyDefinition
+
+    with _Session(registry._engine) as session:
+        session.add(
+            _StrategyDefinition(
+                strategy_id=strategy_id,
+                config_hash=config_hash,
+                name=name,
+                version=version,
+                config={"legacy": True},
+                fingerprint_algo_version=1,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+
+def test_add_definition_version_collision_raises_algo_version_error_for_legacy_row(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """A genuine uq_strategy_definitions_version collision (same
+    strategy_id + version, different config_hash) whose EXISTING row is a
+    pre-v2 legacy fingerprint must raise FingerprintAlgorithmVersionError,
+    not DuplicateVersionError -- the collision may be an algorithm-version
+    artifact rather than a genuine second config variant, and "bump
+    version" is the wrong remedy until that is ruled out."""
+    p = _write_config(tmp_path / "v1.yaml", version=1)
+    fp = fingerprint(str(p))
+    _seed_legacy_definition_row(
+        registry,
+        strategy_id=fp.strategy_id,
+        config_hash="f" * 64,  # arbitrary, distinct from fp.config_hash
+        name=fp.name,
+        version=fp.version,
+    )
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        registry.add_definition(str(p))
+
+
+def test_add_definition_version_collision_still_raises_duplicate_for_genuine_variant(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """Two genuinely different configs sharing a version (both hashed under
+    the current algorithm) must still raise DuplicateVersionError -- the
+    version-precedence check must not mask a real variant collision."""
+    p1 = _write_config(tmp_path / "v1a.yaml", version=1, weight=1.0)
+    p2 = _write_config(tmp_path / "v1b.yaml", version=1, weight=0.5)
+    registry.add_definition(str(p1))
+    with pytest.raises(DuplicateVersionError):
+        registry.add_definition(str(p2))
+
+
+def test_register_version_collision_raises_algo_version_error_for_legacy_row(
+    registry: StrategyRegistry, tmp_path: Path
+) -> None:
+    """Same as the add_definition case above, but through register()'s
+    flush()-time collision path. Reachable because the seeded legacy row
+    has no corresponding Strategy lifecycle row, so register() passes its
+    StrategyAlreadyRegisteredError check and proceeds to the definition
+    insert, which collides on uq_strategy_definitions_version."""
+    p = _write_config(tmp_path / "v1.yaml", version=1, name="alpha")
+    fp = fingerprint(str(p))
+    _seed_legacy_definition_row(
+        registry,
+        strategy_id=fp.strategy_id,
+        config_hash="e" * 64,
+        name=fp.name,
+        version=fp.version,
+    )
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        registry.register(str(p))

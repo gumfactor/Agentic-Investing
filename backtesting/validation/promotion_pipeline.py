@@ -66,19 +66,34 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
   resolved policy's correctness bar (C7 data-version pinning already
   guarantees byte-identical inputs across re-runs) while deferring the
   actual compute-cost optimization to a later slice if it is ever needed.
-- **holdout_mode is GATED/DEFERRED (not yet supported)**: a promoted
-  strategy's ``config_hash`` INCLUDES its ``backtest.start_date``/
-  ``end_date``, so the frozen winner's config cannot be re-evaluated over
-  the sealed holdout window without changing its hash -- holdout
-  confirmation as previously built either fails the holdout guard or
-  silently confirms a DIFFERENT config than the frozen winner. Pending an
-  identity/evaluation-context design decision (see
-  ``docs/plans/04-identity-evaluation-context-design.md``), ``run(...,
-  holdout_mode=True)`` now fails closed immediately with
-  :class:`HoldoutConfirmationNotSupportedError`, before any instrument or
-  DB work happens. The parameter is kept on the signature for callers/
-  tests that reference it. The train/OOS (``holdout_mode=False``) path
-  described below is unaffected and fully supported.
+- **holdout_mode is GATED/DEFERRED (not yet supported)**: as of
+  ``docs/plans/04-identity-evaluation-context-design.md`` (operator
+  decision, Option 1) and its 04-4W implementation, a promoted strategy's
+  ``config_hash`` EXCLUDES its ``backtest.start_date``/``end_date`` --
+  identity and evaluation window are separate, so the frozen winner CAN in
+  principle be re-evaluated over the sealed holdout window without
+  changing its hash. What is still missing is the seal-safe,
+  holdout-appropriate evaluation machinery itself (a single-fixed-window
+  evaluator distinct from the fold-based ``WalkForwardValidator``, and the
+  preflight that keeps a setup failure from prematurely consuming the
+  one-shot holdout seal) -- that work is deferred to slice 04-4H, which
+  builds on top of 04-4W. Until then, ``run(..., holdout_mode=True)`` fails
+  closed immediately with :class:`HoldoutConfirmationNotSupportedError`,
+  before any instrument or DB work happens. The parameter is kept on the
+  signature for callers/tests that reference it. The train/OOS
+  (``holdout_mode=False``) path described below is unaffected and fully
+  supported.
+- **evaluation window is a required, explicit per-measurement input
+  (04-4W)**: ``run()`` requires an ``eval_window: EvaluationWindow``
+  argument. It is threaded to ``TrialRecorder.run_walk_forward``/
+  ``run_parameter_sweep`` unchanged, which inject it into the dispatched
+  config copy the same way ``data_version`` already is. The date fields on
+  ``StrategyDefinition.config`` (``defn.config["backtest"]["start_date"]``/
+  ``["end_date"]``) are never read for this purpose -- per
+  docs/plans/04-identity-evaluation-context-design.md, ``config_hash``
+  excludes them from identity precisely so the SAME frozen definition can be
+  measured over different windows; reading the window back out of the
+  stored definition would silently defeat that.
 - **MLflow logging failure degrades gracefully**: when a ``backtest_logger``
   IS supplied (as opposed to the ``backtest_logger=None`` "skip MLflow
   entirely" path) but raises during ``_log_to_mlflow`` (e.g. a transient
@@ -95,15 +110,22 @@ Baked-in decisions (operator-resolved, §8; NOT re-litigated here)
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Optional
 
 import structlog
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
+from backtesting.config_contract import (
+    UnsupportedStrategyConfigError,
+    assert_fill_simulator_matches_config,
+    is_behavioral,
+    validate_backtest_config,
+)
 from backtesting.validation.bootstrap_stress import (
     BootstrapStressResult,
     bootstrap_stress as _default_bootstrap_stress,
@@ -113,8 +135,13 @@ from backtesting.validation.overfitting_checks import (
     deflated_sharpe_ratio as _default_deflated_sharpe_ratio,
 )
 from backtesting.validation.parameter_sensitivity import (
+    DEFAULT_MAX_SHARPE_STD,
+    DEFAULT_MIN_POSITIVE_FRACTION,
     ParameterSensitivityResult,
+    ParameterSensitivityRow,
     ParameterSweeper,
+    summarize_variants,
+    _apply_params as _sweep_apply_params,
 )
 from backtesting.validation.survival_funnel import (
     SurvivalFunnel,
@@ -128,12 +155,51 @@ from backtesting.validation.trial_recorder import (
     _sanitize_metrics,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
+from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.hypothesis import HypothesisRegistry, HypothesisNotFoundError
 from strategy_registry.models import Base
 from strategy_registry.registry import StrategyNotFoundError, StrategyRegistry
 from strategy_registry.selection_models import PromotionDecision
 
 logger = structlog.get_logger(__name__)
+
+
+# PR #50 Codex round-1 R1-B fix (P1, promotion-integrity/C8 precondition).
+# The minimum number of DISTINCT, successfully completed (finite OOS
+# Sharpe) parameter-sweep variants required for the sensitivity verdict to
+# be trusted at all. Below this, ParameterSweeper's own curve_fit_flag
+# computation has no real statistical power: positive_fraction can only
+# take the values {0.0, 1.0} at n=1 and {0.0, 0.5, 1.0} at n=2, so a
+# single-combination grid -- or a grid where all but one variant failed --
+# trivially satisfies the default min_positive_fraction=0.5 threshold on
+# ONE data point and skips the std-dispersion gate entirely (guarded by
+# n_valid > 1 in parameter_sensitivity.py), yielding a "robust" verdict
+# with zero evidentiary weight. Originally introduced in 04-4A (merged
+# a5b7e1c) and found on PR #50 (04-4W); a curve-fit strategy could
+# otherwise clear the survival funnel with real live-capital (C8)
+# consequences, since Gate 04's promotion decision is the precondition for
+# any paper-to-live discussion. 3 is the smallest count at which
+# positive_fraction stops being a near-coin-flip statistic: n=3 is the
+# first grid size fine enough to distinguish "most variants passed"
+# (0.67) from "all variants passed" (1.0) rather than collapsing to a
+# single pass/fail bit.
+MIN_SENSITIVITY_SWEEP_VARIANTS: int = 3
+
+
+def _nan_safe(value: Any) -> Any:
+    """Normalize a NaN float to ``None`` (equal to itself); pass through
+    everything else unchanged.
+
+    PR #50 Codex round-11 fix: Python's NaN != NaN under default equality,
+    so two dict/tuple keys that are otherwise identical except for an
+    independently-NaN field never collapse -- used to build the sensitivity
+    dedupe's outcome key (see MIN_SENSITIVITY_SWEEP_VARIANTS's dedupe logic
+    in ``PromotionPipeline.run``), where two rows with the same coerced
+    oos_sharpe but each producing NaN for an auxiliary metric (e.g.
+    avg_is_sharpe, undefined for a zero-variance in-sample fold) represent
+    the identical simulated outcome and must be counted once, not twice.
+    """
+    return None if isinstance(value, float) and math.isnan(value) else value
 
 
 # ── Acknowledged residual limitations (design doc §9) ──────────────────────────
@@ -224,17 +290,42 @@ class MissingParameterGridError(PromotionPipelineError):
 class HoldoutConfirmationNotSupportedError(PromotionPipelineError):
     """Raised immediately when ``run(..., holdout_mode=True)`` is called.
 
-    Holdout confirmation is DEFERRED: a promoted strategy's
-    ``config_hash`` includes its ``backtest.start_date``/``end_date``, so
-    the frozen winner's config cannot be re-evaluated over the sealed
-    holdout window without changing its hash -- holdout confirmation as
-    previously built either fails the holdout guard or silently confirms
-    a DIFFERENT config than the frozen winner. This is gated fail-closed
-    pending an identity/evaluation-context design decision -- see
-    ``docs/plans/04-identity-evaluation-context-design.md``. The
-    ``holdout_mode`` parameter is kept on ``run()`` so existing callers/
-    tests referencing it still import; it now always raises before any
-    instrument or DB work happens.
+    Holdout confirmation is DEFERRED: as of 04-4W, a promoted strategy's
+    ``config_hash`` EXCLUDES its ``backtest.start_date``/``end_date`` (see
+    ``docs/plans/04-identity-evaluation-context-design.md``, operator
+    decision, Option 1) -- so the frozen winner CAN in principle be
+    re-evaluated over the sealed holdout window without changing its hash.
+    What remains missing is the seal-safe, holdout-appropriate evaluation
+    machinery itself (a single-fixed-window evaluator, and the preflight
+    that keeps a setup failure from prematurely consuming the one-shot
+    holdout seal), deferred to slice 04-4H, which builds on top of 04-4W.
+    This is gated fail-closed until that slice lands. The ``holdout_mode``
+    parameter is kept on ``run()`` so existing callers/tests referencing it
+    still import; it now always raises before any instrument or DB work
+    happens.
+    """
+
+
+class NonCanonicalConfigHashError(PromotionPipelineError):
+    """Raised when ``run(strategy_id, config_hash, ...)`` is called for a
+    REGISTERED ``strategy_id`` (has a ``Strategy`` lifecycle row) whose
+    requested ``config_hash`` does not equal that row's frozen
+    ``canonical_config_hash``.
+
+    A registered strategy has exactly one frozen/registered winning
+    ``strategy_definitions`` row -- the one pinned at ``register()`` time
+    as ``canonical_config_hash``. If the same ``strategy_id`` also has
+    OTHER (non-canonical) ``strategy_definitions`` rows on file (e.g. from
+    earlier sweep/trial exploration), a caller passing one of those other
+    hashes must not be allowed to generate promotion evidence -- or, worse,
+    consume the strategy-level one-shot holdout seal -- for a definition
+    other than the frozen winner. ``verify_config_integrity`` alone does
+    not catch this: it only re-checks the lifecycle row's OWN
+    ``canonical_config_hash`` against its source YAML, never against the
+    ``config_hash`` the caller actually requested. This check is fail-closed
+    and runs BEFORE any instrument (walk-forward included) dispatches, so a
+    mismatched request never touches the holdout seal or leaves partial
+    trial evidence.
     """
 
 
@@ -390,6 +481,7 @@ class PromotionPipeline:
         strategy_id: str,
         config_hash: str,
         data_handler: Any,
+        eval_window: EvaluationWindow,
         hypothesis_id: Optional[int] = None,
         holdout_mode: bool = False,
     ) -> PromotionResult:
@@ -402,6 +494,13 @@ class PromotionPipeline:
                 (composite key with ``strategy_id``).
             data_handler: Pre-loaded ``DataHandler`` covering the full
                 date range, forwarded unchanged to the wrapped instruments.
+            eval_window: The required, explicit evaluation date range for
+                this promotion run (04-4W). Threaded unchanged to
+                ``TrialRecorder.run_walk_forward``/``run_parameter_sweep``,
+                which inject it into the dispatched config copy -- never
+                read from ``StrategyDefinition.config``'s stored dates. See
+                the module docstring's "evaluation window is a required,
+                explicit per-measurement input" note.
             hypothesis_id: FK to the ``strategy_hypotheses`` row this
                 promotion's parameter grid is sourced from. Required
                 (never inferred) -- see ``MissingParameterGridError``.
@@ -419,6 +518,10 @@ class PromotionPipeline:
         Raises:
             HoldoutConfirmationNotSupportedError: ``holdout_mode=True`` was
                 passed. Checked first, before any instrument or DB work.
+            NonCanonicalConfigHashError: ``strategy_id`` is registered
+                (has a ``Strategy`` lifecycle row) and ``config_hash`` does
+                not equal that row's frozen ``canonical_config_hash``.
+                Checked before any instrument or DB work.
             MissingParameterGridError: ``hypothesis_id`` is None, does not
                 belong to ``strategy_id``, or its ``param_grid_json`` is
                 missing/empty/malformed (a scalar, string, non-sequence, or
@@ -437,12 +540,13 @@ class PromotionPipeline:
         if holdout_mode:
             raise HoldoutConfirmationNotSupportedError(
                 "PromotionPipeline.run(holdout_mode=True) is not yet "
-                "supported: a promoted strategy's config_hash includes its "
+                "supported: as of 04-4W, config_hash EXCLUDES "
                 "backtest.start_date/end_date, so the frozen winner's "
-                "config cannot be re-evaluated over the sealed holdout "
-                "window without changing its hash. Holdout confirmation is "
-                "deferred pending an identity/evaluation-context design "
-                "decision -- see "
+                "config CAN in principle be re-evaluated over the sealed "
+                "holdout window without changing its hash -- but the "
+                "seal-safe, holdout-appropriate evaluation machinery "
+                "itself is not yet built. Holdout confirmation is deferred "
+                "to slice 04-4H -- see "
                 "docs/plans/04-identity-evaluation-context-design.md. Use "
                 "holdout_mode=False (the train/OOS path) for now."
             )
@@ -460,12 +564,37 @@ class PromotionPipeline:
             self._registry.verify_config_integrity(strategy_id)
         except StrategyNotFoundError:
             pass
+        else:
+            # verify_config_integrity only re-checks the lifecycle row's
+            # OWN canonical_config_hash against its source YAML -- it never
+            # compares that canonical hash against the config_hash THIS
+            # call actually requested. A strategy_id can have multiple
+            # strategy_definitions rows (e.g. earlier sweep/trial
+            # exploration); without this check a caller could pass a
+            # non-canonical config_hash for a REGISTERED strategy and
+            # generate promotion evidence -- and, in holdout_mode, consume
+            # the one-shot holdout seal -- for a definition other than the
+            # frozen/registered winner. Bind the run to the canonical hash
+            # here, before any instrument dispatches (see
+            # NonCanonicalConfigHashError's docstring).
+            registered_strategy = self._registry.get(strategy_id)
+            if config_hash != registered_strategy.canonical_config_hash:
+                raise NonCanonicalConfigHashError(
+                    f"strategy_id={strategy_id!r} is registered with frozen "
+                    f"canonical_config_hash="
+                    f"{registered_strategy.canonical_config_hash!r}, but this "
+                    f"run requested config_hash={config_hash!r}, which does "
+                    "not match. A promotion/holdout run must target the "
+                    "frozen registered winner -- refusing to generate "
+                    "promotion evidence (or, in holdout_mode, consume the "
+                    "one-shot holdout seal) for a non-canonical definition."
+                )
 
         # Fail-closed precondition only (§4.4): confirms a valid,
         # non-empty grid exists BEFORE any instrument runs. The value read
         # here is deliberately NOT the one dispatched to the sweep below --
         # see the FIX 2 re-read comment at the sweep dispatch site for why.
-        self._resolve_frozen_grid(strategy_id, hypothesis_id)
+        self._resolve_frozen_grid(strategy_id, hypothesis_id, config)
         strategy_family = self._resolve_strategy_family(strategy_id)
 
         # Stage 1: walk-forward (fresh; see module docstring's "re-run
@@ -477,6 +606,7 @@ class PromotionPipeline:
             config_hash=config_hash,
             data_version=self._data_version,
             config=config,
+            eval_window=eval_window,
             data_handler=data_handler,
             hypothesis_id=hypothesis_id,
             final_holdout_confirmation=holdout_mode,
@@ -509,13 +639,14 @@ class PromotionPipeline:
             # match the frozen record it's supposed to attest to.
             # Re-fetching and re-validating the grid here guarantees the
             # sweep provably uses the immutable, already-frozen grid.
-            frozen_param_grid = self._resolve_frozen_grid(strategy_id, hypothesis_id)
+            frozen_param_grid = self._resolve_frozen_grid(strategy_id, hypothesis_id, config)
             sensitivity_result = self._trial_recorder.run_parameter_sweep(
                 self._sweeper,
                 strategy_id=strategy_id,
                 config_hash=config_hash,
                 data_version=self._data_version,
                 base_config=config,
+                eval_window=eval_window,
                 param_grid=frozen_param_grid,
                 data_handler=data_handler,
                 hypothesis_id=hypothesis_id,
@@ -540,12 +671,248 @@ class PromotionPipeline:
         # overall_passed).
         fdr_evidence = self._compute_family_fdr(strategy_id, strategy_family, dsr_value)
 
-        sensitivity_verdict = sensitivity_result.verdict if sensitivity_result else None
         stress_verdict = stress_result.verdict
+
+        # PR #50 Codex round-1 R1-B fix (P1, promotion-integrity/C8): a
+        # sweep's own curve_fit_flag computation degenerates with too few
+        # DISTINCT, successfully completed (finite OOS Sharpe) variants --
+        # a single valid variant with a positive Sharpe trivially satisfies
+        # the default min_positive_fraction=0.5 threshold (positive_fraction
+        # can only be 0.0 or 1.0 at n=1) and the std-dispersion gate is
+        # skipped entirely (guarded by n_valid > 1 in ParameterSweeper.sweep),
+        # so a single-combination grid -- or one where all but one variant
+        # failed -- gets labelled "robust" with zero statistical power, and
+        # overall_passed could become True with no meaningful parameter-
+        # sensitivity test having run at all. Recompute the finite-variant
+        # count HERE (not trusted from sensitivity_result.verdict alone) and
+        # force the gate closed when it falls short of
+        # MIN_SENSITIVITY_SWEEP_VARIANTS, regardless of what verdict the
+        # sweep itself reported.
+        #
+        # PR #50 Codex round-2 fix (P1, promotion-integrity/C8): counting
+        # raw finite rows is itself gameable -- _resolve_frozen_grid does
+        # not reject duplicate values in a param_grid list (e.g.
+        # {"portfolio.n_long": [10, 10, 10]}), so a grid with N copies of
+        # the SAME combination produces N identical successful rows that
+        # would satisfy MIN_SENSITIVITY_SWEEP_VARIANTS without testing any
+        # actual parameter sensitivity. Dedupe finite rows by their
+        # normalized params before counting distinct variants against the
+        # threshold.
+        #
+        # PR #50 Codex round-3 fix (P2): a normalized key built from
+        # tuple(sorted(row.params.items())) is unhashable the moment any
+        # candidate value is itself a list/dict -- e.g.
+        # {"universe": [{"source": "sp500"}, ...]} is a structurally-valid
+        # grid entry per _resolve_frozen_grid's non-empty-list-or-tuple
+        # check, and 04-3's strict-JSON param_grid validation
+        # (json.dumps(..., allow_nan=False)) only guarantees candidates are
+        # JSON-serializable, not scalar. A canonical JSON string
+        # (sort_keys=True) fixed the unhashability, but was still deduping
+        # the wrong THING -- see the round-5 fix below.
+        #
+        # PR #50 Codex round-5 fix (P1, promotion-integrity/C8): the real
+        # invariant was never "count distinct row.params representations"
+        # -- it is "count distinct EFFECTIVE, fully-applied backtest
+        # configs actually tested." Those are not the same thing the
+        # moment param_grid has overlapping/ancestor-descendant dot-paths:
+        # e.g. a "portfolio" candidate that sets a whole sub-object and a
+        # "portfolio.n_long" candidate that always overrides just that key
+        # afterward (dict iteration/dispatch order in _apply_params is
+        # insertion order, i.e. param_grid key order) can make several
+        # DISTINCT row.params dicts resolve to the IDENTICAL applied
+        # config -- ParameterSweeper backtests the same thing N times,
+        # but a raw-params-based dedupe (tuple or JSON string) still
+        # counts N variants and can clear MIN_SENSITIVITY_SWEEP_VARIANTS
+        # with zero real diversity. Reuse _apply_params -- the exact same
+        # function ParameterSweeper.sweep uses to build the config it
+        # actually backtests -- to recompute each row's effective config
+        # and dedupe THAT.
+        #
+        # Reconstructed from the exact SAME base
+        # (_config_with_data_version_and_window(config, ...), not the raw
+        # `config` this method received) that TrialRecorder.run_parameter_
+        # sweep actually dispatched to ParameterSweeper.sweep -- so this
+        # recomputation can never disagree with what was really run,
+        # because it retraces the identical two-step pipeline (inject
+        # data_version/window, then apply params) using the SAME two
+        # functions, not a reimplementation of either step that could
+        # itself drift out of sync with the real dispatch path.
+        #
+        # PR #50 Codex round-6 fix (P1, promotion-integrity/C8): the
+        # round-5 fix only corrected the finite-variant COUNT gate -- it
+        # left sensitivity_verdict/positive_fraction/std_oos_sharpe
+        # themselves sourced from sensitivity_result, i.e. ParameterSweeper
+        # computing them over EVERY raw row including duplicates. A grid
+        # with 100 copies of one profitable config and 2 distinct losing
+        # configs has 3 distinct effective configs (clears
+        # MIN_SENSITIVITY_SWEEP_VARIANTS), but the duplicated winner still
+        # dominates ParameterSweeper's own positive_fraction/std -- 2 of
+        # the 3 real configs lose, yet the sweep reports "robust". Build
+        # ONE row per distinct effective config (first occurrence, in row
+        # order) and recompute mean/std/positive_fraction/verdict from
+        # THAT deduped set via summarize_variants -- the same function
+        # ParameterSweeper.sweep itself uses (extracted, not
+        # reimplemented, so this can never drift from what "robust" means
+        # there) -- rather than trusting sensitivity_result's stats, which
+        # remain over the raw (possibly duplicate-inflated) rows.
+        #
+        # PR #50 Codex round-7 fix (P1, promotion-integrity/C8): "distinct
+        # effective config" (round-5) is still not the same as "distinct
+        # BACKTEST BEHAVIOR" -- a grid entry like
+        # {"description": ["a", "b", "c"]} produces three genuinely
+        # different serialized configs, but backtesting/config_contract.py
+        # explicitly classifies "description" as INFORMATIONAL: accepted,
+        # but never read by the backtest path AT ALL (see field_status()).
+        # Three rows that only differ in an informational field all
+        # execute the IDENTICAL backtest, so they must count as ONE
+        # variant, not three.
+        #
+        # PR #50 Codex round-8 fix (P1, same class one layer deeper): plain
+        # CONSUMED is not precise enough either -- config_contract.py's own
+        # docstring says CONSUMED means "read BY KEY, whether to change
+        # behavior OR to individually label a persisted record" (e.g.
+        # "version" -> the strategy_version MLflow tag). BacktestLogger is
+        # never invoked per-sweep-variant (only once, for the aggregate
+        # walk-forward leg), so a grid like {"version": [1, 2, 3]} would
+        # still execute the identical backtest 3 times under a naive
+        # "keep everything CONSUMED" filter. is_behavioral() (added this
+        # round in config_contract.py, the new CONSUMED_LOGGING_ONLY tier)
+        # is the precise question this dedupe actually needs answered:
+        # "does varying this field change what an individual sweep variant
+        # SIMULATES" -- not "is this field read anywhere in the backtest
+        # path, including post-hoc logging."
+        #
+        # PR #50 Codex round-9 fix (P1, same class yet another layer
+        # deeper): filtering row.params BEFORE applying it (round-7/8) is
+        # still not enough -- a grid key that is a bare SECTION name (e.g.
+        # "reporting") replaces that section's ENTIRE subtree via
+        # _apply_params, and the candidate value itself can consist
+        # entirely of non-behavioral sub-keys (both "reporting" sub-keys
+        # are CONSUMED_LOGGING_ONLY after round-8), so
+        # is_behavioral("reporting") is True (bare sections are never
+        # themselves classified non-behavioral -- only their sub-keys are)
+        # yet every possible value assigned to it is non-behavioral. Fixed
+        # by applying row.params UNFILTERED then pruning the FULL resulting
+        # config recursively via prune_to_behavioral_leaves.
+        #
+        # PR #50 Codex round-10 fix (P1, promotion-integrity/C8) -- the
+        # class TERMINATES here: rounds 5-9 all tried to PREDICT, from the
+        # config alone, whether two variants would behave identically.
+        # Round 10 found the fundamental hole in that strategy: value
+        # COERCION. {"portfolio.n_long": [1, 1.0, True]} produces 3
+        # genuinely different serialized values, but BacktestEngine.run
+        # applies int(...) to n_long, so all 3 execute with n_long == 1 --
+        # no config-shape classification (behavioral vs not, section vs
+        # leaf) can ever predict this, because it depends on ENGINE-
+        # INTERNAL type coercion that can exist for any field, today or in
+        # the future, and reimplementing every such coercion rule here
+        # would be an unbounded, permanently-incomplete parallel model of
+        # the engine -- the exact "reimplementation that can drift"
+        # anti-pattern every fix since round-5 has been careful to avoid
+        # for the APPLY step. There is no config-level fix that closes this
+        # FOR REAL, because the question "will these two configs behave
+        # identically" is fundamentally a question about the engine's
+        # behavior, not the config's shape.
+        #
+        # So stop asking the config. The walk-forward/backtest simulation
+        # is deterministic given the same effective inputs (C7 data_version
+        # pinning already guarantees byte-identical inputs across re-runs,
+        # per this module's "re-run staleness" note above) -- so two
+        # variants that behave identically MUST produce bit-identical
+        # metrics, regardless of WHY they behave identically (raw-param
+        # duplication, ancestor/descendant collapse, non-behavioral fields,
+        # or a coercion neither this module nor config_contract.py has ever
+        # heard of). Dedupe on the row's own OBSERVED OUTCOME -- the same
+        # four metrics ParameterSensitivityRow already carries from the
+        # REAL simulation -- instead of trying to predict equivalence from
+        # the config. This is not a reimplementation of the engine's
+        # coercion rules; it is reading the engine's own answer directly,
+        # so it cannot drift out of sync with the engine no matter what
+        # coercion/aliasing exists now or is added later. (is_behavioral is
+        # still used below, in _resolve_frozen_grid's SEPARATE fail-closed
+        # pre-flight quality gate -- a config-shape question, unlike THIS
+        # dedupe, which is purely about counting
+        # distinct observed outcomes.)
+        #
+        # PR #50 Codex round-11 fix (P1, same round-10 mechanism, one real
+        # edge case): NaN != NaN under Python's default equality, so two
+        # rows with the SAME (coerced) oos_sharpe but each independently
+        # producing NaN for an AUXILIARY metric -- most plausibly
+        # avg_is_sharpe, undefined when an in-sample fold has zero-
+        # variance returns -- would NOT collapse as dict keys, even though
+        # they represent the identical simulated outcome (the finite-ness
+        # filter above only checks oos_sharpe, not the other three
+        # fields). Normalize NaN to a stable sentinel (None, which DOES
+        # compare equal to itself) in the outcome key before using it,
+        # so two independently-NaN auxiliary metrics correctly collapse.
+        #
+        # PR #50 Codex round-12 fix (P1): the four summary scalars alone
+        # are a NECESSARY but not SUFFICIENT condition for "these two rows
+        # ran the identical simulation" -- two genuinely DIFFERENT return
+        # paths can coincidentally share all four aggregates (trade_count
+        # especially is low-cardinality), wrongly collapsing distinct
+        # variants (or, in the adversarial direction Codex flagged,
+        # collapsing several distinct LOSERS while a distinct WINNER stays
+        # separate, skewing positive_fraction upward and potentially
+        # flipping curve_fit to robust). Fold in
+        # row.oos_returns_fingerprint (a SHA-256 of the full OOS return
+        # sequence, computed once per variant in ParameterSweeper.sweep --
+        # see fingerprint_returns()'s docstring) as an additional key
+        # component: a vastly stronger execution-identity proxy than four
+        # aggregates of it, while remaining purely OUTPUT-based (reads
+        # what the engine produced, does not model/predict it), so it
+        # inherits round-10's "cannot drift out of sync with the engine"
+        # property rather than reintroducing round-5/6's config-shape
+        # guessing.
+        effective_config_to_row: dict[tuple, ParameterSensitivityRow] = {}
+        if sensitivity_result is not None:
+            for row in sensitivity_result.rows:
+                if not math.isfinite(row.oos_sharpe):
+                    continue
+                outcome_key = tuple(
+                    _nan_safe(v)
+                    for v in (
+                        row.oos_sharpe,
+                        row.oos_max_drawdown,
+                        row.trade_count,
+                        row.avg_is_sharpe,
+                    )
+                ) + (row.oos_returns_fingerprint,)
+                effective_config_to_row.setdefault(outcome_key, row)
+
+        n_finite_sensitivity_variants = (
+            len(effective_config_to_row) if sensitivity_result is not None else None
+        )
+        sensitivity_underpowered = (
+            n_finite_sensitivity_variants is not None
+            and n_finite_sensitivity_variants < MIN_SENSITIVITY_SWEEP_VARIANTS
+        )
+
+        if sensitivity_result is not None:
+            (
+                dedup_mean_oos_sharpe,
+                dedup_std_oos_sharpe,
+                dedup_positive_fraction,
+                _dedup_curve_fit_flag,
+                sensitivity_verdict,
+            ) = summarize_variants(
+                list(effective_config_to_row.values()),
+                getattr(self._sweeper, "_min_positive_fraction", DEFAULT_MIN_POSITIVE_FRACTION),
+                getattr(self._sweeper, "_max_sharpe_std", DEFAULT_MAX_SHARPE_STD),
+            )
+        else:
+            dedup_mean_oos_sharpe = None
+            dedup_std_oos_sharpe = None
+            dedup_positive_fraction = None
+            sensitivity_verdict = None
 
         overall_passed = funnel_result.passed and stress_verdict == "solid"
         if not holdout_mode:
-            overall_passed = overall_passed and sensitivity_verdict == "robust"
+            overall_passed = (
+                overall_passed
+                and sensitivity_verdict == "robust"
+                and not sensitivity_underpowered
+            )
 
         evidence = self._build_evidence(
             strategy_id=strategy_id,
@@ -553,6 +920,12 @@ class PromotionPipeline:
             holdout_mode=holdout_mode,
             funnel_result=funnel_result,
             sensitivity_result=sensitivity_result,
+            sensitivity_verdict=sensitivity_verdict,
+            dedup_mean_oos_sharpe=dedup_mean_oos_sharpe,
+            dedup_std_oos_sharpe=dedup_std_oos_sharpe,
+            dedup_positive_fraction=dedup_positive_fraction,
+            n_finite_sensitivity_variants=n_finite_sensitivity_variants,
+            sensitivity_underpowered=sensitivity_underpowered,
             stress_result=stress_result,
             dsr_value=dsr_value,
             n_trials=n_trials,
@@ -560,6 +933,7 @@ class PromotionPipeline:
             observed_sharpe=observed_sharpe,
             fdr_evidence=fdr_evidence,
             overall_passed=overall_passed,
+            eval_window=eval_window,
         )
 
         mlflow_run_id = self._log_to_mlflow(
@@ -595,6 +969,12 @@ class PromotionPipeline:
             overall_passed=overall_passed,
             mlflow_run_id=mlflow_run_id,
             evidence_json=evidence,
+            # R1-A: sourced directly from the eval_window argument threaded
+            # into this run() call -- never re-derived from
+            # StrategyDefinition.config -- so promotion_decisions carries
+            # the SAME window every other measurement sink now records.
+            eval_start_date=eval_window.start,
+            eval_end_date=eval_window.end,
         )
 
         logger.info(
@@ -628,7 +1008,7 @@ class PromotionPipeline:
     # ── Stage helpers ─────────────────────────────────────────────────────────
 
     def _resolve_frozen_grid(
-        self, strategy_id: str, hypothesis_id: Optional[int]
+        self, strategy_id: str, hypothesis_id: Optional[int], config: dict
     ) -> dict[str, list]:
         """Fail closed unless a pre-registered hypothesis with a non-empty
         ``param_grid_json`` is linked (§4.4: "an ad hoc grid invented after
@@ -688,6 +1068,89 @@ class PromotionPipeline:
                 "or an empty list is not admissible -- it would let the "
                 "expensive walk-forward run and record trial evidence "
                 "before the sweep discovers zero usable combinations)."
+            )
+        # PR #50 Codex round-7/8 fix: a grid key that is not behavioral per
+        # backtesting.config_contract.is_behavioral (INFORMATIONAL -- e.g.
+        # "description" -- or CONSUMED_LOGGING_ONLY -- e.g. "version", read
+        # only by BacktestLogger, never per-sweep-variant) can never change
+        # what a variant actually backtests. Sweeping over such a key
+        # wastes N identical backtests for zero sensitivity information.
+        #
+        # NOTE (round-10): this is now a fail-fast QUALITY gate, not a
+        # correctness dependency -- the n_finite_sensitivity_variants dedupe
+        # in run() no longer filters by is_behavioral at all; it dedupes on
+        # each row's OBSERVED metrics (see the round-10 comment at that
+        # computation), which correctly collapses non-behavioral-field
+        # duplicates unconditionally, without needing to know WHY two rows
+        # produced the same outcome. This check still runs because failing
+        # here is cheaper (no wasted walk-forward/sweep compute) and gives
+        # a clearer diagnostic than "your sweep produced 1 distinct outcome"
+        # after the fact -- but it is no longer the thing standing between
+        # a non-behavioral grid and a false "robust" verdict.
+        non_behavioral_keys = sorted(key for key in param_grid if not is_behavioral(key))
+        if non_behavioral_keys:
+            raise MissingParameterGridError(
+                f"strategy_hypotheses id={hypothesis_id} (strategy_id="
+                f"{strategy_id!r}) has param_grid_json key(s) "
+                f"{non_behavioral_keys!r} that are not behavioral per "
+                "backtesting.config_contract.is_behavioral -- accepted by "
+                "the backtest config contract (possibly even read by key), "
+                "but never affecting what an individual backtest/sweep-"
+                "variant SIMULATES, so sweeping over them can never produce "
+                "a behaviorally different variant. A parameter-sensitivity "
+                "sweep must vary fields that actually affect what gets "
+                "backtested; remove these key(s) from the grid via "
+                "HypothesisRegistry.update_param_grid(...)."
+            )
+
+        # PR #50 Codex round-10 fix (P2-class efficiency/fail-fast, found
+        # alongside the P1 value-coercion finding above): a grid key or
+        # candidate value the backtest config contract cannot accept at
+        # all -- e.g. a REJECTED section ("constraints"), a genuinely
+        # unknown/typo'd field, an out-of-range portfolio.method value, or
+        # an execution.* value that mismatches the fixed FillSimulator --
+        # previously surfaced only when ParameterSweeper.sweep actually
+        # tried that variant, which is AFTER the (expensive) walk-forward
+        # leg has already run and recorded trial evidence (Stage 1 runs
+        # before Stage 3). UnsupportedStrategyConfigError/
+        # ExecutionConfigMismatchError are deliberately not swallowed as a
+        # NaN variant (see their docstrings), so this crashed the whole
+        # promotion run instead of failing the SAME fail-closed precondition
+        # check this method already performs for every other malformed-grid
+        # shape. Validate every (key, candidate) pair against the REAL
+        # validate_backtest_config/assert_fill_simulator_matches_config
+        # machinery here -- reusing it rather than reimplementing
+        # rejected/unknown/value-restricted logic a second time -- so any
+        # variant that would crash the sweep is caught before any
+        # instrument runs, exactly like every other check in this method.
+        # A dot-path absent from `config` entirely (_apply_params/
+        # _set_nested only OVERRIDES existing keys) raises KeyError from
+        # ParameterSweeper.sweep the same way -- also fail-closed here.
+        fill_simulator = getattr(self._sweeper, "_fill_sim", None)
+        invalid_candidates: list[str] = []
+        for key, candidates in param_grid.items():
+            for candidate in candidates:
+                try:
+                    candidate_config = _sweep_apply_params(config, {key: candidate})
+                except KeyError as exc:
+                    invalid_candidates.append(f"{key}={candidate!r}: {exc}")
+                    continue
+                try:
+                    validate_backtest_config(candidate_config)
+                    if fill_simulator is not None:
+                        assert_fill_simulator_matches_config(candidate_config, fill_simulator)
+                except UnsupportedStrategyConfigError as exc:
+                    invalid_candidates.append(f"{key}={candidate!r}: {exc}")
+        if invalid_candidates:
+            raise MissingParameterGridError(
+                f"strategy_hypotheses id={hypothesis_id} (strategy_id="
+                f"{strategy_id!r}) has param_grid_json candidate value(s) "
+                "that the backtest config contract cannot accept -- would "
+                "crash ParameterSweeper.sweep on that variant, AFTER the "
+                "walk-forward leg has already run. Checked BEFORE any "
+                "instrument runs, same as every other fail-closed "
+                f"precondition here:\n"
+                + "\n".join(f"  - {c}" for c in invalid_candidates)
             )
         return dict(param_grid)
 
@@ -862,6 +1325,12 @@ class PromotionPipeline:
         holdout_mode: bool,
         funnel_result: SurvivalFunnelResult,
         sensitivity_result: Optional[ParameterSensitivityResult],
+        sensitivity_verdict: Optional[str],
+        dedup_mean_oos_sharpe: Optional[float],
+        dedup_std_oos_sharpe: Optional[float],
+        dedup_positive_fraction: Optional[float],
+        n_finite_sensitivity_variants: Optional[int],
+        sensitivity_underpowered: bool,
         stress_result: BootstrapStressResult,
         dsr_value: Optional[float],
         n_trials: int,
@@ -869,11 +1338,21 @@ class PromotionPipeline:
         observed_sharpe: Optional[float],
         fdr_evidence: dict[str, Any],
         overall_passed: bool,
+        eval_window: EvaluationWindow,
     ) -> dict[str, Any]:
         return {
             "strategy_id": strategy_id,
             "config_hash": config_hash,
             "data_version": self._data_version,
+            # R1-A: the same eval_window persisted on this row's
+            # eval_start_date/eval_end_date columns (migration 018),
+            # surfaced in evidence_json too for auditability -- mirrors
+            # data_version already being both a first-class column AND an
+            # evidence_json field.
+            "eval_window": {
+                "start": eval_window.start.isoformat(),
+                "end": eval_window.end.isoformat(),
+            },
             "holdout_mode": holdout_mode,
             "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
             "overall_passed": overall_passed,
@@ -899,12 +1378,48 @@ class PromotionPipeline:
                 if sensitivity_result is None
                 else {
                     "skipped": False,
-                    "verdict": sensitivity_result.verdict,
+                    # AUTHORITATIVE (PR #50 Codex round-6 fix): recomputed
+                    # from ONE row per distinct effective config (see
+                    # n_finite_sensitivity_variants below) via the same
+                    # summarize_variants function ParameterSweeper.sweep
+                    # itself uses -- this is what actually gates
+                    # overall_passed, NOT sensitivity_result.verdict/
+                    # positive_fraction/std_oos_sharpe (those are computed
+                    # over every raw row, including duplicate-effective-
+                    # config ones, and are recorded separately below as
+                    # "raw_*" for audit/comparison only).
+                    "verdict": sensitivity_verdict,
+                    "mean_oos_sharpe": dedup_mean_oos_sharpe,
+                    "std_oos_sharpe": dedup_std_oos_sharpe,
+                    "positive_fraction": dedup_positive_fraction,
+                    # RAW (uncorrected): ParameterSweeper's own report over
+                    # every row it ran, including any that share an
+                    # effective config with another row. Kept for audit --
+                    # a divergence between "raw_verdict" and "verdict"
+                    # above is itself evidence the grid had duplicate-
+                    # effect combinations.
+                    "raw_verdict": sensitivity_result.verdict,
+                    "raw_mean_oos_sharpe": sensitivity_result.mean_oos_sharpe,
+                    "raw_std_oos_sharpe": sensitivity_result.std_oos_sharpe,
+                    "raw_positive_fraction": sensitivity_result.positive_fraction,
                     "configs_tested": sensitivity_result.configs_tested,
-                    "mean_oos_sharpe": sensitivity_result.mean_oos_sharpe,
-                    "std_oos_sharpe": sensitivity_result.std_oos_sharpe,
-                    "positive_fraction": sensitivity_result.positive_fraction,
                     "param_grid": sensitivity_result.param_grid,
+                    # R1-B (PR #50 Codex round-1 P1) + round-2/3/5 dedupe
+                    # fixes: the DISTINCT (by fully-applied effective
+                    # config, not raw params representation -- see the
+                    # round-5 fix at the n_finite_sensitivity_variants
+                    # computation above) finite-variant count actually
+                    # used to gate overall_passed, and whether it fell
+                    # short of MIN_SENSITIVITY_SWEEP_VARIANTS -- auditable
+                    # proof the "robust" verdict (if any) reflects a real,
+                    # sufficiently-powered sweep over genuinely distinct
+                    # BACKTESTED configs, not a single lucky/surviving
+                    # variant, repeated copies of the same combination, or
+                    # different param representations that happen to
+                    # resolve to the same effective config.
+                    "n_finite_variants": n_finite_sensitivity_variants,
+                    "underpowered": sensitivity_underpowered,
+                    "min_required_variants": MIN_SENSITIVITY_SWEEP_VARIANTS,
                 }
             ),
             "stress": {
@@ -952,6 +1467,25 @@ class PromotionPipeline:
                 config,
                 wf_result,
                 self._experiment_name,
+                # PR #50 Codex round-6 fix (P2): the built-in "config_hash"
+                # tag mlflow_logger.py sets is _hash_config(wf_result.config)
+                # -- a naive full-dict SHA-256 over the DISPATCHED config,
+                # which includes data_version and the injected eval_window
+                # dates. That tag therefore differs from the canonical v2
+                # identity hash stored in StrategyDefinition/PromotionDecision
+                # (which deliberately EXCLUDES those dates per
+                # docs/plans/04-identity-evaluation-context-design.md) and
+                # changes across two promotion runs of the SAME strategy
+                # identity over different windows -- exactly the two runs
+                # 04-4W's identity/window split defines as correlatable. Add
+                # the authoritative config_hash as a SEPARATELY named tag
+                # (additive only -- does not touch _hash_config or the
+                # existing provenance-mismatch check, which serve a
+                # different purpose: proving the logged config is literally
+                # the object the engine ran, not identity correlation) so an
+                # MLflow run can be looked up by the same config_hash a
+                # promotion_decisions/strategy_definitions row carries.
+                tags={"canonical_config_hash": config_hash},
                 funnel_result=funnel_result,
                 stress_result=stress_result,
                 require_manifest_data_version=self._require_manifest_data_version,
@@ -989,6 +1523,8 @@ class PromotionPipeline:
         overall_passed: bool,
         mlflow_run_id: Optional[str],
         evidence_json: dict[str, Any],
+        eval_start_date: date,
+        eval_end_date: date,
     ) -> int:
         now = datetime.now(tz=timezone.utc)
         with Session(self._engine) as session:
@@ -1004,6 +1540,12 @@ class PromotionPipeline:
                 mlflow_run_id=mlflow_run_id,
                 evidence_json=_sanitize_metrics(evidence_json),
                 created_at=now,
+                # R1-A: the EFFECTIVE evaluation window this decision's
+                # walk-forward/sensitivity/stress legs actually ran over --
+                # see migration 018's docstring for why this must never be
+                # re-derived from StrategyDefinition.config.
+                eval_start_date=eval_start_date,
+                eval_end_date=eval_end_date,
             )
             session.add(decision)
             session.commit()

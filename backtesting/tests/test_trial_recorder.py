@@ -35,8 +35,13 @@ from backtesting.validation.trial_recorder import (
     TrialRecorder,
 )
 from backtesting.validation.walk_forward import WalkForwardResult, WalkForwardValidator
+from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.fingerprint import hash_config
-from strategy_registry.registry import DefinitionNotFoundError, MissingDataVersionError
+from strategy_registry.registry import (
+    DefinitionNotFoundError,
+    FingerprintAlgorithmVersionError,
+    MissingDataVersionError,
+)
 from strategy_registry.models import StrategyDefinition
 from strategy_registry.selection_models import ResearchDataWindow, StrategyHypothesis
 from sqlalchemy.orm import Session
@@ -63,6 +68,7 @@ def _seed_definition(
     strategy_id: str = "v1_test_strategy",
     config: dict | None = None,
     config_hash: str | None = None,
+    fingerprint_algo_version: int = 2,
 ) -> str:
     """Seed a ``strategy_definitions`` row and return the ``config_hash`` used.
 
@@ -74,6 +80,11 @@ def _seed_definition(
     that only exercise a guard which rejects BEFORE the provenance check
     (e.g. the holdout-overlap tests) can omit it and keep the arbitrary
     legacy placeholder hash, since it is never compared in that path.
+
+    04-4W (PM amendment A1): ``fingerprint_algo_version`` defaults to the
+    current algorithm (2) so ordinary tests are unaffected; pass 1 to
+    simulate a pre-04-4W legacy row for the FingerprintAlgorithmVersionError
+    precedence tests.
     """
     if config_hash is None:
         config_hash = hash_config(config) if config is not None else "a" * 64
@@ -85,6 +96,7 @@ def _seed_definition(
                 name=strategy_id,
                 version=1,
                 config={"foo": "bar"},
+                fingerprint_algo_version=fingerprint_algo_version,
                 created_at=datetime.now(timezone.utc),
             )
         )
@@ -147,6 +159,10 @@ def _config(start: str, end: str) -> dict:
     }
 
 
+def _window(start: str, end: str) -> EvaluationWindow:
+    return EvaluationWindow(start=date.fromisoformat(start), end=date.fromisoformat(end))
+
+
 def _wf_result(sharpe: float = 1.2, max_dd: float = -0.1) -> WalkForwardResult:
     return WalkForwardResult(
         folds=[],
@@ -206,6 +222,7 @@ def test_walk_forward_inside_train_oos_succeeds_and_records_one_row(recorder: Tr
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -240,6 +257,7 @@ def test_run_overlapping_holdout_window_is_rejected_without_dispatch(recorder: T
             config_hash="a" * 64,
             data_version=DATA_VERSION,
             config=_config("2022-06-01", "2023-03-01"),
+            eval_window=_window("2022-06-01", "2023-03-01"),
             data_handler=MagicMock(),
         )
 
@@ -259,6 +277,7 @@ def test_run_fully_inside_holdout_window_is_rejected_without_dispatch(recorder: 
             config_hash="a" * 64,
             data_version=DATA_VERSION,
             config=_config("2023-02-01", "2023-04-01"),
+            eval_window=_window("2023-02-01", "2023-04-01"),
             data_handler=MagicMock(),
         )
 
@@ -279,6 +298,7 @@ def test_parameter_sweep_overlapping_holdout_window_is_rejected_without_dispatch
             config_hash="a" * 64,
             data_version=DATA_VERSION,
             base_config=_config("2022-06-01", "2023-03-01"),
+            eval_window=_window("2022-06-01", "2023-03-01"),
             param_grid={"portfolio.n_long": [10, 20]},
             data_handler=MagicMock(),
         )
@@ -302,6 +322,7 @@ def test_run_that_raises_leaves_an_errored_row(recorder: TrialRecorder) -> None:
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
         )
 
@@ -330,6 +351,7 @@ def test_parameter_sweep_that_raises_leaves_an_errored_row(recorder: TrialRecord
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"portfolio.n_long": [10, 20]},
             data_handler=MagicMock(),
         )
@@ -362,6 +384,7 @@ def test_parameter_sweep_that_raises_still_records_planned_configs_tested(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid=param_grid,
             data_handler=MagicMock(),
         )
@@ -405,6 +428,7 @@ def test_parameter_sweep_success_still_records_actual_configs_tested(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         base_config=base_config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         param_grid=param_grid,
         data_handler=MagicMock(),
     )
@@ -435,6 +459,7 @@ def test_parameter_sweep_malformed_param_grid_does_not_crash_seeding(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"portfolio.n_long": 10},  # not a list -- malformed
             data_handler=MagicMock(),
         )
@@ -461,6 +486,7 @@ def test_first_holdout_confirmation_succeeds_and_records_holdout_row(recorder: T
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2023-01-01", "2023-07-01"),
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -494,6 +520,7 @@ def test_second_holdout_confirmation_is_rejected_by_app_layer_guard(recorder: Tr
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2023-01-01", "2023-07-01"),
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -506,6 +533,7 @@ def test_second_holdout_confirmation_is_rejected_by_app_layer_guard(recorder: Tr
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2023-01-01", "2023-07-01"),
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -536,6 +564,7 @@ def test_second_holdout_confirmation_is_rejected_even_after_a_failed_first_attem
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2023-01-01", "2023-07-01"),
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -548,6 +577,7 @@ def test_second_holdout_confirmation_is_rejected_even_after_a_failed_first_attem
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2023-01-01", "2023-07-01"),
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -567,6 +597,7 @@ def test_holdout_confirmation_requires_range_within_window(recorder: TrialRecord
             data_version=DATA_VERSION,
             # Starts before holdout_start -- not fully contained.
             config=_config("2022-11-01", "2023-03-01"),
+            eval_window=_window("2022-11-01", "2023-03-01"),
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -586,6 +617,7 @@ def test_holdout_confirmation_requires_a_registered_window(recorder: TrialRecord
             config_hash="a" * 64,
             data_version=DATA_VERSION,
             config=_config("2023-01-01", "2023-07-01"),
+            eval_window=_window("2023-01-01", "2023-07-01"),
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -612,6 +644,7 @@ def test_holdout_seal_is_scoped_per_strategy_id(recorder: TrialRecorder) -> None
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2023-01-01", "2023-07-01"),
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -621,6 +654,7 @@ def test_holdout_seal_is_scoped_per_strategy_id(recorder: TrialRecorder) -> None
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2023-01-01", "2023-07-01"),
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -644,6 +678,7 @@ def test_nan_and_inf_metrics_are_normalized_to_none(recorder: TrialRecorder) -> 
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -673,6 +708,7 @@ def test_missing_definition_raises_and_does_not_dispatch(recorder: TrialRecorder
             config_hash="a" * 64,
             data_version=DATA_VERSION,
             config=_config("2022-01-01", "2022-12-31"),
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
         )
 
@@ -691,6 +727,7 @@ def test_blank_data_version_is_rejected(recorder: TrialRecorder) -> None:
             config_hash="a" * 64,
             data_version="   ",
             config=_config("2022-01-01", "2022-12-31"),
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
         )
 
@@ -712,6 +749,7 @@ def test_parameter_sweep_inside_train_oos_succeeds_and_records_one_row(recorder:
         config_hash=config_hash,
         data_version=DATA_VERSION,
         base_config=base_config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         param_grid={"portfolio.n_long": [10, 20]},
         data_handler=MagicMock(),
     )
@@ -746,6 +784,7 @@ def test_mark_errored_failure_does_not_mask_original_exception(recorder: TrialRe
                     config_hash=config_hash,
                     data_version=DATA_VERSION,
                     config=config,
+                    eval_window=_window("2022-01-01", "2022-12-31"),
                     data_handler=MagicMock(),
                 )
 
@@ -788,6 +827,7 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2023-01-01", "2023-07-01"),
         data_handler=MagicMock(),
         final_holdout_confirmation=True,
     )
@@ -800,6 +840,7 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2023-01-01", "2023-07-01"),
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -815,19 +856,16 @@ def test_toctou_race_on_holdout_seal_is_translated_to_holdout_violation(
 
 
 def test_reversed_date_range_raises_value_error(recorder: TrialRecorder) -> None:
+    """A reversed range is now rejected at EvaluationWindow construction
+    (04-4W) -- fail-closed before run_walk_forward is ever called, since
+    eval_window is a required, explicit argument the caller must construct
+    up front rather than something TrialRecorder derives from config."""
     _seed_definition(recorder)
     _seed_window(recorder)
     validator = _mock_validator()
 
-    with pytest.raises(ValueError, match="reversed"):
-        recorder.run_walk_forward(
-            validator,
-            strategy_id="v1_test_strategy",
-            config_hash="a" * 64,
-            data_version=DATA_VERSION,
-            config=_config("2023-01-01", "2022-01-01"),
-            data_handler=MagicMock(),
-        )
+    with pytest.raises(ValueError, match="must be <="):
+        _window("2023-01-01", "2022-01-01")
 
     validator.run.assert_not_called()
     assert recorder.list_trials("v1_test_strategy") == []
@@ -855,6 +893,7 @@ def test_parameter_sweep_final_holdout_confirmation_is_rejected_before_dispatch(
             config_hash="a" * 64,
             data_version=DATA_VERSION,
             base_config=_config("2023-01-01", "2023-07-01"),
+            eval_window=_window("2023-01-01", "2023-07-01"),
             param_grid={"portfolio.n_long": [10, 20]},
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
@@ -890,6 +929,7 @@ def test_non_hash_data_version_is_rejected_on_walk_forward(
             config_hash="a" * 64,
             data_version=bad_data_version,
             config=_config("2022-01-01", "2022-12-31"),
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
         )
 
@@ -909,6 +949,7 @@ def test_non_hash_data_version_is_rejected_on_parameter_sweep(recorder: TrialRec
             config_hash="a" * 64,
             data_version="rqis-snapshots/manifests/2026-06-14/manifest.json",
             base_config=_config("2022-01-01", "2022-12-31"),
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"portfolio.n_long": [10, 20]},
             data_handler=MagicMock(),
         )
@@ -929,6 +970,7 @@ def test_valid_hash_shaped_data_version_is_accepted(recorder: TrialRecorder) -> 
         config_hash=config_hash,
         data_version="3fae" + "0" * 60,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -962,6 +1004,39 @@ def test_config_hash_mismatch_is_rejected_before_dispatch(recorder: TrialRecorde
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=mutated_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
+            data_handler=MagicMock(),
+        )
+
+    validator.run.assert_not_called()
+    assert recorder.list_trials("v1_test_strategy") == []
+
+
+def test_legacy_fingerprint_algo_version_raises_before_provenance_check(
+    recorder: TrialRecorder,
+) -> None:
+    """04-4W PM amendment A1: a definition row hashed under a fingerprint
+    algorithm version other than the current one must raise
+    FingerprintAlgorithmVersionError -- NOT ConfigProvenanceMismatchError --
+    even when the passed config is completely unmodified. A fresh
+    hash_config(config) computed under the CURRENT algorithm would differ
+    from a pre-v2 row's stored config_hash purely from the algorithm
+    change, and misdiagnosing that as "the config passed does not match its
+    own config_hash" would send an operator chasing a nonexistent content
+    mutation."""
+    config = _config("2022-01-01", "2022-12-31")
+    config_hash = _seed_definition(recorder, config=config, fingerprint_algo_version=1)
+    _seed_window(recorder)
+    validator = _mock_validator()
+
+    with pytest.raises(FingerprintAlgorithmVersionError, match="fingerprint algorithm v1"):
+        recorder.run_walk_forward(
+            validator,
+            strategy_id="v1_test_strategy",
+            config_hash=config_hash,
+            data_version=DATA_VERSION,
+            config=config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
         )
 
@@ -983,6 +1058,7 @@ def test_config_hash_match_is_accepted(recorder: TrialRecorder) -> None:
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -1018,6 +1094,7 @@ def test_config_differing_only_in_data_version_is_not_a_mismatch(recorder: Trial
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config_with_data_version,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -1041,6 +1118,7 @@ def test_parameter_sweep_config_hash_mismatch_is_rejected_before_dispatch(record
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=mutated_base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"portfolio.n_long": [10, 20]},
             data_handler=MagicMock(),
         )
@@ -1069,6 +1147,7 @@ def test_post_holdout_non_confirmation_run_is_rejected(recorder: TrialRecorder) 
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2023-08-01", "2023-12-31"),
             data_handler=MagicMock(),
         )
 
@@ -1092,6 +1171,7 @@ def test_pre_train_start_non_confirmation_run_is_rejected(recorder: TrialRecorde
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2021-01-01", "2021-06-01"),
             data_handler=MagicMock(),
         )
 
@@ -1121,6 +1201,7 @@ def test_run_entirely_within_train_oos_partition_is_accepted(recorder: TrialReco
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -1147,6 +1228,7 @@ def test_confirmation_mode_still_requires_containment_in_holdout_window_only(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2022-06-01", "2022-12-01"),
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
         )
@@ -1170,6 +1252,7 @@ def test_no_registered_window_advisory_mode_allows_any_range(recorder: TrialReco
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2099-01-01", "2099-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -1204,6 +1287,7 @@ def test_run_ending_exactly_on_touching_holdout_boundary_is_rejected(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2022-01-01", "2023-01-01"),
             data_handler=MagicMock(),
         )
 
@@ -1229,6 +1313,7 @@ def test_run_ending_one_day_before_touching_holdout_boundary_is_accepted(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -1260,6 +1345,7 @@ def test_gap_window_run_ending_before_holdout_start_is_still_accepted(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-11-01"),
         data_handler=MagicMock(),
     )
 
@@ -1292,6 +1378,7 @@ def test_config_data_version_differing_from_argument_is_rejected(recorder: Trial
             config_hash=config_hash,
             data_version=DATA_VERSION,  # "a" * 64 -- differs from config["data_version"]
             config=config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
         )
 
@@ -1317,6 +1404,7 @@ def test_config_without_data_version_gets_the_validated_value_dispatched(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -1344,6 +1432,7 @@ def test_recorded_trial_data_version_matches_what_the_instrument_was_dispatched_
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
     )
 
@@ -1369,6 +1458,7 @@ def test_parameter_sweep_dispatched_config_carries_validated_data_version(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         base_config=base_config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         param_grid={"portfolio.n_long": [10, 20]},
         data_handler=MagicMock(),
     )
@@ -1407,6 +1497,7 @@ def test_parameter_sweep_rejects_start_date_override_before_dispatch(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"backtest.start_date": ["2022-06-01", "2023-02-01"]},
             data_handler=MagicMock(),
         )
@@ -1435,6 +1526,7 @@ def test_parameter_sweep_rejects_end_date_override_before_dispatch(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"backtest.end_date": ["2022-12-31", "2023-03-01"]},
             data_handler=MagicMock(),
         )
@@ -1461,6 +1553,7 @@ def test_parameter_sweep_rejects_both_window_keys_listed_together(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={
                 "backtest.start_date": ["2022-06-01"],
                 "backtest.end_date": ["2023-03-01"],
@@ -1494,6 +1587,7 @@ def test_parameter_sweep_window_override_rejected_even_without_a_registered_wind
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"backtest.start_date": ["2021-01-01"]},
             data_handler=MagicMock(),
         )
@@ -1518,6 +1612,7 @@ def test_parameter_sweep_legitimate_strategy_param_grid_still_accepted(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         base_config=base_config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         param_grid={
             "portfolio.n_long": [10, 20, 30],
             "portfolio.min_holding_days": [0, 21],
@@ -1553,6 +1648,7 @@ def test_parameter_sweep_window_override_checked_before_final_holdout_confirmati
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"backtest.start_date": ["2022-06-01"]},
             data_handler=MagicMock(),
             final_holdout_confirmation=True,
@@ -1587,6 +1683,7 @@ def test_parameter_sweep_rejects_whole_backtest_section_override_before_dispatch
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={
                 "backtest": [
                     {
@@ -1619,6 +1716,7 @@ def test_parameter_sweep_rejects_empty_string_key(recorder: TrialRecorder) -> No
             config_hash=config_hash,
             data_version=DATA_VERSION,
             base_config=base_config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             param_grid={"": [1, 2]},
             data_handler=MagicMock(),
         )
@@ -1645,6 +1743,7 @@ def test_parameter_sweep_accepts_initial_capital_sibling_key(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         base_config=base_config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         param_grid={"backtest.initial_capital": [50000, 100000]},
         data_handler=MagicMock(),
     )
@@ -1702,6 +1801,7 @@ def test_legacy_path_hypothesis_id_none_records_trial_with_no_freeze_and_no_erro
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
         hypothesis_id=None,
     )
@@ -1734,6 +1834,7 @@ def test_recording_trial_with_unfrozen_hypothesis_freezes_it_as_side_effect(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
         hypothesis_id=hypothesis_id,
     )
@@ -1765,6 +1866,7 @@ def test_second_trial_linking_already_frozen_hypothesis_is_a_noop_on_frozen_at(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
         hypothesis_id=hypothesis_id,
     )
@@ -1781,6 +1883,7 @@ def test_second_trial_linking_already_frozen_hypothesis_is_a_noop_on_frozen_at(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
         hypothesis_id=hypothesis_id,
     )
@@ -1824,6 +1927,7 @@ def test_freeze_uses_conditional_update_and_never_overwrites_an_existing_timesta
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
             hypothesis_id=hypothesis_id,
         )
@@ -1865,6 +1969,7 @@ def test_freeze_log_not_emitted_when_trial_insert_fails_after_freeze(
                 config_hash=config_hash,
                 data_version=DATA_VERSION,
                 config=config,
+                eval_window=_window("2022-01-01", "2022-12-31"),
                 data_handler=MagicMock(),
                 hypothesis_id=hypothesis_id,
             )
@@ -1896,6 +2001,7 @@ def test_freeze_log_emitted_exactly_once_after_successful_commit(
             config_hash=config_hash,
             data_version=DATA_VERSION,
             config=config,
+            eval_window=_window("2022-01-01", "2022-12-31"),
             data_handler=MagicMock(),
             hypothesis_id=hypothesis_id,
         )
@@ -1943,6 +2049,7 @@ def test_param_grid_edit_rejected_after_recorder_freezes_hypothesis(
         config_hash=config_hash,
         data_version=DATA_VERSION,
         config=config,
+        eval_window=_window("2022-01-01", "2022-12-31"),
         data_handler=MagicMock(),
         hypothesis_id=hyp.id,
     )

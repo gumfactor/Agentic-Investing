@@ -32,6 +32,7 @@ from backtesting.experiment_tracking.mlflow_logger import BacktestLogger
 from backtesting.validation.bootstrap_stress import BootstrapStressResult
 from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
+    ParameterSensitivityRow,
     ParameterSweeper,
 )
 from backtesting.validation.promotion_pipeline import (
@@ -42,6 +43,7 @@ from backtesting.validation.promotion_pipeline import (
     _sanitize_metrics,
 )
 from backtesting.validation.walk_forward import WalkForwardFold, WalkForwardResult, WalkForwardValidator
+from strategy_registry.evaluation_window import EvaluationWindow
 from strategy_registry.fingerprint import hash_config
 from strategy_registry.hypothesis import HypothesisRegistry
 from strategy_registry.models import Base, Strategy, StrategyDefinition
@@ -53,6 +55,12 @@ from strategy_registry.selection_models import (
 
 
 DATA_VERSION = "a" * 64
+
+# All _config()/_seed_definition() helpers below default to this same
+# 2022-01-01..2022-12-31 window (04-4W: eval_window is now a required,
+# explicit PromotionPipeline.run() argument, never read from the seeded
+# StrategyDefinition.config's dates).
+DEFAULT_EVAL_WINDOW = EvaluationWindow(start=date(2022, 1, 1), end=date(2022, 12, 31))
 
 
 # ── Fixtures / helpers ───────────────────────────────────────────────────────
@@ -80,6 +88,45 @@ def _config(strategy_id: str = "v1_test_strategy") -> dict:
         "name": strategy_id,
         "version": 1,
         "backtest": {"start_date": "2022-01-01", "end_date": "2022-12-31"},
+        # Round-5 fix: PromotionPipeline.run() recomputes each sweep row's
+        # EFFECTIVE applied config (via _apply_params) using this same
+        # seeded config as the base -- so every dot-path key any fixture's
+        # ParameterSensitivityRow.params uses ("portfolio.n_long",
+        # "universe", "description") must already exist here for
+        # _apply_params/_set_nested to resolve it (it only OVERRIDES
+        # existing keys, never creates new ones), exactly as a real
+        # strategy config would already define every tunable a param_grid
+        # can override.
+        #
+        # Round-10 fix: _resolve_frozen_grid now runs
+        # validate_backtest_config on every (grid key, candidate) pair
+        # applied to this base config, BEFORE any instrument runs -- so
+        # this fixture must be a genuinely CONTRACT-VALID config (every
+        # top-level/section key classified CONSUMED/CONSUMED_LOGGING_ONLY/
+        # INFORMATIONAL by backtesting/config_contract.py), not just
+        # "has the keys some test's row.params happens to touch." A
+        # previous "custom_metadata" placeholder field (deliberately
+        # unclassified, for a round-3 crash-safety test) is gone -- dedup
+        # is metrics-based now (round-10), so it never needed a params-
+        # level placeholder anyway; see
+        # test_nested_dict_param_values_do_not_crash_the_dedupe's updated
+        # docstring for why that test's original premise is now moot.
+        "description": "placeholder description",
+        # "method" is required for the round-10 invalid-value pre-flight
+        # test (portfolio.method is consumed_value_restricted) --
+        # _set_nested only overrides EXISTING keys, so a grid touching
+        # "portfolio.method" needs it present in the base config first.
+        "portfolio": {"n_long": 10, "method": "equal_weight"},
+        # "universe" is a REAL INFORMATIONAL section per
+        # backtesting.config_contract (upstream signal-pipeline metadata,
+        # never read by the backtest path).
+        "universe": {"source": "sp500"},
+        # "reporting" is a known section whose ONLY two sub-keys
+        # (save_positions/save_trades) are BOTH CONSUMED_LOGGING_ONLY
+        # (round-8) -- used by the round-9 test proving a section-level
+        # grid override (which replaces this whole subtree) still collapses
+        # correctly even though is_behavioral("reporting") itself is True.
+        "reporting": {"save_trades": True, "save_positions": False},
     }
 
 
@@ -157,12 +204,67 @@ def _wf_result(
     )
 
 
-def _sweep_result(verdict: str = "robust", configs_tested: int = 6) -> ParameterSensitivityResult:
+def _sweep_result(
+    verdict: str = "robust",
+    configs_tested: int = 6,
+    n_finite_rows: int | None = None,
+    duplicate_params: bool = False,
+) -> ParameterSensitivityResult:
+    """R1-B (PR #50): PromotionPipeline now recomputes the finite-variant
+    count directly from ``rows`` (not just ``configs_tested``) to gate the
+    sensitivity verdict -- see MIN_SENSITIVITY_SWEEP_VARIANTS. Defaults to
+    populating ``rows`` with ``configs_tested`` finite-Sharpe entries (a
+    well-powered sweep) unless ``n_finite_rows`` overrides that count, for
+    tests exercising the underpowered path specifically.
+
+    Round-2 P1 fix: ``duplicate_params=True`` gives every row the SAME
+    ``params`` dict (as ``_resolve_frozen_grid`` permits when a param_grid
+    list contains repeated values), for tests exercising the dedupe-by-
+    normalized-params path -- distinct from ``n_finite_rows``, which still
+    produces DISTINCT params per row.
+
+    Round-6 fix: PromotionPipeline now recomputes verdict/mean/std/
+    positive_fraction itself from the (deduped) rows via
+    summarize_variants, rather than trusting this object's own verdict=
+    field -- so when ``verdict="curve_fit"`` is requested, the per-row
+    ``oos_sharpe`` values alternate between a high and a deeply negative
+    value (wide dispersion, std > the 0.5 default max_sharpe_std) so a
+    REAL recomputation over these rows also independently lands on
+    curve_fit, not just this object's cosmetic label.
+
+    Round-10 fix: PromotionPipeline now dedupes on each row's OBSERVED
+    METRICS (oos_sharpe/oos_max_drawdown/trade_count/avg_is_sharpe), not
+    on row.params at all -- a deterministic engine means identical params
+    (or params that coerce/collapse to the same effective config) MUST
+    produce identical metrics, and vice versa. So ``oos_sharpe`` must vary
+    per row here to represent genuinely DISTINCT params (the default,
+    non-duplicate case) -- previously it was fixed at 0.9 for every row,
+    which was fine when dedup looked at row.params, but would make every
+    row collapse to one outcome now regardless of params.
+    ``duplicate_params=True`` keeps identical oos_sharpe across rows,
+    correctly representing "same params -> same observed outcome"."""
+    n_rows = configs_tested if n_finite_rows is None else n_finite_rows
+    if verdict == "curve_fit":
+        sharpes = [2.0 if i % 2 == 0 else -2.0 for i in range(n_rows)]
+    elif duplicate_params:
+        sharpes = [0.9] * n_rows
+    else:
+        sharpes = [0.9 + i * 0.01 for i in range(n_rows)]
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 10} if duplicate_params else {"portfolio.n_long": 10 + i},
+            oos_sharpe=sharpes[i],
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for i in range(n_rows)
+    ]
     return ParameterSensitivityResult(
         base_config_name="v1_test_strategy",
         param_grid={"portfolio.n_long": [10, 20]},
         configs_tested=configs_tested,
-        rows=[],
+        rows=rows,
         mean_oos_sharpe=0.9,
         std_oos_sharpe=0.1,
         positive_fraction=1.0,
@@ -253,7 +355,7 @@ def test_promotion_pipeline_pass_produces_matching_promotion_decision(db_url: st
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is True
@@ -292,7 +394,7 @@ def test_funnel_failure_flips_overall_passed_and_is_attributed(db_url: str) -> N
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is False
@@ -315,13 +417,593 @@ def test_sensitivity_curve_fit_flips_overall_passed_and_is_attributed(db_url: st
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is True
     assert result.sensitivity_verdict == "curve_fit"
     assert result.overall_passed is False
     assert result.evidence_json["sensitivity"]["verdict"] == "curve_fit"
+
+
+# ── R1-B (PR #50 Codex round-1 P1): an underpowered sweep must not clear the
+#    gate even when ParameterSweeper itself labels it "robust" ────────────────
+
+
+def test_single_variant_robust_sweep_does_not_clear_overall_passed(db_url: str) -> None:
+    """A single-combination grid (or one variant that happens to survive)
+    trivially satisfies ParameterSweeper's positive_fraction >= 0.5
+    threshold and skips its std-dispersion gate (n_valid > 1 guard), so
+    ParameterSweeper itself reports verdict='robust' with zero statistical
+    power. PromotionPipeline must recompute the finite-variant count and
+    refuse to pass overall_passed on that basis -- this is the exact defect
+    class (curve-fit strategy clearing the funnel) R1-B closes."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        # ParameterSweeper itself would compute verdict="robust" here (one
+        # finite, positive Sharpe -> positive_fraction=1.0 >= 0.5, std gate
+        # skipped) -- the sweep result asserts that verdict explicitly to
+        # prove the PromotionPipeline-level override is what closes the gate,
+        # not ParameterSweeper disagreeing with itself.
+        sweep_result=_sweep_result(verdict="robust", configs_tested=1, n_finite_rows=1),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.funnel_passed is True
+    assert result.stress_verdict == "solid"
+    assert result.sensitivity_verdict == "robust"  # ParameterSweeper's own (uncorrected) verdict
+    assert result.overall_passed is False  # but PromotionPipeline refuses to trust it
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+    assert result.evidence_json["sensitivity"]["min_required_variants"] == 3
+
+
+def test_mostly_failed_sweep_with_one_survivor_does_not_clear_overall_passed(
+    db_url: str,
+) -> None:
+    """A grid where all but one variant failed (n_finite=1 out of a larger
+    configs_tested) is the other shape of the same defect -- configs_tested
+    alone would look like a real sweep ran, but only one row actually
+    produced a usable result."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(verdict="robust", configs_tested=8, n_finite_rows=1),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.overall_passed is False
+    assert result.evidence_json["sensitivity"]["configs_tested"] == 8
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_exactly_min_finite_variants_clears_the_underpowered_gate(db_url: str) -> None:
+    """The boundary case: exactly MIN_SENSITIVITY_SWEEP_VARIANTS (3) finite
+    variants must NOT be flagged underpowered -- pins the threshold as
+    inclusive, not exclusive."""
+    from backtesting.validation.promotion_pipeline import MIN_SENSITIVITY_SWEEP_VARIANTS
+
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(
+            verdict="robust",
+            configs_tested=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            n_finite_rows=MIN_SENSITIVITY_SWEEP_VARIANTS,
+        ),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["underpowered"] is False
+    assert result.overall_passed is True
+
+
+# ── Round-2 (PR #50 Codex P1): duplicate param combinations must not count
+#    as distinct variants ────────────────────────────────────────────────
+
+
+def test_duplicate_param_variants_do_not_clear_the_underpowered_gate(db_url: str) -> None:
+    """_resolve_frozen_grid does not reject a param_grid list with repeated
+    values (e.g. {"portfolio.n_long": [10, 10, 10]}), so ParameterSweeper can
+    produce MIN_SENSITIVITY_SWEEP_VARIANTS-many finite rows that all share the
+    SAME params -- zero actual parameter-sensitivity testing occurred.
+    PromotionPipeline must dedupe by normalized params before comparing
+    against the threshold and refuse to pass overall_passed on that basis."""
+    from backtesting.validation.promotion_pipeline import MIN_SENSITIVITY_SWEEP_VARIANTS
+
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(
+            verdict="robust",
+            configs_tested=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            n_finite_rows=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            duplicate_params=True,
+        ),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.sensitivity_verdict == "robust"  # ParameterSweeper's own (uncorrected) verdict
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1  # deduped, not 3
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+    assert result.overall_passed is False
+
+
+def test_distinct_params_at_min_threshold_still_clears_after_dedupe(db_url: str) -> None:
+    """Sanity counterpart to the duplicate-params test: MIN_SENSITIVITY_SWEEP_VARIANTS
+    genuinely DISTINCT finite variants still dedupe down to the full count and
+    clear the gate -- the dedupe fix must not under-count real diversity."""
+    from backtesting.validation.promotion_pipeline import MIN_SENSITIVITY_SWEEP_VARIANTS
+
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=_sweep_result(
+            verdict="robust",
+            configs_tested=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            n_finite_rows=MIN_SENSITIVITY_SWEEP_VARIANTS,
+            duplicate_params=False,
+        ),
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == MIN_SENSITIVITY_SWEEP_VARIANTS
+    assert result.evidence_json["sensitivity"]["underpowered"] is False
+    assert result.overall_passed is True
+
+
+def test_nested_dict_param_values_do_not_crash_the_dedupe(db_url: str) -> None:
+    """Round-3 (PR #50 Codex P2), superseded by round-10: the ORIGINAL
+    concern here was that a dedupe key built from
+    tuple(sorted(row.params.items())) raises TypeError: unhashable type
+    the moment a param candidate is itself a list/dict. Rounds 5-9 all
+    tried to derive the dedupe key from row.params (directly, or via the
+    fully-applied effective config) -- each fix closing one more way two
+    DIFFERENT param representations could resolve to the SAME effective
+    config, but round-10 found the fundamentally unclosable hole in that
+    whole strategy (engine-internal value COERCION, e.g. int(1) ==
+    int(1.0) == int(True)) and pivoted the dedupe to the row's OBSERVED
+    METRICS instead -- which never reads row.params AT ALL.
+
+    That pivot makes THIS test's original premise structurally moot: since
+    ParameterSensitivityRow's metrics fields (oos_sharpe/oos_max_drawdown/
+    trade_count/avg_is_sharpe) are always plain hashable scalars by
+    dataclass construction, the dedupe can no longer be reached by
+    whatever garbage lives in row.params, regardless of its shape. This
+    test now instead documents and pins that pivot directly: two rows with
+    WILDLY different (including unhashable, deeply nested) params but
+    IDENTICAL metrics still collapse to one variant -- proving params
+    content is irrelevant to dedup now, only the observed outcome is."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            # Unhashable nested params, and utterly unrelated to the row
+            # above's params -- but IDENTICAL metrics (same deterministic
+            # outcome). Must still collapse with the row above.
+            params={"portfolio.n_long": [{"deeply": {"nested": ["unhashable", "garbage"]}}]},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 20},
+            oos_sharpe=0.7,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [10, 20]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.8,
+        std_oos_sharpe=0.1,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, but only 2 distinct OBSERVED OUTCOMES -- the two rows
+    # sharing metrics collapse to one, regardless of how different (or
+    # unhashable) their params are.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
+
+
+def test_informational_grid_key_variants_collapse_to_one_effective_config(db_url: str) -> None:
+    """Round-7 (PR #50 Codex P1): Codex's exact example -- a grid entry
+    like {"description": ["a", "b", "c"]} produces 3 genuinely different
+    serialized configs (round-5's dedupe key), but "description" is
+    classified INFORMATIONAL by backtesting.config_contract.field_status:
+    accepted, but never read by the backtest path. All 3 rows execute the
+    IDENTICAL backtest, so they must count as ONE variant.
+
+    This exercises the dedupe-level filter directly (bypassing
+    _resolve_frozen_grid's round-7 validation-time rejection, the same way
+    test_ancestor_descendant_grid_paths_collapse_to_same_effective_config
+    bypasses it) -- the defense-in-depth path documented for any grid
+    frozen before the round-7 fix shipped."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"description": label},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for label in ("a", "b", "c")
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"description": ["a", "b", "c"]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows differing only in an INFORMATIONAL field -- all 3 execute the
+    # identical backtest, so exactly 1 distinct effective variant.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_logging_only_grid_key_variants_collapse_to_one_effective_config(db_url: str) -> None:
+    """Round-8 (PR #50 Codex P1): Codex's exact example -- "version" is
+    CONSUMED (read by key), not INFORMATIONAL, so the round-7 fix (which
+    only filtered INFORMATIONAL dot-paths) does NOT catch this. version is
+    read ONLY by BacktestLogger, never per-sweep-variant, so
+    {"version": [1, 2, 3]} still executes the identical backtest 3 times.
+    is_behavioral() (CONSUMED_LOGGING_ONLY tier) must collapse these too.
+
+    Exercises the dedupe-level filter directly (bypassing
+    _resolve_frozen_grid's round-8 validation-time rejection), the
+    defense-in-depth path for any grid frozen before this fix shipped."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"version": v},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for v in (1, 2, 3)
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"version": [1, 2, 3]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows differing only in a CONSUMED_LOGGING_ONLY field -- all 3
+    # execute the identical backtest, so exactly 1 distinct effective
+    # variant.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_section_level_override_of_all_logging_only_subkeys_collapses(db_url: str) -> None:
+    """Round-9 (PR #50 Codex P1): Codex's exact example -- a grid entry
+    like {"reporting": [{"save_trades": True}, {"save_trades": False},
+    {"save_positions": True}]} produces 3 genuinely different serialized
+    configs (round-5's dedupe key). "reporting" itself has field_status
+    "section" -- is_behavioral("reporting") is True, so the round-7/8
+    row.params-level filter did NOT catch this (it only filters the GRID's
+    declared keys, and "reporting" itself passes). But "reporting"'s only
+    two known sub-keys (save_positions, save_trades) are BOTH
+    CONSUMED_LOGGING_ONLY (round-8), so no possible value assigned to the
+    whole section can ever be behavioral. All 3 rows execute the IDENTICAL
+    backtest -- must count as ONE variant, proving the round-9 fix (prune
+    the FULLY-APPLIED config recursively, after applying row.params, not
+    filter row.params before applying it)."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"reporting": candidate},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for candidate in (
+            {"save_trades": True},
+            {"save_trades": False},
+            {"save_positions": True},
+        )
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={
+            "reporting": [
+                {"save_trades": True},
+                {"save_trades": False},
+                {"save_positions": True},
+            ]
+        },
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, 3 distinct serialized "reporting" values, but ALL sub-keys
+    # are CONSUMED_LOGGING_ONLY -- exactly 1 distinct effective variant.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_ancestor_descendant_grid_paths_collapse_to_same_effective_config(db_url: str) -> None:
+    """Round-5 (PR #50 Codex P1), dedupe mechanism superseded by round-10:
+    distinct row.params dicts can resolve to the IDENTICAL effective
+    backtest config when the grid has overlapping ancestor/descendant
+    dot-paths -- e.g. a grid combining "portfolio" (replaces the whole
+    subtree) with "portfolio.n_long" (a leaf within it) is legal, and
+    _apply_params applies entries in insertion order, so whichever key
+    comes later always wins for any key it also touches. Two rows whose
+    "portfolio" candidate differs but whose later "portfolio.n_long"
+    override lands on the SAME value therefore backtest the identical
+    config.
+
+    Round-5 originally closed this by dedupeing on the fully-applied
+    config; round-10 replaced that mechanism with dedupeing on each row's
+    OBSERVED metrics instead (config-shape reasoning can never predict
+    engine-internal value coercion -- see
+    test_nested_dict_param_values_do_not_crash_the_dedupe). Under a
+    deterministic engine, two rows that backtest the identical effective
+    config MUST also produce identical metrics -- so this fixture gives
+    the two ancestor/descendant-collapsed rows IDENTICAL metrics (as a
+    real sweep would), pinning that the historical motivating scenario
+    still collapses correctly under the new mechanism."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            # "portfolio" replaces the whole subtree with {"n_long": 999},
+            # then "portfolio.n_long" (applied after, same insertion
+            # order as the dict literal) overrides just that leaf to 10 --
+            # net effect: portfolio == {"n_long": 10}.
+            params={"portfolio": {"n_long": 999}, "portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            # Different "portfolio" candidate (888 vs 999 above), but the
+            # SAME final "portfolio.n_long" override (10) -- net effect is
+            # IDENTICAL to the row above: portfolio == {"n_long": 10}, so
+            # a real (deterministic) sweep would ALSO produce identical
+            # metrics -- given here directly, since dedup is metrics-based.
+            params={"portfolio": {"n_long": 888}, "portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+        ParameterSensitivityRow(
+            # Genuinely different final value (20, not 10) -- a real sweep
+            # would produce a different outcome, so this row gets distinct
+            # metrics -- must remain a distinct variant.
+            params={"portfolio": {"n_long": 777}, "portfolio.n_long": 20},
+            oos_sharpe=0.7,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        ),
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio": [{"n_long": 999}, {"n_long": 888}, {"n_long": 777}], "portfolio.n_long": [10, 20]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.8,
+        std_oos_sharpe=0.1,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, 3 DISTINCT raw params dicts, but only 2 distinct EFFECTIVE
+    # configs -- the first two rows backtest the identical config despite
+    # having different raw params.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
+
+
+def test_duplicated_winner_does_not_mask_two_distinct_losers(db_url: str) -> None:
+    """Round-6 (PR #50 Codex P1): the round-5 dedupe fix only corrected the
+    finite-variant COUNT gate -- sensitivity_verdict/positive_fraction/
+    std_oos_sharpe themselves were still sourced from sensitivity_result,
+    i.e. computed by ParameterSweeper over every RAW row. A grid with 100
+    copies of one profitable configuration and 2 distinct losing
+    configurations has 3 distinct effective configs (clears
+    MIN_SENSITIVITY_SWEEP_VARIANTS), but the duplicated winner would still
+    dominate ParameterSweeper's own positive_fraction/std -- 2 of the 3
+    real configs lose, yet the sweep would report "robust". PromotionPipeline
+    must recompute the verdict from ONE row per distinct effective config,
+    not merely check the count."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    winner_rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 10},
+            oos_sharpe=2.0,
+            oos_max_drawdown=-0.05,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for _ in range(100)
+    ]
+    loser_rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 20},
+            oos_sharpe=-0.5,
+            oos_max_drawdown=-0.30,
+            trade_count=40,
+            avg_is_sharpe=-0.2,
+        ),
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 30},
+            oos_sharpe=-0.8,
+            oos_max_drawdown=-0.35,
+            trade_count=40,
+            avg_is_sharpe=-0.3,
+        ),
+    ]
+    rows = winner_rows + loser_rows
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [10, 20, 30]},
+        configs_tested=len(rows),
+        rows=rows,
+        # ParameterSweeper's OWN (uncorrected) report over all 102 raw
+        # rows: positive_fraction dominated by the 100 duplicated winners.
+        mean_oos_sharpe=1.933,
+        std_oos_sharpe=0.35,
+        positive_fraction=100 / 102,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 distinct effective configs -- clears MIN_SENSITIVITY_SWEEP_VARIANTS.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 3
+    assert result.evidence_json["sensitivity"]["underpowered"] is False
+    # ParameterSweeper's own (uncorrected) verdict still says "robust" --
+    # the fixture asserts this explicitly to prove the PromotionPipeline-
+    # level override is what closes the gate, not ParameterSweeper
+    # disagreeing with itself.
+    assert result.evidence_json["sensitivity"]["raw_verdict"] == "robust"
+    # But the AUTHORITATIVE verdict, recomputed over one row per distinct
+    # effective config (positive_fraction = 1/3, well below the 0.5
+    # default), must be curve_fit -- and overall_passed must be False.
+    assert result.sensitivity_verdict == "curve_fit"
+    assert result.evidence_json["sensitivity"]["verdict"] == "curve_fit"
+    assert result.evidence_json["sensitivity"]["positive_fraction"] == pytest.approx(1 / 3)
+    assert result.overall_passed is False
 
 
 def test_stress_fragile_flips_overall_passed_and_is_attributed(db_url: str) -> None:
@@ -336,7 +1018,7 @@ def test_stress_fragile_flips_overall_passed_and_is_attributed(db_url: str) -> N
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.funnel_passed is True
@@ -361,7 +1043,7 @@ def test_low_dsr_does_not_flip_overall_passed(db_url: str) -> None:
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.dsr_value == pytest.approx(0.01)
@@ -376,7 +1058,7 @@ def test_dsr_is_computed_and_recorded(db_url: str) -> None:
 
     pipeline = _make_pipeline(db_url)
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.dsr_value is not None
@@ -443,7 +1125,7 @@ def test_missing_hypothesis_id_fails_closed(db_url: str) -> None:
     pipeline._wf_validator = validator
 
     with pytest.raises(MissingParameterGridError):
-        pipeline.run("v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=None)
+        pipeline.run("v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=None)
 
     validator.run.assert_not_called()
 
@@ -457,7 +1139,7 @@ def test_hypothesis_with_no_param_grid_fails_closed(db_url: str) -> None:
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -472,7 +1154,7 @@ def test_hypothesis_belonging_to_different_strategy_fails_closed(db_url: str) ->
         pipeline.run(
             "v1_test_strategy",
             config_hash,
-            data_handler=MagicMock(),
+            data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW,
             hypothesis_id=other_hyp_id,
         )
 
@@ -492,7 +1174,7 @@ def test_grid_with_empty_candidate_list_fails_closed_before_walk_forward(db_url:
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -509,7 +1191,7 @@ def test_grid_with_scalar_value_fails_closed_before_walk_forward(db_url: str) ->
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -527,7 +1209,328 @@ def test_grid_with_string_value_fails_closed_before_walk_forward(db_url: str) ->
 
     with pytest.raises(MissingParameterGridError):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_informational_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """Round-7 (PR #50 Codex P1): a grid key classified INFORMATIONAL by
+    backtesting.config_contract.field_status (e.g. "description") can
+    never produce a behaviorally different backtest -- sweeping over it
+    wastes N identical backtests and creates the exact "distinct params,
+    identical behavior" overcounting class the dedupe fixes exist to
+    close. Reject it at the SOURCE, before any instrument runs, rather
+    than relying solely on downstream dedupe filtering."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"description": ["a", "b", "c"]})
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="not behavioral"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_mixed_informational_and_behavioral_keys_fails_closed(db_url: str) -> None:
+    """A grid mixing one genuinely behavioral key with one informational
+    key must still be rejected outright -- a caller cannot smuggle an
+    informational sweep dimension past validation just by pairing it with
+    a valid one."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"portfolio.n_long": [10, 20], "description": ["a", "b"]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="not behavioral"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_logging_only_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """Round-8 (PR #50 Codex P1): "version" is CONSUMED (read by key), not
+    INFORMATIONAL -- config_contract.py's own docstring says CONSUMED means
+    "read BY KEY, whether to change behavior OR to individually label a
+    persisted record." version is read ONLY by BacktestLogger, which is
+    never invoked per-sweep-variant, so {"version": [1, 2, 3]} would
+    execute the identical backtest 3 times under a naive "keep everything
+    CONSUMED" filter. is_behavioral() must reject it too, the same as an
+    INFORMATIONAL key."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"version": [1, 2, 3]})
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="not behavioral"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+# ── Round-10 (PR #50 Codex P1): value coercion defeats config-shape dedup;
+#    the fix pivots to dedupeing on OBSERVED metrics instead ─────────────
+
+
+def test_coerced_values_collapse_to_one_effective_variant(db_url: str) -> None:
+    """Codex's exact example: {"portfolio.n_long": [1, 1.0, True]} produces
+    3 genuinely different serialized/typed values (int, float, bool), but
+    BacktestEngine.run applies int(...) to n_long, so all 3 execute with
+    n_long == 1 -- no config-shape classification can predict this,
+    because it depends on engine-internal type coercion. Since the engine
+    is deterministic, all 3 rows produce IDENTICAL metrics in a real
+    sweep -- given identically here, since dedup is metrics-based and
+    never inspects row.params at all."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": value},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for value in (1, 1.0, True)
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [1, 1.0, True]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_coerced_values_with_independently_nan_auxiliary_metric_still_collapse(
+    db_url: str,
+) -> None:
+    """Round-11 (PR #50 Codex P1): NaN != NaN under Python's default
+    equality, so the round-10 dedupe key (a plain tuple of the row's four
+    metrics) would NOT collapse two rows sharing the same coerced
+    oos_sharpe if each independently produces NaN for avg_is_sharpe (e.g.
+    an in-sample fold with zero-variance returns) -- even though they
+    represent the identical simulated outcome. {"portfolio.n_long":
+    [1, 1.0, True]} (Codex's round-10 example) with avg_is_sharpe=NaN on
+    all 3 rows must still collapse to 1 variant, not 3."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": value},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=float("nan"),
+        )
+        for value in (1, 1.0, True)
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [1, 1.0, True]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_nan_safe_normalizes_nan_and_passes_through_other_values() -> None:
+    from backtesting.validation.promotion_pipeline import _nan_safe
+
+    assert _nan_safe(float("nan")) is None
+    assert _nan_safe(0.9) == 0.9
+    assert _nan_safe(40) == 40
+    assert _nan_safe(None) is None
+
+
+def test_coincidental_metric_match_does_not_collapse_distinct_executions(db_url: str) -> None:
+    """Round-12 (PR #50 Codex P1): the four summary scalars alone are a
+    NECESSARY but not SUFFICIENT condition for "same execution" -- two
+    genuinely DIFFERENT return paths can coincidentally share Sharpe/
+    max_drawdown/trade_count/avg_is_sharpe. Two rows with IDENTICAL
+    summary metrics but DIFFERENT oos_returns_fingerprint (proving their
+    full OOS return sequences actually diverged) must NOT collapse -- the
+    adversarial direction Codex flagged: several distinct losers
+    coincidentally matching a winner's summary stats must not silently
+    reduce the counted diversity."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+            oos_returns_fingerprint="fingerprint-A",
+        ),
+        ParameterSensitivityRow(
+            # Identical summary scalars to the row above, but a genuinely
+            # different observed return sequence.
+            params={"portfolio.n_long": 20},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+            oos_returns_fingerprint="fingerprint-B",
+        ),
+        ParameterSensitivityRow(
+            # A true duplicate of the first row -- same summary AND same
+            # fingerprint -- must still collapse with it.
+            params={"portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+            oos_returns_fingerprint="fingerprint-A",
+        ),
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [10, 20]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, identical summary metrics throughout, but only 2 distinct
+    # oos_returns_fingerprint values -- rows 1 and 3 (same fingerprint)
+    # collapse; row 2 (different fingerprint despite matching summary
+    # stats) stays separate.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
+
+
+# ── Round-10 (P2-class efficiency/fail-fast): a grid candidate the config
+#    contract cannot accept at all must fail closed BEFORE any instrument
+#    runs, not crash mid-sweep after the walk-forward leg already ran ────
+
+
+def test_grid_with_rejected_section_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """"constraints" is an entire REJECTED section (backend never reads it
+    at all -- BUG-075) -- previously this would only surface as
+    UnsupportedStrategyConfigError when ParameterSweeper.sweep actually
+    tried the variant, AFTER the walk-forward leg already ran. Must fail
+    the same fail-closed precondition every other malformed-grid shape
+    does here."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"constraints": [{"max_sector_weight": 0.3}]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="cannot accept"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_unknown_field_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """A dot-path absent from the base config entirely -- _apply_params/
+    _set_nested only OVERRIDES existing keys, so this raises KeyError
+    inside ParameterSweeper.sweep's per-variant loop, which (like
+    UnsupportedStrategyConfigError) is not caught as a NaN variant and
+    crashes the whole sweep. Must fail closed at the SAME precondition,
+    before any instrument runs."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"totally_made_up_field": ["a", "b"]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="cannot accept"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_invalid_portfolio_method_value_fails_closed(db_url: str) -> None:
+    """portfolio.method is consumed_value_restricted -- only "equal_weight"
+    is implemented (BUG-075). A grid sweeping to an unsupported value would
+    previously crash ParameterSweeper.sweep on that variant, after the
+    walk-forward leg already ran."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(
+        db_url, param_grid={"portfolio.method": ["equal_weight", "mvo"]}
+    )
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="cannot accept"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     validator.run.assert_not_called()
@@ -545,7 +1548,7 @@ def test_valid_grid_still_runs(db_url: str) -> None:
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.promotion_decision_id is not None
@@ -603,7 +1606,7 @@ def test_sweep_uses_frozen_grid_not_stale_pre_freeze_read(db_url: str) -> None:
         side_effect=_get_hypothesis_with_simulated_race,
     ):
         pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     # get_hypothesis was called (at least) twice: once for the initial
@@ -636,7 +1639,7 @@ def test_n_trials_counts_sweep_variants_not_one(db_url: str) -> None:
         sweep_result=_sweep_result(verdict="robust", configs_tested=9),
     )
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     # 1 walk_forward trial + 9 (NOT 1) for the sweep invocation.
@@ -653,7 +1656,7 @@ def test_residual_bug_flags_present_in_evidence(db_url: str) -> None:
     pipeline = _make_pipeline(db_url)
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     flags = result.evidence_json["residual_bug_acknowledgements"]
@@ -670,7 +1673,7 @@ def test_residual_bug_flags_present_in_evidence(db_url: str) -> None:
         sweep_result=_sweep_result(verdict="curve_fit"),
     )
     fail_result = fail_pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
     assert "BUG-066" in fail_result.evidence_json["residual_bug_acknowledgements"]
 
@@ -704,7 +1707,7 @@ def test_holdout_mode_fails_closed_before_any_instrument_or_db_work(db_url: str)
         pipeline.run(
             "v1_test_strategy",
             config_hash,
-            data_handler=MagicMock(),
+            data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW,
             hypothesis_id=hyp_id,
             holdout_mode=True,
         )
@@ -740,7 +1743,7 @@ def test_holdout_mode_default_false_train_oos_path_unaffected(db_url: str) -> No
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.sensitivity_result is not None
@@ -772,13 +1775,21 @@ def test_dsr_fdr_logged_via_mlflow_additive_path(db_url: str) -> None:
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     mock_logger.log_walk_forward_run.assert_called_once()
     call_kwargs = mock_logger.log_walk_forward_run.call_args.kwargs
     assert call_kwargs["funnel_result"] is result.funnel_result
     assert call_kwargs["stress_result"] is result.stress_result
+    # Round-6 (PR #50 Codex P2): the MLflow-internal "config_hash" tag is a
+    # naive hash of the dispatched config (includes data_version/eval_window),
+    # which diverges from the canonical identity hash and would change across
+    # runs of the same strategy over different windows. A separately named
+    # "canonical_config_hash" tag carries the SAME config_hash this promotion
+    # decision is keyed by, so an MLflow run can be correlated back to its
+    # promotion_decisions/strategy_definitions row.
+    assert call_kwargs["tags"] == {"canonical_config_hash": config_hash}
 
     mock_logger.log_promotion_decision.assert_called_once()
     log_kwargs = mock_logger.log_promotion_decision.call_args.kwargs
@@ -798,7 +1809,7 @@ def test_pipeline_works_without_mlflow_logger(db_url: str) -> None:
     pipeline = _make_pipeline(db_url, backtest_logger=None)
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.mlflow_run_id is None
@@ -862,7 +1873,7 @@ def test_mlflow_logging_passes_dispatched_config_not_original(db_url: str) -> No
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     mock_logger.log_walk_forward_run.assert_called_once()
@@ -904,7 +1915,7 @@ def test_failing_mlflow_logger_does_not_discard_promotion_decision(
 
     with structlog.testing.capture_logs() as captured_logs:
         result = pipeline.run(
-            "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
 
     # The pipeline must still complete and return a real decision id.
@@ -951,7 +1962,7 @@ def test_failing_db_persist_still_propagates(db_url: str) -> None:
     ):
         with pytest.raises(RuntimeError, match="db write failed"):
             pipeline.run(
-                "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+                "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
             )
 
 
@@ -1148,7 +2159,7 @@ def test_all_nan_funnel_and_sensitivity_still_persists_decision(db_url: str) -> 
     pipeline = _make_pipeline(db_url, validator_result=wf, sweep_result=sweep)
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     assert result.overall_passed is False
@@ -1165,9 +2176,20 @@ def test_all_nan_funnel_and_sensitivity_still_persists_decision(db_url: str) -> 
         _assert_no_nan(row.evidence_json)
         gate_values = [g["value"] for g in row.evidence_json["funnel"]["gates"]]
         assert any(v is None for v in gate_values)
+        # "mean_oos_sharpe"/"std_oos_sharpe"/"positive_fraction" are now the
+        # round-6 AUTHORITATIVE (deduped) stats, computed by summarize_variants
+        # over zero finite rows -- matching real ParameterSweeper.sweep
+        # semantics for n_valid=0 (mean=NaN->None, but std/positive_fraction
+        # are legitimately 0.0, not NaN). The "raw_*" counterparts are still
+        # this fixture's directly hand-set NaN values, sanitized to None --
+        # that's what actually exercises the NaN-sanitization path this test
+        # is about.
         assert row.evidence_json["sensitivity"]["mean_oos_sharpe"] is None
-        assert row.evidence_json["sensitivity"]["std_oos_sharpe"] is None
-        assert row.evidence_json["sensitivity"]["positive_fraction"] is None
+        assert row.evidence_json["sensitivity"]["std_oos_sharpe"] == 0.0
+        assert row.evidence_json["sensitivity"]["positive_fraction"] == 0.0
+        assert row.evidence_json["sensitivity"]["raw_mean_oos_sharpe"] is None
+        assert row.evidence_json["sensitivity"]["raw_std_oos_sharpe"] is None
+        assert row.evidence_json["sensitivity"]["raw_positive_fraction"] is None
 
 
 def test_nan_dsr_from_deflated_sharpe_fn_normalized_to_none(db_url: str) -> None:
@@ -1189,7 +2211,7 @@ def test_nan_dsr_from_deflated_sharpe_fn_normalized_to_none(db_url: str) -> None
     )
 
     result = pipeline.run(
-        "v1_test_strategy", config_hash, data_handler=MagicMock(), hypothesis_id=hyp_id
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
     )
 
     # Source-normalized: None everywhere, never a raw NaN surfacing anywhere.

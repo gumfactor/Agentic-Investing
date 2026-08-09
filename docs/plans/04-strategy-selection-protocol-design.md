@@ -509,7 +509,11 @@ independently from the purely additive `014`):
   primary integration point. `strategy_registry/registry.py`'s
   `transition()` method and its transition-table dict both need the new
   edge; `strategy_registry/models.py`'s two CHECK constraints need the
-  migration 015 change mirrored in the ORM model declarations (the existing
+  migration 018 change mirrored in the ORM model declarations (renumbered
+  from the original 015 -- slice 04-4W consumed 015/016/017 for the
+  fingerprint-algorithm-version marker and the trial/run evaluation-window
+  columns; the `validated`-status migration is now 018, chaining onto 017)
+  (the existing
   pattern already keeps Alembic migrations and `models.py` CheckConstraint
   strings in sync manually — e.g. `data/research/models.py`'s docstring
   calls out mirroring `012_research_identity.py` explicitly; this plan
