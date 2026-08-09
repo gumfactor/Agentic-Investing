@@ -1333,6 +1333,65 @@ def test_coerced_values_collapse_to_one_effective_variant(db_url: str) -> None:
     assert result.evidence_json["sensitivity"]["underpowered"] is True
 
 
+def test_coerced_values_with_independently_nan_auxiliary_metric_still_collapse(
+    db_url: str,
+) -> None:
+    """Round-11 (PR #50 Codex P1): NaN != NaN under Python's default
+    equality, so the round-10 dedupe key (a plain tuple of the row's four
+    metrics) would NOT collapse two rows sharing the same coerced
+    oos_sharpe if each independently produces NaN for avg_is_sharpe (e.g.
+    an in-sample fold with zero-variance returns) -- even though they
+    represent the identical simulated outcome. {"portfolio.n_long":
+    [1, 1.0, True]} (Codex's round-10 example) with avg_is_sharpe=NaN on
+    all 3 rows must still collapse to 1 variant, not 3."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": value},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=float("nan"),
+        )
+        for value in (1, 1.0, True)
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [1, 1.0, True]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_nan_safe_normalizes_nan_and_passes_through_other_values() -> None:
+    from backtesting.validation.promotion_pipeline import _nan_safe
+
+    assert _nan_safe(float("nan")) is None
+    assert _nan_safe(0.9) == 0.9
+    assert _nan_safe(40) == 40
+    assert _nan_safe(None) is None
+
+
 # ── Round-10 (P2-class efficiency/fail-fast): a grid candidate the config
 #    contract cannot accept at all must fail closed BEFORE any instrument
 #    runs, not crash mid-sweep after the walk-forward leg already ran ────

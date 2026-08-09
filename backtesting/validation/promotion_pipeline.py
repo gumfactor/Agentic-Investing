@@ -186,6 +186,22 @@ logger = structlog.get_logger(__name__)
 MIN_SENSITIVITY_SWEEP_VARIANTS: int = 3
 
 
+def _nan_safe(value: Any) -> Any:
+    """Normalize a NaN float to ``None`` (equal to itself); pass through
+    everything else unchanged.
+
+    PR #50 Codex round-11 fix: Python's NaN != NaN under default equality,
+    so two dict/tuple keys that are otherwise identical except for an
+    independently-NaN field never collapse -- used to build the sensitivity
+    dedupe's outcome key (see MIN_SENSITIVITY_SWEEP_VARIANTS's dedupe logic
+    in ``PromotionPipeline.run``), where two rows with the same coerced
+    oos_sharpe but each producing NaN for an auxiliary metric (e.g.
+    avg_is_sharpe, undefined for a zero-variance in-sample fold) represent
+    the identical simulated outcome and must be counted once, not twice.
+    """
+    return None if isinstance(value, float) and math.isnan(value) else value
+
+
 # ── Acknowledged residual limitations (design doc §9) ──────────────────────────
 # Stamped inline into every evidence_json bundle per §8 Q8's resolution
 # (surface inline, not just a one-time acknowledgment in the design doc).
@@ -817,16 +833,31 @@ class PromotionPipeline:
         # pre-flight quality gate -- a config-shape question, unlike THIS
         # dedupe, which is purely about counting
         # distinct observed outcomes.)
+        #
+        # PR #50 Codex round-11 fix (P1, same round-10 mechanism, one real
+        # edge case): NaN != NaN under Python's default equality, so two
+        # rows with the SAME (coerced) oos_sharpe but each independently
+        # producing NaN for an AUXILIARY metric -- most plausibly
+        # avg_is_sharpe, undefined when an in-sample fold has zero-
+        # variance returns -- would NOT collapse as dict keys, even though
+        # they represent the identical simulated outcome (the finite-ness
+        # filter above only checks oos_sharpe, not the other three
+        # fields). Normalize NaN to a stable sentinel (None, which DOES
+        # compare equal to itself) in the outcome key before using it,
+        # so two independently-NaN auxiliary metrics correctly collapse.
         effective_config_to_row: dict[tuple, ParameterSensitivityRow] = {}
         if sensitivity_result is not None:
             for row in sensitivity_result.rows:
                 if not math.isfinite(row.oos_sharpe):
                     continue
-                outcome_key = (
-                    row.oos_sharpe,
-                    row.oos_max_drawdown,
-                    row.trade_count,
-                    row.avg_is_sharpe,
+                outcome_key = tuple(
+                    _nan_safe(v)
+                    for v in (
+                        row.oos_sharpe,
+                        row.oos_max_drawdown,
+                        row.trade_count,
+                        row.avg_is_sharpe,
+                    )
                 )
                 effective_config_to_row.setdefault(outcome_key, row)
 
