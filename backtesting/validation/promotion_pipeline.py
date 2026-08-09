@@ -120,7 +120,7 @@ import structlog
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
-from backtesting.config_contract import is_behavioral
+from backtesting.config_contract import is_behavioral, prune_to_behavioral_leaves
 from backtesting.validation.bootstrap_stress import (
     BootstrapStressResult,
     bootstrap_stress as _default_bootstrap_stress,
@@ -760,30 +760,38 @@ class PromotionPipeline:
         # is the precise question this dedupe actually needs answered:
         # "does varying this field change what an individual sweep variant
         # SIMULATES" -- not "is this field read anywhere in the backtest
-        # path, including post-hoc logging." Filter each row's params to
-        # exclude non-behavioral dot-paths BEFORE building the dedup key --
-        # a row whose params become empty after filtering (every grid key
-        # it touched was non-behavioral) correctly collapses to the base
-        # config's own key, same as every other such row, which is exactly
-        # right: if nothing behavioral varies, there is only one real
-        # variant regardless of row count.
+        # path, including post-hoc logging."
+        #
+        # PR #50 Codex round-9 fix (P1, same class yet another layer
+        # deeper): filtering row.params BEFORE applying it (round-7/8) is
+        # still not enough -- a grid key that is a bare SECTION name (e.g.
+        # "reporting") replaces that section's ENTIRE subtree via
+        # _apply_params, and the candidate value itself can consist
+        # entirely of non-behavioral sub-keys (both "reporting" sub-keys
+        # are CONSUMED_LOGGING_ONLY after round-8), so
+        # is_behavioral("reporting") is True (bare sections are never
+        # themselves classified non-behavioral -- only their sub-keys are)
+        # yet every possible value assigned to it is non-behavioral. Apply
+        # row.params UNFILTERED first (so ancestor/descendant/section-
+        # replace semantics work exactly as the real sweep does), THEN
+        # prune the resulting FULL effective config recursively by real
+        # leaf classification via prune_to_behavioral_leaves -- this closes
+        # the class regardless of which grid key or nesting depth
+        # introduced a non-behavioral value, rather than requiring another
+        # fix each time a new non-behavioral shape is found.
         effective_config_to_row: dict[str, ParameterSensitivityRow] = {}
         if sensitivity_result is not None:
             for row in sensitivity_result.rows:
                 if not math.isfinite(row.oos_sharpe):
                     continue
-                behavioral_params = {
-                    dot_path: value
-                    for dot_path, value in row.params.items()
-                    if is_behavioral(dot_path)
-                }
-                effective_key = json.dumps(
-                    _sweep_apply_params(
-                        _config_with_data_version_and_window(
-                            config, self._data_version, eval_window.start, eval_window.end
-                        ),
-                        behavioral_params,
+                effective_config = _sweep_apply_params(
+                    _config_with_data_version_and_window(
+                        config, self._data_version, eval_window.start, eval_window.end
                     ),
+                    row.params,
+                )
+                effective_key = json.dumps(
+                    prune_to_behavioral_leaves(effective_config),
                     sort_keys=True,
                     default=str,
                 )

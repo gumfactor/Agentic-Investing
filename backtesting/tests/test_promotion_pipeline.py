@@ -92,10 +92,17 @@ def _config(strategy_id: str = "v1_test_strategy") -> dict:
         # row's EFFECTIVE applied config (via _apply_params) to dedupe on,
         # using this same seeded config as the base -- so every dot-path
         # key any fixture's ParameterSensitivityRow.params uses ("portfolio
-        # .n_long", "universe", "custom_metadata") must already exist here
-        # for _apply_params/_set_nested to resolve it, exactly as a real
-        # strategy config would already define every tunable a param_grid
-        # can override.
+        # .n_long", "universe", "custom_metadata", "description") must
+        # already exist here for _apply_params/_set_nested to resolve it
+        # (it only OVERRIDES existing keys, never creates new ones -- see
+        # round-9's fix note below), exactly as a real strategy config
+        # would already define every tunable a param_grid can override.
+        # Round-9 fix: pruning now happens AFTER applying row.params
+        # (unfiltered) rather than before, so every dot-path a test's rows
+        # touch -- including non-behavioral ones like "description" --
+        # must resolve via _apply_params first, same as v1_base_momentum
+        # .yaml (a real config) always declares a "description" field.
+        "description": "placeholder description",
         "portfolio": {"n_long": 10},
         # "universe" is a REAL INFORMATIONAL section per
         # backtesting.config_contract (upstream signal-pipeline metadata,
@@ -111,6 +118,12 @@ def _config(strategy_id: str = "v1_test_strategy") -> dict:
         # the round-7 informational-filtering property independently
         # testable.
         "custom_metadata": {},
+        # "reporting" is a known section whose ONLY two sub-keys
+        # (save_positions/save_trades) are BOTH CONSUMED_LOGGING_ONLY
+        # (round-8) -- used by the round-9 test proving a section-level
+        # grid override (which replaces this whole subtree) still collapses
+        # correctly even though is_behavioral("reporting") itself is True.
+        "reporting": {"save_trades": True, "save_positions": False},
     }
 
 
@@ -729,6 +742,71 @@ def test_logging_only_grid_key_variants_collapse_to_one_effective_config(db_url:
     # 3 rows differing only in a CONSUMED_LOGGING_ONLY field -- all 3
     # execute the identical backtest, so exactly 1 distinct effective
     # variant.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
+def test_section_level_override_of_all_logging_only_subkeys_collapses(db_url: str) -> None:
+    """Round-9 (PR #50 Codex P1): Codex's exact example -- a grid entry
+    like {"reporting": [{"save_trades": True}, {"save_trades": False},
+    {"save_positions": True}]} produces 3 genuinely different serialized
+    configs (round-5's dedupe key). "reporting" itself has field_status
+    "section" -- is_behavioral("reporting") is True, so the round-7/8
+    row.params-level filter did NOT catch this (it only filters the GRID's
+    declared keys, and "reporting" itself passes). But "reporting"'s only
+    two known sub-keys (save_positions, save_trades) are BOTH
+    CONSUMED_LOGGING_ONLY (round-8), so no possible value assigned to the
+    whole section can ever be behavioral. All 3 rows execute the IDENTICAL
+    backtest -- must count as ONE variant, proving the round-9 fix (prune
+    the FULLY-APPLIED config recursively, after applying row.params, not
+    filter row.params before applying it)."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"reporting": candidate},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for candidate in (
+            {"save_trades": True},
+            {"save_trades": False},
+            {"save_positions": True},
+        )
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={
+            "reporting": [
+                {"save_trades": True},
+                {"save_trades": False},
+                {"save_positions": True},
+            ]
+        },
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, 3 distinct serialized "reporting" values, but ALL sub-keys
+    # are CONSUMED_LOGGING_ONLY -- exactly 1 distinct effective variant.
     assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
     assert result.evidence_json["sensitivity"]["underpowered"] is True
 

@@ -153,6 +153,48 @@ def is_behavioral(dot_path: str) -> bool:
     return field_status(dot_path) not in _NON_BEHAVIORAL_STATUSES
 
 
+def prune_to_behavioral_leaves(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``config`` containing only the fields that could
+    change what an individual backtest/sweep-variant actually SIMULATES --
+    i.e. every leaf for which :func:`is_behavioral` is True, at every depth
+    this module's classification reaches (top-level fields, and one level
+    inside each known section; matches :func:`field_status`'s own "only
+    the first one or two path segments are inspected" depth).
+
+    PR #50 Codex round-9 fix: filtering only the GRID's declared override
+    keys (round-7/8, at the ``row.params`` level) is not enough -- a grid
+    key that is a bare SECTION name (``field_status`` status ``"section"``,
+    e.g. ``"reporting"``) replaces that section's ENTIRE subtree with the
+    candidate value via ``_apply_params``/``_set_nested``, and that value
+    can itself consist entirely of ``CONSUMED_LOGGING_ONLY``/
+    ``INFORMATIONAL`` leaves -- e.g.
+    ``{"reporting": [{"save_trades": True}, {"save_trades": False}]}``:
+    ``"reporting"``'s only two known sub-keys are BOTH
+    ``CONSUMED_LOGGING_ONLY``, so no possible value assigned to the whole
+    section can ever be behavioral, yet ``is_behavioral("reporting")`` is
+    True (bare section names are never themselves classified
+    non-behavioral -- only their sub-keys are). Pruning the FULLY-APPLIED
+    effective config recursively, by each leaf's real classification,
+    closes this regardless of which grid key or nesting depth introduced
+    the non-behavioral value -- the caller applies a row's params to the
+    base config FIRST (via ``_apply_params``), then prunes the RESULT,
+    rather than trying to pre-filter the override dict before applying it.
+    """
+    pruned: dict[str, Any] = {}
+    for key, value in config.items():
+        if field_status(key) == "section" and isinstance(value, Mapping):
+            sub_pruned = {
+                sub_key: sub_value
+                for sub_key, sub_value in value.items()
+                if is_behavioral(f"{key}.{sub_key}")
+            }
+            if sub_pruned:
+                pruned[key] = sub_pruned
+        elif is_behavioral(key):
+            pruned[key] = value
+    return pruned
+
+
 class UnsupportedStrategyConfigError(Exception):
     """Raised by :func:`validate_backtest_config` when a strategy config
     declares a field, section, or value the backtest path does not

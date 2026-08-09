@@ -508,3 +508,47 @@ def test_is_behavioral_true_for_bare_section_name() -> None:
     is always potentially behavioral -- it is not itself classified
     CONSUMED_LOGGING_ONLY/INFORMATIONAL, only its sub-keys are."""
     assert is_behavioral("portfolio") is True
+
+
+# ── PR #50 Codex round-9: prune_to_behavioral_leaves() recursively strips
+#    non-behavioral leaves, including inside a section whose sub-keys are
+#    ALL non-behavioral even though the bare section name is_behavioral ──
+
+
+def test_prune_to_behavioral_leaves_drops_top_level_non_behavioral_fields() -> None:
+    from backtesting.config_contract import prune_to_behavioral_leaves
+
+    config = {
+        "name": "v1",
+        "version": 3,
+        "description": "some notes",
+        "portfolio": {"n_long": 10},
+    }
+    pruned = prune_to_behavioral_leaves(config)
+    assert pruned == {"name": "v1", "portfolio": {"n_long": 10}}
+
+
+def test_prune_to_behavioral_leaves_drops_all_non_behavioral_subkeys_of_a_section() -> None:
+    """Codex's exact example: "reporting"'s only two known sub-keys
+    (save_positions, save_trades) are both CONSUMED_LOGGING_ONLY, so a
+    "reporting" section containing only those collapses to nothing --
+    even though "reporting" itself (a bare section name) is_behavioral."""
+    from backtesting.config_contract import prune_to_behavioral_leaves
+
+    config = {
+        "name": "v1",
+        "reporting": {"save_trades": True, "save_positions": False},
+    }
+    pruned = prune_to_behavioral_leaves(config)
+    assert pruned == {"name": "v1"}
+    assert "reporting" not in pruned
+
+
+def test_prune_to_behavioral_leaves_keeps_mixed_section_behavioral_subkeys_only() -> None:
+    from backtesting.config_contract import prune_to_behavioral_leaves
+
+    config = {
+        "portfolio": {"n_long": 10, "target_volatility": 0.1},  # n_long consumed, target_volatility informational
+    }
+    pruned = prune_to_behavioral_leaves(config)
+    assert pruned == {"portfolio": {"n_long": 10}}
