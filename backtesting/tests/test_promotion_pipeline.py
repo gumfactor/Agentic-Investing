@@ -680,6 +680,59 @@ def test_informational_grid_key_variants_collapse_to_one_effective_config(db_url
     assert result.evidence_json["sensitivity"]["underpowered"] is True
 
 
+def test_logging_only_grid_key_variants_collapse_to_one_effective_config(db_url: str) -> None:
+    """Round-8 (PR #50 Codex P1): Codex's exact example -- "version" is
+    CONSUMED (read by key), not INFORMATIONAL, so the round-7 fix (which
+    only filtered INFORMATIONAL dot-paths) does NOT catch this. version is
+    read ONLY by BacktestLogger, never per-sweep-variant, so
+    {"version": [1, 2, 3]} still executes the identical backtest 3 times.
+    is_behavioral() (CONSUMED_LOGGING_ONLY tier) must collapse these too.
+
+    Exercises the dedupe-level filter directly (bypassing
+    _resolve_frozen_grid's round-8 validation-time rejection), the
+    defense-in-depth path for any grid frozen before this fix shipped."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"version": v},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+        )
+        for v in (1, 2, 3)
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"version": [1, 2, 3]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows differing only in a CONSUMED_LOGGING_ONLY field -- all 3
+    # execute the identical backtest, so exactly 1 distinct effective
+    # variant.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 1
+    assert result.evidence_json["sensitivity"]["underpowered"] is True
+
+
 def test_ancestor_descendant_grid_paths_collapse_to_same_effective_config(db_url: str) -> None:
     """Round-5 (PR #50 Codex P1): distinct row.params dicts can still
     resolve to the IDENTICAL effective backtest config when the grid has
@@ -1064,7 +1117,7 @@ def test_grid_with_informational_key_fails_closed_before_walk_forward(db_url: st
     pipeline = _make_pipeline(db_url)
     pipeline._wf_validator = validator
 
-    with pytest.raises(MissingParameterGridError, match="INFORMATIONAL"):
+    with pytest.raises(MissingParameterGridError, match="not behavioral"):
         pipeline.run(
             "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )
@@ -1085,7 +1138,30 @@ def test_grid_with_mixed_informational_and_behavioral_keys_fails_closed(db_url: 
     pipeline = _make_pipeline(db_url)
     pipeline._wf_validator = validator
 
-    with pytest.raises(MissingParameterGridError, match="INFORMATIONAL"):
+    with pytest.raises(MissingParameterGridError, match="not behavioral"):
+        pipeline.run(
+            "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+        )
+
+    validator.run.assert_not_called()
+
+
+def test_grid_with_logging_only_key_fails_closed_before_walk_forward(db_url: str) -> None:
+    """Round-8 (PR #50 Codex P1): "version" is CONSUMED (read by key), not
+    INFORMATIONAL -- config_contract.py's own docstring says CONSUMED means
+    "read BY KEY, whether to change behavior OR to individually label a
+    persisted record." version is read ONLY by BacktestLogger, which is
+    never invoked per-sweep-variant, so {"version": [1, 2, 3]} would
+    execute the identical backtest 3 times under a naive "keep everything
+    CONSUMED" filter. is_behavioral() must reject it too, the same as an
+    INFORMATIONAL key."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url, param_grid={"version": [1, 2, 3]})
+    validator = _mock_validator()
+    pipeline = _make_pipeline(db_url)
+    pipeline._wf_validator = validator
+
+    with pytest.raises(MissingParameterGridError, match="not behavioral"):
         pipeline.run(
             "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
         )

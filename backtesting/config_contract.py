@@ -25,49 +25,76 @@ field by field, whether the backtest path's ACTUAL behavior can honestly
 support what a config declares. Anything it cannot support is REJECTED
 (:class:`UnsupportedStrategyConfigError`), never warned-and-continued.
 
-Three-tier classification
+Four-tier classification
 --------------------------
 Every field that can legally appear in a strategy config dict is one of:
 
 ``CONSUMED``
     The backtest path reads this field and its value materially changes
-    backtest behavior (e.g. ``portfolio.n_long``, ``backtest.start_date``).
+    what an individual backtest COMPUTES/SIMULATES (e.g.
+    ``portfolio.n_long``, ``backtest.start_date``, ``name`` -- via
+    ``backtesting/loader.py``'s alpha_scores strategy_id fallback, which
+    changes WHICH SCORES get traded, not merely a label).
+
+``CONSUMED_LOGGING_ONLY`` (PR #50 Codex round-8 fix, promotion-integrity/C8)
+    The backtest path reads this field BY KEY, but only inside
+    ``BacktestLogger`` (``log_run``/``log_walk_forward_run``) to label an
+    MLflow record AFTER a run completes -- never inside
+    ``BacktestEngine.run``/``WalkForwardValidator.run``/``ParameterSweeper.
+    sweep``'s actual simulation, and never per-sweep-variant (only once,
+    for the aggregate walk-forward leg). ``version`` (``strategy_version``
+    MLflow tag) and ``reporting.save_positions``/``reporting.save_trades``
+    (gate whether an artifact gets written, not what gets simulated) are
+    the current members. This tier exists because ``PromotionPipeline``'s
+    parameter-sensitivity dedupe (``backtesting/validation/
+    promotion_pipeline.py``) needs to know "does varying this field change
+    an individual SWEEP VARIANT's simulated output" -- a narrower question
+    than plain ``CONSUMED``'s "is this field read anywhere in the backtest
+    path, including post-hoc logging." Before this tier existed,
+    ``CONSUMED`` conflated the two: a grid like ``{"version": [1, 2, 3]}``
+    would count as 3 distinct behavioral variants even though
+    ``ParameterSweeper.sweep``'s per-variant loop never invokes
+    ``BacktestLogger`` at all, so all 3 backtest identically. See
+    :func:`is_behavioral`.
 
 ``INFORMATIONAL``
-    The backtest path does not read this field, but its presence does not
-    misrepresent anything the backtest path computed. This covers two
-    distinct cases: (a) pure metadata (``name``, ``version``, ``description``)
-    and (b) fields that describe a DIFFERENT subsystem's behavior honestly --
-    ``universe.*``/``indicators.*`` describe how the upstream alpha_scores
-    were computed (a separate, already-tracked research-run methodology, see
-    BUG-009), and ``portfolio.target_volatility`` is a live/paper-only sizing
-    knob (``portfolio/rebalancing``, ``portfolio/risk_model``) that the
-    backtest engine has never claimed to apply. Declaring these alongside a
-    backtest does not assert the backtest engine did anything with them.
+    The backtest path does not read this field at all (not even for
+    logging), but its presence does not misrepresent anything the backtest
+    path computed. This covers two distinct cases: (a) pure metadata
+    (``description``, ``created``) and (b) fields that describe a
+    DIFFERENT subsystem's behavior honestly -- ``universe.*``/
+    ``indicators.*`` describe how the upstream alpha_scores were computed
+    (a separate, already-tracked research-run methodology, see BUG-009),
+    and ``portfolio.target_volatility`` is a live/paper-only sizing knob
+    (``portfolio/rebalancing``, ``portfolio/risk_model``) that the
+    backtest engine has never claimed to apply. Declaring these alongside
+    a backtest does not assert the backtest engine did anything with them.
 
-Anything not explicitly classified CONSUMED or INFORMATIONAL below is
-REJECTED: an entire unknown top-level section, an unknown key inside a known
-section, or a known field holding a value the engine cannot honor (the
-canonical case: ``portfolio.method`` set to anything other than
-``"equal_weight"``, since ``_select_equal_weight`` is the only construction
-method the engine actually runs).
+Anything not explicitly classified CONSUMED, CONSUMED_LOGGING_ONLY, or
+INFORMATIONAL below is REJECTED: an entire unknown top-level section, an
+unknown key inside a known section, or a known field holding a value the
+engine cannot honor (the canonical case: ``portfolio.method`` set to
+anything other than ``"equal_weight"``, since ``_select_equal_weight`` is
+the only construction method the engine actually runs).
 
-What counts as "read" (adversarial-review sweep, 02B round 2)
+What counts as "read" (adversarial-review sweep, 02B round 2; refined 04-4W
+round-8 for the CONSUMED/CONSUMED_LOGGING_ONLY split)
 -------------------------------------------------------------
 Every classification below was audited against the actual keyed reads in
 ``backtesting/loader.py``, ``backtesting/engine/event_loop.py``,
 ``backtesting/experiment_tracking/mlflow_logger.py``,
 ``backtesting/validation/walk_forward.py``, and
-``backtesting/validation/parameter_sensitivity.py``. A field is CONSUMED
-iff some backtest-path code reads it BY KEY -- whether to change behavior
-(``portfolio.n_long``) or to individually label a persisted record
-(``version`` -> the ``strategy_version`` MLflow tag). Bulk verbatim
-recording does NOT count: ``_log_params_flat``, the ``config.json`` MLflow
-artifact, and ``config_hash`` copy the ENTIRE config without interpreting
-any specific key, so "it appears in the params dump" is true of every
-field and distinguishes nothing. INFORMATIONAL therefore means: no keyed
-read anywhere in the backtest path (verified by grep for each field), only
-possibly the verbatim bulk copies.
+``backtesting/validation/parameter_sensitivity.py``. A field is CONSUMED or
+CONSUMED_LOGGING_ONLY iff some backtest-path code reads it BY KEY -- the
+split is WHERE: inside the simulation itself (``BacktestEngine.run``/
+``WalkForwardValidator.run``/``ParameterSweeper.sweep``/``loader.py``) is
+CONSUMED; inside ``BacktestLogger`` ONLY is CONSUMED_LOGGING_ONLY. Bulk
+verbatim recording does NOT count as either: ``_log_params_flat``, the
+``config.json`` MLflow artifact, and ``config_hash`` copy the ENTIRE config
+without interpreting any specific key, so "it appears in the params dump"
+is true of every field and distinguishes nothing. INFORMATIONAL therefore
+means: no keyed read anywhere in the backtest path (verified by grep for
+each field), only possibly the verbatim bulk copies.
 
 ``execution.*`` is a special case: no backtest-path code reads
 ``config["execution"]`` to CONSTRUCT the ``FillSimulator`` (callers build
@@ -102,7 +129,28 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 CONSUMED = "consumed"
+CONSUMED_LOGGING_ONLY = "consumed_logging_only"
 INFORMATIONAL = "informational"
+
+# PR #50 Codex round-8 fix: statuses under which varying a field can NEVER
+# change what an individual backtest/sweep-variant COMPUTES -- see
+# is_behavioral() and the module docstring's four-tier classification.
+_NON_BEHAVIORAL_STATUSES = frozenset({INFORMATIONAL, CONSUMED_LOGGING_ONLY})
+
+
+def is_behavioral(dot_path: str) -> bool:
+    """True iff varying ``dot_path``'s value could change what an
+    individual backtest/sweep-variant actually SIMULATES -- i.e. its
+    ``field_status()`` is neither ``INFORMATIONAL`` nor
+    ``CONSUMED_LOGGING_ONLY``.
+
+    The single source of truth for "is this field a meaningful parameter-
+    sensitivity sweep dimension," used by ``PromotionPipeline`` (both the
+    fail-closed grid-validation rejection and the dedupe-key filter) --
+    see the module docstring's ``CONSUMED_LOGGING_ONLY`` entry for why
+    plain ``CONSUMED`` alone is not precise enough for that purpose.
+    """
+    return field_status(dot_path) not in _NON_BEHAVIORAL_STATUSES
 
 
 class UnsupportedStrategyConfigError(Exception):
@@ -158,10 +206,15 @@ _TOP_LEVEL_FIELDS: dict[str, str] = {
     # silently produce a cash-only backtest. Prefer declaring an explicit
     # top-level `strategy_id` in new configs.
     "name": CONSUMED,
-    # CONSUMED (02B round-2 sweep): read by key in BacktestLogger for the
-    # `strategy_version` MLflow tag -- a record-labeling read, but a keyed
-    # read nonetheless; a wrong version misattributes every logged run.
-    "version": CONSUMED,
+    # CONSUMED_LOGGING_ONLY (02B round-2 sweep; reclassified from CONSUMED,
+    # PR #50 Codex round-8 fix): read by key ONLY in BacktestLogger for the
+    # `strategy_version` MLflow tag -- a record-labeling read, never read
+    # inside BacktestEngine.run/WalkForwardValidator.run/ParameterSweeper.
+    # sweep's actual simulation, and BacktestLogger is never invoked
+    # per-sweep-variant. A wrong version misattributes every logged run
+    # (still worth failing on if declared-vs-actual ever diverges), but
+    # sweeping over it produces zero behaviorally distinct variants.
+    "version": CONSUMED_LOGGING_ONLY,
     "description": INFORMATIONAL,
     "created": INFORMATIONAL,
     # Top-level data_version: read directly by BacktestEngine.run
@@ -282,10 +335,17 @@ _REJECTED_SECTIONS = {
 # behavior). Before this, the section was wildcard-informational while
 # v1_base_momentum.yaml declared both keys and the logger ignored them --
 # the same classification-vs-actual-reads defect class as round 2's P0s.
+#
+# CONSUMED_LOGGING_ONLY, not plain CONSUMED (PR #50 Codex round-8 fix):
+# both keys are read ONLY by BacktestLogger's post-run artifact block --
+# they gate whether a CSV gets WRITTEN, never anything
+# BacktestEngine.run/WalkForwardValidator.run/ParameterSweeper.sweep
+# actually simulates. BacktestLogger is not invoked per-sweep-variant, so
+# sweeping over either key produces zero behaviorally distinct variants.
 # ---------------------------------------------------------------------------
 _REPORTING_FIELDS: dict[str, str] = {
-    "save_positions": CONSUMED,
-    "save_trades": CONSUMED,
+    "save_positions": CONSUMED_LOGGING_ONLY,
+    "save_trades": CONSUMED_LOGGING_ONLY,
 }
 
 _KNOWN_SECTION_VALIDATORS: dict[str, dict[str, str]] = {
@@ -493,11 +553,18 @@ def field_status(dot_path: str) -> str:
 
     Returns one of:
 
-    * ``"consumed"`` -- read and used to control backtest behavior.
+    * ``"consumed"`` -- read and used to control what an individual
+      backtest/sweep-variant SIMULATES.
     * ``"consumed_value_restricted"`` -- read, but only a specific value is
       supported (currently only ``portfolio.method``); the caller must still
       check the actual value via :func:`validate_backtest_config`.
-    * ``"informational"`` -- accepted, but not read by the backtest path.
+    * ``"consumed_logging_only"`` -- read BY KEY, but only inside
+      ``BacktestLogger`` to label an MLflow record after a run completes,
+      never inside the simulation itself and never per-sweep-variant. See
+      :func:`is_behavioral` for the "does this field matter for a
+      parameter-sensitivity sweep" question this status exists to answer.
+    * ``"informational"`` -- accepted, but not read by the backtest path
+      at all (not even for logging).
     * ``"section"`` -- the bare name of a known enumerated section
       (``portfolio``, ``execution``, ``backtest``) rather than a field
       inside it. The section name itself carries no classification --

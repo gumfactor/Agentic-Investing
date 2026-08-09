@@ -120,7 +120,7 @@ import structlog
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
-from backtesting.config_contract import INFORMATIONAL, field_status
+from backtesting.config_contract import is_behavioral
 from backtesting.validation.bootstrap_stress import (
     BootstrapStressResult,
     bootstrap_stress as _default_bootstrap_stress,
@@ -741,17 +741,32 @@ class PromotionPipeline:
         # BACKTEST BEHAVIOR" -- a grid entry like
         # {"description": ["a", "b", "c"]} produces three genuinely
         # different serialized configs, but backtesting/config_contract.py
-        # explicitly classifies "description" (and other such fields) as
-        # INFORMATIONAL: accepted, but never read by the backtest path
-        # (see field_status()). Three rows that only differ in an
-        # informational field all execute the IDENTICAL backtest, so they
-        # must count as ONE variant, not three. Filter each row's params
-        # to exclude informational dot-paths BEFORE building the dedup
-        # key -- a row whose params become empty after filtering (every
-        # grid key it touched was informational) correctly collapses to
-        # the base config's own key, same as every other such row, which
-        # is exactly right: if nothing behavioral varies, there is only
-        # one real variant regardless of row count.
+        # explicitly classifies "description" as INFORMATIONAL: accepted,
+        # but never read by the backtest path AT ALL (see field_status()).
+        # Three rows that only differ in an informational field all
+        # execute the IDENTICAL backtest, so they must count as ONE
+        # variant, not three.
+        #
+        # PR #50 Codex round-8 fix (P1, same class one layer deeper): plain
+        # CONSUMED is not precise enough either -- config_contract.py's own
+        # docstring says CONSUMED means "read BY KEY, whether to change
+        # behavior OR to individually label a persisted record" (e.g.
+        # "version" -> the strategy_version MLflow tag). BacktestLogger is
+        # never invoked per-sweep-variant (only once, for the aggregate
+        # walk-forward leg), so a grid like {"version": [1, 2, 3]} would
+        # still execute the identical backtest 3 times under a naive
+        # "keep everything CONSUMED" filter. is_behavioral() (added this
+        # round in config_contract.py, the new CONSUMED_LOGGING_ONLY tier)
+        # is the precise question this dedupe actually needs answered:
+        # "does varying this field change what an individual sweep variant
+        # SIMULATES" -- not "is this field read anywhere in the backtest
+        # path, including post-hoc logging." Filter each row's params to
+        # exclude non-behavioral dot-paths BEFORE building the dedup key --
+        # a row whose params become empty after filtering (every grid key
+        # it touched was non-behavioral) correctly collapses to the base
+        # config's own key, same as every other such row, which is exactly
+        # right: if nothing behavioral varies, there is only one real
+        # variant regardless of row count.
         effective_config_to_row: dict[str, ParameterSensitivityRow] = {}
         if sensitivity_result is not None:
             for row in sensitivity_result.rows:
@@ -760,7 +775,7 @@ class PromotionPipeline:
                 behavioral_params = {
                     dot_path: value
                     for dot_path, value in row.params.items()
-                    if field_status(dot_path) != INFORMATIONAL
+                    if is_behavioral(dot_path)
                 }
                 effective_key = json.dumps(
                     _sweep_apply_params(
@@ -963,33 +978,34 @@ class PromotionPipeline:
                 "expensive walk-forward run and record trial evidence "
                 "before the sweep discovers zero usable combinations)."
             )
-        # PR #50 Codex round-7 fix (P1, promotion-integrity/C8): a grid key
-        # classified INFORMATIONAL by backtesting.config_contract.field_status
-        # (e.g. "description", "created", or the whole "universe" section --
-        # accepted by validate_backtest_config, but never READ by the
-        # backtest path) can never change what a variant actually backtests.
-        # Sweeping over such a key wastes N identical backtests AND creates
-        # exactly the "distinct row.params but IDENTICAL effective behavior"
+        # PR #50 Codex round-7 fix (P1, promotion-integrity/C8), refined
+        # round-8: a grid key that is not behavioral per
+        # backtesting.config_contract.is_behavioral (INFORMATIONAL -- e.g.
+        # "description", "created", the whole "universe" section -- or
+        # CONSUMED_LOGGING_ONLY -- e.g. "version", "reporting.save_trades",
+        # read only by BacktestLogger, never per-sweep-variant) can never
+        # change what a variant actually backtests. Sweeping over such a
+        # key wastes N identical backtests AND creates exactly the
+        # "distinct row.params but IDENTICAL effective behavior"
         # overcounting class the round-5/6 dedupe fixes exist to close --
         # closing it at the SOURCE (reject the grid outright, before any
         # instrument runs) rather than only downstream in the dedupe is both
         # cheaper (no wasted walk-forward/sweep compute) and cannot be
         # bypassed by a future dedupe-key change that forgets to filter.
         # (backtesting.validation.promotion_pipeline.run() ALSO filters
-        # informational keys before computing the dedupe key, as defense in
-        # depth for any grid frozen before this fix shipped.)
-        informational_keys = sorted(
-            key for key in param_grid if field_status(key) == INFORMATIONAL
-        )
-        if informational_keys:
+        # non-behavioral keys before computing the dedupe key, as defense
+        # in depth for any grid frozen before this fix shipped.)
+        non_behavioral_keys = sorted(key for key in param_grid if not is_behavioral(key))
+        if non_behavioral_keys:
             raise MissingParameterGridError(
                 f"strategy_hypotheses id={hypothesis_id} (strategy_id="
                 f"{strategy_id!r}) has param_grid_json key(s) "
-                f"{informational_keys!r} classified INFORMATIONAL by "
-                "backtesting.config_contract.field_status -- accepted by "
-                "the backtest config contract, but never read by the "
-                "backtest path, so sweeping over them can never produce a "
-                "behaviorally different variant. A parameter-sensitivity "
+                f"{non_behavioral_keys!r} that are not behavioral per "
+                "backtesting.config_contract.is_behavioral -- accepted by "
+                "the backtest config contract (possibly even read by key), "
+                "but never affecting what an individual backtest/sweep-"
+                "variant SIMULATES, so sweeping over them can never produce "
+                "a behaviorally different variant. A parameter-sensitivity "
                 "sweep must vary fields that actually affect what gets "
                 "backtested; remove these key(s) from the grid via "
                 "HypothesisRegistry.update_param_grid(...)."

@@ -30,6 +30,7 @@ from backtesting.config_contract import (
     UnsupportedStrategyConfigError,
     assert_fill_simulator_matches_config,
     field_status,
+    is_behavioral,
     validate_backtest_config,
 )
 
@@ -95,7 +96,8 @@ def test_every_yaml_key_is_explicitly_classified(filename: str) -> None:
             f"{filename}: key '{dot_path}' is not classified by "
             "backtesting/config_contract.py (field_status returned "
             "'unknown'). Add it to the contract as CONSUMED, "
-            "INFORMATIONAL, or an explicitly rejected section/key -- do "
+            "CONSUMED_LOGGING_ONLY, INFORMATIONAL, or an explicitly "
+            "rejected section/key -- do "
             "not let a new key pass through unclassified (Roadmap 02B / "
             "BUG-075)."
         )
@@ -464,7 +466,45 @@ def test_bare_known_section_name_has_distinct_status(section: str) -> None:
 
 
 def test_name_and_version_are_consumed() -> None:
-    """P0-2/sweep: `name` (loader strategy_id fallback + MLflow tag) and
-    `version` (MLflow strategy_version tag) are keyed reads -> CONSUMED."""
+    """P0-2/sweep: `name` (loader strategy_id fallback + MLflow tag) is a
+    keyed read that changes WHICH SCORES a backtest trades -> CONSUMED.
+
+    `version` (MLflow strategy_version tag only) is ALSO a keyed read, but
+    round-8 (PR #50) split it out to CONSUMED_LOGGING_ONLY: BacktestLogger
+    is the only reader, and it never runs per-sweep-variant, so varying
+    `version` can never change what an individual backtest/sweep-variant
+    simulates -- see is_behavioral()."""
     assert field_status("name") == "consumed"
-    assert field_status("version") == "consumed"
+    assert field_status("version") == "consumed_logging_only"
+
+
+# ── PR #50 Codex round-8: is_behavioral() distinguishes "affects
+#    simulation" from "affects logging/labeling only" ─────────────────────
+
+
+def test_is_behavioral_true_for_simulation_affecting_fields() -> None:
+    assert is_behavioral("portfolio.n_long") is True
+    assert is_behavioral("backtest.initial_capital") is True
+    assert is_behavioral("name") is True  # changes WHICH SCORES get traded
+    assert is_behavioral("strategy_id") is True
+
+
+def test_is_behavioral_false_for_logging_only_fields() -> None:
+    """Codex's exact example: `version` is read by key (CONSUMED, not
+    INFORMATIONAL), but only inside BacktestLogger, never per-sweep-variant
+    -- so it must NOT count as a behavioral sweep dimension."""
+    assert is_behavioral("version") is False
+    assert is_behavioral("reporting.save_positions") is False
+    assert is_behavioral("reporting.save_trades") is False
+
+
+def test_is_behavioral_false_for_informational_fields() -> None:
+    assert is_behavioral("description") is False
+    assert is_behavioral("universe.source") is False
+
+
+def test_is_behavioral_true_for_bare_section_name() -> None:
+    """A bare section name (e.g. "portfolio", replacing the whole subtree)
+    is always potentially behavioral -- it is not itself classified
+    CONSUMED_LOGGING_ONLY/INFORMATIONAL, only its sub-keys are."""
+    assert is_behavioral("portfolio") is True
