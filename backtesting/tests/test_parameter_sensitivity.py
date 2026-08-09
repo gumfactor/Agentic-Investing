@@ -14,9 +14,34 @@ from backtesting.validation.parameter_sensitivity import (
     ParameterSensitivityResult,
     ParameterSensitivityRow,
     ParameterSweeper,
+    fingerprint_returns,
     _apply_params,
     _set_nested,
 )
+
+
+# ── PR #50 Codex round-12: fingerprint_returns() -- a strong execution-
+#    identity proxy from the full OOS return sequence ──────────────────
+
+
+def test_fingerprint_returns_identical_series_match() -> None:
+    a = pd.Series([0.01, -0.02, 0.03, 0.0])
+    b = pd.Series([0.01, -0.02, 0.03, 0.0])
+    assert fingerprint_returns(a) == fingerprint_returns(b)
+
+
+def test_fingerprint_returns_differing_series_differ() -> None:
+    a = pd.Series([0.01, -0.02, 0.03, 0.0])
+    b = pd.Series([0.01, -0.02, 0.03, 0.0001])
+    assert fingerprint_returns(a) != fingerprint_returns(b)
+
+
+def test_fingerprint_returns_order_sensitive() -> None:
+    """Same VALUES in a different order must NOT match -- this is meant
+    to fingerprint a specific observed sequence, not a multiset."""
+    a = pd.Series([0.01, -0.02, 0.03])
+    b = pd.Series([-0.02, 0.01, 0.03])
+    assert fingerprint_returns(a) != fingerprint_returns(b)
 
 
 # ------------------------------------------------------------------

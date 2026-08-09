@@ -26,6 +26,7 @@ Usage::
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
 import math
 from dataclasses import dataclass, field
@@ -83,6 +84,29 @@ def summarize_variants(
     return mean_sharpe, std_sharpe, pos_frac, curve_fit_flag, verdict
 
 
+def fingerprint_returns(returns: "pd.Series") -> str:
+    """SHA-256 hex digest of a return series' full value sequence.
+
+    PR #50 Codex round-12 fix: the four summary scalars on
+    ``ParameterSensitivityRow`` (oos_sharpe/oos_max_drawdown/trade_count/
+    avg_is_sharpe) are a NECESSARY but not SUFFICIENT condition for "two
+    variants ran the identical simulation" -- two genuinely DIFFERENT
+    return paths can coincidentally share all four aggregate scalars
+    (trade_count in particular is low-cardinality), which would let
+    ``PromotionPipeline``'s round-10 outcome-based dedupe wrongly collapse
+    distinct variants (or, in the adversarial direction Codex flagged,
+    collapse several distinct LOSERS while a distinct WINNER stays
+    separate, skewing positive_fraction upward). Hashing the FULL ordered
+    sequence of OOS returns is a vastly stronger execution-identity proxy
+    -- for two variants to collide here, their entire day-by-day OOS
+    return sequence must be byte-identical, not just four aggregates of
+    it. Still purely OUTPUT-based (reads what the engine actually
+    produced; does not model or predict it), so it inherits round-10's
+    "cannot drift out of sync with the engine" property.
+    """
+    return hashlib.sha256(np.ascontiguousarray(returns.to_numpy()).tobytes()).hexdigest()
+
+
 @dataclass
 class ParameterSensitivityRow:
     """Backtest result for one parameter configuration.
@@ -94,6 +118,12 @@ class ParameterSensitivityRow:
         oos_max_drawdown: Maximum drawdown on the stitched OOS series.
         trade_count: Total OOS trade count across all folds.
         avg_is_sharpe: Average in-sample Sharpe across folds.
+        oos_returns_fingerprint: SHA-256 hex digest of the full OOS return
+            sequence (see :func:`fingerprint_returns`) -- a strong
+            execution-identity proxy, stronger than the four summary
+            scalars above. Empty string for an errored/NaN variant (no
+            returns series was produced). Defaults to "" for callers
+            (mainly tests) that construct a row without a real backtest.
     """
 
     params: dict[str, Any]
@@ -101,6 +131,7 @@ class ParameterSensitivityRow:
     oos_max_drawdown: float
     trade_count: int
     avg_is_sharpe: float
+    oos_returns_fingerprint: str = ""
 
 
 @dataclass
@@ -265,6 +296,10 @@ class ParameterSweeper:
                 oos_dd = float(wf.oos_metrics.get("max_drawdown", float("nan")))
                 avg_is = _avg_is_sharpe(wf)
                 trade_count = oos_trade_count_from_wf(wf)
+                # PR #50 Codex round-12 fix: fingerprint the FULL OOS
+                # returns sequence, not just the summary scalars above --
+                # see fingerprint_returns()'s docstring.
+                returns_fingerprint = fingerprint_returns(wf.oos_returns)
             except (ValueError, RuntimeError) as exc:
                 # Catch engine-level failures (e.g. insufficient data for a
                 # specific param combo) but not configuration errors.
@@ -277,6 +312,7 @@ class ParameterSweeper:
                 oos_dd = float("nan")
                 avg_is = float("nan")
                 trade_count = 0
+                returns_fingerprint = ""
 
             rows.append(ParameterSensitivityRow(
                 params=params,
@@ -284,6 +320,7 @@ class ParameterSweeper:
                 oos_max_drawdown=oos_dd,
                 trade_count=trade_count,
                 avg_is_sharpe=avg_is,
+                oos_returns_fingerprint=returns_fingerprint,
             ))
 
         n_valid = sum(1 for r in rows if math.isfinite(r.oos_sharpe))

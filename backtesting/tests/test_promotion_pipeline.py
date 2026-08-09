@@ -1392,6 +1392,78 @@ def test_nan_safe_normalizes_nan_and_passes_through_other_values() -> None:
     assert _nan_safe(None) is None
 
 
+def test_coincidental_metric_match_does_not_collapse_distinct_executions(db_url: str) -> None:
+    """Round-12 (PR #50 Codex P1): the four summary scalars alone are a
+    NECESSARY but not SUFFICIENT condition for "same execution" -- two
+    genuinely DIFFERENT return paths can coincidentally share Sharpe/
+    max_drawdown/trade_count/avg_is_sharpe. Two rows with IDENTICAL
+    summary metrics but DIFFERENT oos_returns_fingerprint (proving their
+    full OOS return sequences actually diverged) must NOT collapse -- the
+    adversarial direction Codex flagged: several distinct losers
+    coincidentally matching a winner's summary stats must not silently
+    reduce the counted diversity."""
+    config_hash = _seed_definition(db_url)
+    hyp_id = _seed_hypothesis(db_url)
+
+    rows = [
+        ParameterSensitivityRow(
+            params={"portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+            oos_returns_fingerprint="fingerprint-A",
+        ),
+        ParameterSensitivityRow(
+            # Identical summary scalars to the row above, but a genuinely
+            # different observed return sequence.
+            params={"portfolio.n_long": 20},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+            oos_returns_fingerprint="fingerprint-B",
+        ),
+        ParameterSensitivityRow(
+            # A true duplicate of the first row -- same summary AND same
+            # fingerprint -- must still collapse with it.
+            params={"portfolio.n_long": 10},
+            oos_sharpe=0.9,
+            oos_max_drawdown=-0.10,
+            trade_count=40,
+            avg_is_sharpe=1.0,
+            oos_returns_fingerprint="fingerprint-A",
+        ),
+    ]
+    sweep_result = ParameterSensitivityResult(
+        base_config_name="v1_test_strategy",
+        param_grid={"portfolio.n_long": [10, 20]},
+        configs_tested=3,
+        rows=rows,
+        mean_oos_sharpe=0.9,
+        std_oos_sharpe=0.0,
+        positive_fraction=1.0,
+        curve_fit_flag=False,
+        verdict="robust",
+    )
+
+    pipeline = _make_pipeline(
+        db_url,
+        validator_result=_wf_result(),
+        sweep_result=sweep_result,
+    )
+
+    result = pipeline.run(
+        "v1_test_strategy", config_hash, data_handler=MagicMock(), eval_window=DEFAULT_EVAL_WINDOW, hypothesis_id=hyp_id
+    )
+
+    # 3 rows, identical summary metrics throughout, but only 2 distinct
+    # oos_returns_fingerprint values -- rows 1 and 3 (same fingerprint)
+    # collapse; row 2 (different fingerprint despite matching summary
+    # stats) stays separate.
+    assert result.evidence_json["sensitivity"]["n_finite_variants"] == 2
+
+
 # ── Round-10 (P2-class efficiency/fail-fast): a grid candidate the config
 #    contract cannot accept at all must fail closed BEFORE any instrument
 #    runs, not crash mid-sweep after the walk-forward leg already ran ────

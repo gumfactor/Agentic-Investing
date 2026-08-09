@@ -845,6 +845,25 @@ class PromotionPipeline:
         # fields). Normalize NaN to a stable sentinel (None, which DOES
         # compare equal to itself) in the outcome key before using it,
         # so two independently-NaN auxiliary metrics correctly collapse.
+        #
+        # PR #50 Codex round-12 fix (P1): the four summary scalars alone
+        # are a NECESSARY but not SUFFICIENT condition for "these two rows
+        # ran the identical simulation" -- two genuinely DIFFERENT return
+        # paths can coincidentally share all four aggregates (trade_count
+        # especially is low-cardinality), wrongly collapsing distinct
+        # variants (or, in the adversarial direction Codex flagged,
+        # collapsing several distinct LOSERS while a distinct WINNER stays
+        # separate, skewing positive_fraction upward and potentially
+        # flipping curve_fit to robust). Fold in
+        # row.oos_returns_fingerprint (a SHA-256 of the full OOS return
+        # sequence, computed once per variant in ParameterSweeper.sweep --
+        # see fingerprint_returns()'s docstring) as an additional key
+        # component: a vastly stronger execution-identity proxy than four
+        # aggregates of it, while remaining purely OUTPUT-based (reads
+        # what the engine produced, does not model/predict it), so it
+        # inherits round-10's "cannot drift out of sync with the engine"
+        # property rather than reintroducing round-5/6's config-shape
+        # guessing.
         effective_config_to_row: dict[tuple, ParameterSensitivityRow] = {}
         if sensitivity_result is not None:
             for row in sensitivity_result.rows:
@@ -858,7 +877,7 @@ class PromotionPipeline:
                         row.trade_count,
                         row.avg_is_sharpe,
                     )
-                )
+                ) + (row.oos_returns_fingerprint,)
                 effective_config_to_row.setdefault(outcome_key, row)
 
         n_finite_sensitivity_variants = (
